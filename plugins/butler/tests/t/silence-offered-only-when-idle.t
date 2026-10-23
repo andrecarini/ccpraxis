@@ -2,13 +2,22 @@
 # platform: any
 # ORACLE for package 38-silence-cannot-bypass-live-work (blueprint
 # hook-continuity-remake), gate/command/prose half: AC-12..AC-22 of
-# specs/38-silence-cannot-bypass-live-work-spec.md, under Decisions 127-129.
+# specs/38-silence-cannot-bypass-live-work-spec.md, under Decisions 127-129,
+# REPURPOSED by spec 05-remove-silence (judged-continuity-disarm blueprint,
+# Decision 9): `butler-continuity silence` is removed outright, not
+# narrowed -- it is no longer "offered only when idle", it refuses
+# unconditionally, whether work is running or not, with the exact M1 text.
+# This file now pins:
+#   - the RUNNING/IDLE Stop-gate deny text (unchanged by 05's removal);
+#   - the running/<sid> snapshot and holder-trust behavior (unchanged);
+#   - silence's own refusal: every invocation (idle, running, before any
+#     Stop, with or without a planted silence/<sid> record) exits 1 with
+#     stderr exactly M1 and writes no silence/<sid> file.
 #
-# Decision 128: while the session has running work, the Stop gate's message
-# does not list silence at all (the RUNNING text); silence is offered only
-# when nothing runs (the IDLE text); `butler-continuity silence` run anyway
-# while work runs explains and points at hold (exit 1, stderr), and silence
-# is framed everywhere as a sparingly used escape hatch.
+# Decision 128 (superseded for silence, kept for the RUNNING/IDLE text
+# itself): while the session has running work, the Stop gate's message
+# does not list silence at all (the RUNNING text); the IDLE text (2.4.3)
+# no longer lists silence either, since the verb no longer exists.
 #
 # Decision 129: running work is the UNION of the Stop payload's
 # background_tasks and the holder's own live tracked set, because a
@@ -242,6 +251,11 @@ sub run_cmd {
         $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} = $LEGACY;
         $ENV{CLAUDE_PROJECT_DIR}             = $PROJECT;
         $ENV{CCPRAXIS_NO_WAKELOCK}           = 1;
+        # judged-continuity-disarm package 03 (CONFLICT-3, Decision 25):
+        # off-confirm now dispatches the disarm judge on a successful OTP
+        # claim; without the stub this would launch a real `claude -p`. Set
+        # AFTER the CCPRAXIS_* scrub above so it is not itself deleted.
+        $ENV{CCPRAXIS_DISARM_JUDGE_STUB}     = 'approve';
         open(STDOUT, '>', $opath) or _exit(126);
         open(STDERR, '>', $epath) or _exit(126);
         { no warnings 'exec'; exec($^X, $CMD, @args); }
@@ -253,18 +267,6 @@ sub run_cmd {
     my $err = slurp($epath);
     unlink $opath, $epath;
     return ($out, $err, $rc);
-}
-
-sub silence_log_count {
-    my ($root, $sid) = @_;
-    my $p = cont_dir($root) . '/reasons.log';
-    return 0 unless -f $p;
-    my $n = 0;
-    for my $l (split /\n/, slurp($p)) {
-        my @f = split /\t/, $l;
-        $n++ if ($f[1] // '') eq $sid && ($f[3] // '') eq 'silence';
-    }
-    return $n;
 }
 
 sub read_json_file {
@@ -286,16 +288,23 @@ sub token_of { my ($err) = @_; my ($t) = ($err =~ /Stop token: ([0-9a-f]{8})$/m)
 # ---------------------------------------------------------------------------
 # expected texts, exactly as the spec gives them
 # ---------------------------------------------------------------------------
+# M1 (spec 05-remove-silence section 2.1): the byte-exact CLI refusal for
+# `butler-continuity silence`.
+my $M1 = "butler-continuity: 'butler-continuity silence' is removed: an armed session does not end a turn to wait for the operator. File the question with almanac inbox file --title '<question>' and keep working on everything that does not depend on the answer; if nothing can proceed, turn continuity off with a reason. See \"If you have a question for the operator\" in plugins/butler/skills/continuity/SKILL.md.\n";
+
 sub idle_text {
     my ($t) = @_;
+    # 2.4.3 (spec 05-remove-silence): the escape-hatch/silence lines are
+    # deleted outright, not reworded.
+    # 04-docs-and-wiring (spec addendum 0 / 2.2): two-step off + emergency-stop
+    # mention, matching stop-gate-single.t S2's 6-line expected template.
     return <<"TXT";
 Continuity is on for this session and no holder is running. Stop token: $t
 Waiting on a subagent or background task? Hold it, as a background Bash tool call:
   butler-hold --token $t <id> [<id> ...]
-All work done? Turn continuity off, as a Bash tool call:
+All work done? Turn continuity off (two steps: off mints an OTP, then off-confirm with it), as a Bash tool call:
   butler-continuity off --reason '<what is done>' --token $t
-Escape hatch, only when a stop is truly necessary, e.g. to talk with an operator who is present:
-  butler-continuity silence --reason '<why this stop>' --token $t
+(Genuine ccpraxis/Claude-Code defect, not just finished work? butler-continuity emergency-stop --reason '<the actual defect>' instead -- not a normal option.)
 TXT
 }
 
@@ -315,17 +324,6 @@ Hold it, as a background Bash tool call; the holder wakes this session when the 
   butler-hold --token $t $l3
 If that work is no longer needed and everything is done, turn continuity off, as a Bash tool call:
   butler-continuity off --reason '<what is done>' --token $t
-TXT
-}
-
-sub refusal_text {
-    my (@ids) = @_;
-    my ($l1, $l3) = ids_parts(@ids);
-    return <<"TXT";
-butler-continuity: not silenced: work is still running in this session ($l1), as of the last stop.
-A silence would end the turn with nothing waiting on that work. Hold it instead, as a background Bash tool call; the holder wakes this session when it finishes:
-  butler-hold $l3
-If that work is no longer needed and everything is done: butler-continuity off --reason '<what is done>'
 TXT
 }
 
@@ -549,9 +547,18 @@ SKIP: {
     arm_session($root, $sid);
     run_gate($root, payload_json($sid, background_tasks => [bg('a1', 'subagent')]));
     ok(-f snap_path($root, $sid), 'AC-17: precondition -- a RUNNING deny wrote running/<sid>');
-    my ($out, $err, $rc) = run_cmd($root, $sid, 'off', '--reason', 'work all done');
-    is($rc, 0, 'AC-17: off --reason exits 0') or diag("stderr: $err");
-    ok(!-e snap_path($root, $sid), 'AC-17: running/<sid> is gone after off');
+    # judged-continuity-disarm package 02: agent `off` now only mints a
+    # disarm OTP (exit 1); the actual disarm (and the running/<sid>
+    # snapshot removal AC-17 cares about) only happens once off-confirm
+    # disarms for real.
+    my ($out0, $err0, $rc0) = run_cmd($root, $sid, 'off', '--reason', 'work all done');
+    is($rc0, 1, 'AC-17: off --reason exits 1 (mints a disarm OTP)') or diag("stdout: $out0");
+    my ($otp) = ($err0 =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
+    ok(defined $otp, 'AC-17: off printed an 8-hex-char disarm OTP') or diag("stderr: $err0");
+
+    my ($out, $err, $rc) = run_cmd($root, $sid, 'off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'goal is met');
+    is($rc, 0, 'AC-17: off-confirm --otp --justification exits 0') or diag("stderr: $err");
+    ok(!-e snap_path($root, $sid), 'AC-17: running/<sid> is gone after off-confirm');
 }
 
 # ===========================================================================
@@ -572,8 +579,9 @@ SKIP: {
 }
 
 # ===========================================================================
-# AC-18 (DC2) -- silence while the snapshot exists: explained, refused, and
-# nothing written; the next Stop with work running is denied again.
+# AC-18 (DC2, spec 05-remove-silence section 4.3): silence is removed
+# outright -- it refuses with M1 whether or not work is running, writes
+# nothing; the next Stop with work running is still denied (RUNNING text).
 # ===========================================================================
 {
     my $root = fresh_root();
@@ -581,19 +589,16 @@ SKIP: {
     arm_session($root, $sid);
     my $r1 = run_gate($root, payload_json($sid, background_tasks => [bg('a1', 'subagent')]));
     is($r1->{rc}, 2, 'AC-18: precondition -- a RUNNING deny');
-    my $before = silence_log_count($root, $sid);
     my ($out, $err, $rc) = run_cmd($root, $sid, 'silence', '--reason', 'two words');
     is($rc, 1, 'AC-18: silence while work runs exits 1');
-    is($err, refusal_text('a1'), 'AC-18: stderr is exactly the section 2.4 text for a1');
+    is($err, $M1, 'AC-18: stderr is exactly M1');
     ok(!-e silence_path($root, $sid), 'AC-18: no silence/<sid> file');
-    is(silence_log_count($root, $sid), $before, 'AC-18: reasons.log has no new silence line');
     my $r2 = run_gate($root, payload_json($sid, background_tasks => [bg('a1', 'subagent')]));
     is($r2->{rc}, 2, 'AC-18: the following Stop with running work is denied again');
     my $t = token_of($r2->{err});
     is($r2->{err}, running_text($t // 'xxxxxxxx', 'a1'), 'AC-18: ...with the RUNNING text');
 }
 {
-    # the 2.4 text follows the same 8-id rule
     my $root = fresh_root();
     my $sid  = next_sid();
     arm_session($root, $sid);
@@ -601,12 +606,14 @@ SKIP: {
     run_gate($root, payload_json($sid, background_tasks => [map { bg($_, 'shell') } @ids]));
     my ($out, $err, $rc) = run_cmd($root, $sid, 'silence', '--reason', 'two words');
     is($rc, 1, 'AC-18 (8-id rule): exit 1');
-    is($err, refusal_text(@ids), 'AC-18 (8-id rule): w1..w8 then ", and 3 more"; the hold line carries the first eight');
+    is($err, $M1, 'AC-18 (8-id rule): stderr is exactly M1 regardless of how many ids are running');
     ok(!-e silence_path($root, $sid), 'AC-18 (8-id rule): no silence file');
 }
 
 # ===========================================================================
-# AC-19 (DC2, DC4) -- with no snapshot, silence behaves as today.
+# AC-19 (DC2, DC4, spec 05-remove-silence section 4.3) -- with no snapshot,
+# silence is still removed outright: exit 1, stderr M1; the next Stop is
+# still exit 2 (there is no silence to have let it through).
 # ===========================================================================
 {
     my $root = fresh_root();
@@ -615,26 +622,30 @@ SKIP: {
     my $r1 = run_gate($root, payload_json($sid, background_tasks => []));
     is($r1->{err}, idle_text(token_of($r1->{err}) // 'xxxxxxxx'), 'AC-19: precondition -- an IDLE deny');
     my ($out, $err, $rc) = run_cmd($root, $sid, 'silence', '--reason', 'two words');
-    is($rc, 0, 'AC-19: silence exits 0') or diag("stderr: $err");
-    my $s8 = substr($sid, 0, 8);
-    like($out . $err, qr/^continuity silenced for one stop of session \Q$s8\E; reason logged\.$/m, "AC-19: today's line is printed");
+    is($rc, 1, 'AC-19: silence exits 1') or diag("stdout: $out");
+    is($err, $M1, 'AC-19: stderr is exactly M1');
     my $r2 = run_gate($root, payload_json($sid, background_tasks => []));
-    is($r2->{rc}, 0, 'AC-19: the next Stop is allowed');
+    is($r2->{rc}, 2, 'AC-19: the next Stop is still exit 2');
 }
 
 # ===========================================================================
-# AC-20 (DC2) -- a silence set earlier is honoured even while work runs.
+# AC-20 (DC2, spec 05-remove-silence section 4.1/4.3) -- a planted
+# silence/<sid> record (hand-planted: set_silence is removed) is never read
+# by the gate. A Stop with running work still denies with the RUNNING text,
+# and the planted file is left exactly as it was.
 # ===========================================================================
 {
     my $root = fresh_root();
     my $sid  = next_sid();
     arm_session($root, $sid);
-    with_root($root, sub { BpHook::set_silence($sid, reason => 'talking with the operator') });
-    ok(-e silence_path($root, $sid), 'AC-20: precondition -- the silence is set');
+    write_file(silence_path($root, $sid), JSON::PP->new->utf8->canonical->encode(
+        { session_id => $sid, by => 'butler-continuity', reason => 'talking with the operator', at => time() }));
+    ok(-e silence_path($root, $sid), 'AC-20: precondition -- the silence record is planted');
     my $res = run_gate($root, payload_json($sid, background_tasks => [bg('a1', 'subagent')]));
-    is($res->{rc}, 0, 'AC-20: the Stop with a running entry exits 0');
-    is(with_root($root, sub { BpHook::take_silence($sid) }), 0, 'AC-20: the silence was consumed');
-    ok(!-e snap_path($root, $sid), 'AC-20: an allowed Stop leaves no running/<sid>');
+    is($res->{rc}, 2, 'AC-20: the Stop with a running entry still exits 2 (the planted record is never read)');
+    my $t = token_of($res->{err});
+    is($res->{err}, running_text($t // 'xxxxxxxx', 'a1'), 'AC-20: ...with the RUNNING text');
+    ok(-e silence_path($root, $sid), 'AC-20: the planted silence record still exists afterward');
 }
 
 # ===========================================================================
@@ -739,6 +750,7 @@ SKIP: {
 
     my ($out, $err, $rc) = run_cmd($root, $sid, 'silence', '--reason', 'two words');
     is($rc, 1, 'D129 (dead holder): silence while the snapshot names the resumed agent exits 1');
+    is($err, $M1, 'D129 (dead holder): stderr is exactly M1');
     ok(!-e silence_path($root, $sid), 'D129 (dead holder): no silence file');
 
     # the holder was already reaped above (the dead-variant transition);
@@ -747,12 +759,10 @@ SKIP: {
 }
 
 # ===========================================================================
-# D130 (S1) -- `butler-continuity silence` refuses whenever this session has
-# live running work AT INVOCATION TIME, not only after a Stop recorded a
-# RUNNING snapshot. A live holder holding a non-empty items record, with no
-# Stop having run yet at all (so running/<sid> was never written), still
-# gets the section 2.4 refusal. With no holder and nothing fresh, silence
-# before any Stop succeeds exactly as today.
+# D130 (S1), spec 05-remove-silence section 4.3 -- `butler-continuity
+# silence` refuses unconditionally now (M1), whether invoked with a live
+# holder holding work or with nothing running at all. Both shapes exit 1
+# with stderr exactly M1 and write no silence/<sid> file.
 # ===========================================================================
 SKIP: {
     skip 'D130 (S1): /proc/<pid>/cmdline is unavailable on this host, so no holder can read as alive', 4
@@ -765,10 +775,7 @@ SKIP: {
     my ($out, $err, $rc) = run_cmd($root, $sid, 'silence', '--reason', 'two words');
     is($rc, 1, 'D130 (S1): silence before any Stop, with a live holder holding work, exits 1')
         or diag("stdout: $out\nstderr: $err");
-    like($err, qr/\bzz\b/, 'D130 (S1): stderr names zz');
-    like($err, qr/already held|is held|held\b/i, 'D130 (S1): stderr says the work is already held');
-    like($err, qr/turn (can|may) (simply )?end/i, 'D130 (S1): stderr says the turn can simply end');
-    unlike($err, qr/butler-hold\b.*\bzz\b/s, 'D130 (S1): stderr does not tell the agent to hold zz (it is already held)');
+    is($err, $M1, 'D130 (S1): stderr is exactly M1');
     ok(!-e silence_path($root, $sid), 'D130 (S1): no silence/<sid> file is written');
 }
 {
@@ -777,9 +784,10 @@ SKIP: {
     arm_session($root, $sid);
     ok(!-e snap_path($root, $sid), 'D130 (S1, no work): precondition -- no snapshot exists');
     my ($out, $err, $rc) = run_cmd($root, $sid, 'silence', '--reason', 'two words');
-    is($rc, 0, 'D130 (S1, no work): silence before any Stop, with no holder and nothing fresh, exits 0')
-        or diag("stderr: $err");
-    ok(-e silence_path($root, $sid), 'D130 (S1, no work): the silence file was written');
+    is($rc, 1, 'D130 (S1, no work): silence before any Stop, with no holder and nothing fresh, exits 1')
+        or diag("stdout: $out");
+    is($err, $M1, 'D130 (S1, no work): stderr is exactly M1');
+    ok(!-e silence_path($root, $sid), 'D130 (S1, no work): no silence file is written');
 }
 
 # ===========================================================================
@@ -851,26 +859,15 @@ sub block_of {
     return [ @l[$b + 1 .. $e - 1] ];
 }
 {
+    # AC-20/AC21 (spec 05-remove-silence section 4.1): the continuity SKILL
+    # block no longer documents silence anywhere.
     my $cont = block_of("$BUTLER/skills/continuity/SKILL.md");
-    my $want = join("\n",
-        q{- **Silence** (`butler-continuity silence --reason '<why this stop>'`) is an escape hatch: use it},
-        q{  sparingly, only when a stop is truly necessary, e.g. to talk with an operator who is present or to},
-        q{  wait for the operator's answer. It lets one stop through; the gate applies again next stop. It is},
-        q{  not offered while work is running, and refuses then: hold the work instead.});
-    ok(defined $cont && index(join("\n", map { s/\r\z//r } @$cont), $want) >= 0,
-        'AC-21: the continuity SKILL block contains the four Silence lines of section 2.6');
-
-    my $rep = block_of("$BUTLER/skills/reporter/SKILL.md");
-    my @content = grep { /\S/ } map { s/\r\z//r } @{ $rep // [] };
-    is($content[-1] // '',
-        q{operator when a stop is truly necessary and nothing is running: `butler-continuity silence --reason '<why this stop>'` (an escape hatch; use it sparingly); when no live run is left to watch: `butler-continuity off --reason '<what is done>'`.},
-        'AC-21: the last content line of the reporter block is section 2.6\'s line');
-    like($content[-2] // '', qr/To wait for the\z/, 'AC-21: the reporter line before it still ends with "To wait for the"');
+    my $cont_text = defined $cont ? join("\n", map { s/\r\z//r } @$cont) : '';
+    unlike($cont_text, qr/\bsilence/i, 'AC-21: the continuity SKILL block has no case-insensitive match for \bsilence');
 
     my $src = slurp($CMD);
     my ($usage) = $src =~ /(\$USAGE\s*=.*?;)\s*$/ms;
-    ok(defined $usage && index($usage, q{silence --reason '<why>' [--token T] (escape hatch: use sparingly)}) >= 0,
-        'AC-21: $USAGE carries "silence --reason \'<why>\' [--token T] (escape hatch: use sparingly)"');
+    unlike($usage // '', qr/silence/i, 'AC-21: $USAGE contains no "silence"');
 
     my $doc = slurp("$BUTLER/docs/hook-architecture.md");
     $doc =~ s/\r\n/\n/g;
@@ -888,25 +885,20 @@ sub block_of {
             push @$cur, $line if defined $cur;
         }
     }
-    (my $idle_doc = idle_text('<token>'))                         =~ s/\r//g;
     (my $run_doc  = running_text('<token>', '<ids>'))            =~ s/\r//g;
     # the doc template keeps the placeholders literally: <ids><more> on line 1, <ids> on line 3
     $run_doc =~ s/still running: <ids>\./still running: <ids><more>./;
-    is($blocks[0] // '', $idle_doc, 'AC-21: the first fenced block under "Stop gate denial text" is the IDLE template');
-    ok((grep { $_ eq $run_doc } @blocks[1 .. $#blocks]) ? 1 : 0,
-        'AC-21: a later fenced block is the RUNNING template') or diag("expected:\n$run_doc");
-    ok(defined $section && index($section,
-        "When the payload's `background_tasks` lists running work (`running_work`), silence is not offered:") >= 0,
-        'AC-21: the RUNNING block is introduced by the sentence of section 2.7');
+    ok((grep { $_ eq $run_doc } @blocks) ? 1 : 0,
+        'AC-21: a fenced block is the RUNNING template') or diag("expected:\n$run_doc");
 }
 
 # ===========================================================================
 # D130 (S2) -- the continuity skill names a persistent process nobody is
 # waiting on (a dev server, a `tail -f`, a watcher) as NOT work to hold, and
 # says the right move -- when nothing else is pending -- is `off` with a
-# reason. It also says silence refuses while work is running. Loose
-# regexes: this is prose the implementer is free to word, not the pinned
-# section 2.6 template (already checked exactly above).
+# reason. Loose regexes: this is prose the implementer is free to word, not
+# the pinned section 2.6 template. The silence-specific assertion is
+# removed (spec 05-remove-silence): there is no more silence prose to pin.
 # ===========================================================================
 {
     my $cont = block_of("$BUTLER/skills/continuity/SKILL.md");
@@ -918,8 +910,6 @@ sub block_of {
         'D130 (S2): ...and says such a process is not work to hold');
     like($text, qr/\boff\b[^.\n]*\breason\b/i,
         'D130 (S2): ...and points at `off` with a reason as the right move once nothing else is pending');
-    like($text, qr/refuses?\s+while\s+work\s+is\s+running|not\s+offered\s+while\s+work\s+is\s+running/i,
-        'D130 (S2): ...and says silence refuses/is not offered while work is running');
 }
 
 # ===========================================================================

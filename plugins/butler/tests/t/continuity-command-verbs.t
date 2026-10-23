@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 # platform: any
 # ORACLE for package 04-continuity-command (blueprint hook-continuity-remake),
-# V1-V20 of specs/04-continuity-command-spec.md: the on/off/silence/status/ask
+# V1-V20 of specs/04-continuity-command-spec.md: the on/off/status/ask
 # verbs, usage errors, the coordinator carve-out, binding, and the operator-off
 # discriminator, exercised as documented in "Test hygiene": tickets written
 # in-process through BpHook, the command itself run as a real subprocess.
@@ -434,6 +434,26 @@ sub reasons_log_lines {
     return @lines;
 }
 
+# Spec 05-remove-silence section 2.1: byte-exact M1 (CLI refusal) and C
+# (pre-existing coordinator refusal, unchanged).
+my $M1 = "butler-continuity: 'butler-continuity silence' is removed: an armed session does not end a turn to wait for the operator. File the question with almanac inbox file --title '<question>' and keep working on everything that does not depend on the answer; if nothing can proceed, turn continuity off with a reason. See \"If you have a question for the operator\" in plugins/butler/skills/continuity/SKILL.md.\n";
+my $C  = "butler-continuity: a coordinator cannot turn continuity off; it stops when its ledger is terminal.\n";
+
+# plant_silence($sid, $reason) -- hand-plant a valid-shape silence/<sid>
+# record directly on disk (spec 05-remove-silence section 2.2/B6), since
+# BpHook::set_silence is removed. Mirrors the old valid shape.
+sub plant_silence {
+    my ($sid, $reason) = @_;
+    my $dir = state_root() . '/silence';
+    make_path($dir);
+    open my $fh, '>', "$dir/$sid" or die "plant_silence: $!";
+    print {$fh} JSON::PP->new->encode({
+        session_id => $sid, by => 'butler-continuity', reason => $reason, at => time(),
+    });
+    close $fh;
+    return "$dir/$sid";
+}
+
 # ===========================================================================
 # V1 -- on binds and arms only the calling session
 # ===========================================================================
@@ -499,8 +519,8 @@ sub reasons_log_lines {
     # exemption, so it needs a thread flag now too. This block is about
     # role/off-clearing bookkeeping, not thread content, so --new-thread with
     # a throwaway name is enough.
-    write_ticket_argv($sid, ['on', '--role', 'driver', '--new-thread', 'v2-thread']);
-    my ($out, $err, $rc) = run_cmd({}, 'on', '--role', 'driver', '--new-thread', 'v2-thread');
+    write_ticket_argv($sid, ['on', '--role', 'driver', '--new-thread', 'v2-thread', '--goal', 'clear the off record and re-arm']);
+    my ($out, $err, $rc) = run_cmd({}, 'on', '--role', 'driver', '--new-thread', 'v2-thread', '--goal', 'clear the off record and re-arm');
     is($rc, 0, 'V2: on --role driver --new-thread exits 0') or diag("stderr: $err");
     ok(!-e "$root/off/$sid", 'V2: on clears off/S1 (Decision 36)');
     my $armed = read_json_file("$root/armed/$sid");
@@ -516,9 +536,20 @@ sub reasons_log_lines {
     ok(BpHook::arm($sid, role => 'manual', by => 'on'), 'V3 setup: session armed');
     my $before = time();
 
+    # judged-continuity-disarm package 02: agent `off` now only mints a
+    # disarm OTP (exit 1); the record V3 cares about (armed/S1 gone,
+    # off/S1 written, one reasons.log line) only appears once off-confirm
+    # actually disarms.
     write_ticket_argv($sid, ['off', '--reason', 'work all done']);
-    my ($out, $err, $rc) = run_cmd({}, 'off', '--reason', 'work all done');
-    is($rc, 0, 'V3: off --reason exits 0') or diag("stderr: $err");
+    my ($out0, $err0, $rc0) = run_cmd({}, 'off', '--reason', 'work all done');
+    is($rc0, 1, 'V3: off --reason exits 1 (mints a disarm OTP)') or diag("stdout: $out0");
+    ok(-e state_root() . "/armed/$sid", 'V3: armed/S1 still exists (not yet disarmed)');
+    my ($otp) = ($err0 =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
+    ok(defined $otp, 'V3: off printed an 8-hex-char disarm OTP') or diag("stderr: $err0");
+
+    write_ticket_argv($sid, ['off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'goal is met']);
+    my ($out, $err, $rc) = run_cmd({ CCPRAXIS_DISARM_JUDGE_STUB => 'approve' }, 'off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'goal is met');
+    is($rc, 0, 'V3: off-confirm --otp --justification exits 0') or diag("stderr: $err");
     ok(!-e state_root() . "/armed/$sid", 'V3: armed/S1 is gone');
     my $off = read_json_file(state_root() . "/off/$sid");
     is(ref $off eq 'HASH' ? $off->{actor} : undef, 'agent', 'V3: off/S1 has actor agent');
@@ -532,7 +563,12 @@ sub reasons_log_lines {
         is($verb, 'off', 'V3: log line verb field');
         is($project, $PROJECT, 'V3: log line project field');
         chomp $reason if defined $reason;
-        is($reason, 'work all done', 'V3: log line reason field');
+        # judged-continuity-disarm package 03 (spec sec 2.6 E5 / DC2): V3's
+        # off-confirm now routes through STUB=approve judge dispatch, so the
+        # reasons.log 6th field is _judged_log_text(reason, goal,
+        # justification, otp), not the plain reason.
+        like($reason, qr/^work all done; goal: .*; justification: goal is met; verdict: disarm-judge\/[0-9a-f]{8}\.verdict\.json$/,
+            'V3: log line reason field is the judged log text (E5 format)');
         if ($ts =~ /^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)Z$/) {
             require Time::Local;
             my $logged = Time::Local::timegm($6, $5, $4, $3, $2 - 1, $1);
@@ -545,23 +581,49 @@ sub reasons_log_lines {
 }
 
 # ===========================================================================
-# V4 -- silence --reason logs, take_silence fires once, armed survives
+# V4 -- AC1 (spec 05-remove-silence section 4.1): silence is removed. Every
+# B1 argv shape refuses with M1, consumes nothing, logs nothing, leaves
+# armed/<sid> untouched.
 # ===========================================================================
 {
+    my @shapes = (
+        [],
+        ['--reason', 'two words'],
+        ['--reason'],
+        ['--reason', ''],
+        ['--reason', 'done'],
+        ['--token', 'deadbeef'],
+        ['--bogus'],
+        ['stray-positional'],
+    );
+    for my $args (@shapes) {
+        fresh_state_dir();
+        my $sid = sess_id('v4' . join('', @$args));
+        ok(BpHook::arm($sid, role => 'manual', by => 'on'), "V4 setup: @$args armed");
+        my @argv = ('silence', @$args);
+        my (undef, $tuid) = write_ticket_argv($sid, \@argv);
+        my $before_log = scalar(grep { /\Q$sid\E/ } reasons_log_lines());
+        my ($out, $err, $rc) = run_cmd({}, @argv);
+        is($rc, 1, "V4: silence @$args exits 1");
+        is($out, '', "V4: silence @$args prints nothing on stdout");
+        is($err, $M1, "V4: silence @$args stderr is exactly M1");
+        ok(defined find_ticket_file($sid, $tuid), "V4: silence @$args does not consume the ticket");
+        ok(-e state_root() . "/armed/$sid", "V4: silence @$args leaves armed/<sid> untouched");
+        my $after_log = scalar(grep { /\Q$sid\E/ } reasons_log_lines());
+        is($after_log, $before_log, "V4: silence @$args writes no reasons.log line");
+        ok(!-e state_root() . "/silence/$sid", "V4: silence @$args creates no silence/<sid> file");
+    }
+}
+
+# AC2: the same refusal (M1) fires even with no ticket and no state dir
+# prepared at all -- proving the check precedes binding and the state-root
+# step.
+{
     fresh_state_dir();
-    my $sid = sess_id('v4');
-    ok(BpHook::arm($sid, role => 'manual', by => 'on'), 'V4 setup: session armed');
-
-    write_ticket_argv($sid, ['silence', '--reason', 'reporting to operator']);
-    my ($out, $err, $rc) = run_cmd({}, 'silence', '--reason', 'reporting to operator');
-    is($rc, 0, 'V4: silence --reason exits 0') or diag("stderr: $err");
-
-    my @sl = grep { /\Q$sid\E.*silence/ } reasons_log_lines();
-    is(scalar(@sl), 1, 'V4: exactly one silence log line');
-
-    is(BpHook::take_silence($sid), 1, 'V4: take_silence returns 1 the first time');
-    is(BpHook::take_silence($sid), 0, 'V4: and 0 the second time');
-    ok(-e state_root() . "/armed/$sid", 'V4: armed/S1 survives a silence');
+    my $sid = sess_id('v4ac2');
+    my ($out, $err, $rc) = run_cmd({}, 'silence', '--reason', 'a b');
+    is($rc, 1, 'AC2: silence with no ticket and no state dir exits 1');
+    is($err, $M1, 'AC2: and stderr is exactly M1');
 }
 
 # ===========================================================================
@@ -569,18 +631,14 @@ sub reasons_log_lines {
 # ===========================================================================
 {
     my @cases = (
-        { verb => 'silence', args => [] },
         { verb => 'off',     args => ['--reason', ''] },
-        { verb => 'silence', args => ['--reason', ''] },
         { verb => 'off',     args => ['--reason', 'done'] },
-        { verb => 'silence', args => ['--reason', 'done'] },
         { verb => 'off',     args => ['--reason'] },
-        { verb => 'silence', args => ['--reason'] },
     );
     for my $c (@cases) {
         fresh_state_dir();
         my $sid = sess_id('v5' . $c->{verb} . join('', @{ $c->{args} }));
-        ok(BpHook::arm($sid, role => 'manual', by => 'on'), "V5 setup: $sid armed");
+        ok(BpHook::arm($sid, role => 'manual', by => 'on'), "V5 setup: $c->{verb} @{$c->{args}} armed");
         my @argv = ($c->{verb}, @{ $c->{args} });
         my (undef, $tuid) = write_ticket_argv($sid, \@argv);
         my $before_log = scalar(grep { /\Q$sid\E/ } reasons_log_lines());
@@ -765,17 +823,27 @@ sub reasons_log_lines {
     write_ticket_argv($sid, ['silence', '--reason', 'a b']);
     ($out, $err, $rc) = run_cmd({ BP_LEDGER => '/x/ledger.md' }, 'silence', '--reason', 'a b');
     is($rc, 1, 'V8: silence refuses under BP_LEDGER');
-    like($err, qr/coordinator/, 'V8: silence names the coordinator');
+    is($err, $C, 'AC3: silence under BP_LEDGER stderr is exactly C');
 
     my $sid2 = sess_id('v8on');
     my ($out2, $err2, $rc2) = run_cmd({ BP_LEDGER => '/x/ledger.md' }, 'on');
     is($rc2, 0, 'V8: on under BP_LEDGER exits 0');
     like($out2, qr/nothing to do/, 'V8: on under BP_LEDGER prints the nothing-to-do line');
     ok(!-e state_root() . "/armed/$sid2", 'V8: on under BP_LEDGER writes no armed/ file');
+
+    # AC10 (01-arm-goal-capture spec sec 4): a coordinator's own status still
+    # shows no goal: line, since it never writes an arm record at all.
+    write_ticket_argv($sid2, ['status']);
+    my ($sout, $serr, $src) = run_cmd({ BP_LEDGER => '/x/ledger.md' }, 'status');
+    is($src, 0, 'V8/AC10: status under BP_LEDGER exits 0') or diag("stderr: $serr");
+    my @slines = split /\n/, $sout;
+    is($slines[0], "session " . s8($sid2) . ": armed (coordinator)",
+        'V8/AC10: status line 0 is the coordinator line');
+    ok(!(grep { /^goal:/ } @slines), 'V8/AC10: status under BP_LEDGER prints no goal: line');
 }
 
 # ===========================================================================
-# V9 -- a stop token binds off/silence with no ticket; the token is one-shot
+# V9 -- a stop token binds off with no ticket; the token is one-shot
 # ===========================================================================
 {
     fresh_state_dir();
@@ -784,8 +852,21 @@ sub reasons_log_lines {
     my $token = mint_stop_token_for($sid);
     ok(defined $token, 'V9 setup: a stop token was minted');
 
+    # judged-continuity-disarm package 02: agent `off` now only mints a
+    # disarm OTP (exit 1), even when bound by a stop --token rather than a
+    # ticket. The token is still one-shot (consumed by the mint call), so
+    # the actual disarm (and its reasons.log line) happens via an
+    # off-confirm bound by a TICKET with an empty cwd -- off-confirm takes
+    # no --token fallback at all (Decision 18) -- which reproduces the
+    # project field ('-') the original token-bound case exercised.
     my ($out, $err, $rc) = run_cmd({}, 'off', '--reason', 'a b', '--token', $token // 'deadbeef');
-    is($rc, 0, 'V9: off with a valid token and no ticket exits 0') or diag("stderr: $err");
+    is($rc, 1, 'V9: off with a valid token and no ticket exits 1 (mints a disarm OTP)') or diag("stdout: $out");
+    my ($otp) = ($err =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
+    ok(defined $otp, 'V9: off printed an 8-hex-char disarm OTP') or diag("stderr: $err");
+
+    write_ticket_argv($sid, ['off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'goal is met'], cwd => '');
+    my ($outc, $errc, $rcc) = run_cmd({ CCPRAXIS_DISARM_JUDGE_STUB => 'approve' }, 'off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'goal is met');
+    is($rcc, 0, 'V9: off-confirm --otp --justification exits 0') or diag("stderr: $errc");
     my @lines = grep { /\Q$sid\E/ } reasons_log_lines();
     my ($line) = grep { /\toff\t/ } @lines;
     if ($line) {
@@ -819,7 +900,9 @@ sub reasons_log_lines {
 }
 
 # ===========================================================================
-# V11 -- a ticket carrying agent_id refuses on/off/silence (subagent line)
+# V11 -- a ticket carrying agent_id refuses on/off (subagent line); AC4
+# (spec 05-remove-silence B3): silence was never actor-gated, so a subagent
+# ticket hits the removal refusal M1 instead, never the subagent line.
 # ===========================================================================
 {
     # package 04-continuity-threads (spec 2.3, behaviour 14): the subagent
@@ -827,7 +910,7 @@ sub reasons_log_lines {
     # agent_id would now hit R1 first instead of the subagent line -- give it
     # a thread flag (--new-thread) so it reaches the subagent check, exactly
     # as behaviour 14's own fixture does.
-    for my $verb_argv (['on', '--new-thread', 'v11-thread'], ['off', '--reason', 'a b'], ['silence', '--reason', 'a b']) {
+    for my $verb_argv (['on', '--new-thread', 'v11-thread', '--goal', 'reach the subagent refusal check'], ['off', '--reason', 'a b']) {
         fresh_state_dir();
         my $sid = sess_id('v11' . join('', @$verb_argv));
         BpHook::arm($sid, role => 'manual', by => 'on') if $verb_argv->[0] ne 'on';
@@ -836,6 +919,16 @@ sub reasons_log_lines {
         is($rc, 1, "V11: @$verb_argv with agent_id refuses");
         like($err, qr/subagent/, "V11: @$verb_argv refusal names a subagent");
     }
+
+    # AC4: silence from a subagent ticket gets M1, not the subagent line.
+    fresh_state_dir();
+    my $sid = sess_id('v11silence');
+    BpHook::arm($sid, role => 'manual', by => 'on');
+    write_ticket_argv($sid, ['silence', '--reason', 'a b'], agent_id => 'sub1');
+    my ($out, $err, $rc) = run_cmd({}, 'silence', '--reason', 'a b');
+    is($rc, 1, 'AC4: silence with agent_id exits 1');
+    is($err, $M1, 'AC4: stderr is exactly M1');
+    unlike($err, qr/subagent/, 'AC4: stderr does not mention subagent');
 }
 
 # ===========================================================================
@@ -911,20 +1004,27 @@ sub reasons_log_lines {
         deadline => time() + 600, items => ['item-a', 'item-b'],
     });
     close $fh;
-    BpHook::set_silence($sid, reason => 'still going');
+    # AC6 (spec 05-remove-silence section 4.1): hand-plant a valid-shape
+    # silence/<sid> record directly (set_silence is removed) -- status must
+    # never print a silence: line for it.
+    plant_silence($sid, 'still going');
 
     write_ticket_argv($sid, ['status']);
     my ($out, $err, $rc) = run_cmd({}, 'status');
     is($rc, 0, 'V13: status exits 0') or diag("stderr: $err");
     my @lines = split /\n/, $out;
     # package 04-continuity-threads added a mandatory `thread:` line right
-    # after the session line (spec 2.6) -- every index below shifts by one,
-    # and the cap grows by one line.
+    # after the session line (spec 2.6); package 01-arm-goal-capture
+    # (judged-continuity-disarm) then added a mandatory `goal:` line right
+    # after THAT (own spec sec 2.6) -- every index below shifts by one again.
+    # AC6: a planted silence/<sid> record is inert -- status caps at 5 lines
+    # (session, goal, thread, holder, wake-lock), never a silence: line.
     cmp_ok(scalar(@lines), '<=', 5, 'V13: status prints at most 5 lines');
     like($lines[0] // '', qr/armed/, 'V13: line 1 matches armed');
-    like($lines[1] // '', qr/^thread: /, 'V13: line 2 is the thread line');
-    like($lines[2] // '', qr/holder: running until.*item-a.*item-b/, 'V13: line 3 names both items');
-    like($lines[3] // '', qr/^silence:/, 'V13: line 4 starts silence:');
+    like($lines[1] // '', qr/^goal: /, 'V13: line 2 is the goal line');
+    like($lines[2] // '', qr/^thread: /, 'V13: line 3 is the thread line');
+    like($lines[3] // '', qr/holder: running until.*item-a.*item-b/, 'V13: line 4 names both items');
+    ok(!(grep { /^silence:/ } @lines), 'AC6: no line starts silence:');
     is($lines[4], 'wake-lock: disabled', 'V13: line 5 is wake-lock: disabled');
 
     # past deadline -> holder: none
@@ -935,15 +1035,15 @@ sub reasons_log_lines {
     write_ticket_argv($sid, ['status']);
     my ($out2, $err2, $rc2) = run_cmd({}, 'status');
     my @lines2 = split /\n/, $out2;
-    is($lines2[2], 'holder: none', 'V13: a past deadline reports holder: none');
+    is($lines2[3], 'holder: none', 'V13: a past deadline reports holder: none');
 
-    # unarmed, no silence -> 4 lines (session, thread, holder, wake-lock),
-    # line 1 ends "not armed"
+    # unarmed -> 4 lines (session, thread, holder, wake-lock), line 1 ends
+    # "not armed"
     my $sid2 = sess_id('v13b');
     write_ticket_argv($sid2, ['status']);
     my ($out3, $err3, $rc3) = run_cmd({}, 'status');
     my @lines3 = split /\n/, $out3;
-    is(scalar(@lines3), 4, 'V13: unarmed with no silence prints 4 lines');
+    is(scalar(@lines3), 4, 'V13: unarmed prints 4 lines');
     like($lines3[0] // '', qr/not armed$/, 'V13: line 1 ends "not armed"');
 }
 
@@ -974,6 +1074,10 @@ sub reasons_log_lines {
         'echo butler-continuity on'                    => 'echo butler-continuity on',
         'butler-continuity off with a var'              => 'butler-continuity off --reason "$X"',
         q{butler-continuity ask}                        => "butler-continuity ask --text 'q'",
+        # AC23 (spec 05-remove-silence section 2.5/4.1, DC7): silence is no
+        # longer a recognized verb in ContinuityOffCheck.pm's verb list, so
+        # a predictable, well-formed silence invocation writes no ticket.
+        'butler-continuity silence'                     => "butler-continuity silence --reason 'a b'",
     );
     for my $label (sort keys %no_ticket_cases) {
         my $p = { tool_name => 'Bash', tool_input => { command => $no_ticket_cases{$label} },
@@ -996,7 +1100,8 @@ sub reasons_log_lines {
 }
 
 # ===========================================================================
-# V15 -- unarmed silence is a no-op; unarmed off still writes off/S1
+# V15 -- silence on an unarmed session refuses with M1 (removed outright,
+# not a no-op); unarmed off still writes off/S1
 # ===========================================================================
 {
     fresh_state_dir();
@@ -1004,15 +1109,21 @@ sub reasons_log_lines {
     write_ticket_argv($sid, ['silence', '--reason', 'a b']);
     my $before = scalar(grep { /\Q$sid\E/ } reasons_log_lines());
     my ($out, $err, $rc) = run_cmd({}, 'silence', '--reason', 'a b');
-    is($rc, 0, 'V15: silence on an unarmed session exits 0') or diag("stderr: $err");
-    like($out, qr/nothing to silence/, 'V15: and prints the nothing-to-silence line');
+    is($rc, 1, 'V15: silence on an unarmed session exits 1') or diag("stdout: $out");
+    is($err, $M1, 'V15: and stderr is exactly M1');
     ok(!-e state_root() . "/silence/$sid", 'V15: no silence/S1 was written');
     is(scalar(grep { /\Q$sid\E/ } reasons_log_lines()), $before, 'V15: no log line was written');
 
     my $sid2 = sess_id('v15b');
     write_ticket_argv($sid2, ['off', '--reason', 'a b']);
-    my ($out2, $err2, $rc2) = run_cmd({}, 'off', '--reason', 'a b');
-    is($rc2, 0, 'V15: off on an unarmed session exits 0');
+    my ($out2a, $err2a, $rc2a) = run_cmd({}, 'off', '--reason', 'a b');
+    is($rc2a, 1, 'V15: off on an unarmed session exits 1 (mints a disarm OTP)') or diag("stdout: $out2a");
+    my ($otp2) = ($err2a =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
+    ok(defined $otp2, 'V15: off printed an 8-hex-char disarm OTP') or diag("stderr: $err2a");
+
+    write_ticket_argv($sid2, ['off-confirm', '--otp', $otp2 // 'deadbeef', '--justification', 'a b']);
+    my ($out2, $err2, $rc2) = run_cmd({ CCPRAXIS_DISARM_JUDGE_STUB => 'approve' }, 'off-confirm', '--otp', $otp2 // 'deadbeef', '--justification', 'a b');
+    is($rc2, 0, 'V15: off-confirm on an unarmed session exits 0') or diag("stderr: $err2");
     ok(-e state_root() . "/off/$sid2", 'V15: off/S1 is written even though it was never armed');
     like($out2, qr/was not armed/, 'V15: the printed line contains "was not armed"');
 }
@@ -1049,8 +1160,19 @@ sub reasons_log_lines {
     is($rc1, 0, 'V16: on --role reporter succeeds under a state root containing André') or diag("stderr: $err1");
 
     write_ticket_argv($sid, ['off', '--reason', $reason]);
-    my ($out2, $err2, $rc2) = run_cmd({ BUTLER_STATE_DIR => $andre_base }, 'off', '--reason', $reason);
-    is($rc2, 0, 'V16: off succeeds under the same root') or diag("stderr: $err2");
+    my ($out2a, $err2a, $rc2a) = run_cmd({ BUTLER_STATE_DIR => $andre_base }, 'off', '--reason', $reason);
+    is($rc2a, 1, 'V16: off exits 1 under the same root (mints a disarm OTP)') or diag("stdout: $out2a");
+    my ($otp2) = ($err2a =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
+    ok(defined $otp2, 'V16: off printed an 8-hex-char disarm OTP') or diag("stderr: $err2a");
+
+    # judged-continuity-disarm pkg 03: the logged line now also carries the
+    # justification (_judged_log_text), so a justification equal to $reason
+    # would make the UTF-8 reason text match twice in one line; use a
+    # distinct ASCII justification to keep the exactly-once check meaningful.
+    write_ticket_argv($sid, ['off-confirm', '--otp', $otp2 // 'deadbeef', '--justification', 'goal is met']);
+    my ($out2, $err2, $rc2) = run_cmd({ BUTLER_STATE_DIR => $andre_base, CCPRAXIS_DISARM_JUDGE_STUB => 'approve' },
+        'off-confirm', '--otp', $otp2 // 'deadbeef', '--justification', 'goal is met');
+    is($rc2, 0, 'V16: off-confirm succeeds under the same root') or diag("stderr: $err2");
 
     my $log = slurp("$andre_base/continuity/reasons.log");
     my @matches = ($log =~ /\Q$reason\E/g);
@@ -1120,7 +1242,7 @@ for my $iter (1 .. 5) {
 
     my $armed_exists = -e state_root() . "/armed/$sid" ? 1 : 0;
     my $off_exists    = -e state_root() . "/off/$sid"   ? 1 : 0;
-    is($armed_exists + $off_exists, 1, "V19 iteration $iter: exactly one of armed/off exists for $sid");
+    is($armed_exists + $off_exists, 1, "V19 iteration $iter: exactly one of armed/off exists");
 }
 
 # ===========================================================================
@@ -1254,16 +1376,17 @@ for my $iter (1 .. 5) {
     fresh_state_dir();
     my $sid = sess_id('r4rvm1silence');
     BpHook::arm($sid, role => 'manual', by => 'on');
-    ok(BpHook::set_silence($sid, reason => "line one\nline two\nline three"),
-       'R4-RVM1 setup: silence with a multi-line reason');
+    # AC6: a hand-planted multi-line silence record (set_silence is removed)
+    # is still inert -- no silence: line, and the cap is 5 lines now that
+    # silence never contributes a line.
+    plant_silence($sid, "line one\nline two\nline three");
     write_ticket_argv($sid, ['status']);
     my ($out, $err, $rc) = run_cmd({}, 'status');
     is($rc, 0, 'R4-RVM1 (silence): status exits 0') or diag("stderr: $err");
     my @lines = split /\n/, $out;
-    # package 04-continuity-threads added a mandatory `thread:` line (spec
-    # 2.6), so this armed+silenced case is now 5 lines, not 4.
     cmp_ok(scalar(@lines), '<=', 5,
-           'R4-RVM1 (silence): status prints at most 5 lines even with a multi-line silence reason');
+           'R4-RVM1 (silence): status prints at most 5 lines even with a multi-line planted silence record');
+    ok(!(grep { /^silence:/ } @lines), 'R4-RVM1 (silence): no line starts silence:');
 }
 
 # ===========================================================================
@@ -1275,13 +1398,24 @@ for my $iter (1 .. 5) {
 {
     # (a) real words plus terminal escapes: accepted, but the escapes must
     # not survive into the log or into status output.
+    #
+    # judged-continuity-disarm package 02: agent `off` now only mints a
+    # disarm OTP (exit 1); reasons.log and status only reflect the disarm
+    # once off-confirm actually runs it (Decision 18: gate result + reason
+    # captured at off/mint time, side effects run at off-confirm time).
     fresh_state_dir();
     my $sid = sess_id('r4lreasonesc');
     BpHook::arm($sid, role => 'manual', by => 'on');
     my $reason = "\x1b]0;pwned\x07\x1b[2Jhello there friend\x1b[8mhidden";
     write_ticket_argv($sid, ['off', '--reason', $reason]);
-    my ($out, $err, $rc) = run_cmd({}, 'off', '--reason', $reason);
-    is($rc, 0, 'R4-L-reason: off with escapes plus real words exits 0') or diag("stderr: $err");
+    my ($out0, $err0, $rc0) = run_cmd({}, 'off', '--reason', $reason);
+    is($rc0, 1, 'R4-L-reason: off with escapes plus real words mints a disarm OTP') or diag("stderr: $err0");
+    my ($otp) = ($err0 =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
+    ok(defined $otp, 'R4-L-reason: off printed an 8-hex-char disarm OTP') or diag("stderr: $err0");
+
+    write_ticket_argv($sid, ['off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'goal is met']);
+    my ($out, $err, $rc) = run_cmd({ CCPRAXIS_DISARM_JUDGE_STUB => 'approve' }, 'off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'goal is met');
+    is($rc, 0, 'R4-L-reason: off-confirm with escapes plus real words exits 0') or diag("stderr: $err");
     my $log = slurp(state_root() . '/reasons.log');
     unlike($log, qr/\x1b/, 'R4-L-reason: reasons.log holds no ESC byte');
     unlike($log, qr/\x07/, 'R4-L-reason: reasons.log holds no BEL byte');
@@ -1651,14 +1785,15 @@ sub run_cmd_at {
 # ===========================================================================
 {
     my $TP = thread_pl_abs();
-    for my $case (['on --new-thread', 'manual', ['--new-thread', 'ac26-a']],
-                  ['on --role driver --new-thread', 'driver', ['--role', 'driver', '--new-thread', 'ac26-b']]) {
+    for my $case (['on --new-thread', 'manual', ['--new-thread', 'ac26-a', '--goal', 'print the created thread shape']],
+                  ['on --role driver --new-thread', 'driver', ['--role', 'driver', '--new-thread', 'ac26-b', '--goal', 'print the created thread shape']]) {
         my ($label, $role, $extra) = @$case;
         fresh_state_dir();
         my $proj = "$TMPROOT/$role-ac26-proj";
         make_path("$proj/.ccpraxis-local-data");
         my $sid = sess_id('ac26' . $role);
-        my ($name) = grep { $_ ne '--new-thread' && $_ ne '--role' && $_ ne $role } @$extra;
+        my ($name) = grep { $_ ne '--new-thread' && $_ ne '--role' && $_ ne $role
+                          && $_ ne '--goal' && $_ ne 'print the created thread shape' } @$extra;
         write_ticket_argv($sid, ['on', @$extra], cwd => $proj);
         my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj, ':cwd' => $proj }, 'on', @$extra);
         is($rc, 0, "AC-26 [$label]: exits 0") or diag("stderr: $err");
@@ -1684,8 +1819,8 @@ sub run_cmd_at {
     my $sid = sess_id('ac27');
     my $proj_ac27 = "$TMPROOT/ac27-proj";
     make_path("$proj_ac27/.ccpraxis-local-data");
-    write_ticket_argv($sid, ['on', '--new-thread', 'ac27'], cwd => $proj_ac27);
-    run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac27, ':cwd' => $proj_ac27 }, 'on', '--new-thread', 'ac27');
+    write_ticket_argv($sid, ['on', '--new-thread', 'ac27', '--goal', 'finish the open task listing'], cwd => $proj_ac27);
+    run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac27, ':cwd' => $proj_ac27 }, 'on', '--new-thread', 'ac27', '--goal', 'finish the open task listing');
 
     my %ids;
     for my $title (qw(A B C D)) {
@@ -1699,9 +1834,16 @@ sub run_cmd_at {
     }
 
     write_ticket_argv($sid, ['off', '--reason', 'work all done'], cwd => $proj_ac27);
-    my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac27, ':cwd' => $proj_ac27 },
+    my ($out0, $err0, $rc0) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac27, ':cwd' => $proj_ac27 },
         'off', '--reason', 'work all done');
-    is($rc, 0, 'AC-27: off --reason exits 0') or diag("stderr: $err");
+    is($rc0, 1, 'AC-27: off --reason exits 1 (mints a disarm OTP)') or diag("stdout: $out0");
+    my ($otp) = ($err0 =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
+    ok(defined $otp, 'AC-27: off printed an 8-hex-char disarm OTP') or diag("stderr: $err0");
+
+    write_ticket_argv($sid, ['off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'goal is met'], cwd => $proj_ac27);
+    my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac27, ':cwd' => $proj_ac27, CCPRAXIS_DISARM_JUDGE_STUB => 'approve' },
+        'off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'goal is met');
+    is($rc, 0, 'AC-27: off-confirm --otp --justification exits 0') or diag("stderr: $err");
 
     my $expect = "continuity off for session " . s8($sid) . " (actor agent); reason logged.\n"
                . "Thread ac27 handed off; the reason is in its log.\n"
@@ -1723,8 +1865,8 @@ sub run_cmd_at {
     my $sid = sess_id('ac28');
     my $proj_ac28 = "$TMPROOT/ac28-proj";
     make_path("$proj_ac28/.ccpraxis-local-data");
-    write_ticket_argv($sid, ['on', '--new-thread', 'ac28'], cwd => $proj_ac28);
-    run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac28, ':cwd' => $proj_ac28 }, 'on', '--new-thread', 'ac28');
+    write_ticket_argv($sid, ['on', '--new-thread', 'ac28', '--goal', 'check the ten task cap'], cwd => $proj_ac28);
+    run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac28, ':cwd' => $proj_ac28 }, 'on', '--new-thread', 'ac28', '--goal', 'check the ten task cap');
 
     my @ids;
     for my $i (1 .. 12) {
@@ -1734,9 +1876,16 @@ sub run_cmd_at {
     }
 
     write_ticket_argv($sid, ['off', '--reason', 'checking the cap'], cwd => $proj_ac28);
-    my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac28, ':cwd' => $proj_ac28 },
+    my ($out0, $err0, $rc0) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac28, ':cwd' => $proj_ac28 },
         'off', '--reason', 'checking the cap');
-    is($rc, 0, 'AC-28: off --reason exits 0') or diag("stderr: $err");
+    is($rc0, 1, 'AC-28: off --reason exits 1 (mints a disarm OTP)') or diag("stdout: $out0");
+    my ($otp) = ($err0 =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
+    ok(defined $otp, 'AC-28: off printed an 8-hex-char disarm OTP') or diag("stderr: $err0");
+
+    write_ticket_argv($sid, ['off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'checking the cap'], cwd => $proj_ac28);
+    my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac28, ':cwd' => $proj_ac28, CCPRAXIS_DISARM_JUDGE_STUB => 'approve' },
+        'off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'checking the cap');
+    is($rc, 0, 'AC-28: off-confirm --otp --justification exits 0') or diag("stderr: $err");
 
     my @lines = split /\n/, $out;
     is(scalar(grep { /^  \S+ pending / } @lines), 10, 'AC-28: exactly 10 task lines are printed');
@@ -1763,12 +1912,19 @@ sub run_cmd_at {
         my $sid = sess_id('ac29a');
         my $proj_empty = "$TMPROOT/ac29a-proj";
         make_path("$proj_empty/.ccpraxis-local-data");
-        write_ticket_argv($sid, ['on', '--new-thread', 'ac29a'], cwd => $proj_empty);
-        run_cmd({ CLAUDE_PROJECT_DIR => $proj_empty, ':cwd' => $proj_empty }, 'on', '--new-thread', 'ac29a');
+        write_ticket_argv($sid, ['on', '--new-thread', 'ac29a', '--goal', 'check the empty task listing'], cwd => $proj_empty);
+        run_cmd({ CLAUDE_PROJECT_DIR => $proj_empty, ':cwd' => $proj_empty }, 'on', '--new-thread', 'ac29a', '--goal', 'check the empty task listing');
         write_ticket_argv($sid, ['off', '--reason', 'nothing to chart'], cwd => $proj_empty);
-        my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_empty, ':cwd' => $proj_empty },
+        my ($out0, $err0, $rc0) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_empty, ':cwd' => $proj_empty },
             'off', '--reason', 'nothing to chart');
-        is($rc, 0, 'AC-29a: off --reason exits 0') or diag("stderr: $err");
+        is($rc0, 1, 'AC-29a: off --reason exits 1 (mints a disarm OTP)') or diag("stdout: $out0");
+        my ($otp) = ($err0 =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
+        ok(defined $otp, 'AC-29a: off printed an 8-hex-char disarm OTP') or diag("stderr: $err0");
+
+        write_ticket_argv($sid, ['off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'nothing to chart'], cwd => $proj_empty);
+        my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_empty, ':cwd' => $proj_empty, CCPRAXIS_DISARM_JUDGE_STUB => 'approve' },
+            'off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'nothing to chart');
+        is($rc, 0, 'AC-29a: off-confirm --otp --justification exits 0') or diag("stderr: $err");
         is($out, "continuity off for session " . s8($sid) . " (actor agent); reason logged.\n"
                . "Thread ac29a handed off; the reason is in its log.\n",
             'AC-29a: stdout is exactly the off line and the hand-off line, nothing more (no tasks at all)');
@@ -1779,8 +1935,8 @@ sub run_cmd_at {
         my $sid = sess_id('ac29b');
         my $proj_ac29b = "$TMPROOT/ac29b-proj";
         make_path("$proj_ac29b/.ccpraxis-local-data");
-        write_ticket_argv($sid, ['on', '--new-thread', 'ac29b'], cwd => $proj_ac29b);
-        run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac29b, ':cwd' => $proj_ac29b }, 'on', '--new-thread', 'ac29b');
+        write_ticket_argv($sid, ['on', '--new-thread', 'ac29b', '--goal', 'check the done only task listing'], cwd => $proj_ac29b);
+        run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac29b, ':cwd' => $proj_ac29b }, 'on', '--new-thread', 'ac29b', '--goal', 'check the done only task listing');
         my $rec = eval { Almanac::Thread::add_task('ac29b', title => 'already finished', actor => 'session', root => $proj_ac29b) };
         my $id  = (ref $rec eq 'HASH') ? $rec->{id} : undef;
         # direct Store write (spec 3 behaviour 10): avoids Thread.pm's own
@@ -1789,9 +1945,16 @@ sub run_cmd_at {
         # below is what's under test.
         eval { mark_task_done_direct('ac29b', $id, root => $proj_ac29b) } if defined $id;
         write_ticket_argv($sid, ['off', '--reason', 'all tasks done'], cwd => $proj_ac29b);
-        my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac29b, ':cwd' => $proj_ac29b },
+        my ($out0, $err0, $rc0) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac29b, ':cwd' => $proj_ac29b },
             'off', '--reason', 'all tasks done');
-        is($rc, 0, 'AC-29b: off --reason exits 0') or diag("stderr: $err");
+        is($rc0, 1, 'AC-29b: off --reason exits 1 (mints a disarm OTP)') or diag("stdout: $out0");
+        my ($otp) = ($err0 =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
+        ok(defined $otp, 'AC-29b: off printed an 8-hex-char disarm OTP') or diag("stderr: $err0");
+
+        write_ticket_argv($sid, ['off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'all tasks done'], cwd => $proj_ac29b);
+        my ($out, $err, $rc) = run_cmd({ CLAUDE_PROJECT_DIR => $proj_ac29b, ':cwd' => $proj_ac29b, CCPRAXIS_DISARM_JUDGE_STUB => 'approve' },
+            'off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'all tasks done');
+        is($rc, 0, 'AC-29b: off-confirm --otp --justification exits 0') or diag("stderr: $err");
         # NOTE: a thread whose only task is done is also ALL-DONE (thread_is_done),
         # so the hand-off itself archives it in the same call (behaviour 10) --
         # this exercises BOTH "archived" (the second line) and "no open tasks"
@@ -1833,8 +1996,8 @@ sub run_cmd_at {
 
     fresh_state_dir();
     my $sid_on = sess_id('ac31on');
-    write_ticket_argv($sid_on, ['on']);
-    my ($out_on, $err_on, $rc_on) = run_cmd_at($iso_cmd, {}, 'on');
+    write_ticket_argv($sid_on, ['on', '--goal', 'arm with no sibling almanac']);
+    my ($out_on, $err_on, $rc_on) = run_cmd_at($iso_cmd, {}, 'on', '--goal', 'arm with no sibling almanac');
     is($rc_on, 0, 'AC-31: on (no sibling almanac) exits 0') or diag("stderr: $err_on");
     is($out_on, "continuity on for session " . s8($sid_on) . " (role manual).\n",
        'AC-31: on stdout is exactly the thread-free one-liner (no chart line at all)');
@@ -1842,8 +2005,14 @@ sub run_cmd_at {
     my $sid_off = sess_id('ac31off');
     BpHook::arm($sid_off, role => 'manual', by => 'on');
     write_ticket_argv($sid_off, ['off', '--reason', 'a b']);
-    my ($out_off, $err_off, $rc_off) = run_cmd_at($iso_cmd, {}, 'off', '--reason', 'a b');
-    is($rc_off, 0, 'AC-31: off (no sibling almanac) exits 0') or diag("stderr: $err_off");
+    my ($out_off0, $err_off0, $rc_off0) = run_cmd_at($iso_cmd, {}, 'off', '--reason', 'a b');
+    is($rc_off0, 1, 'AC-31: off --reason (no sibling almanac) exits 1 (mints a disarm OTP)') or diag("stdout: $out_off0");
+    my ($otp_off) = ($err_off0 =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
+    ok(defined $otp_off, 'AC-31: off printed an 8-hex-char disarm OTP') or diag("stderr: $err_off0");
+
+    write_ticket_argv($sid_off, ['off-confirm', '--otp', $otp_off // 'deadbeef', '--justification', 'a b']);
+    my ($out_off, $err_off, $rc_off) = run_cmd_at($iso_cmd, { CCPRAXIS_DISARM_JUDGE_STUB => 'approve' }, 'off-confirm', '--otp', $otp_off // 'deadbeef', '--justification', 'a b');
+    is($rc_off, 0, 'AC-31: off-confirm (no sibling almanac) exits 0') or diag("stderr: $err_off");
     is($out_off, "continuity off for session " . s8($sid_off) . " (actor agent); reason logged.\n",
        'AC-31: off stdout is exactly the existing line only (no header, no task lines)');
 }
@@ -1868,6 +2037,47 @@ sub run_cmd_at {
     is($rc2, 0, 'AC-32: coordinator on exits 0');
     is($out2, "continuity is on by construction for a coordinator; nothing to do.\n",
         'AC-32: coordinator on stdout is exactly the nothing-to-do line');
+}
+
+# ===========================================================================
+# AC5 (spec 05-remove-silence section 4.1, DC1): an operator-shaped ticket
+# (operator => 1) for ['silence'] refuses with M1, same as any other actor --
+# silence was never actor-gated.
+# ===========================================================================
+{
+    fresh_state_dir();
+    my $sid = sess_id('ac5operator');
+    ok(BpHook::arm($sid, role => 'manual', by => 'on'), 'AC5 setup: session armed');
+    write_ticket_argv($sid, ['silence'], operator => 1);
+    my ($out, $err, $rc) = run_cmd({}, 'silence');
+    is($rc, 1, 'AC5: an operator-ticketed silence exits 1');
+    is($err, $M1, 'AC5: and stderr is exactly M1');
+}
+
+# ===========================================================================
+# AC8 (spec 05-remove-silence section 4.1, DC2): source checks on
+# butler-continuity.pl and BpHook/ContinuityOffCheck.pm -- no set_silence/
+# take_silence references, no "$root/silence" or "$ROOT/silence" state
+# path, and no `if ($verb eq 'silence')` block in butler-continuity.pl other
+# than the removal refusal itself (which must contain no state access).
+# ===========================================================================
+{
+    my $src = slurp($CMD);
+    unlike($src, qr/set_silence/, 'AC8: butler-continuity.pl has no set_silence reference');
+    unlike($src, qr/take_silence/, 'AC8: butler-continuity.pl has no take_silence reference');
+    unlike($src, qr/["']\$root\/silence|["']\$ROOT\/silence/, 'AC8: butler-continuity.pl has no silence state path');
+
+    my @silence_verb_blocks = ($src =~ /if\s*\(\s*(?:defined\s*\(?\s*\$verb\s*\)?\s*&&\s*)?\$verb\s+eq\s+'silence'\s*\)\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}/gs);
+    is(scalar(@silence_verb_blocks), 1,
+        'AC8: exactly one `if ($verb eq \'silence\')` block remains (the removal refusal)');
+    if (@silence_verb_blocks) {
+        unlike($silence_verb_blocks[0], qr/\$root|\$ROOT|state_dir|reasons\.log/,
+            'AC8: that block contains no state access');
+    }
+
+    my $copm_src = slurp($COPM);
+    unlike($copm_src, qr/set_silence/, 'AC8: ContinuityOffCheck.pm has no set_silence reference');
+    unlike($copm_src, qr/take_silence/, 'AC8: ContinuityOffCheck.pm has no take_silence reference');
 }
 
 done_testing();

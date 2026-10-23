@@ -54,7 +54,7 @@ $src //= '';
 # ===========================================================================
 my $CONTINUITY_BLOCK = <<'BLOCK';
 <!-- continuity:begin -->
-First step, before Preflight: `butler-continuity on --role driver --new-thread <name>`, or `--thread <name>` in place of `--new-thread` to resume this run's handed-off thread (`almanac thread list` shows it). Arms the session onto that thread and clears an earlier off; after a new session id, the first director call re-arms it.
+First step, before Preflight: `butler-continuity on --role driver --new-thread <name> --goal '<what this run is for>'`, or `--thread <name>` (same `--goal`) in place of `--new-thread` to resume this run's handed-off thread (`almanac thread list` shows it). Arms the session onto that thread and clears an earlier off; after a new session id, the first director call re-arms it.
 Then `almanac thread add-packages <name> <blueprint> [<blueprint> ...]` for each blueprint in scope (for `all`, each blueprint when its first `run-package` arrives); at `done`, archive the thread if it is done (see the `done` row).
 Every dispatch prompt carries one line `Ledger: .ccpraxis-local-data/blueprints/<blueprint>/packages/<package>.md` (the `blueprint` and `package` of `run-package`, data-dir-relative).
 With more than one package in flight, a dispatch without exactly one such line naming an in-flight package is denied, and the denial lists the valid lines.
@@ -64,7 +64,7 @@ When the holder exits, act on its report and hold again for ids still running.
 At `done`, at `pause-long`, or when the operator says stop: `butler-continuity off --reason '<what is done>'`.
 A denied stop prints commands carrying a stop token; run them as printed.
 On `ac-stand-down`, step (c): `butler-continuity off --reason 'AC power lost: stood down until AC returns'`; if it refuses because a thread task is `doing`, set that task `pending` and run it again. Never `butler-hold` the AC monitor: continuity is off.
-When the AC monitor exits 0 or 2: `butler-continuity on --thread <your thread> --role driver`, then `next`.
+When the AC monitor exits 0 or 2: `butler-continuity on --thread <your thread> --role driver --goal '<what this run is for>'`, then `next`.
 <!-- continuity:end -->
 BLOCK
 # Normalize line endings before comparing (the fixture above is LF-only).

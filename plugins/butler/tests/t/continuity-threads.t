@@ -308,8 +308,8 @@ sub write_ledger {
     fresh_fixture();
     my $sid = sess_id('ac2');
     my $tp  = ensure_transcript($sid, time());
-    write_ticket_argv($sid, ['on', '--new-thread', 't1'], transcript_path => $tp);
-    my ($out, $err, $rc) = run_cmd({}, 'on', '--new-thread', 't1');
+    write_ticket_argv($sid, ['on', '--new-thread', 't1', '--goal', 'ship the parser fix'], transcript_path => $tp);
+    my ($out, $err, $rc) = run_cmd({}, 'on', '--new-thread', 't1', '--goal', 'ship the parser fix');
     is($rc, 0, 'AC2: on --new-thread t1 exits 0') or diag("stderr: $err");
     is($err, '', 'AC2: stderr empty');
 
@@ -356,8 +356,8 @@ sub write_ledger {
     });
 
     my $sid2 = sess_id('ac3resume');
-    write_ticket_argv($sid2, ['on', '--thread', 'h']);
-    my ($out, $err, $rc) = run_cmd({}, 'on', '--thread', 'h');
+    write_ticket_argv($sid2, ['on', '--thread', 'h', '--goal', 'resume the handed off thread']);
+    my ($out, $err, $rc) = run_cmd({}, 'on', '--thread', 'h', '--goal', 'resume the handed off thread');
     is($rc, 0, 'AC3: on --thread h (handed off) exits 0 for a new owner') or diag("stderr: $err");
     like($out, qr/Thread h resumed\.\n/, 'AC3: the mode line is "Thread h resumed."');
 
@@ -372,8 +372,8 @@ sub write_ledger {
 
     # behaviour 6: on --thread h BY ITS CURRENT OWNER -> no-op.
     my $before = slurp("$PROJECT/.ccpraxis-local-data/almanac/thread/h.md");
-    write_ticket_argv($sid2, ['on', '--thread', 'h']);
-    my ($out2, $err2, $rc2) = run_cmd({}, 'on', '--thread', 'h');
+    write_ticket_argv($sid2, ['on', '--thread', 'h', '--goal', 'resume the handed off thread']);
+    my ($out2, $err2, $rc2) = run_cmd({}, 'on', '--thread', 'h', '--goal', 'resume the handed off thread');
     is($rc2, 0, 'AC3: a second on --thread h by the SAME owner exits 0') or diag("stderr: $err2");
     like($out2, qr/Thread h is already attached to this session\.\n/,
         'AC3: the mode line is "Thread h is already attached to this session."');
@@ -397,8 +397,8 @@ sub write_ledger {
     utime($old, $old, $t_d);
 
     my $sid3 = sess_id('ac4takeover');
-    write_ticket_argv($sid3, ['on', '--thread', 'd']);
-    my ($out, $err, $rc) = run_cmd({}, 'on', '--thread', 'd');
+    write_ticket_argv($sid3, ['on', '--thread', 'd', '--goal', 'take over the dead owner thread']);
+    my ($out, $err, $rc) = run_cmd({}, 'on', '--thread', 'd', '--goal', 'take over the dead owner thread');
     is($rc, 0, 'AC4: on --thread d (dead owner) exits 0') or diag("stderr: $err");
     like($out, qr/\QThread d taken over from session:D; its owner is no longer live.\E\n/,
         'AC4: the mode line names the dead owner');
@@ -431,8 +431,8 @@ sub write_ledger {
 
     my $before = slurp("$PROJECT/.ccpraxis-local-data/almanac/thread/l.md");
     my $sid3 = sess_id('ac5live');
-    write_ticket_argv($sid3, ['on', '--thread', 'l']);
-    my ($out, $err, $rc) = run_cmd({}, 'on', '--thread', 'l');
+    write_ticket_argv($sid3, ['on', '--thread', 'l', '--goal', 'take over the live owner thread']);
+    my ($out, $err, $rc) = run_cmd({}, 'on', '--thread', 'l', '--goal', 'take over the live owner thread');
     is($rc, 1, 'AC5: on --thread l (live owner) exits 1');
     is($err, "butler-continuity: thread l belongs to session:L, which is still live; it cannot be taken over "
            . "until its owner hands it off or goes idle.\n",
@@ -483,19 +483,19 @@ sub write_ledger {
     # R6 / R8: thread-already-exists, and this-session-already-attached.
     fresh_fixture();
     my $sid1 = sess_id('ac6r8owner');
-    write_ticket_argv($sid1, ['on', '--new-thread', 't1']);
-    run_cmd({}, 'on', '--new-thread', 't1');
+    write_ticket_argv($sid1, ['on', '--new-thread', 't1', '--goal', 'own thread t1 first']);
+    run_cmd({}, 'on', '--new-thread', 't1', '--goal', 'own thread t1 first');
 
     my $sid2 = sess_id('ac6r6other');
-    write_ticket_argv($sid2, ['on', '--new-thread', 't1']);
-    my ($out, $err, $rc) = run_cmd({}, 'on', '--new-thread', 't1');
+    write_ticket_argv($sid2, ['on', '--new-thread', 't1', '--goal', 'try to create thread t1 again']);
+    my ($out, $err, $rc) = run_cmd({}, 'on', '--new-thread', 't1', '--goal', 'try to create thread t1 again');
     is($rc, 1, 'AC6 R6: a second session creating the same name exits 1');
     is($err, "butler-continuity: thread t1 already exists; resume it with butler-continuity on --thread t1\n",
         'AC6 R6: stderr is exactly R6');
     ok(!-e state_root() . "/armed/$sid2", 'AC6 R6: the second session is not armed');
 
-    write_ticket_argv($sid1, ['on', '--new-thread', 't2']);
-    my ($out2, $err2, $rc2) = run_cmd({}, 'on', '--new-thread', 't2');
+    write_ticket_argv($sid1, ['on', '--new-thread', 't2', '--goal', 'create a second thread t2']);
+    my ($out2, $err2, $rc2) = run_cmd({}, 'on', '--new-thread', 't2', '--goal', 'create a second thread t2');
     is($rc2, 1, 'AC6 R8: the ALREADY-ATTACHED session creating a new thread exits 1');
     is($err2, "butler-continuity: this session is already attached to thread t1; re-arm on it with "
             . "butler-continuity on --thread t1, or hand it off first with butler-continuity off --reason '<why>'\n",
@@ -507,8 +507,8 @@ sub write_ledger {
     # R9: on --thread of a thread that does not exist.
     fresh_fixture();
     my $sid = sess_id('ac6r9');
-    write_ticket_argv($sid, ['on', '--thread', 'nope']);
-    my ($out, $err, $rc) = run_cmd({}, 'on', '--thread', 'nope');
+    write_ticket_argv($sid, ['on', '--thread', 'nope', '--goal', 'resume a thread that does not exist']);
+    my ($out, $err, $rc) = run_cmd({}, 'on', '--thread', 'nope', '--goal', 'resume a thread that does not exist');
     is($rc, 1, 'AC6 R9: exits 1');
     is($err, "butler-continuity: no thread nope in this project; start it with butler-continuity on "
             . "--new-thread nope\n",
@@ -522,8 +522,8 @@ sub write_ledger {
 {
     fresh_fixture();
     my $sid = sess_id('ac7');
-    write_ticket_argv($sid, ['on', '--new-thread', 't-doing']);
-    run_cmd({}, 'on', '--new-thread', 't-doing');
+    write_ticket_argv($sid, ['on', '--new-thread', 't-doing', '--goal', 'write the tests for this feature']);
+    run_cmd({}, 'on', '--new-thread', 't-doing', '--goal', 'write the tests for this feature');
 
     my $task; lib_ok('add the doing task', sub {
         $task = Almanac::Thread::add_task('t-doing', title => 'write the tests', actor => 'session', root => $PROJECT);
@@ -563,8 +563,8 @@ sub write_ledger {
     # linked task whose ledger says "running" never appears in the listing).
     fresh_fixture();
     my $sid = sess_id('ac8handoff');
-    write_ticket_argv($sid, ['on', '--new-thread', 't-hand']);
-    run_cmd({}, 'on', '--new-thread', 't-hand');
+    write_ticket_argv($sid, ['on', '--new-thread', 't-hand', '--goal', 'write the first slice of work']);
+    run_cmd({}, 'on', '--new-thread', 't-hand', '--goal', 'write the first slice of work');
 
     my $pending_task; lib_ok('add the pending task', sub {
         $pending_task = Almanac::Thread::add_task('t-hand', title => 'write slice 2', actor => 'session', root => $PROJECT);
@@ -574,9 +574,18 @@ sub write_ledger {
         Almanac::Thread::add_task('t-hand', link => 'fx/01-a', actor => 'session', root => $PROJECT);
     });
 
+    # judged-continuity-disarm package 02: agent `off` now only mints a
+    # disarm OTP (exit 1); the hand-off AC8 cares about only happens once
+    # off-confirm actually disarms.
     write_ticket_argv($sid, ['off', '--reason', 'first slice done']);
-    my ($out, $err, $rc) = run_cmd({}, 'off', '--reason', 'first slice done');
-    is($rc, 0, 'AC8: off --reason exits 0') or diag("stderr: $err");
+    my ($out0, $err0, $rc0) = run_cmd({}, 'off', '--reason', 'first slice done');
+    is($rc0, 1, 'AC8: off --reason exits 1 (mints a disarm OTP)') or diag("stdout: $out0");
+    my ($otp) = ($err0 =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
+    ok(defined $otp, 'AC8: off printed an 8-hex-char disarm OTP') or diag("stderr: $err0");
+
+    write_ticket_argv($sid, ['off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'goal is met']);
+    my ($out, $err, $rc) = run_cmd({ CCPRAXIS_DISARM_JUDGE_STUB => 'approve' }, 'off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'goal is met');
+    is($rc, 0, 'AC8: off-confirm --otp --justification exits 0') or diag("stderr: $err");
 
     my $TP = thread_pl_abs();
     my $expect = "continuity off for session " . s8($sid) . " (actor agent); reason logged.\n"
@@ -605,8 +614,8 @@ sub write_ledger {
     # Part 2: every task done -> handed off AND archived in the same call.
     fresh_fixture();
     my $sid = sess_id('ac8archive');
-    write_ticket_argv($sid, ['on', '--new-thread', 't-done']);
-    run_cmd({}, 'on', '--new-thread', 't-done');
+    write_ticket_argv($sid, ['on', '--new-thread', 't-done', '--goal', 'finish the only step here']);
+    run_cmd({}, 'on', '--new-thread', 't-done', '--goal', 'finish the only step here');
     my $t; lib_ok('add a task, mark it done', sub {
         $t = Almanac::Thread::add_task('t-done', title => 'only step', actor => 'session', root => $PROJECT);
     });
@@ -618,9 +627,18 @@ sub write_ledger {
         mark_task_done_direct('t-done', $t->{id});
     });
 
+    # judged-continuity-disarm package 02: agent `off` now only mints a
+    # disarm OTP (exit 1); the archive AC8 cares about only happens once
+    # off-confirm actually disarms.
     write_ticket_argv($sid, ['off', '--reason', 'all done here']);
-    my ($out, $err, $rc) = run_cmd({}, 'off', '--reason', 'all done here');
-    is($rc, 0, 'AC8 archive: off --reason exits 0') or diag("stderr: $err");
+    my ($out0, $err0, $rc0) = run_cmd({}, 'off', '--reason', 'all done here');
+    is($rc0, 1, 'AC8 archive: off --reason exits 1 (mints a disarm OTP)') or diag("stdout: $out0");
+    my ($otp) = ($err0 =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
+    ok(defined $otp, 'AC8 archive: off printed an 8-hex-char disarm OTP') or diag("stderr: $err0");
+
+    write_ticket_argv($sid, ['off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'goal is met']);
+    my ($out, $err, $rc) = run_cmd({ CCPRAXIS_DISARM_JUDGE_STUB => 'approve' }, 'off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'goal is met');
+    is($rc, 0, 'AC8 archive: off-confirm --otp --justification exits 0') or diag("stderr: $err");
     is($out, "continuity off for session " . s8($sid) . " (actor agent); reason logged.\n"
            . "Thread t-done handed off and archived: all its tasks are done.\n",
         'AC8 archive: stdout is exactly the off line and the archived line');
@@ -636,9 +654,18 @@ sub write_ledger {
     fresh_fixture();
     my $sid = sess_id('ac8nothread');
     ok(BpHook::arm($sid, role => 'manual', by => 'on'), 'AC8 (no thread) setup: armed directly');
+    # judged-continuity-disarm package 02: agent `off` now only mints a
+    # disarm OTP (exit 1); the no-thread off line this case cares about
+    # only appears once off-confirm actually disarms.
     write_ticket_argv($sid, ['off', '--reason', 'nothing to hand off']);
-    my ($out, $err, $rc) = run_cmd({}, 'off', '--reason', 'nothing to hand off');
-    is($rc, 0, 'AC8 (no thread): off --reason exits 0');
+    my ($out0, $err0, $rc0) = run_cmd({}, 'off', '--reason', 'nothing to hand off');
+    is($rc0, 1, 'AC8 (no thread): off --reason exits 1 (mints a disarm OTP)') or diag("stdout: $out0");
+    my ($otp) = ($err0 =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
+    ok(defined $otp, 'AC8 (no thread): off printed an 8-hex-char disarm OTP') or diag("stderr: $err0");
+
+    write_ticket_argv($sid, ['off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'goal is met']);
+    my ($out, $err, $rc) = run_cmd({ CCPRAXIS_DISARM_JUDGE_STUB => 'approve' }, 'off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'goal is met');
+    is($rc, 0, 'AC8 (no thread): off-confirm --otp --justification exits 0');
     is($out, "continuity off for session " . s8($sid) . " (actor agent); reason logged.\n",
         'AC8 (no thread): stdout is exactly the existing off line');
 
@@ -693,8 +720,8 @@ sub write_ledger {
 {
     fresh_fixture();
     my $sid = sess_id('ac12');
-    write_ticket_argv($sid, ['on', '--new-thread', 't-status']);
-    run_cmd({}, 'on', '--new-thread', 't-status');
+    write_ticket_argv($sid, ['on', '--new-thread', 't-status', '--goal', 'check the thread status line']);
+    run_cmd({}, 'on', '--new-thread', 't-status', '--goal', 'check the thread status line');
 
     my $done_task; lib_ok('add unlinked done task', sub {
         $done_task = Almanac::Thread::add_task('t-status', title => 'finished', actor => 'session', root => $PROJECT);
@@ -836,7 +863,7 @@ sub write_ledger {
 
     fresh_fixture();
     my $sid = sess_id('ac16noalm');
-    write_ticket_argv($sid, ['on']);
+    write_ticket_argv($sid, ['on', '--goal', 'arm with no sibling almanac present']);
 
     my (undef, $outfile) = tempfile();
     my (undef, $errfile) = tempfile();
@@ -845,7 +872,7 @@ sub write_ledger {
     if ($pid == 0) {
         open(STDOUT, '>', $outfile) or POSIX::_exit(126);
         open(STDERR, '>', $errfile) or POSIX::_exit(126);
-        exec($^X, "$iso/scripts/butler-continuity.pl", 'on');
+        exec($^X, "$iso/scripts/butler-continuity.pl", 'on', '--goal', 'arm with no sibling almanac present');
         POSIX::_exit(127);
     }
     push @KILL_PIDS, $pid;
@@ -860,8 +887,8 @@ sub write_ledger {
     # existing subagent refusal, thread t9 not created.
     fresh_fixture();
     my $sid = sess_id('ac16subagent');
-    write_ticket_argv($sid, ['on', '--new-thread', 't9'], agent_id => 'sub1');
-    my ($out, $err, $rc) = run_cmd({}, 'on', '--new-thread', 't9');
+    write_ticket_argv($sid, ['on', '--new-thread', 't9', '--goal', 'start thread t9 as a subagent'], agent_id => 'sub1');
+    my ($out, $err, $rc) = run_cmd({}, 'on', '--new-thread', 't9', '--goal', 'start thread t9 as a subagent');
     is($rc, 1, 'AC16: a subagent ticket for on --new-thread t9 refuses');
     like($err, qr/subagent/, 'AC16: the refusal names a subagent');
     my $t9 = eval { Almanac::Thread::read_thread('t9', root => $PROJECT) };
@@ -916,8 +943,8 @@ sub write_ledger {
 
     fresh_fixture();
     my $sid = sess_id('m1nonascii');
-    write_ticket_argv($sid, ['on', '--new-thread', 't-m1']);
-    my ($oon, $eon, $rcon) = $run_iso->('on', '--new-thread', 't-m1');
+    write_ticket_argv($sid, ['on', '--new-thread', 't-m1', '--goal', 'write the garbled path test']);
+    my ($oon, $eon, $rcon) = $run_iso->('on', '--new-thread', 't-m1', '--goal', 'write the garbled path test');
     is($rcon, 0, 'M1: on --new-thread via the non-ASCII-path copy exits 0') or diag("stderr: $eon");
 
     my $task; lib_ok('M1 fixture: add the doing task', sub {
@@ -959,8 +986,8 @@ sub write_ledger {
 {
     fresh_fixture();
     my $sid = sess_id('s1corrupt');
-    write_ticket_argv($sid, ['on', '--new-thread', 't-legit']);
-    run_cmd({}, 'on', '--new-thread', 't-legit');
+    write_ticket_argv($sid, ['on', '--new-thread', 't-legit', '--goal', 'do in progress work here']);
+    run_cmd({}, 'on', '--new-thread', 't-legit', '--goal', 'do in progress work here');
 
     my $task; lib_ok('S1 fixture: add the doing task on t-legit', sub {
         $task = Almanac::Thread::add_task('t-legit', title => 'in progress work', actor => 'session', root => $PROJECT);
@@ -994,8 +1021,8 @@ sub write_ledger {
     # second `on --new-thread`, even though attached_thread cannot
     # positively confirm t-legit while the store errors. Run before S1b so
     # the session is still armed+attached when this is exercised. ---
-    write_ticket_argv($sid, ['on', '--new-thread', 't-second']);
-    my ($o3, $e3, $rc3) = run_cmd({}, 'on', '--new-thread', 't-second');
+    write_ticket_argv($sid, ['on', '--new-thread', 't-second', '--goal', 'start a second thread anyway']);
+    my ($o3, $e3, $rc3) = run_cmd({}, 'on', '--new-thread', 't-second', '--goal', 'start a second thread anyway');
     is($rc3, 1, 'S1c: on --new-thread t-second is refused -- not silently allowed -- '
               . 'when the already-attached check cannot be confirmed cleanly')
         or diag("stdout: $o3 / stderr: $e3");

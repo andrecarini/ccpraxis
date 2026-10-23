@@ -934,7 +934,11 @@ sub nudged_path { my ($home, $sid) = @_; return "$home/.claude/almanac-state/cha
 # OVERRIDDEN by blueprint where-things-go, package 04-continuity-threads
 # (specs/04-continuity-threads-spec.md section 2.8): the N5 nudge now says
 # "arm and attach a thread" and names both CLI forms.
-sub n5_text { my ($n) = @_; return "No operator message for $n min and work continues. If this session should keep working without the operator, arm and attach a thread: butler-continuity on --new-thread <name> (or --thread <name> to resume one)" }
+# 04-docs-and-wiring (spec 2.4.9/2.13): names --goal. reminder-chart-tasklist.pl
+# is a Perl double-quoted string (no bash single-quote hazard), so this keeps
+# the quoted `'<what this is for>'` placeholder form, per spec 2.13 exactly --
+# NOT the unquoted form used for arm-nudge-prompt.sh's bash single-quoted string.
+sub n5_text { my ($n) = @_; return "No operator message for $n min and work continues. If this session should keep working without the operator, arm and attach a thread: butler-continuity on --new-thread <name> --goal '<what this session is for>' (or --thread <name> to resume one)" }
 sub n5_regex {
     my (@ns) = @_;
     my $alt = join('|', map { quotemeta(n5_text($_)) } @ns);

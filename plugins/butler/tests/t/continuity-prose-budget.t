@@ -371,10 +371,10 @@ my %SKILLS = (
             'outlive the turn',
             'unattended multi-step',
             "butler-continuity off --reason '<what is done>'",
-            "butler-continuity silence --reason '<why this stop>'",
             'at least two words',
             'all work is done',
             'wait for the operator',
+            'never end a turn to wait for the operator',
             '--token',
             'butler-hold <id>',
             'run_in_background: true',
@@ -396,6 +396,10 @@ my %SKILLS = (
             '--thread <name>',
             'hands the thread off',
             'refuses while a task of the thread is doing',
+            # package 04-docs-and-wiring (spec 2.1/2.7): the new disarm/escape
+            # verbs added by judged-continuity-disarm.
+            'off-confirm',
+            'emergency-stop',
         ],
         file_required => [],
         rule_q => undef,
@@ -441,7 +445,6 @@ my %SKILLS = (
         block_required => [
             'butler-continuity on --role reporter',
             'butler-hold',
-            'butler-continuity silence --reason',
             'butler-continuity off --reason',
             'no thread',   # package 04-continuity-threads (spec 2.10)
         ],
@@ -582,6 +585,14 @@ for my $skill_name (sort keys %SKILLS) {
                 diag($_) for @qv;
             }
         }
+
+        # AC20 (spec 05-remove-silence section 4.1/4.3, DC4): the whole
+        # continuity SKILL.md file has zero case-insensitive matches for
+        # \bsilence -- silence is no longer documented anywhere in it.
+        if ($skill_name eq 'continuity') {
+            unlike($text, qr/\bsilence/i,
+                'AC20: continuity SKILL.md has no case-insensitive match for \bsilence');
+        }
     };
 }
 
@@ -721,7 +732,7 @@ for my $skill_name (sort keys %SKILLS) {
             my $hi = $heading_idx[0];
 
             my @EXPECT_BULLETS = (
-                '- Arm with `butler-continuity on` before work that should go on without the operator: '
+                q{- Arm with `butler-continuity on --new-thread <name> --goal '<what this is for>'` before work that should go on without the operator: }
               . 'they said "keep going", they are away or it runs overnight, or the work is unattended '
               . 'and multi-step.',
                 '- Never arm for one interactive answer.',

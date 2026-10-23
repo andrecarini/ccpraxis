@@ -3,8 +3,8 @@
 # ORACLE for package 06 (blueprint hook-continuity-remake), non-coordinator
 # side: specs/06-stop-gate-spec.md S1-S21 (DC1) + B1-B4 (DC3). The single
 # Stop gate's decision table (G1-G11): unarmed allow, own-live-holder allow,
-# a denial's exact 7-line continuity text and minted token, silence consumed
-# once, every retired override ignored, and the Decision-33 process budget for
+# a denial's exact 7-line continuity text and minted token, every retired
+# override ignored, and the Decision-33 process budget for
 # a session the gate does not apply to.
 #
 # The hook file and its perl module DO NOT EXIST YET: every subprocess run
@@ -202,13 +202,21 @@ sub arm_session {
     return $ok;
 }
 
-sub set_silence {
+# plant_silence($root, $sid, %o) -- hand-plant a valid-shape silence/<sid>
+# record directly on disk (spec 05-remove-silence section 2.2/B6):
+# set_silence is removed, so this writes the old valid JSON shape itself.
+sub plant_silence {
     my ($root, $sid, %opts) = @_;
-    local %ENV = %ENV;
-    delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
-    $ENV{HOME} = $FAKE_HOME; $ENV{USERPROFILE} = $FAKE_HOME;
-    $ENV{BUTLER_STATE_DIR} = $root;
-    return BpHook::set_silence($sid, reason => ($opts{reason} // 'reporting progress now'));
+    my $dir = state_dir_of($root) . '/silence';
+    make_path($dir);
+    my $path = "$dir/$sid";
+    open my $fh, '>:raw', $path or die "plant_silence: $!";
+    print {$fh} (defined $opts{raw} ? $opts{raw} : JSON::PP->new->encode({
+        session_id => $sid, by => 'butler-continuity',
+        reason => ($opts{reason} // 'reporting progress now'), at => time(),
+    }));
+    close $fh;
+    return $path;
 }
 
 sub read_json_file {
@@ -344,25 +352,26 @@ my ($S2_ROOT, $S2_SID, $S2_TOKEN);
     is($res->{rc}, 2, 'S2 (re-expresses the retired graceful-stop-gate coverage "gate-stop: no signal + non-terminal -> blocked"): subprocess exit 2');
     is($res->{out}, '', 'S2: stdout empty');
     my @lines = lines_of($res->{err});
-    is(scalar(@lines), 7, 'S2: stderr is exactly 7 lines') or diag("stderr:\n$res->{err}");
-    cmp_ok(scalar(@lines), '<=', 8, 'S2: line count <= 8');
+    is(scalar(@lines), 6, 'S2: stderr is exactly 6 lines') or diag("stderr:\n$res->{err}");
     my ($tok) = ($lines[0] // '') =~ /Stop token: ([0-9a-f]{8})\z/;
     ok(defined $tok, 'S2: line 1 carries an 8-hex token') or diag($lines[0] // '');
     SKIP: {
-        skip 'S2: no token extracted', 6 unless defined $tok;
+        skip 'S2: no token extracted', 5 unless defined $tok;
+        # 2.4.3 (spec 05-remove-silence): the idle deny text, with the
+        # escape-hatch/silence lines deleted outright.
+        # 04-docs-and-wiring (spec 2.8): two-step off + emergency-stop mention.
         my $expected = <<"TXT";
 Continuity is on for this session and no holder is running. Stop token: $tok
 Waiting on a subagent or background task? Hold it, as a background Bash tool call:
   butler-hold --token $tok <id> [<id> ...]
-All work done? Turn continuity off, as a Bash tool call:
+All work done? Turn continuity off (two steps: off mints an OTP, then off-confirm with it), as a Bash tool call:
   butler-continuity off --reason '<what is done>' --token $tok
-Escape hatch, only when a stop is truly necessary, e.g. to talk with an operator who is present:
-  butler-continuity silence --reason '<why this stop>' --token $tok
+(Genuine ccpraxis/Claude-Code defect, not just finished work? butler-continuity emergency-stop --reason '<the actual defect>' instead -- not a normal option.)
 TXT
-        is($res->{err}, $expected, 'S2: stderr is exactly the 2.5 continuity template with the token substituted in all 4 places');
+        is($res->{err}, $expected, 'S2: stderr is exactly the updated continuity template (two-step off + emergency-stop mention) with the token substituted in all 3 places');
         like($res->{err}, qr/butler-hold/, 'S2: stderr contains butler-hold');
         like($res->{err}, qr/butler-continuity off --reason/, 'S2: stderr contains butler-continuity off --reason');
-        like($res->{err}, qr/butler-continuity silence --reason/, 'S2: stderr contains butler-continuity silence --reason');
+        unlike($res->{err}, qr/silence/, 'AC14: stderr contains no "silence"');
         $S2_ROOT = $root; $S2_SID = $sid; $S2_TOKEN = $tok;
     }
 }
@@ -385,7 +394,7 @@ SKIP: {
 
 # ===========================================================================
 # S4 -- two consecutive denials mint different tokens; the first is revoked;
-# a silence-allowed Stop after a denial also revokes it.
+# a holder-allowed Stop after a denial also revokes it.
 # ===========================================================================
 {
     my $root = fresh_state_root();
@@ -405,21 +414,26 @@ SKIP: {
         is(BpHook::take_stop_token($t1), undef, 'S4: take_stop_token(first) is undef');
     }
 
-    # a silence-allowed stop after a denial also revokes the pending token.
+    # a holder-allowed stop after a denial also revokes the pending token
+    # (S5's fixture: spawn_sleeper, write_holder items ['B'], background_tasks
+    # running B).
     my $sid2 = next_sid();
     arm_session($root, $sid2);
     my $rd = run_gate(payload_json($sid2), BUTLER_STATE_DIR => $root);
     my ($td) = ($rd->{err} =~ /Stop token: ([0-9a-f]{8})/);
     ok(defined $td, 'S4: precondition -- a denial for sid2 minted a token');
-    set_silence($root, $sid2);
-    my $rs = run_gate(payload_json($sid2), BUTLER_STATE_DIR => $root);
-    is($rs->{rc}, 0, 'S4: the silence-allowed stop exits 0');
+    my $pid = spawn_sleeper();
+    write_holder($root, $sid2, pid => $pid, fp => cmdline_fp_of($pid), items => ['B'], deadline => int(time() + 1800));
+    my $rs = run_gate(payload_json($sid2, background_tasks => [{ id => 'B', type => 'subagent', status => 'running' }]),
+        BUTLER_STATE_DIR => $root);
+    is($rs->{rc}, 0, 'S4: the holder-allowed stop exits 0');
     SKIP: {
         skip 'S4: no token to check', 1 unless defined $td;
         local %ENV = %ENV;
         $ENV{BUTLER_STATE_DIR} = $root;
         ok(!-e (state_dir_of($root) . "/stop-tokens/$td"), 'S4: ...and the pending denial token is revoked too');
     }
+    kill_sleeper($pid);
 }
 
 # ===========================================================================
@@ -560,34 +574,28 @@ SKIP: {
 }
 
 # ===========================================================================
-# S10 -- silence lets one stop through; the next one denies.
+# S10 -- AC9 (spec 05-remove-silence B6): a planted valid-shape silence
+# record never allows a stop. G9 is deleted outright -- a planted record is
+# never read, consumed or acted on by the gate.
 # ===========================================================================
 {
     my $root = fresh_state_root();
     my $sid  = next_sid();
     arm_session($root, $sid);
-    set_silence($root, $sid);
+    plant_silence($root, $sid);
     my $r1 = run_gate(payload_json($sid), BUTLER_STATE_DIR => $root);
-    is($r1->{rc}, 0, 'S10: first Stop with a valid silence -> exit 0');
-    ok(!-e (state_dir_of($root) . "/silence/$sid"), 'S10: silence/<sid> gone');
+    is($r1->{rc}, 2, 'AC9: first Stop with a planted silence record -> exit 2');
+    ok(-e (state_dir_of($root) . "/silence/$sid"), 'AC9: the planted silence/<sid> record still exists');
     my $r2 = run_gate(payload_json($sid), BUTLER_STATE_DIR => $root);
-    is($r2->{rc}, 2, 'S10: second Stop -> exit 2');
+    is($r2->{rc}, 2, 'AC9: second Stop -> exit 2 too');
 }
 
 # ===========================================================================
-# S11 (edge) -- Decision 50 (hook-continuity-remake blueprint.md): silence is
-# ONE-TURN. The next Stop of the session consumes an outstanding silence
-# WHETHER OR NOT the silence was needed -- a holder or unarmed state may
-# have allowed the stop anyway. A silence can never outlive the turn it was
-# taken for. This SUPERSEDES the original spec S11 ("keep an unused silence"),
-# which let a stale silence strand a later armed stop (red-team H1: a
-# silence taken for "this one stop" survived a holder-allowed stop, then was
-# spent on an unrelated later stop with no holder and no reason).
-#
-# So: live holder + valid silence -> exit 0 (the holder still allows it),
-# AND the silence is CONSUMED by this very stop (Decision 50), not kept.
-# A later stop, once the holder is gone, must then be denied on its own
-# merits -- the already-spent silence must not strand it into an allow.
+# S11 (edge) -- AC11 (spec 05-remove-silence B6): a planted silence record
+# is inert. A live holder + a planted record still allows the stop (the
+# holder, not the silence record), and the record is left in place --
+# Decision 50's one-turn consumption no longer applies since there is no
+# silence consumer at all.
 # ===========================================================================
 {
     my $root = fresh_state_root();
@@ -595,25 +603,26 @@ SKIP: {
     arm_session($root, $sid);
     my $pid = spawn_sleeper();
     write_holder($root, $sid, pid => $pid, fp => cmdline_fp_of($pid), items => ['B'], deadline => int(time() + 1800));
-    set_silence($root, $sid);
+    plant_silence($root, $sid);
     my $res = run_gate(payload_json($sid, background_tasks => [{ id => 'B', type => 'subagent', status => 'running' }]),
         BUTLER_STATE_DIR => $root);
-    is($res->{rc}, 0, 'S11: live holder allows the stop');
-    ok(!-e (state_dir_of($root) . "/silence/$sid"),
-        'R6-H1 (Decision 50): silence/<sid> is CONSUMED by the holder-allowed stop (one-turn silence), not kept');
+    is($res->{rc}, 0, 'AC11: live holder allows the stop');
+    ok(-e (state_dir_of($root) . "/silence/$sid"),
+        'AC11: the planted silence/<sid> record still exists -- not read, so not consumed');
     kill_sleeper($pid);
 
     # The holder is now gone (no re-hold). A later Stop of the SAME session
-    # must be denied on its own merits: the already-spent silence must never
-    # strand it into an allow.
+    # must be denied on its own merits; the inert silence record never
+    # strands it into an allow.
     my $res2 = run_gate(payload_json($sid), BUTLER_STATE_DIR => $root);
     is($res2->{rc}, 2,
-        'R6-H1 (Decision 50): a later Stop with no holder and the silence already spent -> DENIED, not stranded into an allow');
+        'AC11: a later Stop with no holder -> DENIED (the planted silence record is never read)');
 }
 
 # ===========================================================================
-# S12 (edge) -- an empty (touch-created) silence file does not allow, and is
-# removed by the core.
+# S12 (edge) -- AC10 (spec 05-remove-silence B6): an empty (touch-created)
+# silence file does not allow, and the gate leaves it in place (it is never
+# read, so never removed either).
 # ===========================================================================
 {
     my $root = fresh_state_root();
@@ -624,8 +633,8 @@ SKIP: {
     open my $fh, '>', "$dir/$sid" or die $!;
     close $fh;
     my $res = run_gate(payload_json($sid), BUTLER_STATE_DIR => $root);
-    is($res->{rc}, 2, 'S12: an empty silence/<sid> file does not allow -> exit 2');
-    ok(!-e "$dir/$sid", 'S12: the malformed silence file is removed');
+    is($res->{rc}, 2, 'AC10: an empty silence/<sid> file does not allow -> exit 2');
+    ok(-e "$dir/$sid", 'AC10: the empty silence file still exists afterward');
 }
 
 # ===========================================================================
@@ -1041,6 +1050,16 @@ if (defined $REAL_BSTATE) {
     if ($REAL_BSTATE_EXISTS && $exists_after) {
         is((stat($REAL_BSTATE))[9], $REAL_BSTATE_MTIME, 'hygiene: real ~/.claude/butler-state mtime unchanged');
     }
+}
+
+# ===========================================================================
+# AC8 (spec 05-remove-silence section 4.1, DC2): no set_silence/take_silence
+# reference and no "/silence/" state path remain in StopGate.pm's source.
+# ===========================================================================
+{
+    my $sg_src = slurp($STOPGATE_PM);
+    unlike($sg_src, qr/set_silence/, 'AC8: StopGate.pm has no set_silence reference');
+    unlike($sg_src, qr/take_silence/, 'AC8: StopGate.pm has no take_silence reference');
 }
 
 done_testing();

@@ -21,6 +21,7 @@ use Test::More;
 use File::Basename qw(dirname);
 use File::Glob qw(bsd_glob);
 use JSON::PP ();
+use Digest::SHA qw(sha1_hex);
 
 BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use lib dirname(__FILE__) . '/../lib';
@@ -155,6 +156,47 @@ sub tickets { my ($st) = @_; return sort(bsd_glob("$st/tickets/*/*.json")) }
     }
     my @tf = tickets($ST);
     is(scalar(@tf), 0, 'AC13: list / show / todo create (ungated) write no ticket');
+}
+
+# ---------------------------------------------------------------------------
+# AC-24 (judged-continuity-disarm package 02, spec 02-disarm-otp-skeleton
+# sec 2.3/4): ContinuityOffCheck recognizes the new off-confirm verb and
+# writes exactly one ticket for it, keyed on the exact argv, operator false.
+# A command with an off-confirm-LOOKING-but-wrong verb (off-confirmx) writes
+# none. THE off-confirm VERB DOES NOT EXIST YET in ContinuityOffCheck's
+# recognized-verb list at the time this file is written -- both assertions
+# below are expected to fail for exactly that reason (no ticket at all for
+# the first case, since off-confirm is not yet recognized).
+# ---------------------------------------------------------------------------
+{
+    local %ENV = %ENV;
+    GuardHarness::fresh_state();
+    my $ST = BpHook::state_dir();
+    my $cmd = q{butler-continuity off-confirm --otp deadbeef --justification 'goal is met'};
+    my $res = tw(_payload_bash(cmd => $cmd, session_id => 'OFFCONFIRM1', tool_use_id => 'T1', cwd => '/proj'));
+    is($res->{rc}, 0, 'AC-24: ContinuityOffCheck::run on an off-confirm Bash payload returns 0');
+    my @tf = tickets($ST);
+    is(scalar(@tf), 1, 'AC-24: exactly one ticket file for the off-confirm invocation');
+    my $expect_key = sha1_hex(join("\0", 'butler-continuity', 'off-confirm', '--otp', 'deadbeef',
+                                   '--justification', 'goal is met'));
+    my @matching = bsd_glob("$ST/tickets/$expect_key/*.json");
+    is(scalar(@matching), 1, 'AC-24: the ticket is keyed on sha1_hex(argv) exactly as the spec prescribes');
+    my $t = BpHook::take_ticket('butler-continuity',
+        ['off-confirm', '--otp', 'deadbeef', '--justification', 'goal is met']);
+    is(ref $t eq 'HASH' ? $t->{session_id} : 'unreachable', 'OFFCONFIRM1',
+        'AC-24: take_ticket reclaims it, session OFFCONFIRM1');
+    is(ref $t eq 'HASH' ? ($t->{operator} ? 1 : 0) : 'unreachable', 0,
+        'AC-24: the ticket carries operator:false');
+}
+{
+    local %ENV = %ENV;
+    GuardHarness::fresh_state();
+    my $ST = BpHook::state_dir();
+    my $cmd = q{butler-continuity off-confirmx --otp deadbeef --justification 'goal is met'};
+    my $res = tw(_payload_bash(cmd => $cmd, session_id => 'OFFCONFIRMX1', tool_use_id => 'T1', cwd => '/proj'));
+    is($res->{rc}, 0, 'AC-24: ContinuityOffCheck::run on an off-confirmx Bash payload still returns 0');
+    my @tf = tickets($ST);
+    is(scalar(@tf), 0, 'AC-24: a command whose verb is off-confirmx (not off-confirm) writes no ticket');
 }
 
 # ---- hygiene: this file never touched the real ~/.claude/butler-state -----

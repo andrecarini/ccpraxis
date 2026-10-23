@@ -360,6 +360,11 @@ sub slurp {
             $ENV{BUTLER_STATE_DIR}               = $home;
             $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} = $legacy;
             $ENV{CCPRAXIS_NO_WAKELOCK}           = 1;
+            # judged-continuity-disarm package 03 (spec sec 4.1): L7's
+            # off-confirm call now dispatches the disarm judge after a
+            # successful OTP claim; stub it to approve so this file never
+            # spawns a real `claude -p` (DC7).
+            $ENV{CCPRAXIS_DISARM_JUDGE_STUB}     = 'approve';
             open(STDOUT, '>', $outfile) or POSIX::_exit(126);
             open(STDERR, '>', $errfile) or POSIX::_exit(126);
             exec($^X, $CMD, @args);
@@ -410,11 +415,25 @@ sub slurp {
     is($rc1, 0, 'L7: on --role reporter exits 0') or diag("stderr: $err1");
     is(BpContinuityLease::any_active($legacy), 1, 'L7: after on, any_active(legacy_dir) is 1');
 
+    # judged-continuity-disarm package 02 (AC-10): agent `off` now only mints
+    # a disarm OTP (exit 1), leaving the lease active; the lease goes
+    # inactive only once `off-confirm` actually disarms.
     my $p2 = { session_id => $sid, tool_use_id => 'tu2', transcript_path => "$home/x.jsonl", cwd => $home };
     BpHook::write_ticket($p2, 'butler-continuity', ['off', '--reason', 'a b']);
     my ($out2, $err2, $rc2) = run_cli('off', '--reason', 'a b');
-    is($rc2, 0, 'L7: off --reason exits 0') or diag("stderr: $err2");
-    is(BpContinuityLease::any_active($legacy), 0, 'L7: after off, any_active(legacy_dir) is 0');
+    is($rc2, 1, 'L7: off --reason exits 1 (mints a disarm OTP, does not disarm yet)') or diag("stdout: $out2");
+    is(BpContinuityLease::any_active($legacy), 1,
+       'L7: after off (step one), any_active(legacy_dir) is still 1 (not yet disarmed)');
+
+    my ($otp) = ($err2 =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
+    ok(defined $otp, 'L7: off printed an 8-hex-char disarm OTP') or diag("stderr: $err2");
+
+    my $p3 = { session_id => $sid, tool_use_id => 'tu3', transcript_path => "$home/x.jsonl", cwd => $home };
+    BpHook::write_ticket($p3, 'butler-continuity',
+        ['off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'goal is met']);
+    my ($out3, $err3, $rc3) = run_cli('off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'goal is met');
+    is($rc3, 0, 'L7: off-confirm --otp --justification exits 0') or diag("stderr: $err3");
+    is(BpContinuityLease::any_active($legacy), 0, 'L7: after off-confirm, any_active(legacy_dir) is 0');
 }
 
 # ===========================================================================

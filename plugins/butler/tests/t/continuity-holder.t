@@ -1547,15 +1547,48 @@ SKIP: {
             next;
         }
 
+        # judged-continuity-disarm package 02: agent `off` now only mints a
+        # disarm OTP (two-step). The race this block drives is about
+        # BpHook::disarm()'s own lock discipline, which now runs inside
+        # `off-confirm`, not `off` -- so mint the OTP BEFORE taking the test's
+        # own holder/<sid>.lock (minting takes no armlock, and must not be
+        # inside the window being raced), then race `off-confirm` instead.
+        BpHook::write_ticket(
+            { session_id => $sid, tool_use_id => next_tuid(), transcript_path => $tp, cwd => $PROJECT },
+            'butler-continuity', ['off', '--reason', 'race off'],
+            background => 1, operator => 0);
+        my (undef, $out_mint) = tempfile();
+        my (undef, $err_mint) = tempfile();
+        my $pid_mint = fork();
+        die "fork: $!" unless defined $pid_mint;
+        if ($pid_mint == 0) {
+            delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
+            $ENV{HOME}                  = $FAKE_HOME;
+            $ENV{USERPROFILE}           = $FAKE_HOME;
+            $ENV{BUTLER_STATE_DIR}      = $STATE_DIR;
+            $ENV{BUTLER_HOLD_TEST_MODE} = 1;
+            open(STDOUT, '>', $out_mint) or POSIX::_exit(126);
+            open(STDERR, '>', $err_mint) or POSIX::_exit(126);
+            exec('bash', $CONT_SHIM, 'off', '--reason', 'race off');
+            POSIX::_exit(127);
+        }
+        push @KILL_PIDS, $pid_mint;
+        wait_pid_bounded($pid_mint, 10);
+        @KILL_PIDS = grep { $_ != $pid_mint } @KILL_PIDS;
+        my $mint_err = slurp($err_mint);
+        unlink $out_mint, $err_mint;
+        my ($otp) = ($mint_err =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
+        ok(defined $otp, "R5-m1-$i: off minted an 8-hex-char disarm OTP") or diag("stderr: $mint_err");
+
         # Force the EXACT window review m1 names: hold the SAME lock
         # become/extend serialise on (holder/<sid>.lock) from the test
         # process itself, so a concurrent extend blocks INSIDE the lock
-        # wait; run `off` to completion while the extend cannot possibly
-        # observe it (off serialises on a DIFFERENT lock, armlock/<sid>, and
-        # never touches this one); only then release the lock, letting the
-        # extend read a now-empty slot and -- per current behaviour --
-        # BECOME a fresh holder anyway, resurrecting the record `off` just
-        # removed.
+        # wait; run `off-confirm` to completion while the extend cannot
+        # possibly observe it (disarm serialises on a DIFFERENT lock,
+        # armlock/<sid>, and never touches this one); only then release the
+        # lock, letting the extend read a now-empty slot and -- per current
+        # behaviour -- BECOME a fresh holder anyway, resurrecting the record
+        # `off-confirm` just removed.
         make_path("$CONT_ROOT/holder");
         my $lockpath = "$CONT_ROOT/holder/$sid.lock";
         open(my $test_lockfh, '>>', $lockpath) or die "open $lockpath: $!";
@@ -1569,25 +1602,33 @@ SKIP: {
 
         BpHook::write_ticket(
             { session_id => $sid, tool_use_id => next_tuid(), transcript_path => $tp, cwd => $PROJECT },
-            'butler-continuity', ['off', '--reason', 'race off'],
+            'butler-continuity', ['off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'race off confirmed'],
             background => 1, operator => 0);
         my (undef, $out_off) = tempfile();
         my (undef, $err_off) = tempfile();
+        # judged-continuity-disarm package 03 (spec sec 4.1): this off-confirm
+        # expects rc 0 once the OTP claim succeeds; stub the disarm judge to
+        # approve so this race fixture never spawns a real `claude -p`
+        # (DC7). Set in %ENV before the fork (this helper's exec takes no env
+        # argument), and the 10 s wait_pid_bounded below must still hold.
+        local $ENV{CCPRAXIS_DISARM_JUDGE_STUB} = 'approve';
         my $pid_off = fork();
         die "fork: $!" unless defined $pid_off;
         if ($pid_off == 0) {
+            my $judge_stub = $ENV{CCPRAXIS_DISARM_JUDGE_STUB};
             delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
-            $ENV{HOME}                  = $FAKE_HOME;
-            $ENV{USERPROFILE}           = $FAKE_HOME;
-            $ENV{BUTLER_STATE_DIR}      = $STATE_DIR;
-            $ENV{BUTLER_HOLD_TEST_MODE} = 1;
+            $ENV{HOME}                        = $FAKE_HOME;
+            $ENV{USERPROFILE}                 = $FAKE_HOME;
+            $ENV{BUTLER_STATE_DIR}            = $STATE_DIR;
+            $ENV{BUTLER_HOLD_TEST_MODE}       = 1;
+            $ENV{CCPRAXIS_DISARM_JUDGE_STUB}  = $judge_stub;
             open(STDOUT, '>', $out_off) or POSIX::_exit(126);
             open(STDERR, '>', $err_off) or POSIX::_exit(126);
-            exec('bash', $CONT_SHIM, 'off', '--reason', 'race off');
+            exec('bash', $CONT_SHIM, 'off-confirm', '--otp', $otp // 'deadbeef', '--justification', 'race off confirmed');
             POSIX::_exit(127);
         }
         push @KILL_PIDS, $pid_off;
-        wait_pid_bounded($pid_off, 10);   # off completes while extend is locked out
+        wait_pid_bounded($pid_off, 10);   # off-confirm completes while extend is locked out
         @KILL_PIDS = grep { $_ != $pid_off } @KILL_PIDS;
         unlink $out_off, $err_off;
 

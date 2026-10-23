@@ -35,9 +35,14 @@ require "$SCRIPTS/BpHook.pm";
 
 # package 04-continuity-threads (spec 2.8): the nudge now tells the session
 # to arm AND ATTACH A THREAD, naming both the --new-thread and --thread forms.
+# 04-docs-and-wiring (spec addendum 0, the shell-quoting correction of spec
+# 2.10): names --goal, UNQUOTED around the placeholder (no single quotes) --
+# a backslash-escaped single quote inside this bash single-quoted string
+# would terminate the string early, so the placeholder is left bare, matching
+# the existing unquoted-placeholder style of --new-thread <name>.
 my $N3_TEXT = 'This prompt suggests unattended work. If this session should keep working '
             . 'without the operator, arm and attach a thread first: butler-continuity on '
-            . '--new-thread <name> (or --thread <name> to resume one)';
+            . '--new-thread <name> --goal <what this is for> (or --thread <name>, same --goal, to resume one)';
 
 # ---------------------------------------------------------------------------
 # small IO / scaffolding

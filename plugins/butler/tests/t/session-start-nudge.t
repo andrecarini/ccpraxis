@@ -55,11 +55,13 @@ BAIL_OUT('cannot resolve a real timeout utility on PATH') unless length $REAL_TI
 # sec 2.2 pinned text, written out literally -- never read from the module.
 # ---------------------------------------------------------------------------
 my $COMPACT_TEXT = 'Compacted while continuity is armed: re-read your task list, and the ledger of any package you are driving, before the next step.';
-my $RESUME_RE = qr/\AResumed at (\d\d):(\d\d) \((\d\d):(\d\d)Z\) while continuity is armed: continue the held work, or turn continuity off with a reason: butler-continuity off --reason '<why>'\z/;
+# 04-docs-and-wiring (spec addendum 0 / 2.4.7): names the two-step disarm
+# instead of the old one-call "turn continuity off with a reason".
+my $RESUME_RE = qr/\AResumed at (\d\d):(\d\d) \((\d\d):(\d\d)Z\) while continuity is armed: continue the held work, or start the two-step disarm: butler-continuity off --reason '<why>'\z/;
 
 sub resume_text_literal {
     my ($hhmm) = @_; # e.g. "23:59 (23:59Z)"
-    return "Resumed at $hhmm while continuity is armed: continue the held work, or turn continuity off with a reason: butler-continuity off --reason '<why>'";
+    return "Resumed at $hhmm while continuity is armed: continue the held work, or start the two-step disarm: butler-continuity off --reason '<why>'";
 }
 
 # Direct access to BpHook::SessionStartNudge::lines() (AC-2's second half) --
@@ -292,7 +294,7 @@ for my $role (qw(manual driver reporter)) {
     unlike($COMPACT_TEXT, qr/[^\x00-\x7F]/, 'AC-4: COMPACT_TEXT is ASCII');
 
     my $resume_rendered = resume_text_literal('23:59 (23:59Z)');
-    is(length($resume_rendered), 153, 'AC-4: a rendered resume line is 153 characters (spec sec 2.2)');
+    is(length($resume_rendered), 145, 'AC-4: a rendered resume line is 145 characters (spec sec 2.2)');
     ok(length($resume_rendered) <= 160, 'AC-4: a rendered resume line <= 160 characters');
     unlike($resume_rendered, qr/[^\x00-\x7F]/, 'AC-4: a rendered resume line is ASCII');
 }
@@ -540,24 +542,57 @@ for my $role (qw(manual driver reporter)) {
 }
 
 # ===========================================================================
-# AC-15: B14. PATH-shim process budget: 0 perl unarmed, 1 perl armed.
+# AC-15 (rewritten, package 10-gatherer-and-digest spec sec 4 AC-17): the
+# old "unarmed gives 0 perl" claim no longer holds, because the one
+# SessionStart route now fires on EVERY source, armed or not (it drops
+# `--pre armed`, spec sec 2.6) to run re-attach and the project digest.
+# Unarmed still runs the route: on a fixture project with gatherable
+# content, the digest is printed even though no nudge text would be. This
+# replaces the process-budget assertion with a content assertion, since
+# "0 perl" is no longer the contract this file can pin.
 # ===========================================================================
 {
     local %ENV = %ENV;
-    GuardHarness::fresh_state();
-    my $p_unarmed = mk_payload(session_id => 'sidac0015-unarmed', source => 'compact');
+    my $state_root = GuardHarness::fresh_state();
+    my $fixture_root = tempdir(CLEANUP => 1);
+    (my $froot = "$fixture_root/André-nudge-fixture") =~ s{\\}{/}g;
+    # This file has no `use utf8;`, so the "André" literal above is read as
+    # the two raw UTF-8 bytes it is stored as on disk (0xC3 0xA9 for the
+    # "é"), NOT as a Unicode character -- the string is flagged as bytes,
+    # not characters. Decoding it here (a no-op on the underlying byte
+    # buffer, which already holds the correct UTF-8 bytes -- it only sets
+    # Perl's internal "these bytes are characters" flag) turns it into the
+    # same Unicode character string real production code receives from a
+    # JSON decode of a hook payload's "cwd" field, so once $froot is handed
+    # to mk_payload()->GuardHarness's JSON-encode-the-payload step below, it
+    # gets UTF-8-encoded exactly once instead of twice.
+    utf8::decode($froot);
+    mkdir $froot or die $!;
+    mkdir "$froot/.ccpraxis-local-data" or die $!;
+    mkdir "$froot/.ccpraxis-local-data/almanac" or die $!;
+    mkdir "$froot/.ccpraxis-local-data/almanac/note" or die $!;
+    open(my $nfh, '>:raw', "$froot/.ccpraxis-local-data/almanac/note/n1.md") or die $!;
+    print {$nfh} "---\ntitle: a fixture note\ncreated: 2026-01-01T00:00:00Z\n---\n";
+    close $nfh;
+
+    my $p_unarmed = mk_payload(session_id => 'sidac0015-unarmed', source => 'compact', cwd => $froot);
     my $sres1 = GuardHarness::run_shim('session-start-nudge', $p_unarmed);
     is($sres1->{rc}, 0, 'AC-15: unarmed P(compact) through the shim -> rc 0');
-    is(GuardHarness::count_lines($sres1->{shim_log}, 'perl'), 0,
-        'AC-15: unarmed P(compact) launches 0 perl');
+    SKIP: {
+        skip 'AC-15: BpHook::SessionStartNudge is not requirable -- cannot check the module for a digest sub yet', 1
+            unless $SN_LOADED;
+        ok(length($sres1->{out}) > 0,
+            'AC-15: unarmed P(compact) on a non-empty fixture still prints the digest (the route runs on every source now)')
+            or diag("stdout: [$sres1->{out}]");
+    }
 
     my $sid = 'sidac0015-armed';
     GuardHarness::arm($sid, 'driver');
-    my $p_armed = mk_payload(session_id => $sid, source => 'compact');
+    my $p_armed = mk_payload(session_id => $sid, source => 'compact', cwd => $froot);
     my $sres2 = GuardHarness::run_shim('session-start-nudge', $p_armed);
     is($sres2->{rc}, 0, 'AC-15: armed P(compact) through the shim -> rc 0');
     is(GuardHarness::count_lines($sres2->{shim_log}, 'perl'), 1,
-        'AC-15: armed P(compact) launches exactly 1 perl');
+        'AC-15: armed P(compact) still launches exactly 1 perl (unchanged: the route is one perl invocation either way)');
 }
 
 # ===========================================================================
@@ -628,21 +663,26 @@ for my $role (qw(manual driver reporter)) {
 }
 
 # ===========================================================================
-# AC-17: session-start-nudge.sh passes bash -n. Its last non-empty line
-# equals the sec 2.3 pinned line exactly.
+# AC-17 (rewritten, package 10-gatherer-and-digest spec sec 2.6/4 AC-17):
+# session-start-nudge.sh passes bash -n. Its last non-empty line now drops
+# `--pre armed` (the ONLY change spec sec 2.6 makes to this file) -- any
+# existing "$d/$DIR" spelling in the rest of the line is kept as written,
+# so this pins only the pinned suffix, not the whole line, to stay robust
+# to that still-undecided spelling.
 # ===========================================================================
 {
     ok(-f $SHIM_SH, 'AC-17: plugins/butler/hooks/session-start-nudge.sh exists');
     SKIP: {
-        skip 'AC-17: session-start-nudge.sh does not exist yet -- cannot check its syntax or content', 2
+        skip 'AC-17: session-start-nudge.sh does not exist yet -- cannot check its syntax or content', 3
             unless -f $SHIM_SH;
         system($REAL_BASH_ABS, '-n', $SHIM_SH);
         my $rc = ($? == -1) ? -1 : ($? >> 8);
         is($rc, 0, 'AC-17: bash -n on session-start-nudge.sh passes');
         my @lines = grep { length } split /\n/, GuardHarness::read_bytes($SHIM_SH);
         my $last = @lines ? $lines[-1] : '';
-        is($last, q{exec bash "$d/run-hook.sh" SessionStartNudge --pre armed -- "$@"},
-            'AC-17: its last non-empty line equals the sec 2.3 pinned line exactly');
+        unlike($last, qr/--pre\s+armed/, 'AC-17: its last non-empty line no longer carries "--pre armed"');
+        like($last, qr/\brun-hook\.sh"?\s+SessionStartNudge\s+--\s+"\$\@"\z/,
+            'AC-17: its last non-empty line still runs run-hook.sh SessionStartNudge -- "$@" (only --pre armed removed)');
     }
 }
 
@@ -690,20 +730,28 @@ for my $role (qw(manual driver reporter)) {
 }
 
 # ===========================================================================
-# AC-23: hook-architecture.md no longer contains the stale "No SessionStart
-# or SessionEnd hook is registered." sentence; it contains the sec 2.6(6)
-# replacement sentence, and "This is 27 hooks.json commands" (26 at never-halt 12; tooling-backlog 11 added ac-standdown-gate.sh).
+# AC-23 (rewritten, package 10-gatherer-and-digest spec sec 4 AC-17/AC-21):
+# the never-halt-12-era sentence about session-start-nudge.sh's scope is now
+# stale (it still describes "speaks only on source compact or resume of an
+# armed session", which package 10 makes untrue: the route now fires on
+# every source, armed or not). hook-architecture.md must instead contain the
+# spec sec 2.6(6)/AC-21 replacement sentence, pinned verbatim. The hooks.json
+# command count is unchanged by this package (no edit to hooks.json), so
+# "This is 27 hooks.json commands" still holds and is still asserted here.
 # ===========================================================================
 {
     ok(-f $DOC, 'AC-23 precondition: hook-architecture.md exists') or BAIL_OUT('hook-architecture.md missing');
     my $text = GuardHarness::read_bytes($DOC);
     unlike($text, qr/No SessionStart or SessionEnd hook is registered\./,
         'AC-23: the stale "No SessionStart or SessionEnd hook is registered." sentence is gone');
-    my $replacement = 'Two SessionStart hooks are registered, and neither carries state across a new id: denial-breaker.sh (never-halt 07) moves its own per-agent counting offset, and session-start-nudge.sh (never-halt 12) speaks only on source compact or resume of an armed session, both of which keep the id. No SessionEnd hook is registered.';
-    ok((index($text, $replacement) >= 0), 'AC-23: the sec 2.6(6) replacement sentence is present verbatim')
+    unlike($text,
+        qr/session-start-nudge\.sh \(never-halt 12\) speaks only on source compact or resume of an armed session/,
+        'AC-23: the stale never-halt-12-only scope sentence for session-start-nudge.sh is gone');
+    my $replacement = q{SessionStart runs one route on every source: re-attach, then the project digest, then the armed nudges.};
+    ok((index($text, $replacement) >= 0), 'AC-23: the spec sec 2.6(6)/AC-21 replacement sentence is present verbatim')
         or diag('doc does not contain the replacement sentence');
     ok((index($text, 'This is 27 hooks.json commands') >= 0),
-        'AC-23: the doc\'s count sentence says "This is 27 hooks.json commands"');
+        'AC-23: the doc\'s count sentence still says "This is 27 hooks.json commands" (unchanged by this package)');
 }
 
 done_testing();

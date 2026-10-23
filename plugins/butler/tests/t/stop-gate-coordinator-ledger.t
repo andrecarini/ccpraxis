@@ -675,8 +675,10 @@ sub spawn_tagged_sleeper {
 }
 
 # ===========================================================================
-# C17 -- Decision 25: a valid silence plus non-terminal ledger denies; the
-# silence file is left in place; no armed/<sid> file needed.
+# C17 -- AC12 (spec 05-remove-silence B6): a hand-planted valid-shape
+# silence record plus non-terminal ledger denies; the silence file is left
+# in place (it is never read by the coordinator path either); no
+# armed/<sid> file needed.
 # ===========================================================================
 {
     my $sid = next_sid();
@@ -684,11 +686,17 @@ sub spawn_tagged_sleeper {
     my $root = fresh_state_root();
     local %ENV = %ENV;
     $ENV{BUTLER_STATE_DIR} = $root; $ENV{HOME} = $FAKE_HOME; $ENV{USERPROFILE} = $FAKE_HOME;
-    BpHook::set_silence($sid, reason => 'reporting progress now');
+    my $sdir = state_dir_of($root) . '/silence';
+    make_path($sdir);
+    open my $fh, '>', "$sdir/$sid" or die $!;
+    print {$fh} JSON::PP->new->encode({
+        session_id => $sid, by => 'butler-continuity', reason => 'reporting progress now', at => time(),
+    });
+    close $fh;
     my $res = run_gate(payload_json($sid),
         BP_LEDGER => $led, BP_DIR => $dir, BP_PACKAGE => 'p', BP_PROJECT_ROOT => $dir, BUTLER_STATE_DIR => $root);
-    is($res->{rc}, 2, 'C17: a valid silence plus a non-terminal ledger -> exit 2 (silence/off/armed never read here)');
-    ok(-e (state_dir_of($root) . "/silence/$sid"), 'C17: the silence file still exists');
+    is($res->{rc}, 2, 'AC12: a planted silence record plus a non-terminal ledger -> exit 2 (silence/off/armed never read here)');
+    ok(-e "$sdir/$sid", 'AC12: the planted silence file still exists');
 }
 
 # ===========================================================================

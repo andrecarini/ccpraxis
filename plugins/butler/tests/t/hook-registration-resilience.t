@@ -78,11 +78,12 @@ sub read_json {
         arm-on-entry.sh bind-dispatch.sh context-ceiling.sh continuity-off-check.sh
         denial-breaker.sh
         gate-shutdown.sh guard-ask-operator.sh guard-bash.sh guard-blueprint-write.sh
+        guard-disarm-judge-readonly.sh
         guard-fork.sh guard-git-mutations.sh guard-writes.sh hooks.json ledger-guard.sh
         record-denial.sh record-prompt.sh
         run-hook.sh session-start-nudge.sh stop-gate.sh track-dispatch.sh wait-shape-guard.sh
     );
-    is(scalar(@EXPECT_FILES), 23, 'sanity: this file\'s own sec 2.4 fixture list has 23 entries (never-halt 06 adds record-prompt.sh, record-denial.sh; never-halt 07 adds denial-breaker.sh; never-halt 11 adds arm-nudge-prompt.sh; never-halt 12 adds session-start-nudge.sh; tooling-backlog package 11 adds ac-standdown-gate.sh)');
+    is(scalar(@EXPECT_FILES), 24, 'sanity: this file\'s own sec 2.4 fixture list has 24 entries (never-halt 06 adds record-prompt.sh, record-denial.sh; never-halt 07 adds denial-breaker.sh; never-halt 11 adds arm-nudge-prompt.sh; never-halt 12 adds session-start-nudge.sh; tooling-backlog package 11 adds ac-standdown-gate.sh; judged-continuity-disarm package 03 adds guard-disarm-judge-readonly.sh)');
 
     opendir(my $dh, $HOOKS) or BAIL_OUT("cannot opendir $HOOKS: $!");
     my (@actual_files, @subdirs);
@@ -221,8 +222,8 @@ sub all_registered_commands {
         all_registered_commands($hooksjson, 'hooks.json'),
         all_registered_commands($settings,  'settings.json'),
     );
-    is(scalar(@combined), 28,
-       'B6a: exactly 28 commands are registered in total across hooks.json + settings.json (never-halt 06 adds 2, never-halt 07 adds 4: PreToolUse/PostToolUse/PostToolUseFailure/SessionStart denial-breaker.sh; never-halt 11 adds 1: UserPromptSubmit arm-nudge-prompt.sh; never-halt 12 adds 1: SessionStart session-start-nudge.sh; tooling-backlog package 11 adds 1: PreToolUse ac-standdown-gate.sh)')
+    is(scalar(@combined), 29,
+       'B6a: exactly 29 commands are registered in total across hooks.json + settings.json (never-halt 06 adds 2, never-halt 07 adds 4: PreToolUse/PostToolUse/PostToolUseFailure/SessionStart denial-breaker.sh; never-halt 11 adds 1: UserPromptSubmit arm-nudge-prompt.sh; never-halt 12 adds 1: SessionStart session-start-nudge.sh; tooling-backlog package 11 adds 1: PreToolUse ac-standdown-gate.sh; judged-continuity-disarm package 03 adds 1: PreToolUse guard-disarm-judge-readonly.sh)')
         or diag('found ' . scalar(@combined) . ' registered commands');
 
     my (@bad_127, @bad_rc, @slow);

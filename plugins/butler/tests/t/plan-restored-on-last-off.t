@@ -714,6 +714,32 @@ sub off_write_ticket {
     return BpHook::write_ticket($p, 'butler-continuity', $argv, operator => 0, background => 0);
 }
 
+# off_two_step($env, $sid, $reason, $cwd, $tp, $justification) -- judged-
+# continuity-disarm package 02: agent `off` now only mints a disarm OTP
+# (exit 1); runs step one (off), extracts the OTP from stderr, writes a
+# fresh ticket for off-confirm, and runs step two. Returns the step-two
+# (out, err, rc) -- the ONLY thing every pre-existing assertion in this file
+# cared about (the actual disarm / reconcile side effects).
+sub off_two_step {
+    my ($env, $sid, $reason, $cwd, $tp, $justification) = @_;
+    $justification //= 'goal is met';
+    off_write_ticket($sid, ['off', '--reason', $reason], cwd => $cwd, transcript_path => $tp);
+    my ($out1, $err1, $rc1) = off_run_cmd($env, 'off', '--reason', $reason);
+    Test::More::is($rc1, 1, "off_two_step($sid): off --reason exits 1 (mints a disarm OTP)")
+        or Test::More::diag("stdout: $out1");
+    my ($otp) = ($err1 =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
+    Test::More::ok(defined $otp, "off_two_step($sid): off printed an 8-hex-char disarm OTP")
+        or Test::More::diag("stderr: $err1");
+    off_write_ticket($sid, ['off-confirm', '--otp', $otp // 'deadbeef', '--justification', $justification],
+        cwd => $cwd, transcript_path => $tp);
+    # judged-continuity-disarm package 03 (spec sec 4.1): every off_two_step
+    # caller expects a successful disarm (rc 0) from off-confirm, which now
+    # dispatches the disarm judge after a successful OTP claim -- stub it to
+    # approve so this file never spawns a real `claude -p` (DC7).
+    my %env2 = (%$env, CCPRAXIS_DISARM_JUDGE_STUB => 'approve');
+    return off_run_cmd(\%env2, 'off-confirm', '--otp', $otp // 'deadbeef', '--justification', $justification);
+}
+
 sub off_run_cmd {
     my ($env, @args) = @_;
     my (undef, $outfile) = tempfile();
@@ -774,7 +800,6 @@ sub off_env {
     local $ENV{BUTLER_STATE_DIR} = $fx->{home};
     my $sid = 'ac11offsid';
     ok(BpHook::arm($sid, role => 'manual', by => 'on'), 'AC11 setup: session armed');
-    off_write_ticket($sid, ['off', '--reason', 'wrapping up now'], cwd => $fx->{project});
 
     my ($fake, $ctrl) = write_fake_powercfg(
         getactivescheme => { out => ga_bytes($CW_GUID_STORED, $CW_NAME) },
@@ -789,8 +814,8 @@ sub off_env {
         CCPRAXIS_TEST_POWERCFG_CONTROL     => $ctrl,
         CCPRAXIS_TEST_POWERCFG_CALL_LOG    => $call_log,
     );
-    my ($out, $err, $rc) = off_run_cmd($env, 'off', '--reason', 'wrapping up now');
-    is($rc, 0, 'AC11: off exits 0') or diag("stderr: $err");
+    my ($out, $err, $rc) = off_two_step($env, $sid, 'wrapping up now', $fx->{project}, undef, 'goal is met');
+    is($rc, 0, 'AC11: off-confirm exits 0') or diag("stderr: $err");
     like($out, qr/^continuity off for session \w{8} \(actor agent\); reason logged\.$/m,
         'AC11: stdout is unchanged') or diag($out);
     is($err, '', 'AC11: no stderr warning') or diag($err);
@@ -814,7 +839,6 @@ sub off_env {
     my $sid = 'ac12offsid';
     local $ENV{BUTLER_STATE_DIR} = $fx->{home};
     ok(BpHook::arm($sid, role => 'manual', by => 'on'), 'AC12 setup: session armed');
-    off_write_ticket($sid, ['off', '--reason', 'wrapping up now'], cwd => $fx->{project});
 
     my ($fake, $ctrl) = write_fake_powercfg(
         getactivescheme => { out => ga_bytes($BAL_GUID, 'Balanced') },
@@ -825,8 +849,8 @@ sub off_env {
         CCPRAXIS_TEST_POWERCFG_CONTROL  => $ctrl,
         CCPRAXIS_TEST_POWERCFG_CALL_LOG => $call_log,
     );
-    my ($out, $err, $rc) = off_run_cmd($env, 'off', '--reason', 'wrapping up now');
-    is($rc, 0, 'AC12: off exits 0') or diag("stderr: $err");
+    my ($out, $err, $rc) = off_two_step($env, $sid, 'wrapping up now', $fx->{project}, undef, 'goal is met');
+    is($rc, 0, 'AC12: off-confirm exits 0') or diag("stderr: $err");
     is($err, '', 'AC12: no stderr warning');
     my @calls = split /\n/, (slurp($call_log) // '');
     ok(!(grep { /^\/setactive/ } @calls), 'AC12: no /setactive when the plan is already Balanced');
@@ -846,7 +870,6 @@ sub off_env {
     local $ENV{BUTLER_STATE_DIR} = $fx->{home};
     ok(BpHook::arm('ac13-a', role => 'manual', by => 'on'), 'AC13 setup: session A armed');
     ok(BpHook::arm('ac13-b', role => 'manual', by => 'on'), 'AC13 setup: session B armed');
-    off_write_ticket('ac13-a', ['off', '--reason', 'done with my part'], cwd => $fx->{project});
 
     my ($fake, $ctrl) = write_fake_powercfg(getactivescheme => { out => ga_bytes($CW_GUID_STORED, $CW_NAME) });
     my $call_log = "$fx->{legacy}/.ac13-calls";
@@ -855,8 +878,8 @@ sub off_env {
         CCPRAXIS_TEST_POWERCFG_CONTROL  => $ctrl,
         CCPRAXIS_TEST_POWERCFG_CALL_LOG => $call_log,
     );
-    my ($out, $err, $rc) = off_run_cmd($env, 'off', '--reason', 'done with my part');
-    is($rc, 0, 'AC13: off exits 0') or diag("stderr: $err");
+    my ($out, $err, $rc) = off_two_step($env, 'ac13-a', 'done with my part', $fx->{project}, undef, 'goal is met');
+    is($rc, 0, 'AC13: off-confirm exits 0') or diag("stderr: $err");
     ok(!-s $call_log, 'AC13: the fake powercfg call log is empty/absent (reconcile never ran)');
     is(scalar(plan_records($fx->{legacy})), 0, 'AC13: no continuity-off record when another arm is still live');
 }
@@ -867,7 +890,6 @@ sub off_env {
 {
     my $fx = off_fixture();
     local $ENV{BUTLER_STATE_DIR} = $fx->{home};
-    off_write_ticket('ac14sid', ['off', '--reason', 'never armed at all'], cwd => $fx->{project});
 
     my ($fake, $ctrl) = write_fake_powercfg(getactivescheme => { out => ga_bytes($CW_GUID_STORED, $CW_NAME) });
     my $call_log = "$fx->{legacy}/.ac14-calls";
@@ -876,8 +898,8 @@ sub off_env {
         CCPRAXIS_TEST_POWERCFG_CONTROL  => $ctrl,
         CCPRAXIS_TEST_POWERCFG_CALL_LOG => $call_log,
     );
-    my ($out, $err, $rc) = off_run_cmd($env, 'off', '--reason', 'never armed at all');
-    is($rc, 0, 'AC14: off exits 0') or diag("stderr: $err");
+    my ($out, $err, $rc) = off_two_step($env, 'ac14sid', 'never armed at all', $fx->{project}, undef, 'goal is met');
+    is($rc, 0, 'AC14: off-confirm exits 0') or diag("stderr: $err");
     like($out, qr/was not armed/, 'AC14: stdout mentions "was not armed"');
     ok(!-s $call_log, 'AC14: the fake powercfg call log is empty/absent');
     is(scalar(plan_records($fx->{legacy})), 0, 'AC14: no continuity-off record when nothing was live before');
@@ -892,7 +914,6 @@ sub off_env {
     local $ENV{BUTLER_STATE_DIR} = $fx->{home};
     my $sid = 'ac15offsid';
     ok(BpHook::arm($sid, role => 'manual', by => 'on'), 'AC15 setup: session armed');
-    off_write_ticket($sid, ['off', '--reason', 'wrapping up now'], cwd => $fx->{project});
 
     my ($fake, $ctrl) = write_fake_powercfg(
         getactivescheme => { out => ga_bytes($CW_GUID_STORED, $CW_NAME) },
@@ -907,8 +928,8 @@ sub off_env {
         CCPRAXIS_TEST_POWERCFG_CONTROL  => $ctrl,
         CCPRAXIS_TEST_POWERCFG_CALL_LOG => $call_log,
     );
-    my ($out, $err, $rc) = off_run_cmd($env, 'off', '--reason', 'wrapping up now');
-    is($rc, 0, 'AC15: off still exits 0 despite the reconcile failure') or diag("stderr: $err");
+    my ($out, $err, $rc) = off_two_step($env, $sid, 'wrapping up now', $fx->{project}, undef, 'goal is met');
+    is($rc, 0, 'AC15: off-confirm still exits 0 despite the reconcile failure') or diag("stderr: $err");
     like($out, qr/^continuity off for session \w{8} \(actor agent\); reason logged\.$/m,
         'AC15: stdout is unchanged') or diag($out);
     my @warn_lines = grep { /\S/ } split /\n/, $err;
@@ -949,22 +970,21 @@ sub off_env {
     like($src, qr/BpPowerPlan::reconcile/, 'AC17: butler-continuity.pl references BpPowerPlan::reconcile');
     like($src, qr/why\s*=>\s*'continuity-off'/, "AC17: the reconcile call passes why => 'continuity-off'");
 
-    # no OTHER verb block (on/silence) calls plan_after_off/reconcile.
+    # no OTHER verb block (on) calls plan_after_off/reconcile. silence is
+    # removed outright (spec 05-remove-silence): there is no longer a
+    # dispatch block to check for it.
     #
     # The script has more than one top-level "if ($verb eq 'on') {" block
     # (argument validation early on, the dispatch that arms much later), so
     # EVERY top-level block for the verb is checked, not just the first one
     # found (todo 20261002-113836-37200000: the old single match checked the
-    # validation block and never saw the dispatch block; the 'silence'
-    # marker, unanchored, matched inside an earlier "elsif" instead).
+    # validation block and never saw the dispatch block).
     # Blocks are top-level, i.e. the "if" starts a line and the block ends
     # at the first "}" alone on a line. The dispatch block (the one that
-    # arms / that checks running work before silencing) must be among those
-    # checked, so the check cannot pass vacuously. Every top-level 'on'
-    # block also keeps the 2000-char shape the where-things-go 04 spec
-    # (sec 2.3) holds it to; the silence block has no such limit.
-    for my $v (['on',      qr/BpHook::arm\(/,           2000],
-               ['silence', qr/BpHook::running_snapshot\(/, undef]) {
+    # arms) must be among those checked, so the check cannot pass
+    # vacuously. Every top-level 'on' block also keeps the 2000-char shape
+    # the where-things-go 04 spec (sec 2.3) holds it to.
+    for my $v (['on',      qr/BpHook::arm\(/,           2000]) {
         my ($verb, $dispatch_re, $cap) = @$v;
         my @blocks;
         my $unclosed = 0;

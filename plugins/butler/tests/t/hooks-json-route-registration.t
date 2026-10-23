@@ -114,8 +114,13 @@ my @EXPECT = (
     # ac-standdown-gate.sh -- the PreToolUse guard that refuses subagent tool
     # calls while an AC-loss stand-down is in effect.
     { event => 'PreToolUse',          matcher => '', file => 'ac-standdown-gate.sh', args => '' },
+    # judged-continuity-disarm package 03 (spec sec 2.5.4): a 5th entry in the
+    # existing PreToolUse Bash group, after continuity-off-check.sh, guarded
+    # 2.2 template, guard-disarm-judge-readonly.sh -- restricts the disarm
+    # judge's own Bash to the Decision-7 read-only allowlist.
+    { event => 'PreToolUse',  matcher => 'Bash',                                        file => 'guard-disarm-judge-readonly.sh', args => '' },
 );
-is(scalar(@EXPECT), 27, 'sanity: this file\'s own sec 2.3 fixture table has 27 rows (never-halt 06 adds 2, never-halt 07 adds 4, never-halt 11 adds 1, never-halt 12 adds 1, tooling-backlog package 11 adds 1)');
+is(scalar(@EXPECT), 28, 'sanity: this file\'s own sec 2.3 fixture table has 28 rows (never-halt 06 adds 2, never-halt 07 adds 4, never-halt 11 adds 1, never-halt 12 adds 1, tooling-backlog package 11 adds 1, judged-continuity-disarm package 03 adds 1)');
 
 sub expect_key { my ($r) = @_; return join("\x1e", $r->{event}, $r->{matcher}, $r->{file}, $r->{args}) }
 
@@ -152,7 +157,7 @@ if (ref $doc eq 'HASH' && ref $doc->{hooks} eq 'HASH') {
 my @expect_keys = sort map { expect_key($_) } @EXPECT;
 my @actual_keys = sort map { expect_key($_) } @actual;
 is_deeply(\@actual_keys, \@expect_keys,
-    'B1a: hooks.json\'s (event, matcher, file, args) multiset equals sec 2.3 exactly (27 commands)')
+    'B1a: hooks.json\'s (event, matcher, file, args) multiset equals sec 2.3 exactly (28 commands)')
     or diag("actual:\n" . join("\n", @actual_keys) . "\nexpected:\n" . join("\n", @expect_keys));
 
 is(scalar(@template_mismatches), 0,
@@ -168,5 +173,52 @@ my @missing = grep { !-f "$HOOKS_DIR/$_" } sort keys %want_file;
 is(scalar(@missing), 0,
     'B1c: every sec 2.3 <file> exists directly under plugins/butler/hooks/')
     or diag('missing under hooks/ (top level): ' . join(', ', @missing));
+
+# ===========================================================================
+# AC-18 (blueprint where-things-go, package 10-gatherer-and-digest spec
+# sec 4): session-start-nudge.sh is registered exactly once, matcher-less,
+# on SessionStart (already proven above via @EXPECT/B1a: it is the only
+# entry anywhere with file session-start-nudge.sh, and its matcher is '').
+# No OTHER registered command's own script file mentions Gather,
+# almanac-gather or reattach -- the one SessionStart route this package adds
+# must stay the ONLY caller of the new gatherer. The SessionStart command
+# set is exactly {denial-breaker.sh, session-start-nudge.sh} (already proven
+# above via @files).
+# ===========================================================================
+{
+    my @nudge_entries = grep { $_->{file} eq 'session-start-nudge.sh' } @actual;
+    is(scalar(@nudge_entries), 1,
+        'AC-18: session-start-nudge.sh is registered exactly once across all of hooks.json');
+    ok((!@nudge_entries || $nudge_entries[0]{matcher} eq ''),
+        'AC-18: session-start-nudge.sh\'s one registration is matcher-less')
+        if @nudge_entries;
+
+    my @session_start_files = sort map { $_->{file} } grep { $_->{event} eq 'SessionStart' } @actual;
+    is_deeply(\@session_start_files, ['denial-breaker.sh', 'session-start-nudge.sh'],
+        'AC-18: the SessionStart command set is exactly {denial-breaker.sh, session-start-nudge.sh}');
+
+    my %other_files = map { ($_->{file} => 1) } grep { $_->{file} ne 'session-start-nudge.sh' } @actual;
+    my @leaked;
+    for my $f (sort keys %other_files) {
+        my $path = "$HOOKS_DIR/$f";
+        next unless -f $path;
+        my $src = _read_file_raw($path);
+        for my $needle (qw(Gather almanac-gather reattach)) {
+            push @leaked, "$f mentions '$needle'" if index($src, $needle) >= 0;
+        }
+    }
+    is(scalar(@leaked), 0,
+        'AC-18: no other registered command\'s script references Gather, almanac-gather or reattach')
+        or diag(join("\n", @leaked));
+}
+
+sub _read_file_raw {
+    my ($path) = @_;
+    open(my $fh, '<:raw', $path) or return '';
+    local $/;
+    my $c = <$fh>;
+    close $fh;
+    return defined $c ? $c : '';
+}
 
 done_testing();

@@ -191,7 +191,6 @@ $SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
     my $continuity = "$root/continuity";
 
     ok(H('arm', 'A', role=>'driver', by=>'arm-on-entry'), 'A3: arm(A) succeeds');
-    H('set_silence', 'B', reason => 'keep me untouched');
     write_json_file("$continuity/holder/B.json",
         {session_id=>'B', pid=>$$, fp=>('x' x 40), items=>[], deadline=>time()+100});
     H('mint_stop_token', 'B', {hook_event_name=>'Stop'});
@@ -206,11 +205,18 @@ $SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
         $name // 'NOPE';
     };
     my %before = (
-        silence => read_bytes("$continuity/silence/B"),
         holder  => read_bytes("$continuity/holder/B.json"),
         token   => read_bytes("$continuity/stop-tokens/$b_token_file"),
         current => read_bytes("$continuity/stop-tokens/B.current"),
     );
+
+    # AC13 (spec 05-remove-silence section 4.1, DC2 -- disarm half): a
+    # planted silence/A record (set_silence is removed, so hand-plant it)
+    # is left byte-identical by disarm(A).
+    make_path("$continuity/silence");
+    write_json_file("$continuity/silence/A",
+        {session_id=>'A', by=>'butler-continuity', reason=>'keep me untouched', at=>time()});
+    my $silence_a_before = read_bytes("$continuity/silence/A");
 
     is(H('is_armed', 'A'), 1, 'A3: is_armed(A) is 1 after arm(A)');
     is(H('is_armed', 'B'), 0, 'A3: is_armed(B) is 0 (never armed)');
@@ -223,10 +229,11 @@ $SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
     is(ref($off) eq 'HASH' ? $off->{reason}     : undef, 'done with A', 'A3: off/A reason');
     ok(ref($off) eq 'HASH' && defined $off->{at}, 'A3: off/A has an at field');
 
-    is(read_bytes("$continuity/silence/B"),          $before{silence}, 'A3: B silence untouched after disarm(A)');
     is(read_bytes("$continuity/holder/B.json"),       $before{holder},  'A3: B holder untouched after disarm(A)');
     is(read_bytes("$continuity/stop-tokens/$b_token_file"), $before{token},   'A3: B stop token untouched');
     is(read_bytes("$continuity/stop-tokens/B.current"),     $before{current}, 'A3: B stop-tokens/B.current untouched');
+    is(read_bytes("$continuity/silence/A"), $silence_a_before,
+        'AC13: a planted silence/A record is byte-identical after disarm(A)');
 }
 
 # ===========================================================================
@@ -333,45 +340,38 @@ $SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
 }
 
 # ===========================================================================
-# A6 -- silence: set_silence/take_silence lifecycle and every corrupt-input
-# refusal, each unlinking the file it refuses.
+# A6 -- AC7/AC8 (spec 05-remove-silence section 4.1, DC2): set_silence and
+# take_silence are gone from BpHook.pm's symbol table, and no "/silence/"
+# state path remains in its source. Plus AC13's gc half: a planted
+# silence/<sid> record for a session whose transcript is gone survives
+# gc_sessions byte-identical.
 # ===========================================================================
 {
+    ok(!defined &BpHook::set_silence, 'AC7: &BpHook::set_silence is not defined');
+    ok(!defined &BpHook::take_silence, 'AC7: &BpHook::take_silence is not defined');
+
+    my $bphook_src = read_bytes($HOOKPM);
+    unlike($bphook_src, qr/set_silence/, 'AC8: BpHook.pm has no set_silence reference');
+    unlike($bphook_src, qr/take_silence/, 'AC8: BpHook.pm has no take_silence reference');
+    unlike($bphook_src, qr/["']\$root\/silence|["']\$ROOT\/silence/, 'AC8: BpHook.pm has no silence state path');
+
     local %ENV = %ENV; scrub_env();
     my $root = fresh_state_root();
     $ENV{BUTLER_STATE_DIR} = $root;
     my $continuity = "$root/continuity";
 
-    is(H('set_silence', 'A6', reason => 'reporting results now'), 1, 'A6: set_silence with a two-word reason succeeds');
-    is(H('take_silence', 'A6'), 1, 'A6: first take_silence(A6) returns 1');
-    is(H('take_silence', 'A6'), 0, 'A6: second take_silence(A6) returns 0');
-    ok(!-e "$continuity/silence/A6", 'A6: file gone after take');
-
-    H('set_silence', 'A6B', reason => 'two words here');
-    is(H('take_silence', 'B6WRONG'), 0, 'A6: take_silence for a different sid returns 0');
-    ok(-e "$continuity/silence/A6B", "A6: A6B's file untouched by a mismatched sid's take");
-
+    my $gone_transcript = "$root/gone-silence-$$.jsonl"; # never created
+    H('arm', 'A6GC', role=>'manual', by=>'arm-on-entry', transcript_path=>$gone_transcript);
     make_path("$continuity/silence");
-    open my $fh, '>', "$continuity/silence/A6T" or die $!; close $fh;
-    is(H('take_silence', 'A6T'), 0, 'A6: an empty (touched) silence file returns 0');
-    ok(!-e "$continuity/silence/A6T", 'A6: ...and is unlinked');
+    write_json_file("$continuity/silence/A6GC",
+        {session_id=>'A6GC', by=>'butler-continuity', reason=>'keep me untouched', at=>time()});
+    my $before = read_bytes("$continuity/silence/A6GC");
 
-    write_json_file("$continuity/silence/A6BY",
-        {session_id=>'A6BY', by=>'someone-else', reason=>'two words', at=>'2026-09-24T00:00:00Z'});
-    is(H('take_silence', 'A6BY'), 0, 'A6: wrong "by" field returns 0');
-    ok(!-e "$continuity/silence/A6BY", 'A6: ...and is unlinked');
-
-    write_json_file("$continuity/silence/A6NAME",
-        {session_id=>'OTHER', by=>'butler-continuity', reason=>'two words', at=>'2026-09-24T00:00:00Z'});
-    is(H('take_silence', 'A6NAME'), 0, 'A6: a file naming another sid returns 0');
-    ok(!-e "$continuity/silence/A6NAME", 'A6: ...and is unlinked');
-
-    write_json_file("$continuity/silence/A6ONE",
-        {session_id=>'A6ONE', by=>'butler-continuity', reason=>'oneword', at=>'2026-09-24T00:00:00Z'});
-    is(H('take_silence', 'A6ONE'), 0, 'A6: a one-word reason returns 0');
-    ok(!-e "$continuity/silence/A6ONE", 'A6: ...and is unlinked');
-
-    is(H('set_silence', 'A6SET', reason => 'oneword'), 0, 'A6: set_silence with a one-word reason returns 0');
+    my $count = H('gc_sessions');
+    is($count, 1, 'AC13 (gc half): gc_sessions collects the session whose transcript is gone');
+    ok(-e "$continuity/silence/A6GC", 'AC13 (gc half): the planted silence/A6GC record still exists after gc_sessions');
+    is(read_bytes("$continuity/silence/A6GC"), $before,
+        'AC13 (gc half): and is byte-identical');
 }
 
 # ===========================================================================
@@ -846,8 +846,6 @@ $SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
     for my $fn_call (
         ['arm',             ['../escape', role=>'manual', by=>'arm-on-entry']],
         ['disarm',          ['../escape', actor=>'agent', reason=>'x y']],
-        ['set_silence',     ['../escape', reason=>'x y']],
-        ['take_silence',    ['../escape']],
         ['holder',          ['../escape']],
         ['latest_is_off',   ['../escape']],
         ['mint_stop_token', ['../escape', {hook_event_name=>'Stop'}]],
@@ -990,12 +988,18 @@ $SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
 }
 
 # ===========================================================================
-# R2-m5/L4 -- set_silence, take_silence, take_stop_token and gc_sessions
-# must not proceed while a real, external process holds LOCK_EX on
-# armlock/<sid> (review m5, redteam L4; both declined in fix-batch.md: gc
-# "works without the lock and unlinks the flock target"; set_silence/
-# take_silence/take_stop_token have "none of these five sub-cases oracle
-# coverage").
+# R2-m5/L4 -- take_stop_token and gc_sessions must not proceed while a real,
+# external process holds LOCK_EX on armlock/<sid> (review m5, redteam L4;
+# both declined in fix-batch.md: gc "works without the lock and unlinks the
+# flock target"; set_silence/take_silence/take_stop_token have "none of
+# these five sub-cases oracle coverage").
+#
+# The M5SET (set_silence) and M5TAKE (take_silence) sub-cases that used to
+# live here were removed by package 05-remove-silence
+# (.ccpraxis-local-data/blueprints/judged-continuity-disarm/packages/05-remove-silence.md),
+# which deletes BpHook::set_silence and BpHook::take_silence entirely
+# (spec section 2.3). M5TOK (take_stop_token) and M5GC (gc_sessions) are
+# unaffected and remain below.
 #
 # specs/03-hook-core-spec.md names a lock-timeout seam (a 10s alarm-bound
 # flock returning 0 with "io: lock timeout") ONLY for arm() and disarm() --
@@ -1061,20 +1065,6 @@ $SIG{$_} = sub { exit 1 } for qw(TERM INT HUP);
         waitpid($pid, 0);
         return { elapsed=>$elapsed, ret=>$ret, err=>$err, ready=>$ready };
     };
-
-    ok(H('arm', 'M5SET', role=>'manual', by=>'arm-on-entry'), 'R2-m5/L4 setup: arm(M5SET) succeeds');
-    my $r1 = $call_while_locked->('M5SET', sub { H('set_silence', 'M5SET', reason=>'two words') });
-    ok($r1->{ready}, 'R2-m5/L4 setup: the external holder signalled it holds armlock/M5SET (set_silence case)');
-    cmp_ok($r1->{elapsed}, '>=', $HOLD - 0.5,
-        "R2-m5/L4: set_silence(M5SET) does not return before armlock/M5SET's external holder releases it "
-      . "(elapsed $r1->{elapsed}s of a ${HOLD}s hold; last_error='" . ($r1->{err} // '') . "')");
-
-    ok(H('set_silence', 'M5TAKE', reason=>'two words'), 'R2-m5/L4 setup: set_silence(M5TAKE) succeeds');
-    my $r2 = $call_while_locked->('M5TAKE', sub { H('take_silence', 'M5TAKE') });
-    ok($r2->{ready}, 'R2-m5/L4 setup: the external holder signalled it holds armlock/M5TAKE (take_silence case)');
-    cmp_ok($r2->{elapsed}, '>=', $HOLD - 0.5,
-        "R2-m5/L4: take_silence(M5TAKE) does not return before armlock/M5TAKE's external holder releases it "
-      . "(elapsed $r2->{elapsed}s of a ${HOLD}s hold; last_error='" . ($r2->{err} // '') . "')");
 
     my $tok = H('mint_stop_token', 'M5TOK', {hook_event_name=>'Stop'});
     ok(defined $tok, 'R2-m5/L4 setup: mint_stop_token(M5TOK) succeeds');
