@@ -56,9 +56,8 @@ Run these as plain Bash tool calls, arguments in single quotes.
 - **Self-arm triggers:** arm and attach a thread (`butler-continuity on --new-thread <name> --goal '<...>'`) before starting background work you expect to
   outlive the turn, or before unattended multi-step work — for example when the operator is away
   or said "keep going". Do not self-arm for one interactive answer. Hooks nudge toward arming; arming stays your call.
-- **Disarm, step 1:** `butler-continuity off --reason '<what is done>'`. Right only when all work is done (the goal is met), or this session can no
-  longer advance the goal (every remaining step needs the operator or is blocked) and no actionable work is left. It refuses while a task of the thread
-  is doing (set each done, pending or blocked first); otherwise it prints `off not done yet`, the goal and an 8-character code, and continuity stays on.
+- **Disarm, step 1:** `butler-continuity off --reason '<what is done>'`. Right only when all work is done (the goal is met), or this session can no longer advance the goal (every remaining step needs the operator or is blocked) and no actionable work is left.
+  It refuses while a task of the thread is doing (set each done, pending or blocked first); otherwise it prints `off not done yet`, the goal and an 8-character code, and continuity stays on.
 - **Disarm, step 2,** within 15 minutes: the line step 1 printed, `butler-continuity off-confirm --otp <code> --justification '<how the goal is met>'`.
   A judge checks the justification against the goal and the actual state (open bugs, todos, git, blueprint ledgers). If it approves, continuity
   turns off: it hands the thread off with the reason in its log, and stays off until an explicit `on`; a later director call does not re-arm it.
