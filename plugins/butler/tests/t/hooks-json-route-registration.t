@@ -119,8 +119,12 @@ my @EXPECT = (
     # 2.2 template, guard-disarm-judge-readonly.sh -- restricts the disarm
     # judge's own Bash to the Decision-7 read-only allowlist.
     { event => 'PreToolUse',  matcher => 'Bash',                                        file => 'guard-disarm-judge-readonly.sh', args => '' },
+    # 2026-10-23 continuity-state guard (operator ruling: guidance, not a
+    # security boundary): its own PreToolUse group on the shell and edit
+    # tools, guarded 2.2 template, guard-continuity-state.sh.
+    { event => 'PreToolUse',  matcher => 'Bash|Edit|Write|MultiEdit|NotebookEdit',      file => 'guard-continuity-state.sh', args => '' },
 );
-is(scalar(@EXPECT), 28, 'sanity: this file\'s own sec 2.3 fixture table has 28 rows (never-halt 06 adds 2, never-halt 07 adds 4, never-halt 11 adds 1, never-halt 12 adds 1, tooling-backlog package 11 adds 1, judged-continuity-disarm package 03 adds 1)');
+is(scalar(@EXPECT), 29, 'sanity: this file\'s own sec 2.3 fixture table has 29 rows (never-halt 06 adds 2, never-halt 07 adds 4, never-halt 11 adds 1, never-halt 12 adds 1, tooling-backlog package 11 adds 1, judged-continuity-disarm package 03 adds 1, the continuity-state guard adds 1)');
 
 sub expect_key { my ($r) = @_; return join("\x1e", $r->{event}, $r->{matcher}, $r->{file}, $r->{args}) }
 

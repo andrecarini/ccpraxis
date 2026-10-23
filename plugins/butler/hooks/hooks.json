@@ -96,6 +96,16 @@
          {
             "hooks" : [
                {
+                  "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/guard-continuity-state.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
+                  "timeout" : 15,
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Bash|Edit|Write|MultiEdit|NotebookEdit"
+         },
+         {
+            "hooks" : [
+               {
                   "command" : "unset BASH_ENV ; f=\"${CLAUDE_PLUGIN_ROOT}/hooks/gate-shutdown.sh\" ; w=\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" ; [ -f \"$f\" ] && [ -f \"$w\" ] || exit 0 ; bash -n \"$f\" 2>/dev/null && bash -n \"$w\" 2>/dev/null || exit 0 ; exec env -u SHELLOPTS bash \"$f\"",
                   "timeout" : 15,
                   "type" : "command"
