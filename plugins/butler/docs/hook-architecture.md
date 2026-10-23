@@ -8,7 +8,7 @@ The system in one paragraph: every hook is a short shell file that execs one wra
 either exits in bash (the hook does not apply to this session) or execs one perl process that loads
 `BpHook.pm` inside an exit-0 guard and parses the payload once. Continuity is one per-session file,
 written by `butler-continuity` and one hook. The Stop gate blocks only when that file exists and there
-is no live holder. When it blocks, the agent sees 5 lines, and those lines carry a single-use stop
+is no live holder. When it blocks, the agent sees 6 lines, and those lines carry a single-use stop
 token the gate itself minted. With that token, `butler-hold` and `butler-continuity off` work even if
 every other hook has failed. An agent's `off` never disarms by itself: it mints a disarm code, and
 `butler-continuity off-confirm` disarms only once a read-only judge approves (see "Judged disarm").
