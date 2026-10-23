@@ -195,8 +195,9 @@ sub run {
         "Continuity is on for this session and no holder is running. Stop token: $t",
         "Waiting on a subagent or background task? Hold it, as a background Bash tool call:",
         "  butler-hold --token $t <id> [<id> ...]",
-        "All work done? Turn continuity off, as a Bash tool call:",
+        "All work done? Turn continuity off (two steps: off mints an OTP, then off-confirm with it), as a Bash tool call:",
         "  butler-continuity off --reason '<what is done>' --token $t",
+        "(Genuine ccpraxis/Claude-Code defect, not just finished work? butler-continuity emergency-stop --reason '<the actual defect>' instead -- not a normal option.)",
         @glass,
     );
 }

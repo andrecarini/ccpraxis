@@ -62,7 +62,7 @@ This is **code** (`bp-orchestrator.pl`), unit-tested decision-by-decision — no
 
 <!-- continuity:begin -->
 A coordinator is armed by construction and stops only on a terminal, fresh ledger, or while
-`butler-hold` holds a running background subagent. `off` and `silence` refuse there. The three
+`butler-hold` holds a running background subagent. `off` and `off-confirm` refuse there. The three
 fleet files remain: `runs/.paused` (a resumable stop), `runs/.shutdown` (a terminal park) and
 `runs/<pkg>.force-stop` (that coordinator may stop once).
 <!-- continuity:end -->

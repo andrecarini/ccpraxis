@@ -282,7 +282,7 @@ To wait: dispatch the worker in the background, run `butler-hold <agent id>` wit
 `run_in_background: true` only when `butler-continuity status` shows `holder: none` (otherwise
 run it in the foreground, which extends the holder), and end the turn; its completion wakes you.
 A hold on anything that is not a running background subagent counts for nothing.
-`butler-continuity off` and `silence` refuse in a coordinator.
+`butler-continuity off` and `off-confirm` refuse in a coordinator; `emergency-stop` files a bug report but does not end it.
 A denied stop prints a stop token for the holder line above; use it as printed.
 <!-- continuity:end -->
 
