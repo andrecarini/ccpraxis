@@ -1480,7 +1480,7 @@ What package 16 changes rather than deletes, so the "exact list" above stays exa
   still mints a disarm code, but `off-confirm` binds by ticket only, so with the ticket hook broken the
   remaining ways out are a hold, the break-glass file and the refusal cap. If the gate cannot store a
   token, or anything in it throws, or its module cannot load, it
-  allows the stop. What remains is one paid turn per refused stop while an agent ignores a 5-line
+  allows the stop. What remains is one paid turn per refused stop while an agent ignores a 6-line
   instruction, and the case where the command scripts themselves are broken, which every package's
   `perl-compile` check guards. There is no turn cap to fall back on: `--max-turns` does not exist in
   2.1.280.
