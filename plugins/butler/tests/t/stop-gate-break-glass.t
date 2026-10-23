@@ -5,7 +5,7 @@
 #
 # A session armed with continuity lost its shell: a PreToolUse hook pointed at
 # a deleted script, so every Bash and PowerShell call failed before running.
-# Every way past the gate (butler-hold, butler-continuity off/silence) is a
+# Every way past the gate (butler-hold, butler-continuity off) is a
 # shell command, so the gate refused more than a hundred stops in a row until
 # a human noticed. The fix is two last resorts:
 #
@@ -13,7 +13,7 @@
 #                 succeeding in between, and the gate lets the stop through,
 #                 logging why. Judged from the transcript bytes appended since
 #                 the previous refusal; inert when there is no transcript.
-#   BREAK GLASS   a silence or off request written as a file with the Write
+#   BREAK GLASS   an off request written as a file with the Write
 #                 tool, carrying the token the last refusal printed. Offered in
 #                 the refusal text only once the shell has visibly failed.
 #
@@ -58,6 +58,10 @@ require "$S/BpHook/StopGate.pm";
 
 my $CAP  = $BpHook::StopGate::REFUSAL_CAP;
 my $HINT = $BpHook::StopGate::BREAK_GLASS_HINT_AT;
+
+# M2 (spec 05-remove-silence section 2.1): the break-glass refusal reason for
+# "action":"silence".
+my $M2 = q{its action "silence" is removed: an armed session does not end a turn to wait for the operator. File the question with almanac inbox file and keep working; if nothing can proceed, use "action":"off". See "If you have a question for the operator" in plugins/butler/skills/continuity/SKILL.md};
 ok($CAP >= 2,   "the refusal cap is a real number of refusals ($CAP)");
 ok($HINT < $CAP, "the break-glass hint ($HINT) comes before the cap ($CAP)");
 
@@ -239,6 +243,8 @@ sub write_glass {
     my $want = BpHook::StopGate::_display_path("$w->{data}/butler-break-glass/$w->{sid}.json");
     like($r2->{err}, qr/\Q$want\E/, 'HINT: it names the project data-dir path');
     like($r2->{err}, qr/"token":"\Q$t2\E"/, 'HINT: with the current token filled in');
+    like($r2->{err}, qr/"action":"off"/, 'HINT: the hint offers only "action":"off"');
+    unlike($r2->{err}, qr/silence/, 'HINT: the hint never mentions silence');
 }
 
 # A healthy session that keeps working between stops never sees the hint.
@@ -261,13 +267,14 @@ sub write_glass {
     ok(defined $t, 'GLASS setup: a refusal minted a token');
     my @before = store_snapshot_for($w);
     my $f = write_glass($w, token => $t, action => 'silence', reason => 'shell is broken, talking to operator');
-    is(stop($w)->{rc}, 0, 'GLASS silence: a valid file lets the stop through');
-    ok(!-e $f, 'GLASS silence: the file is consumed');
+    my $r = stop($w);
+    is($r->{rc}, 2, 'GLASS silence: the "silence" action is removed, so the stop is refused');
+    ok(!-e $f, 'GLASS silence: the file is consumed anyway');
     ok(armed($w), 'GLASS silence: continuity stays on');
-    like(reasons($w), qr/\tbreak-glass-silence\t.*shell is broken/, 'GLASS silence: logged with its reason');
-    is(stop($w)->{rc}, 2, 'GLASS silence: one stop only -- the next is refused again');
-    # AC16 (no regression): silence is Decision 26's untouched path -- it
-    # files no bug report at all.
+    unlike(reasons($w), qr/\tbreak-glass-silence\t/, 'GLASS silence: no break-glass-silence reasons.log line is written');
+    like($r->{err}, qr/\QThe break-glass file was not used: $M2\E/,
+        'GLASS silence: the refusal names the removed-action reason (M2)');
+    # AC16 (no regression): silence files no bug report at all.
     is_deeply([ store_snapshot_for($w) ], \@before, 'AC16: GLASS silence files no report (store has no new *.md)');
 }
 {
@@ -346,23 +353,29 @@ sub write_glass {
 }
 {
     my $w = world(no_data_dir => 1);
-    my $r = stop($w);
-    my $t = token_of($r);
+    my $r0 = stop($w);
+    my $t = token_of($r0);
     my $f = write_glass($w, token => $t, action => 'silence', reason => 'no data dir here');
-    is(stop($w)->{rc}, 0, 'GLASS fallback: without a project data dir the state-dir path works');
+    my $r = stop($w);
+    is($r->{rc}, 2, 'GLASS fallback: without a project data dir the state-dir path is still read, and silence is refused');
     ok(!-e $f, 'GLASS fallback: and is consumed');
+    like($r->{err}, qr/\Q$M2\E/, 'GLASS fallback: the refusal names M2 (AC17)');
 }
 
 # Refusals: each is consumed, refused, and says why in the next refusal.
 for my $case (
-    [ 'wrong token',      sub { (token => 'deadbeef', action => 'silence', reason => 'two words') },
+    [ 'wrong token',      sub { (token => 'deadbeef', action => 'off', reason => 'two words') },
       qr/token is not the one the last refusal printed/ ],
     [ 'unknown action',   sub { (token => $_[0], action => 'leave', reason => 'two words') },
-      qr/action must be "silence" or "off"/ ],
-    [ 'one-word reason',  sub { (token => $_[0], action => 'silence', reason => 'because') },
+      qr/The break-glass file was not used: its action must be "off"$/m ],
+    [ 'one-word reason',  sub { (token => $_[0], action => 'off', reason => 'because') },
       qr/reason must be at least two words/ ],
     [ 'not JSON',         sub { (raw => '{not json') },
       qr/not a JSON object/ ],
+    [ 'removed action silence', sub { (token => $_[0], action => 'silence', reason => 'two words') },
+      qr/\Q$M2\E/ ],
+    [ 'silence, one-word reason', sub { (token => $_[0], action => 'silence', reason => 'because') },
+      qr/\Q$M2\E/ ],
 ) {
     my ($label, $fields, $why) = @$case;
     my $w = world();
