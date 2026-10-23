@@ -142,9 +142,32 @@ else {
     if (defined $script && $script !~ /^-/) {
         my ($base) = $script =~ m{([^/\\]*)$};
         $base = '' unless defined $base;
-        if (($base eq 'almanac-bug.pl' || $base eq 'almanac-todo.pl')
-            && defined $verb && $verb eq 'list') {
-            $ok = 1;
+        my $name_ok = ($base eq 'almanac-bug.pl' || $base eq 'almanac-todo.pl');
+        if ($name_ok && defined $verb && $verb eq 'list') {
+            # The script argument's basename alone is not an identity check --
+            # any path ending in the right filename used to pass (the
+            # red-team finding this closes: "perl /tmp/x/almanac-bug.pl list"
+            # used to allow). bp-judge-disarm.sh now exports the real,
+            # resolved almanac scripts dir as CCPRAXIS_DISARM_JUDGE_ALMANAC_ABS
+            # on every dispatch vector (REAL and every STUB branch), so a
+            # genuine judge invocation always has it set. When it IS set,
+            # pin the match to that exact directory -- the script argument
+            # must equal "<almanac_abs>/<base>" verbatim, never merely share
+            # a filename, so a staged lookalike anywhere else is denied.
+            #
+            # When the env var is unset/empty, there is nothing to pin
+            # against; this guard is also called directly (no dispatcher,
+            # no env var) by this file's own acceptance-table tests, which
+            # intentionally probe the tokenizer/allowlist shape in isolation
+            # from path identity. Fall back to the pre-existing basename-only
+            # match for that case, preserving those tests' behavior exactly.
+            my $almanac_abs = $ENV{CCPRAXIS_DISARM_JUDGE_ALMANAC_ABS};
+            if (defined $almanac_abs && length $almanac_abs) {
+                $ok = 1 if $script eq "$almanac_abs/$base";
+            }
+            else {
+                $ok = 1;
+            }
         }
     }
     if (!$ok) {

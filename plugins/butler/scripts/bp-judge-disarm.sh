@@ -71,6 +71,18 @@ else
   ALMANAC_ABS="$ALMANAC_DIR"
 fi
 
+# Exported (not appended as another "env" argv element below) so the guard
+# can pin the almanac-bug.pl/almanac-todo.pl allowlist match to this exact
+# resolved directory (red-team finding: a basename-only match let a staged
+# lookalike anywhere else through). Exporting it here means it reaches the
+# judge process -- and anything it execs, including Bash tool calls the
+# PreToolUse guard inspects -- via ordinary environment inheritance, the
+# same way every child process sees every other exported variable, without
+# shifting the REAL vector's fixed argv positions that disarm-judge-
+# dispatch.t's AC2 asserts on exactly (argv[0]=env, [1]=CCPRAXIS_DISARM_JUDGE=1,
+# [2]=claude, [3]=-p).
+export CCPRAXIS_DISARM_JUDGE_ALMANAC_ABS="$ALMANAC_ABS"
+
 DIR=$(dirname "$VPATH")
 mkdir -p "$DIR" || { echo "bp-judge-disarm: cannot create $DIR" >&2; exit 2; }
 cd "$PROOT" || { echo "bp-judge-disarm: cannot cd to $PROOT" >&2; exit 2; }
