@@ -163,4 +163,43 @@ subtest 'inflight-conflict detection survives a non-ASCII data dir (bug 20261001
     like($out, qr/overlap in-flight.*other-bp\/02-other/, 'names the conflicting in-flight package') or diag($out);
 };
 
+subtest 'a stale inflight entry whose package is done does not refuse (bug 20261023-070425-989e)' => sub {
+    # inflight.json is pruned only by bp-drive-next.pl `next`, so an entry can
+    # outlive its package. The other ledger's own status decides: done/dropped
+    # frees the paths; running, parked and blocked still hold them.
+    for my $case ([done => 0], [dropped => 0], [running => 3], [parked => 3], [blocked => 3]) {
+        my ($status, $want) = @$case;
+        my $data_dir = tempdir(CLEANUP => 1);
+        make_path("$data_dir/blueprints/own-bp/packages", "$data_dir/blueprints/other-bp/packages",
+                  "$data_dir/.drive-solo");
+        my $own_ledger = "$data_dir/blueprints/own-bp/packages/01-own.md";
+        my ($rc1, $out1) = run_cli('create', '--ledger', $own_ledger, '--package', '01-own',
+                                    '--blueprint', 'own-bp', '--template', $TEMPLATE,
+                                    '--write-set', 'src/a.pl:t/a.t');
+        die "fixture: own ledger create failed ($rc1): $out1" unless $rc1 == 0;
+        open my $bw, '>:raw', "$data_dir/blueprints/own-bp/blueprint.md" or die $!;
+        print $bw "# own-bp\n\n## Decisions\n\n| # | Decision | Decided by | Date |\n|---|---|---|---|\n"
+                . "| 7 | Re-scope: package 01 also ships src/shared.pl. | driver | 2026-10-23 |\n";
+        close $bw;
+        my $other_ledger = "$data_dir/blueprints/other-bp/packages/02-other.md";
+        my ($rc2, $out2) = run_cli('create', '--ledger', $other_ledger, '--package', '02-other',
+                                    '--blueprint', 'other-bp', '--template', $TEMPLATE,
+                                    '--write-set', 'src/shared.pl:t/shared.t');
+        die "fixture: other ledger create failed ($rc2): $out2" unless $rc2 == 0;
+        my $body = slurp($other_ledger);
+        $body =~ s/^status:.*$/status: $status/m or die "fixture: no status line";
+        open my $ow, '>:raw', $other_ledger or die $!; print $ow $body; close $ow;
+        open my $ifh, '>:raw', "$data_dir/.drive-solo/inflight.json" or die $!;
+        print $ifh qq({"packages":[{"blueprint":"other-bp","package":"02-other"}]});
+        close $ifh;
+
+        my ($rc, $out) = run_cli('widen-write-set', '--ledger', $own_ledger, '--decision', '7',
+                                  '--path', 'src/shared.pl');
+        is($rc, $want, "other package $status: widen exits $want") or diag($out);
+        if ($want == 0) {
+            like(write_set($own_ledger), qr{src/shared\.pl}, "  and the path landed in the write set");
+        }
+    }
+};
+
 done_testing();

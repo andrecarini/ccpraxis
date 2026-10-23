@@ -2169,6 +2169,14 @@ sub _widen_check_inflight_conflict {
             $c;
         };
         next unless defined $ocontent;
+        # inflight.json is pruned only as a side effect of bp-drive-next.pl
+        # `next`, so an entry can outlive its package by days. A finished
+        # package holds no write set worth protecting: trust its own status
+        # over the stale membership (judged-continuity-disarm/05 was refused
+        # against where-things-go/12, done for 11 days, bug 20261023-070425-989e).
+        # Only done/dropped: a parked or blocked package can still resume.
+        my $ostatus = extract_frontmatter_value($ocontent, 'status') // '';
+        next if $ostatus =~ /\A(?:done|dropped)\z/;
         my $ows = extract_frontmatter_value($ocontent, 'write_set');
         next unless defined $ows && length $ows;
         my @oset = grep { length } split /:/, $ows;
