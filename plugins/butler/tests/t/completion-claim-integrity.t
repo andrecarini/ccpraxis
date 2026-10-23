@@ -688,7 +688,7 @@ sub claim_check {
     # AC-24: the SAME additive change WITHOUT a reaccept -> ORACLE_DRIFT_UNACCEPTED, naming
     # the added descriptions.
     my $step3 = oracle_line(step => 3, path => 'grow2.t', descriptions => ['alpha', 'beta']);
-    my $step5 = oracle_line(step => 5, path => 'grow2.t', descriptions => ['alpha', 'beta', 'gamma']);
+    my $step5 = oracle_line(step => 5, path => 'grow2.t', descriptions => ['alpha', 'beta', 'gamma'], sha256 => ('b' x 64));
     my $ledger = write_ledger(status => 'done',
         pipeline => mk_pipeline(ticked => { map { $_ => 1 } 1 .. 7 }, na => { 8 => 1 }),
         test_paths => 'grow2.t', oracle_records => [$step3, $step5]);
@@ -777,7 +777,7 @@ sub claim_check {
     my $step3 = oracle_line(step => 3, path => 'skipflip.t',
         descriptions => ['alpha', '# skip the thread segment is not on row 1'], assertions => 3);
     my $step5 = oracle_line(step => 5, path => 'skipflip.t',
-        descriptions => ['alpha', 'thread count is primary', 'thread glyph is muted'], assertions => 3);
+        descriptions => ['alpha', 'thread count is primary', 'thread glyph is muted'], assertions => 3, sha256 => ('b' x 64));
     my $ledger = write_ledger(status => 'done',
         pipeline => mk_pipeline(ticked => { map { $_ => 1 } 1 .. 7 }, na => { 8 => 1 }),
         test_paths => 'skipflip.t', oracle_records => [$step3, $step5]);
@@ -812,7 +812,7 @@ sub claim_check {
     my $step3 = oracle_line(step => 3, path => 'skipflip3.t',
         descriptions => ['alpha', 'beta', '# skip x'], assertions => 3);
     my $step5 = oracle_line(step => 5, path => 'skipflip3.t',
-        descriptions => ['alpha', 'gamma', 'delta'], assertions => 3,
+        descriptions => ['alpha', 'gamma', 'delta'], assertions => 3, sha256 => ('b' x 64),
         reaccept => { reason => 'trying to bless a removal', delta => {} });
     my $ledger = write_ledger(status => 'done',
         pipeline => mk_pipeline(ticked => { map { $_ => 1 } 1 .. 7 }, na => { 8 => 1 }),
@@ -823,6 +823,53 @@ sub claim_check {
     ok($f, 'AC-27e: a removed authored description still fires ORACLE_SHRANK, reaccept or not');
     is_deeply($f ? $f->{delta}{descriptions_removed} : undef, ['beta'],
         'AC-27e: ...and the removed set names only the real description, not the skip string');
+}
+
+{
+    # Bug 20261023-113529-75b2 (RT-1): a byte-identical test file whose run
+    # produced different descriptions (a tempdir in the text, or which racing
+    # branch won) at an equal count is a run-time change, not an edit: no
+    # finding, no reaccept needed.
+    my $step3 = oracle_line(step => 3, path => 'rt1.t', descriptions => ['alpha', 'armed wins the race']);
+    my $step5 = oracle_line(step => 5, path => 'rt1.t', descriptions => ['alpha', 'off wins the race']);
+    my $ledger = write_ledger(status => 'done',
+        pipeline => mk_pipeline(ticked => { map { $_ => 1 } 1 .. 7 }, na => { 8 => 1 }),
+        test_paths => 'rt1.t', oracle_records => [$step3, $step5]);
+    my (undef, undef, undef, $report) = claim_check($ledger);
+    is_deeply($report && $report->{findings}, [],
+        'RT-1: same file sha, same count, different run-time descriptions -> no finding');
+}
+
+{
+    # RT-2: the same file running FEWER assertions is still a shrink -- tests
+    # that stopped running are real.
+    my $step3 = oracle_line(step => 3, path => 'rt2.t', descriptions => ['alpha', 'beta'], assertions => 5);
+    my $step5 = oracle_line(step => 5, path => 'rt2.t', descriptions => ['alpha'], assertions => 3);
+    my $ledger = write_ledger(status => 'done',
+        pipeline => mk_pipeline(ticked => { map { $_ => 1 } 1 .. 7 }, na => { 8 => 1 }),
+        test_paths => 'rt2.t', oracle_records => [$step3, $step5]);
+    my (undef, undef, undef, $report) = claim_check($ledger);
+    ok(($report ? scalar(grep { $_->{code} eq 'ORACLE_SHRANK' } @{ $report->{findings} || [] }) : 0),
+        'RT-2: same file sha with fewer assertions still fires ORACLE_SHRANK');
+}
+
+{
+    # RT-3: an edited file whose descriptions differ only in a tempdir name
+    # under /tmp or a Windows Temp dir is not a shrink: a reaccept that names
+    # nothing settles it, because nothing vanished after normalization.
+    my $step3 = oracle_line(step => 3, path => 'rt3.t', descriptions => [
+        'S13: /tmp/T2Q9iCB1f2/.drive-solo/.stop-ok still exists',
+        'S13: C:\\Users\\x\\AppData\\Local\\Temp\\_XL5vi0x5_\\a.stop-ok still exists']);
+    my $step5 = oracle_line(step => 5, path => 'rt3.t', sha256 => ('b' x 64), descriptions => [
+        'S13: /tmp/jAy7V3qbJT/.drive-solo/.stop-ok still exists',
+        'S13: C:\\Users\\x\\AppData\\Local\\Temp\\kb5v1DxThx\\a.stop-ok still exists'],
+        reaccept => { reason => 'unrelated edit elsewhere in the file', delta => {} });
+    my $ledger = write_ledger(status => 'done',
+        pipeline => mk_pipeline(ticked => { map { $_ => 1 } 1 .. 7 }, na => { 8 => 1 }),
+        test_paths => 'rt3.t', oracle_records => [$step3, $step5]);
+    my (undef, undef, undef, $report) = claim_check($ledger);
+    is_deeply($report && $report->{findings}, [],
+        'RT-3: descriptions differing only in a tempdir name normalize equal -> no ORACLE_SHRANK');
 }
 
 {

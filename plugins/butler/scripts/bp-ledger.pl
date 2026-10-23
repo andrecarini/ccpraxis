@@ -902,6 +902,11 @@ sub normalize_description {
     # 20261012-014847-ded4).
     $d =~ s/^\s*#\s*(?:SKIP|TODO)\b.*\z//is;
     $d =~ s/\s+#\s*(?:SKIP|TODO)\b.*\z//i;
+    # A tempdir name is fresh on every run, so a description that embeds one
+    # (stop-gate-single.t's S13 does) must not read as a vanished description
+    # on the next run (bug 20261023-113529-75b2). Only the first segment under
+    # a temp root is the random one.
+    $d =~ s{((?:^|[^A-Za-z0-9_])tmp[\\/]|[\\/]Temp[\\/])[A-Za-z0-9_.-]+}{$1<tmp>}gi;
     $d =~ s/\(.*\z//s;
     $d =~ s/\s+/ /g;
     $d =~ s/^\s+|\s+\z//g;
@@ -1919,10 +1924,26 @@ sub _reaccept_covers_shrink {
 # claim-check's own classification (op_claim_check): a vanished description
 # or fewer assertions is a shrink, which no reaccept clears; any other
 # difference is drift, which --reaccept-oracle records.
+# _oracle_runtime_only($r3, $r5) -> 1|0. The test file is byte-identical and
+# runs at least as many assertions, so any description difference comes from
+# the run, not from an edit: a value computed at run time, or which of two
+# racing branches won (judged-continuity-disarm/04 and /05, bug
+# 20261023-113529-75b2). Nobody can have renamed or dropped a check in a file
+# nobody changed. Fewer assertions from the same file still counts: tests
+# that stopped running are a real shrink.
+sub _oracle_runtime_only {
+    my ($r3, $r5) = @_;
+    return 0 unless ref $r3 eq 'HASH' && ref $r5 eq 'HASH';
+    return 0 unless defined $r3->{sha256} && length $r3->{sha256};
+    return 0 unless ($r5->{sha256} // '') eq $r3->{sha256};
+    return (($r5->{assertions} // 0) >= ($r3->{assertions} // 0)) ? 1 : 0;
+}
+
 sub _oracle_change_notice {
     my ($path, $r3, $id) = @_;
     return undef unless ref $r3 eq 'HASH' && ref $id eq 'HASH';
     return undef unless ($r3->{status} // '') eq 'ok' && ($id->{status} // '') eq 'ok';
+    return undef if _oracle_runtime_only($r3, $id);
     my $delta = oracle_delta($r3, $id);
     my $comparable = (exists $r3->{descriptions} && exists $id->{descriptions}) ? 1 : 0;
     my @added   = $comparable ? @{ $delta->{descriptions_added} }   : ();
@@ -2726,10 +2747,11 @@ sub op_claim_check {
                     : (($r3->{descriptions_sha256} // '') ne ($r5->{descriptions_sha256} // ''));
                 my $sha_changed        = (($r3->{sha256} // '') ne ($r5->{sha256} // ''));
                 my $assertions_changed = ($r3->{assertions} != $r5->{assertions});
-                my $identical = !$desc_changed && !$sha_changed && !$assertions_changed;
+                my $runtime_only = _oracle_runtime_only($r3, $r5);
+                my $identical = $runtime_only || (!$desc_changed && !$sha_changed && !$assertions_changed);
 
-                my $shrank = ($r5->{assertions} < $r3->{assertions})
-                          || ($comparable && scalar(@{ $delta->{descriptions_removed} }) > 0);
+                my $shrank = !$runtime_only && (($r5->{assertions} < $r3->{assertions})
+                          || ($comparable && scalar(@{ $delta->{descriptions_removed} }) > 0));
 
                 if ($shrank && _reaccept_covers_shrink($r5, $delta, $comparable)) {
                     # Operator ruling 2026-10-23: a reaccept that NAMES every
