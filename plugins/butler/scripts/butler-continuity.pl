@@ -6,7 +6,6 @@
 #   butler-continuity on      --role reporter [--goal '<...>']
 #   butler-continuity off     [--reason '<2+ words>'] [--token <8 hex>]
 #   butler-continuity off-confirm --otp <otp> --justification '<2+ words>'
-#   butler-continuity silence  --reason '<2+ words>'  [--token <8 hex>]
 #   butler-continuity emergency-stop --reason '<2+ words>' [--area <area>]
 #   butler-continuity status
 #
@@ -31,7 +30,7 @@ require "$Bin/BpHook.pm"
 require "$Bin/BpContinuityLease.pm"
     unless grep { m{(?:^|/)BpContinuityLease\.pm$} } keys %INC;
 
-my $USAGE = q{usage: butler-continuity on --new-thread <name> | on --thread <name> [--role driver] --goal '<what this session is for>' | on --role reporter [--goal '<...>'] | off [--reason '<why>'] [--token T] | off-confirm --otp <otp> --justification '<2+ words>' | silence --reason '<why>' [--token T] (escape hatch: use sparingly) | emergency-stop --reason '<why>' [--area <area>] (only for a genuine defect in ccpraxis, Claude Code or another system that leaves no choice but to stop; never for finished work; files a bug report) | status};
+my $USAGE = q{usage: butler-continuity on --new-thread <name> | on --thread <name> [--role driver] --goal '<what this session is for>' | on --role reporter [--goal '<...>'] | off [--reason '<why>'] [--token T] | off-confirm --otp <otp> --justification '<2+ words>' | emergency-stop --reason '<why>' [--area <area>] (only for a genuine defect in ccpraxis, Claude Code or another system that leaves no choice but to stop; never for finished work; files a bug report) | status};
 
 sub _bytes {
     my ($s) = @_;
@@ -101,7 +100,7 @@ sub sanitize_text {
 # visible_word_count($s) -- word count over sanitize_text($s), counting only
 # runs of \p{L}/\p{N}. Stricter than word_count() above (which the core's
 # _word_count mirrors), so nothing this command accepts can ever be a reason
-# BpHook::set_silence would refuse.
+# the core's own two-word rule would refuse.
 sub visible_word_count {
     my ($s) = @_;
     return 0 unless defined $s;
@@ -237,13 +236,27 @@ if (defined $verb && exists $RETIRED_VERBS{$verb}) {
     refuse("'butler-continuity $verb' is retired; use '$RETIRED_VERBS{$verb}' instead");
 }
 
-usage_die() unless defined $verb && $verb =~ /^(?:on|off|off-confirm|silence|status|emergency-stop)$/;
+# Decision 9 (blueprint judged-continuity-disarm, package 05): silence is a
+# second bypass of continuity's "file the question, keep working, never
+# halt" guarantee, so it is removed outright, not narrowed. No flag parsing,
+# no ticket or stop-token consumption, no state-dir access, no reasons.log
+# line, for any argv beginning with silence -- this check runs before the
+# verb whitelist, the coordinator step and the state-root step.
+my $COORDINATOR_OFF_REFUSAL = "a coordinator cannot turn continuity off; it stops when its ledger is terminal.";
+if (defined $verb && $verb eq 'silence') {
+    refuse($COORDINATOR_OFF_REFUSAL) if defined $ENV{BP_LEDGER} && length $ENV{BP_LEDGER};
+    refuse("'butler-continuity silence' is removed: an armed session does not end a turn to wait for the operator. "
+        . "File the question with almanac inbox file --title '<question>' and keep working on everything that "
+        . "does not depend on the answer; if nothing can proceed, turn continuity off with a reason. "
+        . 'See "If you have a question for the operator" in plugins/butler/skills/continuity/SKILL.md.');
+}
+
+usage_die() unless defined $verb && $verb =~ /^(?:on|off|off-confirm|status|emergency-stop)$/;
 
 my %allowed = (
     on           => { role => 1, 'new-thread' => 1, thread => 1, goal => 1 },
     off          => { reason => 1, token => 1 },
     'off-confirm' => { otp => 1, justification => 1 },
-    silence      => { reason => 1, token => 1 },
     status       => {},
     'emergency-stop' => { reason => 1, area => 1 },
 );
@@ -265,13 +278,13 @@ while (@args) {
 # ---------------------------------------------------------------------------
 # Step 1: validation. Nothing is consumed or written.
 # ---------------------------------------------------------------------------
-if ($verb eq 'off' || $verb eq 'silence' || $verb eq 'emergency-stop') {
+if ($verb eq 'off' || $verb eq 'emergency-stop') {
     if (exists $flags{reason}) {
         if (!defined $flags{reason} || visible_word_count($flags{reason}) < 2) {
             refuse("--reason needs at least two words saying why.");
         }
     }
-    elsif ($verb eq 'silence' || $verb eq 'emergency-stop') {
+    elsif ($verb eq 'emergency-stop') {
         refuse("--reason needs at least two words saying why.");
     }
 }
@@ -349,8 +362,8 @@ if ($verb eq 'on') {
 # Step 2: coordinator (Decision 25).
 # ---------------------------------------------------------------------------
 if (defined $ENV{BP_LEDGER} && length $ENV{BP_LEDGER}) {
-    if ($verb eq 'off' || $verb eq 'off-confirm' || $verb eq 'silence') {
-        refuse("a coordinator cannot turn continuity off; it stops when its ledger is terminal.");
+    if ($verb eq 'off' || $verb eq 'off-confirm') {
+        refuse($COORDINATOR_OFF_REFUSAL);
     }
     if ($verb eq 'on') {
         out("continuity is on by construction for a coordinator; nothing to do.\n");
@@ -423,11 +436,11 @@ unless (defined $ROOT) {
 }
 
 # ---------------------------------------------------------------------------
-# Step 4: binding (on, off, silence, status).
+# Step 4: binding (on, off, off-confirm, status, emergency-stop).
 # ---------------------------------------------------------------------------
 my ($SID, $AID, $OPERATOR_TICKET, $PROJECT, $TRANSCRIPT_PATH, $TICKET_CWD);
 
-if ($verb eq 'on' || $verb eq 'off' || $verb eq 'off-confirm' || $verb eq 'silence' || $verb eq 'status'
+if ($verb eq 'on' || $verb eq 'off' || $verb eq 'off-confirm' || $verb eq 'status'
     || $verb eq 'emergency-stop') {
     my $t = BpHook::take_ticket('butler-continuity', \@argv0);
 
@@ -446,7 +459,7 @@ if ($verb eq 'on' || $verb eq 'off' || $verb eq 'off-confirm' || $verb eq 'silen
             }
         }
     }
-    elsif (exists $flags{token} && defined $flags{token} && ($verb eq 'off' || $verb eq 'silence')) {
+    elsif (exists $flags{token} && defined $flags{token} && $verb eq 'off') {
         my $s2 = BpHook::take_stop_token($flags{token});
         if (defined $s2) {
             $SID             = $s2;
@@ -462,7 +475,7 @@ if ($verb eq 'on' || $verb eq 'off' || $verb eq 'off-confirm' || $verb eq 'silen
         _refuse_binding();
     }
 
-    if (($verb eq 'on' || $verb eq 'off' || $verb eq 'off-confirm' || $verb eq 'silence' || $verb eq 'emergency-stop')
+    if (($verb eq 'on' || $verb eq 'off' || $verb eq 'off-confirm' || $verb eq 'emergency-stop')
         && defined $AID) {
         refuse("only the main session changes continuity; a subagent may not.");
     }
@@ -1159,70 +1172,6 @@ if ($verb eq 'emergency-stop') {
     exit 0;
 }
 
-if ($verb eq 'silence') {
-    unless (BpHook::is_armed($SID)) {
-        out("continuity is off for this session; nothing to silence.\n");
-        exit 0;
-    }
-    # Spec 38 sec 2.4 (Decision 128), amended by Decision 130 S1: refuse
-    # whenever running work is present at invocation, not only when the
-    # last Stop was denied with work running. That covers a silence run
-    # BEFORE any Stop, or after a Stop a live holder allowed (which clears
-    # the snapshot): BpHook::running_work reads the same evidence G11 does
-    # (background_tasks is unavailable here, so only the holder's own dead-
-    # holder freshness window applies), with no subprocess. A silence now
-    # would end the turn with nothing waiting on that work; explain, and
-    # point at hold, instead of setting it.
-    my $running = BpHook::running_snapshot($SID);
-    unless ($running) {
-        my @work = BpHook::running_work($SID, {});
-        $running = \@work if @work;
-    }
-    if ($running) {
-        my @ids   = map { $_->{id} } @$running;
-        my @shown = @ids > 8 ? @ids[0 .. 7] : @ids;
-        my $more  = @ids > 8 ? ', and ' . (@ids - 8) . ' more' : '';
-        binmode(STDERR, ':raw');
-        print STDERR _bytes(join('',
-            "butler-continuity: not silenced: work is still running in this session (" . join(', ', @shown) . "$more), as of the last stop.\n",
-            "A silence would end the turn with nothing waiting on that work. Hold it instead, as a background Bash tool call; the holder wakes this session when it finishes:\n",
-            "  butler-hold " . join(' ', @shown) . "\n",
-            "If that work is no longer needed and everything is done: butler-continuity off --reason '<what is done>'\n"));
-        exit 1;
-    }
-    # Decision 130 S1 / Decision 133: running_work({}) never surfaces a
-    # holder's own held items while its process is alive (they are
-    # holder_live's evidence, not running_work's -- see BpHook.pm's
-    # running_work comment), so a silence called before any Stop, with a
-    # live holder still holding non-empty items, would otherwise slip
-    # through undetected. Check the same pid+fp liveness holder_live uses
-    # (reused directly, as butler-continuity's own status verb already
-    # does). Unlike the two cases above, this work is already held -- the
-    # Stop gate already allows the turn to end while the holder runs -- so
-    # the hold-it-instead text is wrong here; say the turn can simply end.
-    my $h = BpHook::holder($SID);
-    if (ref $h eq 'HASH' && ref $h->{items} eq 'ARRAY' && @{ $h->{items} } && BpHook::holder_live($SID, {})) {
-        my @ids = grep { defined $_ && length $_ } @{ $h->{items} };
-        if (@ids) {
-            my @shown = @ids > 8 ? @ids[0 .. 7] : @ids;
-            my $more  = @ids > 8 ? ', and ' . (@ids - 8) . ' more' : '';
-            binmode(STDERR, ':raw');
-            print STDERR _bytes(join('',
-                "butler-continuity: not silenced: " . join(', ', @shown) . "$more already held; no silence needed.\n",
-                "The Stop gate allows the turn to end while the holder runs, so the turn can simply end.\n"));
-            exit 1;
-        }
-    }
-    my $reason = sanitize_text($flags{reason});
-    my $ok = BpHook::set_silence($SID, reason => $reason);
-    unless ($ok) {
-        refuse("could not write continuity state (" . (BpHook::last_error() // '') . ").");
-    }
-    BpHook::log_reason($SID, 'agent', 'silence', $reason, $PROJECT);
-    out("continuity silenced for one stop of session $S8; reason logged.\n");
-    exit 0;
-}
-
 if ($verb eq 'status') {
     my @lines;
 
@@ -1267,13 +1216,6 @@ if ($verb eq 'status') {
     }
     else {
         push @lines, 'holder: none';
-    }
-
-    if (-e "$ROOT/silence/$SID") {
-        my $d = read_json_file("$ROOT/silence/$SID");
-        my $reason = (ref $d eq 'HASH' && defined $d->{reason} && length $d->{reason}) ? sanitize_text($d->{reason}) : 'unknown';
-        $reason = 'unknown' unless length $reason;
-        push @lines, "silence: one stop pending: $reason";
     }
 
     my $wl;

@@ -429,7 +429,6 @@ sub disarm {
         ? $armed_data->{transcript_path}
         : undef;
     unlink("$root/armed/$sid");
-    unlink("$root/silence/$sid");
     unlink("$root/running/$sid");
     unlink("$root/holder/$sid.json");
     revoke_stop_token($sid);
@@ -483,57 +482,6 @@ sub operator_off {
     return 0 unless defined $root;
     my $data = _read_json("$root/off/$sid");
     return (ref $data eq 'HASH' && defined $data->{actor} && !ref($data->{actor}) && $data->{actor} eq 'operator') ? 1 : 0;
-}
-
-# ------------------------------------------------------------------ silence -
-
-sub set_silence {
-    my ($sid, %opts) = @_;
-    _clear_error();
-    return 0 unless defined $sid && $sid =~ $SID_RE;
-    my $reason = $opts{reason};
-    return 0 unless defined $reason && _word_count($reason) >= 2;
-    my $root = state_dir();
-    unless (defined $root) { _set_error('no state root'); return 0 }
-    my $lockfh = _open_armlock($root, $sid);
-    unless ($lockfh) { my $e = "$!"; _set_error("io: $e"); return 0 }
-    unless (_flock_with_timeout($lockfh, 10)) {
-        close $lockfh;
-        _set_error('io: lock timeout');
-        return 0;
-    }
-    my $rec = { session_id => $sid, by => 'butler-continuity', reason => _decode_maybe($reason), at => _iso_now() };
-    my $ok = _write_json_atomic("$root/silence/$sid", $rec) ? 1 : 0;
-    flock($lockfh, LOCK_UN);
-    close $lockfh;
-    return $ok;
-}
-
-sub take_silence {
-    my ($sid) = @_;
-    return 0 unless defined $sid && $sid =~ $SID_RE;
-    my $root = state_dir();
-    return 0 unless defined $root;
-    my $lockfh = _open_armlock($root, $sid);
-    return 0 unless $lockfh;
-    unless (_flock_with_timeout($lockfh, 10)) {
-        close $lockfh;
-        return 0;
-    }
-    my $path = "$root/silence/$sid";
-    my $data = _read_json($path);
-    my $valid = 0;
-    if (ref $data eq 'HASH'
-        && defined $data->{session_id} && $data->{session_id} eq $sid
-        && defined $data->{by} && $data->{by} eq 'butler-continuity'
-        && defined $data->{reason} && _word_count($data->{reason}) >= 2)
-    {
-        $valid = 1;
-    }
-    my $unlinked = unlink($path) ? 1 : 0;
-    flock($lockfh, LOCK_UN);
-    close $lockfh;
-    return ($valid && $unlinked) ? 1 : 0;
 }
 
 # ------------------------------------------------------------------- holder -
