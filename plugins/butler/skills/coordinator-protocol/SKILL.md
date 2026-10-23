@@ -475,7 +475,7 @@ Workers are dispatched via Task with `subagent_type` set to the **plugin-namespa
 7. **Fix-batch.** Consolidate ALL findings from both reports into **one** implementer dispatch — never a sequence of single-finding fixes. Re-validate after. Filing is consolidated the same way: when reviewer and red-team independently name the same tooling defect, file it once — one `TOOLING-BUG-FILED:` marker, never one report per source.
 8. **UI pass** (`bp-ui-prober`), only if the package touches UI. Screenshots get read, the visual checklist applied, findings folded into a final fix-batch if needed.
 
-Check off pipeline steps in the ledger as you go. Steps may be skipped only with a recorded reason.
+Check off pipeline steps in the ledger as you go. Steps may be skipped only with a recorded reason, and a skipped step is still ticked: record why in the attempt log, then `tick-step --step <N>`. Harvest reads the checkbox, not the prose, so an unticked step fails as `PIPELINE_STEP_UNTICKED` even when the log says it was skipped. Step 8 in a package with no UI is the usual case.
 
 ## Worker dispatch contract
 
