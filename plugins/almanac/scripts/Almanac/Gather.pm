@@ -1097,7 +1097,7 @@ sub thread_log_since {
             };
         }
     }
-    @out = sort { ($a->{at} cmp $b->{at}) || ($a->{thread} cmp $b->{thread}) || ($a->{id} cmp $b->{id}) } @out;
+    @out = sort { (($a->{at} // '') cmp ($b->{at} // '')) || (($a->{thread} // '') cmp ($b->{thread} // '')) || (($a->{id} // '') cmp ($b->{id} // '')) } @out;
     return \@out;
 }
 

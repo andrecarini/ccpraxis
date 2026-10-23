@@ -783,7 +783,12 @@ sub pending_report {
     }
 
     my $generated_at = _iso_of($now);
-    my $n = scalar(@$projects);
+    # m4: $projects only holds roots _gather_all() could read; a root it
+    # could not read at all (registry error, never got far enough to
+    # become a per-project errors[] entry) would otherwise silently
+    # understate the registry by that many.
+    my $n_registry_unreadable = scalar(grep { ($_->{section} // '') eq 'registry' } @{ $all->{errors} // [] });
+    my $n = scalar(@$projects) + $n_registry_unreadable;
     my @lines;
     push @lines, "Pending across $n registered projects  $generated_at";
     push @lines, '  No registered projects.' if $n == 0;
