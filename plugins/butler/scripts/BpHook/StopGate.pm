@@ -135,9 +135,18 @@ sub run {
     # the gate stops refusing, and says why in the reasons log and
     # hook-errors.log. Inert without a readable transcript: then there is no
     # way to tell "stuck" from "busy", and the cap must not guess.
+    #
+    # The cap only yields when the session's most recent shell call failed
+    # (operator ruling 2026-10-23, todo 20261023-082209-24290000). Counting
+    # bare refusals also let a healthy agent stop for free by ending five
+    # turns with text alone, the same effect the removed `silence` had. A
+    # broken shell, the case the cap exists for, always leaves a failed call
+    # as the last shell result, even when the model has since stopped trying.
     my ($streak, $shell_failed) = eval { _bump_streak($sid, $p) };
     $streak //= 0;
-    if ($streak >= $REFUSAL_CAP) {
+    my $cap_armed = ($streak >= $BREAK_GLASS_HINT_AT || $shell_failed)
+        ? (eval { _last_shell_failed($p->{transcript_path}) } || 0) : 0;
+    if ($streak >= $REFUSAL_CAP && $cap_armed) {
         eval { _clear_streak($sid) };
         my $why = "refusal cap: $streak consecutive refusals with no tool call succeeding in between";
         eval { BpHook::log_reason($sid, 'gate', 'refusal-cap', $why, $p->{cwd}) };
@@ -166,8 +175,10 @@ sub run {
                 "No shell command can run? Last resort: create this file with the Write tool:",
                 "  " . _display_path($path),
                 "  containing {\"token\":\"$t\",\"action\":\"off\",\"reason\":\"<what is done>\"}",
-                "  (only when all work is done: it turns continuity off and files a bug report).",
-                "After $REFUSAL_CAP refusals in a row with no tool call succeeding, the gate lets the stop through by itself.";
+                "  (only when all work is done: it turns continuity off and files a bug report).";
+            push @glass,
+                "After $REFUSAL_CAP refusals in a row with no tool call succeeding, the gate lets the stop through by itself."
+                if $cap_armed;
         }
     }
 
@@ -357,6 +368,41 @@ sub _bump_streak {
         rename("$path.tmp.$$", $path) or unlink "$path.tmp.$$";
     }
     return ($count, $shell_failed);
+}
+
+# _last_shell_failed($transcript) -> 1|0: whether the newest Bash or
+# PowerShell tool_result in the transcript is an error. Reads at most the last
+# 4 MiB, which holds far more than one turn; a shell call older than that, or
+# none at all, reads as 0, so the refusal cap stays shut on a healthy session.
+sub _last_shell_failed {
+    my ($tp) = @_;
+    return 0 unless defined $tp && !ref $tp && length $tp && -f $tp;
+    my $size = -s $tp;
+    return 0 unless $size;
+    my $start = $size > 4 * 1024 * 1024 ? $size - 4 * 1024 * 1024 : 0;
+    open(my $fh, '<:raw', $tp) or return 0;
+    seek($fh, $start, 0);
+    <$fh> if $start;    # drop the partial first line
+    my (%name_of, $last);
+    while (my $line = <$fh>) {
+        next unless $line =~ /"tool_(?:use|result)"/;
+        my $rec = eval { JSON::PP->new->utf8->decode($line) };
+        next unless ref $rec eq 'HASH' && ref $rec->{message} eq 'HASH';
+        my $content = $rec->{message}{content};
+        next unless ref $content eq 'ARRAY';
+        for my $c (@$content) {
+            next unless ref $c eq 'HASH' && defined $c->{type};
+            if ($c->{type} eq 'tool_use' && defined $c->{id}) {
+                $name_of{$c->{id}} = $c->{name};
+            }
+            elsif ($c->{type} eq 'tool_result' && defined $c->{tool_use_id}) {
+                my $n = $name_of{$c->{tool_use_id}};
+                $last = $c->{is_error} ? 1 : 0 if defined $n && $SHELL_TOOL{$n};
+            }
+        }
+    }
+    close $fh;
+    return $last ? 1 : 0;
 }
 
 # _scan_tool_results($transcript, $offset) -> ($any_ok, $shell_failed) over

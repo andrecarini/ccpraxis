@@ -227,6 +227,39 @@ sub write_glass {
 }
 
 # ===========================================================================
+# TEXT-ONLY (operator ruling 2026-10-23, todo 20261023-082209-24290000): a
+# healthy session that just stops calling tools never reaches the cap. Its
+# last shell call succeeded, so the cap stays shut and its hint is not shown.
+# ===========================================================================
+{
+    my $w = world();
+    spew_append($w->{tp}, shell_call(1));
+    my @r = map { stop($w) } 1 .. $CAP + 3;
+    is_deeply([ map { $_->{rc} } @r ], [ (2) x ($CAP + 3) ],
+        'TEXT-ONLY: text-only stops after a successful shell call are refused, past the cap');
+    unlike(join('', map { $_->{err} } @r), qr/lets the stop through by itself/,
+        'TEXT-ONLY: and the refusal never advertises the cap');
+    unlike(reasons($w), qr/\trefusal-cap\t/, 'TEXT-ONLY: the cap never fired');
+
+    my $w2 = world();
+    my @r2 = map { stop($w2) } 1 .. $CAP + 1;
+    is_deeply([ map { $_->{rc} } @r2 ], [ (2) x ($CAP + 1) ],
+        'TEXT-ONLY: a session that never ran a shell call is refused past the cap too');
+}
+
+# ===========================================================================
+# GAVE-UP: a shell that failed and a model that then stopped trying tools.
+# The last shell result is the failure, so the cap still lets it out.
+# ===========================================================================
+{
+    my $w = world();
+    spew_append($w->{tp}, shell_call(1), shell_call(0));
+    my @rc = map { stop($w)->{rc} } 1 .. $CAP;
+    is($rc[-1], 0, 'GAVE-UP: after a failed shell call, text-only stops still reach the cap');
+    is_deeply([ @rc[0 .. $CAP - 2] ], [ (2) x ($CAP - 1) ], 'GAVE-UP: the stops before it are refused');
+}
+
+# ===========================================================================
 # HINT -- the Write-tool escape appears only once the shell has visibly failed.
 # ===========================================================================
 {

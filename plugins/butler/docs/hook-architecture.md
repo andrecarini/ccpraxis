@@ -1016,7 +1016,10 @@ operator's ruling (2026-10-21) was both of the following, as last resorts for wh
 itself is broken:
 
 - **Refusal cap** (G9b). `$BpHook::StopGate::REFUSAL_CAP` (5) consecutive refusals with no tool
-  call succeeding in between, and the gate lets the stop through. It writes a `refusal-cap` line to
+  call succeeding in between, and the gate lets the stop through, but only when the newest Bash or
+  PowerShell result in the transcript (last 4 MiB) is an error (operator ruling 2026-10-23): a broken
+  shell always leaves one, while a healthy agent that just ends turns with text never does, so it
+  cannot use the cap as a free stop. It writes a `refusal-cap` line to
   `reasons.log` and one to `hook-errors.log`, and does not disarm: the next stop starts a fresh
   streak. The streak lives in `stop-refusals/<sid>` as `{count, offset, shell_failed}`; each
   would-be refusal reads only the transcript bytes appended since `offset`. Any `tool_result`
@@ -1054,6 +1057,8 @@ No shell command can run? Last resort: create this file with the Write tool:
   (only when all work is done: it turns continuity off and files a bug report).
 After 5 refusals in a row with no tool call succeeding, the gate lets the stop through by itself.
 ```
+
+The last line appears only when the cap can fire, that is when the newest shell result failed.
 
 Oracle: `plugins/butler/tests/t/stop-gate-break-glass.t`.
 
