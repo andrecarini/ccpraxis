@@ -568,8 +568,7 @@ sub almanac_counts {
                 $global = $snap;
             } else {
                 my $v = "$home/.claude/claude-code-vault/almanac";
-                $global = { todo => _alm_count("$v/todo", 'open'), note => _alm_count("$v/note"),
-                            thread => (ref($snap) eq 'HASH' ? $snap->{thread} : undef) };
+                $global = { todo => _alm_count("$v/todo", 'open'), note => _alm_count("$v/note"), thread => (ref($snap) eq 'HASH' ? $snap->{thread} : undef) };
             }
         }
         1;
@@ -773,12 +772,10 @@ sub _alm_task_label {
         if ($res->{state} eq 'ok') {
             my $class = _alm_classify_linked($res->{status});
             my $step  = (defined($res->{step}) && length($res->{step})) ? $res->{step} : $res->{status};
-            return ($class, { class => $class, kind => 'link', blueprint => $res->{blueprint},
-                               number => _alm_pkg_number($res->{package}), step => $step });
+            return ($class, { class => $class, kind => 'link', blueprint => $res->{blueprint}, number => _alm_pkg_number($res->{package}), step => $step });
         }
         if ($res->{state} eq 'missing') {
-            return ('pending', { class => 'pending', kind => 'link', blueprint => $res->{blueprint},
-                                  number => _alm_pkg_number($res->{package}), step => 'missing' });
+            return ('pending', { class => 'pending', kind => 'link', blueprint => $res->{blueprint}, number => _alm_pkg_number($res->{package}), step => 'missing' });
         }
         my $txt = _alm_text($fm->{link}) . ' missing';
         return ('pending', { class => 'pending', kind => 'text', title => $txt, waits_on => undef });
@@ -843,8 +840,7 @@ sub _alm_thread_find {
         $next = $label if !defined($next) && $class eq 'pending';
     }
     $current = undef if @doing;
-    return { name => $chosen, done => $done, total => $total, doing => \@doing,
-             current => $current, next => $next };
+    return { name => $chosen, done => $done, total => $total, doing => \@doing, current => $current, next => $next };
 }
 sub almanac_thread {
     my (%o) = @_;

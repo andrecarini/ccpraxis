@@ -20,17 +20,14 @@
 #             in plain and TUI mode (DC2), plus the runtime-wrapper removal
 #             and reap-notice-lines behavior (DC4, AC-12).
 #
-# EXPECTED TO FAIL TODAY, AND WHY: the 59-row inventory (spec section 2.4)
-# has not been applied, so PART A's real-repo-scan assertion (behavior 1)
-# reports real hits, diag'd as path:line: [rule] V1 | C2 for each. PART B's
-# phrase checks fail wherever the cited file still splits the phrase across
-# two lines. PART C's AC-7/8/9 fail because the forced-rebuild-notice
-# sentinel pair does not exist yet, and AC-12 fails because sub _reap_wrap
-# is still present and reap_notice_lines still calls it (a runtime 76-column
-# wrapper that reintroduces mid-string \n exactly like the bug this package
-# fixes at the message-authoring layer). AC-10 (the counter-fixture) and
-# every fixture self-test in PART A are real, non-vacuous checks against
-# code that already exists (tui::LaunchScreens, tui::Frame) and pass today.
+# CURRENT STATE: the 59-row inventory (spec section 2.4) was applied in
+# package 25 (commit 3a603da), so PART A's real-repo-scan assertion
+# (behavior 1) reports zero hits. PART B's phrase checks, PART C's AC-7/8/9
+# (the forced-rebuild-notice sentinel pair) and AC-12 (sub _reap_wrap is
+# gone and reap_notice_lines no longer wraps at 76 columns) all pass. AC-10
+# (the counter-fixture) and every fixture self-test in PART A are real,
+# non-vacuous checks against code that already exists (tui::LaunchScreens,
+# tui::Frame) and pass today.
 #
 # A KNOWN GAP, REPORTED RATHER THAN PAPERED OVER: the spec's own motivating
 # text (launcher.pl:3191-3194 pre-fix) has an internal sentence boundary
@@ -811,8 +808,7 @@ cmp_ok(scalar(@scan_files), '>=', 150,
         }
     }
     unless (is(scalar(@all_hits), 0,
-        'behavior 1 / DC1: the repo scan reports zero hits -- FAILS TODAY because the '
-      . '59-row inventory (spec section 2.4) has not been applied yet')) {
+        'behavior 1 / DC1: the repo scan reports zero hits')) {
         diag_hit($_->{file}, $_) for @all_hits;
     }
 }

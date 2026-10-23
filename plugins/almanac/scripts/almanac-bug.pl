@@ -2221,27 +2221,15 @@ almanac-bug.pl — ccpraxis bug reports, one file per report.
   set-status <id> --to <state> [--note N] [--package BP/PKG] [--no-package] [--repair]
         open -> triaging -> scheduled -> fixed|dropped  (triaging -> open to hand back;
         triaging -> fixed via --no-package, below)
-        Moving to `triaging` CLAIMS the report for the calling session (and agent, for a
-        subagent) -- the identity comes from a butler hook ticket, never from a flag, and is
-        required: run this from a Claude Code session with the butler plugin enabled, with the
-        id and every argument written literally (no $variables). Only the claimant may then move
-        it on or back to `open`; see `takeover` for a stale claim.
-        --to scheduled requires --package <blueprint>/<package>, validated against an existing
-        package ledger (live or archived); reconcile sets `fixed` once that package is done.
-        `fixed` can also be set by hand directly from `triaging`, but ONLY together with
-        --no-package --note "<what fixed it>" -- for an in-place fix with no blueprint package
-        (Decision 66). --to dropped requires --note "<reason>".
+        Moving to `triaging` CLAIMS the report for the calling session (and agent, for a subagent) -- the identity comes from a butler hook ticket, never from a flag, and is required: run this from a Claude Code session with the butler plugin enabled, with the id and every argument written literally (no $variables). Only the claimant may then move it on or back to `open`; see `takeover` for a stale claim.
+        --to scheduled requires --package <blueprint>/<package>, validated against an existing package ledger (live or archived); reconcile sets `fixed` once that package is done.
+        `fixed` can also be set by hand directly from `triaging`, but ONLY together with --no-package --note "<what fixed it>" -- for an in-place fix with no blueprint package (Decision 66). --to dropped requires --note "<reason>".
         --repair: ONLY for a report whose current status is not a known state (hand-written, or from before this machine existed). It cannot skip a legal transition between valid states. Put it last on the line.
         Leaving `open` FREEZES the body and records its sha256.
   takeover <id>
-        Recovers a STALE triaging claim (no transcript for its claimant, or claimed over 24h ago)
-        and records the calling session as the new claimant. Refused on a live claim or a report
-        that is not triaging. Requires a hook ticket, exactly like set-status.
+        Recovers a STALE triaging claim (no transcript for its claimant, or claimed over 24h ago) and records the calling session as the new claimant. Refused on a live claim or a report that is not triaging. Requires a hook ticket, exactly like set-status.
   reconcile [--project ROOT]
-        Moves every scheduled report in ROOT whose package is done to fixed, migrates any leftover
-        taken/resolved/declined report, and flags a scheduled report whose package is parked,
-        dropped or missing. Every OTHER verb already runs this first, silently, for its own
-        project -- this is the explicit, visible form. Idempotent; exits 0 always.
+        Moves every scheduled report in ROOT whose package is done to fixed, migrates any leftover taken/resolved/declined report, and flags a scheduled report whose package is parked, dropped or missing. Every OTHER verb already runs this first, silently, for its own project -- this is the explicit, visible form. Idempotent; exits 0 always.
   list [--status S] [--json]        reports in THIS PROJECT only; flags a stale triaging claim, and a scheduled/taken report needing attention
   collect [--status S] [--json]     reports across every project REGISTERED in steward's backup registry -- filing a bug and registering for backup are unrelated decisions, so an unregistered project is excluded, not scanned for; flags a stale triaging claim, and a scheduled/taken report needing attention
   verify                            re-check every frozen body against its digest

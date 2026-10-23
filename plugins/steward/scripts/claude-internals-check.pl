@@ -85,8 +85,7 @@ sub die_error {
 
 sub usage_text {
     return <<'EOF';
-claude-internals-check.pl -- read-only signature scan of the installed claude
-binary for the undocumented internals ccpraxis settings rely on.
+claude-internals-check.pl -- read-only signature scan of the installed claude binary for the undocumented internals ccpraxis settings rely on.
 
 Usage:
   perl claude-internals-check.pl [--binary <path>] [--data <path>] [--help]
