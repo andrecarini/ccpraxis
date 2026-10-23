@@ -2797,42 +2797,21 @@ SKIP: {
 }
 
 # ---------------------------------------------------------------------------
-# Decision 121 (S1) -- the silence badge is judged on the Stop gate's terms:
-# the record is decoded as UTF-8 JSON and words are split on \s+ over
-# CHARACTERS, so a reason separated only by Unicode whitespace has 2 words.
-# The oracle is BpHook's own _read_json and _word_count, run on the same file
-# (never take_silence, which consumes it).
+# Decision 121 (S1) retired with the `silence` verb (judged-continuity-disarm
+# 05): nothing writes silence/<sid> any more and the Stop gate honours none, so
+# a record left over from an older install must not resurrect the U+2016 badge.
 # ---------------------------------------------------------------------------
 {
-    my $BPHOOK_OK = eval { require "$Bin/../../../butler/scripts/BpHook.pm"; 1 };
-    ok($BPHOOK_OK, 'Decision 121 (S1) setup: BpHook.pm loads, so the gate\'s own reader is the oracle')
-        or diag("  $@");
-  SKIP: {
-        skip('BpHook.pm did not load', 8) unless $BPHOOK_OK;
-        for my $case (
-            [ 'U+3000 only',  "waiting\x{3000}operator" ],
-            [ 'U+00A0 only',  "waiting\x{00A0}operator" ],
-            [ 'U+2003 only',  "waiting\x{2003}operator" ],
-            [ 'one word plus a trailing U+3000', "waiting\x{3000}" ],
-        ) {
-            my ($label, $reason) = @$case;
-            my $sid = 'sess-p10-s1-' . (++$fixture_seq);
-            my $state = nslash(tempdir(CLEANUP => 1));
-            make_path("$state/continuity/armed", "$state/continuity/silence");
-            spew_raw("$state/continuity/armed/$sid", '');
-            spew_raw("$state/continuity/silence/$sid",
-                JSON::PP->new->utf8->canonical->encode({ at => '2026-09-26T00:00:00Z', by => 'butler-continuity',
-                                                         reason => $reason, session_id => $sid }) . "\n");
-            my $data = BpHook::_read_json("$state/continuity/silence/$sid");
-            my $gate = (ref($data) eq 'HASH' && ($data->{session_id} // '') eq $sid
-                        && ($data->{by} // '') eq 'butler-continuity'
-                        && BpHook::_word_count($data->{reason}) >= 2) ? 1 : 0;
-            my ($out, $rc) = render(proj => $P_EMPTY, home => $H_EMPTY, sid => $sid, state => $state);
-            is($rc, 0, "Decision 121 (S1, $label): exits 0");
-            is((index($out, $G_SILENCED) >= 0 ? 1 : 0), $gate,
-                "Decision 121 (S1, $label): the badge shows U+2016 iff the Stop gate would honour this silence (gate says $gate)");
-        }
-    }
+    my $sid = 'sess-p10-s1-' . (++$fixture_seq);
+    my $state = nslash(tempdir(CLEANUP => 1));
+    make_path("$state/continuity/armed", "$state/continuity/silence");
+    spew_raw("$state/continuity/armed/$sid", '');
+    spew_raw("$state/continuity/silence/$sid",
+        JSON::PP->new->utf8->canonical->encode({ at => '2026-09-26T00:00:00Z', by => 'butler-continuity',
+                                                 reason => 'waiting on operator', session_id => $sid }) . "\n");
+    my ($out, $rc) = render(proj => $P_EMPTY, home => $H_EMPTY, sid => $sid, state => $state);
+    is($rc, 0, 'Decision 121 (S1, retired): a leftover silence record still renders, exit 0');
+    is(index($out, $G_SILENCED), -1, 'Decision 121 (S1, retired): and shows no U+2016 badge -- silence no longer exists');
 }
 
 # ---------------------------------------------------------------------------

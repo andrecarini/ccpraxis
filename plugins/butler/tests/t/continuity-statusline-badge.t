@@ -480,10 +480,9 @@ sub mkdir_p_test {
 #
 #   agent-off: <state>/off/<sid> decodes to a hash with actor eq 'agent'
 #              -> U+2205 in state.warn.
-#   silenced:  <state>/silence/<sid> decodes to a hash with session_id eq
-#              <sid>, by eq 'butler-continuity', and a reason of 2+ words
-#              (BpHook::take_silence's own acceptance rule) -> U+2016 in
-#              state.warn.
+#   silenced:  RETIRED. It was U+2016 for a valid <state>/silence/<sid>; the
+#              `silence` verb is gone (judged-continuity-disarm 05), and a
+#              leftover record now renders nothing (AC-19 below).
 #   both -> agent-off only; neither -> nothing, not even a space.
 #   Marker field, stripped: "<lead> <WORD>[ <badge>]". blueprint
 #   operator-ui-tweaks Decision 1(b) (package 01-statusline-counters) moves
@@ -533,8 +532,9 @@ sub badge_sgr_ok {
 }
 
 # ---------------------------------------------------------------------------
-# AC-19 (behaviour 14): a valid silence shows U+2016 after the marker word,
-# with the lead glyph filled; every invalid silence shows nothing.
+# AC-19 (behaviour 14), RETIRED with the `silence` verb (judged-continuity-
+# disarm 05): a silence record, even one the old gate would have honoured,
+# shows nothing. U+2016 stays defined below only to assert its absence.
 # ---------------------------------------------------------------------------
 {
     my $sid = 'sess-ac19-silenced';
@@ -542,36 +542,11 @@ sub badge_sgr_ok {
     plant_armed($state, $sid);
     plant_badge_file($state, 'silence', $sid, silence_json($sid));
     my ($out, $rc) = run_statusline(payload_for(session_id => $sid), state => $state);
-    is($rc, 0, 'AC-19 setup: an armed session with a valid silence record exits 0');
-    ok(armed_out($out), 'AC-19 (behaviour 14): the lead glyph is FILLED -- the session is armed and silenced');
-    my $vis = strip_sgr(row1($out));
-    like($vis, qr/\A\Q$GLYPH_WATCHED\E HOST \Q$G_SILENCED\E(?: |\z)/,
-        'AC-19 (behaviour 14): the marker field reads "<filled> HOST U+2016" -- the silenced badge follows the word, one space apart')
-        or diag("  row 1 = [$vis]");
-    ok(badge_sgr_ok(row1($out), $G_SILENCED), 'AC-19 (spec 2.3): U+2016 is rendered in state.warn');
-    is(index($out, $G_AGENTOFF), -1, 'AC-19: a silence alone renders no agent-off glyph');
-
-    my %INVALID = (
-        '0-byte file'           => '',
-        'not JSON'              => "silenced, honestly\n",
-        'a JSON array'          => "[\"butler-continuity\"]\n",
-        'wrong session_id'      => silence_json($sid, session_id => 'sess-someone-else'),
-        'wrong by'              => silence_json($sid, by => 'operator-shell'),
-        'one-word reason'       => silence_json($sid, reason => 'waiting'),
-        'blank reason'          => silence_json($sid, reason => '   '),
-        # a bounded 4096-byte read cannot reach an object that starts past it
-        'object past 4096 bytes' => (' ' x 4500) . silence_json($sid),
-        'a directory'           => undef,
-    );
-    for my $label (sort keys %INVALID) {
-        my $st = tempdir(CLEANUP => 1);
-        plant_armed($st, $sid);
-        plant_badge_file($st, 'silence', $sid, $INVALID{$label});
-        my ($o, $r) = run_statusline(payload_for(session_id => $sid), state => $st);
-        is($r, 0, "AC-19 ($label silence): exits 0");
-        is(index($o, $G_SILENCED), -1, "AC-19 ($label silence): no U+2016 -- the badge never claims a silence the gate would ignore");
-        ok(armed_out($o), "AC-19 ($label silence): the lead glyph still reflects arming alone (filled)");
-    }
+    is($rc, 0, 'AC-19 (retired) setup: an armed session with a leftover silence record exits 0');
+    ok(armed_out($out), 'AC-19 (retired): the lead glyph is FILLED -- arming alone decides it');
+    is(index($out, $G_SILENCED), -1, 'AC-19 (retired): no U+2016 -- the silence verb is gone, so a leftover record is never read');
+    unlike(strip_sgr(row1($out)), qr/\A\Q$GLYPH_WATCHED\E HOST  /,
+        'AC-19 (retired): no reserved badge slot either (no double space after the word)');
 }
 
 # ---------------------------------------------------------------------------
@@ -710,8 +685,8 @@ sub forbidden_constructs {
     my @f = forbidden_constructs($code);
     ok(defined($blk) && !@f, 'AC-9 (badge half): the badge block contains none of the spec 2.2 forbidden constructs')
         or diag('  found: ' . join(', ', @f));
-    ok($code =~ /\boff\b/ && $code =~ /\bsilence\b/,
-        'AC-9 (badge half): the badge block is where off/<sid> and silence/<sid> are read');
+    ok($code =~ /\boff\b/ && $code !~ /\bsilence\b/,
+        'AC-9 (badge half): the badge block reads off/<sid>, and no longer silence/<sid>');
     ok($code =~ /JSON::PP|decode_json/, 'AC-9 (badge half): the badge records are decoded with JSON::PP');
 
     # counter-fixtures: the scan fires on spawns and writes, and is silent on

@@ -1346,17 +1346,15 @@ if (length $sid) {
     }
 }
 
-# ── Silenced / agent-disarmed badge (Decision 7) ─────────────
+# ── Agent-disarmed badge (Decision 7) ────────────────────────
 # The lead glyph says whether a Stop gate is armed. It cannot say WHY one is
-# not, and two of those reasons are worth seeing: an agent disarmed this
-# session (off/<sid> with "actor":"agent"), or it is silenced
-# (silence/<sid>). Both files live under the same root as armed/<sid>, so the
-# badge costs two bounded reads and no subprocess.
+# not, and one of those reasons is worth seeing: an agent disarmed this
+# session (off/<sid> with "actor":"agent"). The file lives under the same root
+# as armed/<sid>, so the badge costs one bounded read and no subprocess.
 #
-# The silence test is BpHook::take_silence's own acceptance rule (session_id,
-# by, a reason of two or more words), so the badge never claims a silence the
-# gate would ignore. An agent disarm outranks a silence: disarming deletes the
-# silence file, so both at once is a stale leftover, and "off" is the fact.
+# There was a second badge, U+2016 for a silenced session (silence/<sid>). The
+# `silence` verb is gone (judged-continuity-disarm 05), so nothing writes that
+# file and the gate honours none; a leftover one is deliberately not read.
 # -- continuity-badge:begin --
 # _badge_record($path) -> the decoded hash, or undef. One read of at most
 # 4096 bytes, so a record that starts past that point never decodes.
@@ -1381,13 +1379,6 @@ if (length $sid) {
         my $actor = $off ? $off->{actor} : undef;
         if (defined $actor && !ref($actor) && $actor eq 'agent') {
             $badge_glyph = "\x{2205}";
-        } elsif (my $sil = _badge_record("$state/silence/$sid")) {
-            my ($s_sid, $s_by, $s_why) = @{$sil}{qw(session_id by reason)};
-            my @words = (defined $s_why && !ref($s_why)) ? grep { length } split(/\s+/, $s_why) : ();
-            $badge_glyph = "\x{2016}"
-                if defined $s_sid && !ref($s_sid) && $s_sid eq $sid
-                && defined $s_by && !ref($s_by) && $s_by eq 'butler-continuity'
-                && @words >= 2;
         }
     }
 }
@@ -1487,8 +1478,8 @@ my $marker  = ($watched ? $OK : $FAINT)
             . "${R}$WORD_COLOR{$env} ${word}${R}";
 
 # The Decision 7 badge follows the word: why this session is NOT watched, when
-# the reason is an agent's disarm or a silence. Nothing at all -- not even a
-# space -- when neither applies.
+# the reason is an agent's disarm. Nothing at all -- not even a space --
+# otherwise.
 $marker .= "${R} ${WARN}${badge_glyph}${R}" if length $badge_glyph;
 
 # The inbox flag no longer rides in the marker field (Decision 1): it now

@@ -530,7 +530,6 @@ sub _glyphs_data {
         'arrow.right'     => { cp => 0x2192, desc => 'rightwards arrow, the attached thread\'s next task' },
         # The Decision 7 badge. 'agentoff' has no hyphen because glyph names
         # are dot-separated lowercase alphanumerics (Decision 119).
-        'badge.silenced'  => { cp => 0x2016, desc => 'double vertical line, this session is silenced' },
         'badge.agentoff'  => { cp => 0x2205, desc => 'empty set, an agent disarmed this session' },
         # THE GAUGE IS NOT A FULL-HEIGHT BLOCK (operator, 2026-08-26: "I want a
         # different usage bar foreground styling. Different colors and also

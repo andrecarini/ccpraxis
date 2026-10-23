@@ -1541,7 +1541,6 @@ is_deeply(Theme::x256_rgb(196), [255, 0, 0],     'x256_rgb(196) == [255,0,0] (B-
         'icon.notes'      => { cp => 0x2630, width => 2 },
         'icon.decisions'  => { cp => 0x2691, width => 1 },
         'icon.todos'      => { cp => 0x274F, width => 1 },
-        'badge.silenced'  => { cp => 0x2016, width => 1 },
         'badge.agentoff'  => { cp => 0x2205, width => 1 },
         # blueprint where-things-go, package 12-statusline-threads (spec
         # 2.4): icon.tasklist and its U+25A3 counter glyph are RETIRED (the
@@ -1575,6 +1574,11 @@ is_deeply(Theme::x256_rgb(196), [255, 0, 0],     'x256_rgb(196) == [255,0,0] (B-
     # check, the mirror image of the table above.
     ok(!exists $glyphs->{'icon.tasklist'},
         "Theme::glyphs() no longer declares 'icon.tasklist' (AC8, package 12-statusline-threads)");
+
+    # badge.silenced is gone with the `silence` verb (judged-continuity-disarm
+    # 05): nothing can be silenced, so no glyph may claim it.
+    ok(!exists $glyphs->{'badge.silenced'},
+        "Theme::glyphs() no longer declares 'badge.silenced' (silence verb removed)");
 
     # package 12-statusline-threads AC8/section 2.4: thread.blocked exists,
     # is declared width 1, and its codepoint is NOT read as a fixed literal
