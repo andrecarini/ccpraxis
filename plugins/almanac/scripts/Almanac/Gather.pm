@@ -997,8 +997,8 @@ sub digest {
     my $text = eval {
         my $root = defined $opt{root} ? $opt{root} : Almanac::Thread::project_root(cwd => $opt{cwd});
         $root = _fs_bytes($root) if defined $root;
-        # redteam M2: render_digest only ever reads threads/todos/blueprints/
-        # inbox/notes/bugs(tampered)/errors -- never fleet_runs or commits.
+        # redteam M2: render_digest only ever reads threads, todos, blueprints,
+        # inbox, notes, bugs (tampered) and errors -- never fleet_runs or commits.
         # Trimming the sections list to just those does NOT change how many
         # per-blueprint sweeps _run_refresh spawns (reviewer-2-confirm N-1:
         # that happens earlier, during refresh, for every blueprint with a

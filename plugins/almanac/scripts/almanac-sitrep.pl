@@ -752,7 +752,7 @@ sub _project_view {
         }
     }
 
-    # B2: a project whose inbox/blueprints/threads/todos/bugs section
+    # B2: a project whose inbox, blueprints, threads, todos or bugs section
     # failed to read (store corrupt, almanac-bug.pl/BpState unloadable,
     # blueprint dir unreadable) carries that failure on the PROJECT's own
     # errors[] (Gather's _gather_project), separate from _gather_all's
@@ -876,7 +876,7 @@ sub pending_report {
     push @lines, (@bug_rows ? @bug_rows : ('  (none)'));
 
     # == Clear ==
-    # B2: a project whose inbox/blueprints/threads/todos/bugs section
+    # B2: a project whose inbox, blueprints, threads, todos or bugs section
     # failed to read looks identical, here, to one that genuinely has
     # nothing pending -- both leave every $v->{...} array empty. Q8 is a
     # positive claim ("nothing pending"); making that claim from a read

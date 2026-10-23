@@ -32,7 +32,7 @@ require "$Bin/BpContinuityLease.pm"
 
 my $USAGE = q{usage: butler-continuity on --new-thread <name> | on --thread <name> [--role driver] --goal '<what this session is for>' | on --role reporter [--goal '<...>'] | off [--reason '<why>'] [--token T] | off-confirm --otp <otp> --justification '<2+ words>' | emergency-stop --reason '<why>' [--area <area>] (only for a genuine defect in ccpraxis, Claude Code or another system that leaves no choice but to stop; never for finished work; files a bug report) | status};
 
-# Shared by the Decision-9 silence refusal below and Step 2's "a coordinator
+# Shared by the blueprint Decision 9 silence refusal below and Step 2's "a coordinator
 # cannot turn continuity off" check further down.
 my $COORDINATOR_OFF_REFUSAL = "a coordinator cannot turn continuity off; it stops when its ledger is terminal.";
 

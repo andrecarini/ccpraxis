@@ -1,5 +1,5 @@
 # platform: any
-# Regression for red-team H1's extend half (uncommitted change to
+# Regression for red-team H1's extend half (commit 4294be8,
 # plugins/butler/scripts/butler-hold.pl): the running holder's own
 # background-task id is now recorded in its own record as `self_task` at
 # become time (resolve_self_task_id() -- the basename, minus ".output", of
