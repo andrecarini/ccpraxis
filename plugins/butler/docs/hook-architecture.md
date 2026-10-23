@@ -54,7 +54,7 @@ and `runs/<pkg>.force-stop`.
 
 | source | event | matcher | hook |
 |---|---|---|---|
-| hooks.json | PreToolUse | Bash | guard-bash.sh, guard-git-mutations.sh --only-during-butler-run, arm-on-entry.sh, continuity-off-check.sh |
+| hooks.json | PreToolUse | Bash | guard-bash.sh, guard-git-mutations.sh --only-during-butler-run, arm-on-entry.sh, continuity-off-check.sh, guard-disarm-judge-readonly.sh |
 | hooks.json | PreToolUse | Edit\|Write\|MultiEdit\|NotebookEdit | guard-writes.sh, ledger-guard.sh, guard-blueprint-write.sh |
 | hooks.json | PreToolUse | Edit\|Write\|MultiEdit\|NotebookEdit\|Task\|Agent | gate-shutdown.sh |
 | hooks.json | PreToolUse | Task\|Agent | bind-dispatch.sh, track-dispatch.sh, guard-fork.sh |
@@ -82,6 +82,8 @@ bash -n "$f" && bash -n "$w" || exit 0; exec env -u SHELLOPTS bash "$f"`), so a 
 or wrapper never blocks (RT-M1), and neither BASH_ENV nor SHELLOPTS reach the hook's own bash (RT-L7).
 SubagentStop carries track-dispatch.sh alone, added per package 16's carried note so a subagent's own
 completion still clears its writer marker.
+
+judged-continuity-disarm package 03 added a 28th hooks.json command, guard-disarm-judge-readonly.sh on PreToolUse Bash; the count above predates it.
 
 ### file: arm-on-entry.sh
 verdict: keep
@@ -114,6 +116,14 @@ reason: Package 16 flattened this file from the pre-cutover staging tree's guard
 ### file: guard-blueprint-write.sh
 verdict: keep
 reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still denies direct blueprint.md edits and hand-written package ledgers, plus the case and 8.3-alias rule package 16 added in batch A.
+
+### file: guard-disarm-judge-readonly.sh
+verdict: keep
+reason: Package 03 of blueprint judged-continuity-disarm added this guard; it limits the headless disarm judge's Bash to the fixed read-only allowlist of Decision 7 and denies everything else.
+
+### registration: hooks.json PreToolUse [Bash] guard-disarm-judge-readonly.sh
+verdict: keep
+reason: Registered in the Bash group so every Bash call of the judge's own claude process gets an explicit allow or deny; a no-op unless CCPRAXIS_DISARM_JUDGE is exactly 1.
 
 ### file: guard-fork.sh
 verdict: keep
@@ -1232,6 +1242,7 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 | arm-nudge-prompt.sh | 1 | no run-hook.sh and no --pre (pure bash, never starts perl) : exits when BP_LEDGER is set, the payload is not a main-thread UserPromptSubmit, or the prompt is a task-notification |
 | session-start-nudge.sh | 1 | no --pre (runs on every source, armed or not) : exits only when [ -f run-hook.sh ] fails |
 | ac-standdown-gate.sh | 2 | --pre acstanddown : exits when the AC-loss stand-down marker is absent (env-only, no session file read) |
+| guard-disarm-judge-readonly.sh | 1 | no run-hook.sh and no --pre (pure bash env check, never starts perl unless set) : exits when CCPRAXIS_DISARM_JUDGE is not exactly 1 |
 
 **Who each rule applies to.** A fork counts as a subagent everywhere.
 
