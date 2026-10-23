@@ -563,7 +563,7 @@ sub merge_queue {
         # and a done package is one the orchestrator asks a harvest judge to
         # verify. The judge cannot start (no ledger), the spawn cap eventually
         # fires, and _block_and_queue files a harvest-spawn-failure naming an id
-        # that by construction has no ledger. Every bp-answer-decision.pl action
+        # that by construction has no ledger. Every bp-answer-escalation.pl action
         # (accept/drop/relaunch) resolves the ledger first and fail-closes, and
         # `acknowledge` is only available to pseudo-packages, so the operator is
         # left with a queue entry only hand-deletion can clear -- which the

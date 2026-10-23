@@ -2720,7 +2720,7 @@ sub run {
     # blueprint-done→done (the silent false-completion bug); for `record-order`/`park`
     # it would write order/park state under the wrong root where no `next` will ever
     # read it (silent state loss on a hand-run with a wrong CCPRAXIS_DATA_DIR). Mirror
-    # the siblings (bp-orchestrator / bp-answer-decision / bp-wait-for-decision), which
+    # the siblings (bp-orchestrator / bp-answer-escalation / bp-wait-for-escalation), which
     # exit nonzero when the data dir is indeterminate rather than guessing. Runs before
     # any make_path, so a wrong root never materializes a bogus .drive-solo/.
     if ($sub eq 'next' || $sub eq 'record-order' || $sub eq 'park') {

@@ -1189,7 +1189,7 @@ sub op_set_deps {
 # -------------------------------------------------------------------------------------
 # op_set_test_paths — full-replacement write of a PACKAGE LEDGER's `test_paths:`
 # frontmatter field (a02 defect 2 / spec §2.2). `--widen-write-set`
-# (bp-answer-decision.pl, outside this write set) is the precedent for `write_set`;
+# (bp-answer-escalation.pl, outside this write set) is the precedent for `write_set`;
 # there was no counterpart for `test_paths` before this. Operates on a package
 # ledger, NOT blueprint.md -- shape-validated so it cannot be mis-aimed at the wrong
 # file. Full replacement only; there is deliberately no additive/widen mode (spec

@@ -1954,10 +1954,10 @@ sub op_set_next_action {
 # blueprint Decision names each one. This is how a Decision 29 re-scope reaches the
 # contract the write-guards enforce. Before this verb, a recorded re-scope had no typed
 # path into the ledger: guard-blueprint-write.sh rightly refuses a hand edit, and
-# bp-answer-decision.pl's --widen-write-set is reachable only through the fleet's
-# decision queue, whose direct --package actions all change the package's status.
+# bp-answer-escalation.pl's --widen-write-set is reachable only through the fleet's
+# escalation queue, whose direct --package actions all change the package's status.
 #
-# Additive only, like bp-answer-decision.pl's widening: narrowing or replacing a
+# Additive only, like bp-answer-escalation.pl's widening: narrowing or replacing a
 # write_set is not a supported move (it could strand work already done under the old
 # scope). The Decision requirement keeps this from being a free "widen my own scope"
 # lever: the path must appear verbatim in a Decision row of the blueprint.md two

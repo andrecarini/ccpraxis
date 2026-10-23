@@ -41,3 +41,4 @@ Return **≤15 lines**: counts per severity, CRITICAL/HIGH items one line each, 
 - Read-only on the codebase; `Write` is for your report.
 - No exploit tooling, no traffic against deployed environments.
 - Severity discipline: CRITICAL means exploitable now with real impact — don't inflate.
+- Any manual `almanac-*.pl`/`almanac.pl` CLI invocation you run while investigating (not through a test file) must pin `HOME`/`ALMANAC_HOME` (or pass `--home`) to a scratch tempdir — never probe the real vault. An unpinned probe has leaked stale tempdir entries into the live `~/.claude/almanac-global-counts.json` before.

@@ -10,7 +10,7 @@
 # loss — it proves visibility, not durability (spec §5 edge case 8).
 #
 # Core Perl only. Never touches STDOUT/STDERR, never dies, never exits (§2.5 — callers
-# such as bp-answer-decision.pl parse their own combined stdout+stderr as JSON, so a
+# such as bp-answer-escalation.pl parse their own combined stdout+stderr as JSON, so a
 # stray line here would corrupt that).
 #
 # require:  require "<path>/bp-write-guard.pl"; BpWrite::guarded_write({ ... });

@@ -958,7 +958,7 @@ sub reconcile_one {
     # M4 (redteam): the per-record rewrite goes through BpWrite::guarded_write
     # -- the same house primitive the ledger repair above already uses --
     # rather than an unlocked read-decode-mutate-rename. Without a lock,
-    # `bp-answer-decision.pl`/`bp-resolve.pl` archiving a record and unlinking
+    # `bp-answer-escalation.pl`/`bp-resolve.pl` archiving a record and unlinking
     # its queue file, interleaved with this sweep's decode-then-rename, could
     # RESURRECT an already-answered decision (its own header states a deleted
     # id with no archive entry IS the record that a human answered it -- a

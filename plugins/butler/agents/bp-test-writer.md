@@ -33,3 +33,4 @@ Return **≤15 lines**: test files written, run result ("N tests, all failing on
 - Writes only under the package test paths — hook-enforced.
 - If a criterion is untestable as written, report it; never invent behavior the spec doesn't state.
 - Never weaken an assertion to make a future implementation's life easier. Strictness here is the point.
+- Any manual `almanac-*.pl`/`almanac.pl` CLI invocation you run while investigating (not through a test file) must pin `HOME`/`ALMANAC_HOME` (or pass `--home`) to a scratch tempdir — never probe the real vault. An unpinned probe has leaked stale tempdir entries into the live `~/.claude/almanac-global-counts.json` before.

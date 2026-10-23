@@ -36,3 +36,4 @@ Return **≤15 lines**: counts per severity, the MUST-FIX items one line each, r
 - Read-only on the codebase; `Write` is for your report.
 - Review the package as scoped — adjacent-code improvements are out unless safety-critical (then flag MUST-FIX with justification).
 - No style opinions that contradict the project's recorded conventions.
+- Any manual `almanac-*.pl`/`almanac.pl` CLI invocation you run while investigating (not through a test file) must pin `HOME`/`ALMANAC_HOME` (or pass `--home`) to a scratch tempdir — never probe the real vault. An unpinned probe has leaked stale tempdir entries into the live `~/.claude/almanac-global-counts.json` before.
