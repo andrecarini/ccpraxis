@@ -1560,19 +1560,25 @@ eval {
     # snapshot -- Decision 18 F4). All are declared in Theme.pm and, where
     # not one column, in %GLYPH_COLS above.
     #
-    # Clamp, thread only (spec 2.3): a defined global count below the
-    # project's own is shown as the project's, since the global snapshot
-    # counts every project including this one and so can never truly be
-    # lower -- a sandbox-created thread can leave it stale (refresh refuses
-    # in a container). An absent/invalid global thread count is 0, same as
-    # every other counter here, and is never clamped (behaviour 2: no
+    # Thread only ($clamp): the global snapshot counts every project, this
+    # one included, so its side is reduced by P to show the other projects
+    # alone, floored at 0 because a sandbox-created thread can leave the
+    # snapshot stale (refresh refuses in a container). It replaced the old
+    # clamp-to-P (spec 2.3) on 2026-10-23. An absent/invalid global thread
+    # count is 0, same as every other counter here (behaviour 2: no
     # snapshot renders "P", not "P.P").
     for my $c (['thread', "\x{23E3}", 1, ' ', 1], ['todo', "\x{274F}", 1, ' ', 0], ['note', "\x{2630}", 1, '', 0]) {
         my ($kind, $glyph, $has_global, $gap, $clamp) = @$c;
         my $p     = $alm_project->{$kind} // 0;
         my $g_raw = $has_global ? $alm_global->{$kind} : undef;
         my $g     = defined($g_raw) ? $g_raw : 0;
-        $g = $p if $clamp && defined($g_raw) && $g < $p;
+        # Thread only: the snapshot counts every project, this one included,
+        # so the global side shows the OTHER projects' threads (operator,
+        # 2026-10-23: global counts must not include the local count). A
+        # stale snapshot lower than P reads as none elsewhere, never negative.
+        # Todos and notes need nothing: their global side is the separate
+        # user-level vault store, which never held this project's records.
+        $g = ($g > $p ? $g - $p : 0) if $clamp && defined($g_raw);
         next unless $p > 0 || $g > 0;
         my $seg;
         if ($p > 0) {

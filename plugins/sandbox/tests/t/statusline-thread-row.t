@@ -439,7 +439,8 @@ SKIP: {
     skip('Almanac::Thread did not load', 20) unless $THREAD_OK;
 
     # Behaviour 1: P has a(live), b(handed-off), c(archived); snapshot
-    # thread.open=5, projects=[P,Q]. Host and sandbox both render "T 2.5".
+    # thread.open=5, projects=[P,Q]. Host and sandbox both render "T 2.3": the
+    # global side excludes P's own 2 (operator, 2026-10-23).
     {
         my $P = mk_proj();
         my $Q = mk_proj();
@@ -456,7 +457,7 @@ SKIP: {
             my $vis = strip_sgr(last_line($out));
             # row 1 is the first line regardless of surface.
             my $row1 = strip_sgr((split /\n/, $out)[0] // '');
-            is(counter_seg($row1, $T), "$T 2${DOT}5", "behaviour 1 (sandbox=$sb): thread counter is \"T 2.5\"")
+            is(counter_seg($row1, $T), "$T 2${DOT}3", "behaviour 1 (sandbox=$sb): thread counter is \"T 2.3\" (5 open in all, 3 elsewhere)")
                 or diag("  row 1 = [$row1]");
         }
     }
@@ -489,7 +490,8 @@ SKIP: {
             or diag("  row 1 = [$row]");
     }
 
-    # Behaviour 4: P=2, snapshot thread.open=1 -> "T 2.2" (clamp).
+    # Behaviour 4: P=2, snapshot thread.open=1 (stale, below P) -> "T 2": no
+    # other project has one, and the global side never goes negative.
     {
         my $P = mk_proj();
         create_live_thread('x4', $P);
@@ -498,7 +500,7 @@ SKIP: {
         write_snapshot($H, thread => { open => 1 });
         my ($out) = render(root => $P, home => $H);
         my $vis = strip_sgr((split /\n/, $out)[0] // '');
-        is(counter_seg($vis, $T), "$T 2${DOT}2", 'behaviour 4: G < P is clamped to P -> "T 2.2"');
+        is(counter_seg($vis, $T), "$T 2", 'behaviour 4: a stale G < P reads as none elsewhere -> "T 2", no dot');
     }
 
     # Behaviour 5: sandbox; snapshot has valid todo/note and thread.open=-1.
