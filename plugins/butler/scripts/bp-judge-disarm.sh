@@ -5,11 +5,12 @@
 # (_judge_disarm), never by hand.
 #
 # Contract: .ccpraxis-local-data/blueprints/judged-continuity-disarm/specs/
-# 03-disarm-judge-spec.md sec 2.3. Deliberately does NOT mirror bp-judge.sh's
-# shape: no bp_require_sandbox, no bp-lib.sh source, and the real launch
-# vector never carries --dangerously-skip-permissions (that flag would
-# silently disable every PreToolUse hook, including the read-only allowlist
-# guard this whole package depends on).
+# 03-disarm-judge-spec.md sec 2.3. Deliberately diverges from the existing
+# sibling judge dispatcher's shape: this file never requires a sandboxed
+# host and never sources that sibling's shared shell library, and the real
+# launch vector never carries --dangerously-skip-permissions (that flag
+# would silently disable every PreToolUse hook, including the read-only
+# allowlist guard this whole package depends on).
 #
 # Usage: bash bp-judge-disarm.sh <otp> <verdict_path> <project_root> <goal> <off_reason> <justification>
 #

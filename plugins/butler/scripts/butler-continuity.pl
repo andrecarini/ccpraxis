@@ -1050,8 +1050,8 @@ sub _judge_disarm {
         my $log = "$dir/$otp.wrapper.log";
         open(STDOUT, '>', $log) or POSIX::_exit(127);
         open(STDERR, '>>', $log) or POSIX::_exit(127);
-        exec('bash', "$Bin/bp-judge-disarm.sh", $otp, $vpath, $proot, $goal, $reason, $just);
-        POSIX::_exit(127);
+        exec('bash', "$Bin/bp-judge-disarm.sh", $otp, $vpath, $proot, $goal, $reason, $just)
+            or POSIX::_exit(127);
     }
 
     my $deadline = time() + $T + 5;
