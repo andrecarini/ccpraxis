@@ -985,4 +985,53 @@ sub claim_check {
         'AC-37: a clean fixture (everything satisfied) produces findings: [] -- non-vacuity the other way too');
 }
 
+# =====================================================================================
+# tick-step 5 names an unaccepted oracle change at the moment it is recorded, instead
+# of leaving it to the harvest audit (2026-10-23: four packages each lost a corrective
+# round to ORACLE_DRIFT_UNACCEPTED / ORACLE_SHRANK). Advisory only: exit 0, ticked.
+# =====================================================================================
+{
+    my $replace = sub { my ($dst, $src) = @_; write_file($dst, read_file($src)); };
+    my $grown_from = sub {
+        my ($descs3, $descs5) = @_;
+        my $t = gen_tap_fixture($descs3);
+        my $ledger = write_ledger(status => 'running', test_paths => fwd($t), pipeline => mk_pipeline());
+        my ($rc3) = run_pl(['tick-step', '--ledger', $ledger, '--step', '3']);
+        die "fixture: step 3 tick failed" unless $rc3 == 0;
+        $replace->($t, gen_tap_fixture($descs5));
+        return ($t, $ledger);
+    };
+
+    my ($t, $ledger) = $grown_from->(['a', 'b'], ['a', 'b', 'c']);
+    my ($rc, $out, $err) = run_pl(['tick-step', '--ledger', $ledger, '--step', '5']);
+    is($rc, 0, 'drift notice: tick-step 5 still succeeds on a grown oracle');
+    like($err, qr/oracle changed since step 3 \(assertions 2 -> 3\) without a reaccept/,
+        'drift notice: stderr names the unaccepted growth');
+    like($err, qr/--reaccept-oracle \Q@{[fwd($t)]}\E/, 'drift notice: and gives the exact re-tick');
+    like(read_file($ledger), qr/^- \[x\] 5\./m, 'drift notice: step 5 is ticked regardless');
+    # claim-check only gates a done ledger.
+    run_pl(['set-status', '--ledger', $ledger, '--status', 'done']);
+    my (undef, undef, undef, $pre) = claim_check($ledger);
+    ok(scalar(grep { ($_->{code} // '') eq 'ORACLE_DRIFT_UNACCEPTED' } @{ $pre->{findings} || [] }),
+        'drift notice: control -- claim-check sees the same drift before the reaccept');
+
+    ($rc, $out, $err) = run_pl(['tick-step', '--ledger', $ledger, '--step', '5',
+                                '--reaccept-oracle', fwd($t), '--reaccept-reason', 'added c on purpose']);
+    is($rc, 0, 'drift notice: the suggested re-tick succeeds');
+    is($err, '', 'drift notice: and is silent once reaccepted');
+    my (undef, undef, undef, $report) = claim_check($ledger);
+    ok(!grep({ ($_->{code} // '') eq 'ORACLE_DRIFT_UNACCEPTED' } @{ $report->{findings} || [] }),
+        'drift notice: claim-check agrees the drift is accepted');
+
+    ($t, $ledger) = $grown_from->(['a', 'b'], ['a', 'renamed b']);
+    ($rc, $out, $err) = run_pl(['tick-step', '--ledger', $ledger, '--step', '5']);
+    is($rc, 0, 'shrink notice: tick-step 5 still succeeds on a shrunk oracle');
+    like($err, qr/oracle SHRANK since step 3.*1 description\(s\) gone.*a reaccept does not clear a shrink/s,
+        'shrink notice: a renamed description is reported as a shrink no reaccept clears');
+
+    ($t, $ledger) = $grown_from->(['a', 'b'], ['a', 'b']);
+    ($rc, $out, $err) = run_pl(['tick-step', '--ledger', $ledger, '--step', '5']);
+    is($err, '', 'no notice: an unchanged oracle ticks step 5 silently');
+}
+
 done_testing();

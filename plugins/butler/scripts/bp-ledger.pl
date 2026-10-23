@@ -1758,6 +1758,13 @@ sub op_tick_step {
     # printed by the $post_cb, under the same lock discipline append-attempt's own
     # budget notice uses, so it can never race a concurrent invocation.
     my $sidecar_warn;
+    # Step-5 oracle changes that were NOT reaccepted. Advisory only (the
+    # fail-silent mandate: recording never subtracts availability), printed
+    # after the write. Nothing coordinator-facing documented --reaccept-oracle,
+    # so coordinators learned of it only from a failed harvest audit, one
+    # corrective round per package (where-things-go/10 and /11,
+    # judged-continuity-disarm/01 and /06, 2026-10-22/23).
+    my @drift_notices;
 
     run_op('tick-step', $opt{ledger}, sub {
         my ($B) = @_;
@@ -1799,6 +1806,10 @@ sub op_tick_step {
                     my $step3 = $step3_by_path{$path};
                     my $delta = oracle_delta($step3, $identity);
                     $args{reaccept} = { reason => $opt{'reaccept-reason'}, delta => $delta };
+                }
+                elsif ($step_n == 5 && $step3_by_path{$path}) {
+                    my $n = _oracle_change_notice($path, $step3_by_path{$path}, $identity);
+                    push @drift_notices, $n if defined $n;
                 }
                 push @candidates, build_oracle_record(%args);
             }
@@ -1875,7 +1886,36 @@ sub op_tick_step {
         return ($final, undef);
     }, sub {
         print STDERR $sidecar_warn . "\n" if defined $sidecar_warn;
+        print STDERR "bp-ledger: tick-step 5: $_\n" for @drift_notices;
     });
+}
+
+# _oracle_change_notice($path, $step3, $identity) -> $text | undef. Mirrors
+# claim-check's own classification (op_claim_check): a vanished description
+# or fewer assertions is a shrink, which no reaccept clears; any other
+# difference is drift, which --reaccept-oracle records.
+sub _oracle_change_notice {
+    my ($path, $r3, $id) = @_;
+    return undef unless ref $r3 eq 'HASH' && ref $id eq 'HASH';
+    return undef unless ($r3->{status} // '') eq 'ok' && ($id->{status} // '') eq 'ok';
+    my $delta = oracle_delta($r3, $id);
+    my $comparable = (exists $r3->{descriptions} && exists $id->{descriptions}) ? 1 : 0;
+    my @added   = $comparable ? @{ $delta->{descriptions_added} }   : ();
+    my @removed = $comparable ? @{ $delta->{descriptions_removed} } : ();
+    my $a3 = $r3->{assertions} // 0;
+    my $a5 = $id->{assertions} // 0;
+    if ($a5 < $a3 || @removed) {
+        return "$path: the oracle SHRANK since step 3 (assertions $a3 -> $a5, "
+             . scalar(@removed) . " description(s) gone). claim-check will gate this package and a reaccept "
+             . "does not clear a shrink: restore the vanished assertions (a renamed description counts as "
+             . "vanished), then tick step 5 again.";
+    }
+    my $desc_changed = $comparable ? scalar(@added) : (($r3->{descriptions_sha256} // '') ne ($id->{descriptions_sha256} // ''));
+    my $changed = $desc_changed || $a3 != $a5 || (($r3->{sha256} // '') ne ($id->{sha256} // ''));
+    return undef unless $changed;
+    return "$path: the oracle changed since step 3 (assertions $a3 -> $a5) without a reaccept; claim-check "
+         . "will gate this package at harvest. If the change is intended, tick step 5 again with "
+         . "--reaccept-oracle $path --reaccept-reason '<why>'.";
 }
 
 sub op_set_next_action {
