@@ -408,10 +408,6 @@ disarm($sid, actor=>A, reason=>T) -> under flock armlock/<sid>: removes armed/<s
                                  holder/<sid>.json, the session's stop token and its live disarm code;
                                  writes off/<sid>.
 latest_is_off($sid)           -> off/<sid> exists (Decision 36).
-set_silence($sid, reason=>T)  -> writes silence/<sid>. Only butler-continuity.pl calls it.
-take_silence($sid)            -> 1 iff silence/<sid> parses, names this sid, carries a reason of 2+
-                                 words and "by":"butler-continuity", and this call unlinked it. A
-                                 malformed file (for example one made by touch) is unlinked and ignored.
 holder($sid)                  -> holder record hashref or undef.
 holder_live($sid, $p)         -> the liveness rule of the "Liveness at Stop" section (Decision 130).
 running_work($sid, $p)        -> list of {id, type}: the payload's running background_tasks (valid ids
@@ -419,9 +415,7 @@ running_work($sid, $p)        -> list of {id, type}: the payload's running backg
                                  runs, since that holder is itself a shell task) united with -- ONLY
                                  while the holder is dead (Decision 130, M1+S3) -- the holder record's
                                  items whose agent-<id>.jsonl or cached .output changed within 60 s
-                                 (Decision 129). Deduped. Stats only, no process. `butler-continuity
-                                 silence` also calls this directly, with no background_tasks, to
-                                 refuse on the holder's dead-holder evidence even before any Stop.
+                                 (Decision 129). Deduped. Stats only, no process.
 set_running_snapshot($sid, \@work) -> writes running/<sid> atomically:
                                  {"session_id":sid,"at":iso,"work":[{"id":..,"type":..},...]}.
 clear_running_snapshot($sid)  -> unlinks running/<sid>.
@@ -434,6 +428,17 @@ take_ticket($name, \@argv)    -> the ticket hashref, undef (none), or the string
 mint_stop_token($sid)         -> a fresh token string, or undef when it cannot be stored.
 revoke_stop_token($sid)       -> removes this session's token, if any.
 take_stop_token($token)       -> the session id the token was minted for, or undef. Single use.
+mint_disarm_otp($sid, reason=>T, gate_result=>{thread=>N, broken=>0|1|2})
+                              -> a fresh 8-hex disarm code, or undef. Revokes the session's earlier
+                                 code first; stores the reason and off's doing-gate result with it.
+take_disarm_otp($otp, $sid)   -> (record, undef), or (undef, code): no-live-otp, unknown, superseded,
+                                 foreign-session, expired (900 s), corrupt, malformed, lock-timeout.
+                                 Single use: consumed on every path past the claim.
+revoke_disarm_otp($sid)       -> removes the session's live disarm code, if any. disarm calls it.
+file_stop_bug(source=>S, session=>sid, actor=>A, reason=>T, area=>X, cwd=>D)
+                              -> {id, error, note}: files one high-severity almanac bug report (one
+                                 almanac-bug.pl child, bounded at 10 s). Never dies. emergency-stop
+                                 and break-glass off call it.
 gc_sessions()                 -> removes state of sessions whose recorded transcript file is gone.
 state_dir()                   -> continuity state root, or undef (then nothing is armed). The one
                                  resolver: hooks, commands and the statusline all call it.
@@ -450,7 +455,7 @@ resolved per invocation, in this order:
 
 | role | how it is known | armed |
 |---|---|---|
-| coordinator | `BP_LEDGER` is set in the hook's environment and `BP_ROLE` is empty or `coordinator` | by construction (Decision 2). There is no file, and it can never be turned off or silenced (Decision 25). |
+| coordinator | `BP_LEDGER` is set in the hook's environment and `BP_ROLE` is empty or `coordinator` | by construction (Decision 2). There is no file, and it can never be turned off (Decision 25); `emergency-stop` files its bug report but does not disarm it. |
 | judge | `BP_LEDGER` is set and `BP_ROLE` is anything else (harvest, resolve or conformance judge) | never. A one-shot process must be free to end. |
 | driver | `armed/<sid>` exists with `"role":"driver"` (written by arm-on-entry at the director call, or by the drive-solo skill's first step `butler-continuity on --role driver`) | yes |
 | reporter | `armed/<sid>` exists with `"role":"reporter"` (`butler-continuity on --role reporter`, the reporter skill's first step, Decision 24) | yes |
@@ -467,7 +472,7 @@ is never the driver. The core does not rely on `agent_type` being `fork`. Every 
 any payload that carries an `agent_id`. Bug 20260922-205201-f421 (Decision 46) is closed by three such
 rules. A subagent's director call arms nothing and is denied in a driving session (arm-on-entry). A
 subagent's dispatch is denied in a driving session (bind-dispatch). A subagent's
-`butler-continuity on|off|silence` and `butler-hold` are refused when its ticket carries an `agent_id`.
+`butler-continuity on|off|off-confirm|emergency-stop` and `butler-hold` are refused when its ticket carries an `agent_id`.
 
 Harness-facts (a) measured `agent_id` only for `general-purpose` subagents, not for forks. Package 03
 measured this before any rule relied on it, capturing one fork's PreToolUse with
@@ -536,11 +541,11 @@ denies, and prints it in the denial text:
   failure returns undef. The lookup is one file open, never a scan.
 - Only the `Stop` event mints. SubagentStop is not registered, and the gate also refuses to mint for
   any payload that carries an `agent_id` or whose `hook_event_name` is not `Stop`.
-- A token proves the session, never the operator. It is accepted by `butler-continuity off`,
-  `butler-continuity silence` and `butler-hold`, and by nothing else.
+- A token proves the session, never the operator. It is accepted by `butler-continuity off` and
+  `butler-hold`, and by nothing else; `off-confirm` and `emergency-stop` bind by ticket only.
 
 `butler-fork-ok.pl` uses the same ticket API for its own binding, but has no `--token` path of its
-own (Decision 91 scope: stop tokens are accepted by `butler-continuity off|silence` and `butler-hold`
+own (Decision 91 scope: stop tokens are accepted by `butler-continuity off` and `butler-hold`
 only) and refuses outright when no ticket resolves. On success it writes its own one-shot record,
 `fork-ok/<session_id>.json`, consumed by `guard-fork.sh`'s next fork dispatch of that session.
 
