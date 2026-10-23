@@ -610,13 +610,14 @@ continuity/
   armed/<sid>             exists iff armed. One JSON line. mtime = last Stop gate run.
   armlock/<sid>           flock target for arm and disarm.
   off/<sid>               exists iff the latest continuity event is an off (Decision 36).
-  silence/<sid>           exists iff one stop is to be let through.
   running/<sid>           exists iff the latest armed, non-coordinator Stop of the session was denied
-                          while work was running. Holds that work; `silence` reads it (package 38).
+                          while work was running. Holds that work (package 38).
   holder/<sid>.json       the session's holder record (Holder protocol).
   holder/<sid>.lock       flock target for become, extend and holder exit.
   tickets/<k>/            command-binding tickets for one exact command.
   stop-tokens/            gate-minted stop tokens and one <sid>.current pointer per session.
+  disarm-otps/            single-use disarm codes minted by an agent off, one <sid>.current pointer per session.
+  disarm-judge/           the judge's <otp>.verdict.json and <otp>.wrapper.log per disarm attempt.
   fork-ok/<sid>.json      package 19's one-shot fork override token, minted by butler-fork-ok.
   prompted/<sid>          epoch of the session's last operator prompt (never-halt 11). Written in bash by arm-nudge-prompt.sh, read through BpHook::prompt_marker; not collected by gc_sessions.
   reasons.log             the Decision 7 reason log.
@@ -627,13 +628,10 @@ Formats, one JSON object per file, written to a same-directory temp file and ren
 
 ```
 armed/abb7e549-0e1f-4c1b-9a53-0d3b5a3c7f10
-{"session_id":"abb7e549-0e1f-4c1b-9a53-0d3b5a3c7f10","role":"driver","by":"arm-on-entry","transcript_path":"C:/Users/André/.claude/projects/C--Development-ccpraxis/abb7e549-....jsonl","at":"2026-09-24T01:02:03Z"}
+{"session_id":"abb7e549-0e1f-4c1b-9a53-0d3b5a3c7f10","role":"driver","by":"arm-on-entry","transcript_path":"C:/Users/André/.claude/projects/C--Development-ccpraxis/abb7e549-....jsonl","at":"2026-09-24T01:02:03Z","goal":"drive blueprint judged-continuity-disarm to done"}
 
 off/abb7e549-0e1f-4c1b-9a53-0d3b5a3c7f10
 {"session_id":"abb7e549-...","actor":"agent","reason":"all packages done; nothing left to run","at":"2026-09-24T05:00:00Z"}
-
-silence/abb7e549-0e1f-4c1b-9a53-0d3b5a3c7f10
-{"session_id":"abb7e549-...","by":"butler-continuity","reason":"reporting results to the operator","at":"2026-09-24T03:10:00Z"}
 ```
 
 **Who arms (Decision 1 triggers):**
@@ -651,20 +649,26 @@ The skill's first step makes an operator-fired drive-solo arm even after an earl
 solo is fired" is one of the operator's arm triggers. The director-call re-arm keeps honouring an off
 (Decision 36), and arm-on-entry is then a refresh rather than the only arming path.
 
-**Who disarms: exactly the three operator-allowed paths.** `butler-continuity off` in its operator
-form (`/butler:continuity off`), `butler-continuity off --reason` from an agent, and
-`butler-continuity silence --reason` for one stop. Nothing else removes `armed/<sid>` or turns a live
-session off. There is no age-based expiry: `is_armed` is "the file exists". A coordinator cannot be
-disarmed or silenced (Decision 25). The command refuses, and the gate ignores any file for a
-coordinator. `arm` and `disarm` serialise on `armlock/<sid>`, so parallel `on` and `off` calls in one
-message leave either an arm file or an off file, never both.
+Every `on` except `--role reporter` needs `--goal` (two words or more, at most 200 bytes), stored in
+`armed/<sid>`; arm-on-entry's director-call re-arm passes none and keeps the stored goal
+(judged-continuity-disarm Decisions 5 and 17).
+
+**Who disarms: exactly these paths.** The operator's `/butler:continuity off`, at once. An agent's
+`butler-continuity off --reason`, then `butler-continuity off-confirm --otp <code> --justification
+'<...>'`, which disarms only when the judge approves (see "Judged disarm"). `butler-continuity
+emergency-stop --reason`, unjudged, for a genuine tooling defect. The Stop gate's break-glass off (see
+"Break glass"). Nothing else removes `armed/<sid>` or turns a live session off. There is no age-based
+expiry: `is_armed` is "the file exists". A coordinator cannot be disarmed (Decision 25): the command
+refuses `off` and `off-confirm`, `emergency-stop` only files and logs, and the gate ignores any file
+for a coordinator. `arm` and `disarm` serialise on `armlock/<sid>`, so parallel `on` and `off-confirm`
+calls in one message leave either an arm file or an off file, never both.
 
 **Off is permanent until on (Decision 36).** `off` writes `off/<sid>`. arm-on-entry does not arm a
 session that has it. Only `butler-continuity on`, from the operator's `/butler:continuity on`, an agent,
 or the drive-solo and reporter first steps, deletes it.
 
 **Garbage collection, which is not a disarm.** `gc_sessions()` deletes every state file of a session
-(`armed`, `off`, `silence`, `holder`, its stop token) only when the arm or off record carries a
+(`armed`, `off`, `holder`, its stop token) only when the arm or off record carries a
 `transcript_path` and that file no longer exists on disk. A session whose transcript is gone can never
 stop again, so nothing is disarmed. Each removal appends one line to the reason log with actor `gc`,
 verb `gc` and the reason `transcript gone: <path>`. Records without a `transcript_path` are never
@@ -696,8 +700,9 @@ runs out; it is only the lease's view of activity: it never deletes a file and n
 `butler-continuity lease --daemon`, which also runs `gc_sessions()`. `keep-awake.ps1` is untouched.
 
 **Statusline contract (package 10).** `scripts/statusline.pl` resolves the root through
-`BpHook::state_dir()`, then reads `off/<sid>` (a badge when `"actor":"agent"`) and `silence/<sid>` (a
-badge when present), with no subprocess.
+`BpHook::state_dir()`, then reads `off/<sid>` (a badge when `"actor":"agent"`), with no subprocess. It
+still also reads `silence/<sid>`, a leftover of the removed silence verb that nothing writes any more
+(judged-continuity-disarm Decision 19 tracks its removal).
 
 ## Holder protocol
 
@@ -875,8 +880,8 @@ Decision 9; filtered on session_id alone, never agent_id — Decision 40).
 
 ## Reason log
 
-Decision 7: every off and silence reason goes into one log the operator can read, with session, time
-and text.
+Decision 7: every off, judged off and emergency-stop reason goes into one log the operator can read,
+with session, time and text.
 
 reason-log: ~/.claude/butler-state/continuity/reasons.log
 
@@ -886,14 +891,18 @@ One tab-separated line per event, appended with `O_APPEND` by `butler-continuity
 
 ```
 2026-09-24T05:00:00Z	abb7e549-0e1f-4c1b-9a53-0d3b5a3c7f10	agent	off	C:/Development/ccpraxis	all packages done; nothing left to run
-2026-09-24T03:10:00Z	abb7e549-0e1f-4c1b-9a53-0d3b5a3c7f10	agent	silence	C:/Development/ccpraxis	reporting results to the operator
+2026-09-24T03:10:00Z	abb7e549-0e1f-4c1b-9a53-0d3b5a3c7f10	agent	off	C:/Development/ccpraxis	all packages done; goal: drive the blueprint to done; justification: every package is done; verdict: disarm-judge/9f2c41d0.verdict.json
+2026-09-24T04:00:00Z	abb7e549-0e1f-4c1b-9a53-0d3b5a3c7f10	agent	emergency-stop	C:/Development/ccpraxis	the ticket hook fails every call; bug report: 20260924-040000-ab12
 2026-09-24T06:00:00Z	7d8355c7-3202-461f-b319-c85a3402d87c	operator	off	C:/Development/ccpraxis	(operator)
 2026-09-25T07:00:00Z	0409cb25-7656-418b-99f3-e9402646f33a	gc	gc	-	transcript gone: C:/Users/André/.claude/projects/x/0409cb25-....jsonl
 ```
 
-Fields: ISO-8601 UTC time, session id, actor (`agent`, `operator` or `gc`), verb (`off`, `silence`,
-`gc` or `fork-ok`), project root, and reason. For `off` and `silence` this is the ticket `cwd`
-resolved through `data_dir`, or `-` when the binding was a stop token or GC. For `fork-ok`,
+Fields: ISO-8601 UTC time, session id, actor (`agent`, `operator`, `coordinator`, `gate` or `gc`), verb
+(`off`, `emergency-stop`, `break-glass-off`, `refusal-cap`, `gc` or `fork-ok`), project root, and
+reason. A judged off logs `<reason>; goal: <goal>; justification: <text>; verdict:
+disarm-judge/<otp>.verdict.json`, each part cut to 70 characters; an emergency stop logs `<reason>; bug
+report: <id>`, or `bug report: FAILED (<error>)`. For `off` and `emergency-stop` the project root is
+the ticket `cwd` resolved through `data_dir`, or `-` when the binding was a stop token or GC. For `fork-ok`,
 `butler-fork-ok.pl` (package 19, Decision 64) logs the raw ticket `cwd` (or `-` if unset) each time
 it records a fork override, without the `data_dir` resolution the other verbs apply. Tabs and
 newlines in the reason become spaces. The reason is capped at 300 characters. An agent reason must
@@ -901,29 +910,29 @@ hold at least two whitespace-separated words, so it is never empty and never a s
 Otherwise the command prints
 `butler-continuity: --reason needs at least two words saying why.` and exits 1, and nothing is logged.
 An operator off without a reason logs `(operator)`. The log rolls to `reasons.log.1` past 1 MiB. The
-statusline badge (package 10) reads the per-session `off/` and `silence/` files, not this log.
+statusline badge (package 10) reads the per-session `off/` files, not this log.
 
 ## Stop gate denial text
 
 One Stop hook (Decision 5): `plugins/butler/hooks/stop-gate.sh`, logic in
 `plugins/butler/scripts/BpHook/StopGate.pm` (package 06). The ways past it are a live holder, or
-the off and silence commands, each with a reason (Decision 1, Decision 6), plus the two break-glass
-last resorts described under "Break glass" below. The text is built from the
-session's running work (Decision 128). Exact text when an armed non-coordinator session stops with no
-live holder, no silence and nothing running (Decision 8: at most 8 lines, the three commands, nothing
-else, no history). `<token>` is replaced by the token this denial minted, in all four places:
+turning continuity off (Decision 1, Decision 6). An agent's off is the two-step judged disarm, so the
+denial offers its first step and names the second. The two break-glass last resorts are described
+under "Break glass" below. The text is built from the session's running work (Decision 128). Exact
+text when an armed non-coordinator session stops with no live holder and nothing running (Decision 8:
+at most 8 lines, nothing else, no history). `<token>` is replaced by the token this denial minted, in
+all three places:
 
 ```
 Continuity is on for this session and no holder is running. Stop token: <token>
 Waiting on a subagent or background task? Hold it, as a background Bash tool call:
   butler-hold --token <token> <id> [<id> ...]
-All work done? Turn continuity off, as a Bash tool call:
+All work done? Turn continuity off (two steps: off mints an OTP, then off-confirm with it), as a Bash tool call:
   butler-continuity off --reason '<what is done>' --token <token>
-Escape hatch, only when a stop is truly necessary, e.g. to talk with an operator who is present:
-  butler-continuity silence --reason '<why this stop>' --token <token>
+(Genuine ccpraxis/Claude-Code defect, not just finished work? butler-continuity emergency-stop --reason '<the actual defect>' instead -- not a normal option.)
 ```
 
-When the payload's `background_tasks` lists running work (`running_work`), silence is not offered:
+When the payload's `background_tasks` lists running work (`running_work`), the text names it:
 
 ```
 Continuity is on for this session and work is still running: <ids><more>. Stop token: <token>
@@ -938,18 +947,17 @@ If that work is no longer needed and everything is done, turn continuity off, as
 any non-empty held item, so running work never needs the 60 s window there; when the holder is dead,
 running work also counts a held id whose agent transcript or output changed within 60 s, because a
 SendMessage-resumed agent may be missing from `background_tasks` (Decision 129, amended by Decision
-130). The gate records that work in `running/<sid>`, so a `silence` run anyway explains and points at
-hold instead of setting a silence -- and the command refuses on the same evidence even before any
-Stop (Decision 130 S1).
+130). The gate records that work in `running/<sid>`.
 
 The text is written to stderr with exit 2, and Claude Code feeds it back verbatim (harness-facts (f)).
-Silence is the escape hatch for talking with a present operator: use it sparingly, and only when a
-stop is truly necessary, because the operator's reply starts the next turn and the gate is back in
-force, whereas an off would stay off. A persistent process nobody is waiting on (a dev server, a
-`tail -f`) is not work to hold; if nothing else is pending, turn continuity off with a reason instead.
-Reasons are in single quotes so bash expands nothing in them.
+The denial names `emergency-stop` parenthetically, after the two primary bullets (hold, off): it is
+printed at every refused stop, so it is phrased as an aside for a genuine tooling defect rather than an
+equally-weighted third option beside hold and off (judged-continuity-disarm Decision 10). A persistent
+process nobody is waiting on (a dev server, a `tail -f`) is not work to hold; if nothing else is
+pending, turn continuity off with a reason instead. Reasons are in single quotes so bash expands
+nothing in them.
 
-Coordinator variant (off and silence refuse there, Decision 25). `<reason>` is exactly one of: the
+Coordinator variant (off and off-confirm refuse there, Decision 25). `<reason>` is exactly one of: the
 ledger does not exist; status '<s>' is not terminal; the ledger is <n>m stale (limit 15m);
 '## Next action' is empty or a placeholder; a fleet pause is active and status '<s>' is terminal; the
 held ids are not running background subagents. If no token could be minted, the holder line omits
@@ -979,11 +987,10 @@ if role is coordinator:
     deny(coordinator text, mint_stop_token(sid))
 if role is judge                         -> allow
 if not is_armed(sid)                     -> clear streak, allow
-if bg valid                              -> clear streak, disarm if action off, log, allow  (G6b)
+if bg valid                              -> clear streak, file a bug report, disarm, log break-glass-off, allow  (G6b)
 touch armed/<sid>                        ; activity for the wake-lock lease
 clear_running_snapshot(sid)              ; G7b: the snapshot describes only the latest Stop
-holder_live(sid, p)                      -> clear streak, allow   (checked first, so a silence is not wasted)
-take_silence(sid)                        -> clear streak, allow   (consumed by exactly this stop)
+holder_live(sid, p)                      -> clear streak, allow
 streak = bump_streak(sid, p)             ; G9b: >= REFUSAL_CAP -> clear, log, allow
 t = mint_stop_token(sid)                 ; undef -> allow, one hook-errors.log line
 work = running_work(sid, p)              ; G11
@@ -992,10 +999,8 @@ else:    deny(idle text with t, plus the break-glass lines when offered)
 ```
 
 `stop_hook_active` is never read. It resets after a wake and is not a block counter (harness-facts
-(f)). If `take_silence` cannot unlink the silence file, the stop is treated as not silenced, because a
-file that survives would let more than one stop through. If the gate cannot store a token, it allows
-the stop rather than print a denial whose way out would not work. The same holds for any exception:
-the gate fails open.
+(f)). If the gate cannot store a token, it allows the stop rather than print a denial whose way out
+would not work. The same holds for any exception: the gate fails open.
 
 ### Break glass
 
@@ -1013,31 +1018,35 @@ itself is broken:
   without `is_error` resets the count to 1. A failed result whose `tool_use` was Bash or PowerShell
   sets `shell_failed`. Without a readable `transcript_path` the cap is inert, because "stuck" cannot
   be told from "busy". It counts in the running-work branch too, so a stale running record cannot
-  loop forever. A live holder, a silence, a break-glass file or a disarm clears the streak.
-- **Break-glass file** (G2b, G6b). A silence or off request written with the Write tool, which
+  loop forever. A live holder, a break-glass file or a disarm clears the streak.
+- **Break-glass file** (G2b, G6b). An off request written with the Write tool, which
   keeps working when the shell does not, at
   `<project>/.ccpraxis-local-data/butler-break-glass/<sid>.json`. When the project has no data
   directory it goes at `<state>/break-glass/<sid>.json` instead, because Claude Code guards writes
   under `~/.claude` and the project path is the one more likely to be writable. The contents are
-  `{"token":"<token>","action":"silence"|"off","reason":"<two words or more>"}`, and the token must
+  `{"token":"<token>","action":"off","reason":"<two words or more>"}`, and the token must
   be the one the last refusal printed, so the file is exactly as bound to this session and turn as
   the shell commands are. The gate reads it before revoking that token and unlinks it whether or
   not it is valid, so a stale file never acts on a later stop. A refused file is named, with its
-  reason, in the next refusal.
+  reason, in the next refusal. A valid file files a bug report through `file_stop_bug`, as
+  `emergency-stop` does, disarms, and logs `break-glass-off`; it never goes through the judge, because
+  break glass exists for when the tooling is broken (judged-continuity-disarm Decision 26). A file
+  whose action is the removed silence is refused with a pointer to filing the question instead.
 
 The idle refusal offers the file only once the shell has visibly failed: a shell call errored since
 the previous refusal, or this is at least the `$BREAK_GLASS_HINT_AT` (2) refusal in a row with
 nothing succeeding. A healthy session never sees it, so it cannot become the habitual way out.
-The idle text is 7 lines without them, 12 with them, and 13 when a refused file is named, which
-is why stop-gate.sh's budget below is 13 rather than Decision 8's 8.
+The idle text is 6 lines without them, 11 with them, and 12 when a refused file is named;
+stop-gate.sh's budget below stays 13 rather than Decision 8's 8 (it was set when the idle text had 7
+lines).
 The running-work refusal never offers it: while work runs the way out is a hold (Decision 128), and
 a session that cannot hold still reaches the cap. The lines appended to the idle text are:
 
 ```
 No shell command can run? Last resort: create this file with the Write tool:
   <path>
-  containing {"token":"<token>","action":"silence","reason":"<why this stop>"}
-  ("action":"off" instead when all work is done).
+  containing {"token":"<token>","action":"off","reason":"<what is done>"}
+  (only when all work is done: it turns continuity off and files a bug report).
 After 5 refusals in a row with no tool call succeeding, the gate lets the stop through by itself.
 ```
 
@@ -1099,15 +1108,18 @@ false; the operator's whole-message record sets it.
 
 | call | binding says | result |
 |---|---|---|
-| `off --reason '<2+ words>'` | ticket or token, main thread | off, actor `agent` (actor `operator` if the ticket says `"operator":true`), reason logged |
-| `off` (no reason) | ticket with `"operator":true` | off, actor `operator`, logged as `(operator)` |
+| `off --reason '<2+ words>'` | ticket or token, main thread, `"operator":false` | not off: refused while a thread task is doing; else a disarm code is minted and stderr prints that disarm takes two steps, the goal, the reason and the `off-confirm` line; exit 1, continuity unchanged, nothing logged |
+| `off --reason '<2+ words>'` | ticket with `"operator":true` | off at once, actor `operator`, reason logged (judged-continuity-disarm Decision 4) |
+| `off` (no reason) | ticket with `"operator":true` | off at once, actor `operator`, logged as `(operator)` |
 | `off` (no reason) | anything else | refused: `butler-continuity: off needs --reason '<why>' unless the operator typed /butler:continuity off.`, exit 1 |
-| any of on, off, silence | ticket with `agent_id` set | refused: `butler-continuity: only the main session changes continuity; a subagent may not.`, exit 1 |
-| off or silence | `BP_LEDGER` set in the command's environment | refused: `butler-continuity: a coordinator cannot turn continuity off; it stops when its ledger is terminal.`, exit 1 (Decision 25) |
-| off, silence, status | no ticket (or two) and no valid token | refused: `butler-continuity: no session binding; use the --token from the stop message, or quote arguments in single quotes.`, exit 1 |
+| `off-confirm --otp <code> --justification '<2+ words>'` | ticket, main thread | the code is claimed (single use, this session, 15 minutes); the judge runs; approve: off, actor `agent`, thread handed off, judged reason logged, exit 0; reject: refused with the judge's reasoning, exit 1; no verdict within the bound: refused naming the wrapper log, exit 1 |
+| `emergency-stop --reason '<2+ words>' [--area <area>]` | ticket, main thread | off at once with no doing-gate and no judge, a bug report filed (a failed filing warns and still disarms), logged as `emergency-stop`; for a coordinator the bug is filed and logged but nothing is disarmed |
+| any of on, off, off-confirm, emergency-stop | ticket with `agent_id` set | refused: `butler-continuity: only the main session changes continuity; a subagent may not.`, exit 1 |
+| off or off-confirm | `BP_LEDGER` set in the command's environment | refused: `butler-continuity: a coordinator cannot turn continuity off; it stops when its ledger is terminal.`, exit 1 (Decision 25) |
+| off, status | no ticket (or two) and no valid token | refused: `butler-continuity: no session binding; use the --token from the stop message, or quote arguments in single quotes.`, exit 1 |
+| off-confirm, emergency-stop | no ticket (or two) | refused: `butler-continuity: no session binding; run it again as a plain Bash tool call with arguments in single quotes.`, exit 1 |
 | on | no ticket, or two | refused: `butler-continuity: no session binding for on; run it again as a plain Bash tool call.`, exit 1 |
-| silence | armed, and running work is present at invocation (`running/<sid>` names work from the last Stop, OR `BpHook::running_work` reports work directly, checked with no subprocess -- Decision 130 S1) | not silenced: four lines on stderr naming the work (8-id rule) and pointing at `butler-hold <ids>`, or at `off` if the work is no longer needed; exit 1, no silence file, no reason line. A given `--token` is still consumed |
-| silence | armed, no running/snapshot work, but this session's own live holder holds non-empty items (Decision 133) | not silenced: two lines on stderr naming the held ids and saying the turn can simply end, since the Stop gate already allows it while the holder runs; exit 1, no silence file, no reason line |
+| silence | anything | refused: `butler-continuity: 'butler-continuity silence' is removed: ...` with a pointer to `almanac inbox file`; exit 1, nothing consumed or logged |
 
 There is no `--session` option and no environment variable that names a session. No argument, flag,
 token or environment variable produces `"operator":true`. Only the hook sets it, from a transcript
@@ -1115,17 +1127,51 @@ record the agent cannot write. As everywhere in this repo, the threat model is a
 an agent that hand-writes a ticket file or reads another session's token out of the state directory is
 outside the model, and so is one that edits the hook. An off by either actor is permanent until `on`
 (Decision 36). Package 10 shows the badge only for `"actor":"agent"`, so the operator sees when an
-agent has turned continuity off or silenced it.
+agent has turned continuity off.
 
-Other verbs, each printing one line unless noted: `on [--role driver|reporter]`,
-`silence --reason '<2+ words>' [--token <token>]` (marked `(escape hatch: use sparingly)` in the
-usage line), `status` (at most 4 lines: arm state and role, the
-holder and its items and deadline, any pending silence; holder read through `BpHook::holder`),
-and the internal `lease --daemon`. The retired `ask`, `questions` and `answer` each refuse with one
-line naming the inbox command that replaced them (`almanac inbox file`, `almanac inbox list`,
-`almanac inbox answer`). `silence` on an unarmed session prints
-`continuity is off for this session; nothing to silence.`, exits 0 and records nothing. The command
-honours `CCPRAXIS_NO_WAKELOCK` exactly as `bp-continuity.pl` does, so tests never take the real lock.
+Other verbs, each printing one line unless noted: `on (--new-thread <name> | --thread <name>) [--role
+driver] --goal '<2+ words>'` or `on --role reporter [--goal '<...>']`, `status` (arm state and role, a
+`thread:` line, the holder and its items and deadline, and a `wake-lock:` line; holder read through
+`BpHook::holder`), and the internal `lease --daemon`. The retired `ask`, `questions` and `answer` each
+refuse with one line naming the inbox command that replaced them (`almanac inbox file`, `almanac inbox
+list`, `almanac inbox answer`). `silence` was removed outright (judged-continuity-disarm Decision 9):
+it refuses on any session, before any flag is parsed, with a pointer to `almanac inbox file`. The
+command honours `CCPRAXIS_NO_WAKELOCK` exactly as `bp-continuity.pl` does, so tests never take the real
+lock.
+
+### Judged disarm
+
+Blueprint judged-continuity-disarm (packages 01-03 and 06; decision numbers in this subsection are
+that blueprint's). An agent can no longer end an armed session on its own say-so.
+
+1. **Goal at arm.** `on` stores `--goal` in `armed/<sid>`. It is required except for `--role reporter`, and a
+   re-arm with no goal keeps the stored one (Decision 17). `off` and `off-confirm` read it back, as
+   `(no goal recorded)` when it is absent.
+2. **Step one, `off --reason`.** For an agent actor it runs the doing-gate (refusing while a thread
+   task is doing), then `mint_disarm_otp` stores the reason and the gate result under
+   `disarm-otps/<otp>`, revoking any earlier live code of the session. On stderr, with exit 1, it
+   prints that disarming takes two steps, when disarm is and is not right, the goal, the reason
+   and the exact `off-confirm` line. Continuity is unchanged. The operator form skips all of this
+   and disarms at once (Decision 4).
+3. **Step two, `off-confirm --otp <code> --justification '<2+ words>'`.** `take_disarm_otp` claims
+   the code: single use, bound to the calling session, valid for 15 minutes. A wrong, used,
+   replaced, foreign or expired code is refused and is never reusable. The doing-gate is not re-run;
+   the stored result is used (Decision 18). It then runs
+   `plugins/butler/scripts/bp-judge-disarm.sh`, a headless Sonnet judge
+   (`plugins/butler/agents/bp-disarm-judge.md`) with Read, Grep, Glob and a Bash that
+   `plugins/butler/hooks/guard-disarm-judge-readonly.sh` limits to `almanac-bug.pl list`,
+   `almanac-todo.pl list`, `git status` and `git log` (Decision 7). It waits up to 90 s, plus 5,
+   for `disarm-judge/<otp>.verdict.json` and kills the wrapper at that bound. On approve it disarms
+   with actor `agent`, hands the thread off, syncs the lease and logs the judged reason. On reject it
+   refuses with the judge's reasoning; with no verdict it refuses and names the wrapper log. Either way
+   continuity stays on, a retry needs a fresh `off`, and retries are unlimited (Decision 3).
+4. **`emergency-stop --reason '<2+ words>' [--area <area>]`** is not part of this flow. It is one call
+   with no code and no judge, for a genuine defect in ccpraxis, Claude Code or another system. It skips the
+   doing-gate, files a high-severity bug report through `file_stop_bug` (a failed filing warns
+   and still disarms, Decision 15), disarms with the usual hand-off, and logs verb
+   `emergency-stop`. For a coordinator it files and logs but does not disarm (Decision 21).
+
+Tests set `CCPRAXIS_DISARM_JUDGE_STUB=approve|reject` so that no real judge is dispatched.
 
 ## Concurrency binding store and switch
 
@@ -1339,7 +1385,7 @@ Each `SKILL.next.md` that package 15 writes (Decision 19, Decision 24) puts all 
 continuity guidance inside one block delimited by the lines `<!-- continuity:begin -->` and
 `<!-- continuity:end -->`. The budget is the number of non-blank lines inside that block.
 `plugins/butler/tests/t/continuity-prose-budget.t` fails if a file lacks exactly one such block,
-exceeds its budget, mentions `butler-hold`, `butler-continuity` or `silence` outside the block, or
+exceeds its budget, mentions `butler-hold`, `butler-continuity` or the removed `silence` outside the block, or
 mentions a retired mechanism anywhere.
 
 | plugins/butler/skills/continuity/SKILL.next.md | 40 |
@@ -1351,9 +1397,10 @@ mentions a retired mechanism anywhere.
 | skills/carry-over/SKILL.next.md | 3 |
 
 What each block must carry, in the fewest words. Continuity: when to self-arm (background work
-expected to outlive the turn, unattended multi-step work), when off and silence are acceptable and
-what a reason must say (off when all work is done; silence, a sparing escape hatch, only when a stop is
-truly necessary, e.g. to talk with an operator who is present),
+expected to outlive the turn, unattended multi-step work), the `--goal` an arm needs, when the two-step
+judged off is acceptable and what a reason and a justification must say (off when all work is done or
+the session can no longer advance its goal), that `emergency-stop` is only for a genuine tooling
+defect,
 reasons in single quotes, the stop token from a denial, how to call the holder (once, backgrounded,
 re-run to add ids), and the operator branch that 04's Skill-tool measurement decides. Drive-solo: first
 step `butler-continuity on --role driver`, hold on dispatched ids, the one-ledger dispatch rule, and
@@ -1426,12 +1473,14 @@ What package 16 changes rather than deletes, so the "exact list" above stays exa
 
 - **No Stop block cap, and a way out that depends on no other hook.** Harness-facts (f), design
   constraint 1, recommends a per-session hard cap on Stop retries. Decisions 6 and 45 retire
-  `MAX_BLOCKS=3` and forbid any way past the gate except a holder, off or silence. This design follows
-  the Decisions and removes the dead end a different way. Every denial carries a stop token minted and
-  stored by the gate itself. `butler-hold`, `butler-continuity off` and `butler-continuity silence`
-  accept it as proof of session, so the three documented exits work even when the ticket hook has
-  failed. If the gate cannot store a token, or anything in it throws, or its module cannot load, it
-  allows the stop. What remains is one paid turn per refused stop while an agent ignores a 7-line
+  `MAX_BLOCKS=3` and forbid any way past the gate except a holder or off (a third, silence, was
+  removed: judged-continuity-disarm Decision 9). This design follows the Decisions and removes the
+  dead end a different way. Every denial carries a stop token minted and stored by the gate itself.
+  `butler-hold` and `butler-continuity off` accept it as proof of session. An agent's `off --token`
+  still mints a disarm code, but `off-confirm` binds by ticket only, so with the ticket hook broken the
+  remaining ways out are a hold, the break-glass file and the refusal cap. If the gate cannot store a
+  token, or anything in it throws, or its module cannot load, it
+  allows the stop. What remains is one paid turn per refused stop while an agent ignores a 5-line
   instruction, and the case where the command scripts themselves are broken, which every package's
   `perl-compile` check guards. There is no turn cap to fall back on: `--max-turns` does not exist in
   2.1.280.
@@ -1462,13 +1511,13 @@ depend on the variable.
 ### D-1
 question: Does /compact change the session id in-process?
 if yes: The compacted session starts with an unarmed id. A drive-solo session re-arms at its next director call, a reporter or manual session must run butler-continuity on again, and the old id's arm file stays until its transcript is gone, no longer holding the wake-lock once its transcript has gone an hour with no activity (Decision 53).
-if no: nothing changes; arm state, holder and silence stay attached to the unchanged id.
+if no: nothing changes; arm state, holder and any live disarm code stay attached to the unchanged id.
 assumed: no
 
 ### D-2
 question: Does the in-process $CLAUDE_CODE_SESSION_ID follow the new id after /clear?
 if yes: nothing changes; no component reads the variable, and commands bind to the session through tickets written by a hook that sees the payload session_id, or through a stop token the gate minted for that session.
-if no: nothing changes, for the same reason; a stale variable cannot misdirect an arm, off, silence or holder.
+if no: nothing changes, for the same reason; a stale variable cannot misdirect an arm, off, off-confirm or holder.
 assumed: no
 
 ### D-3
