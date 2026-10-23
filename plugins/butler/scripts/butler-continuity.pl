@@ -23,7 +23,7 @@ use strict;
 use warnings;
 use FindBin qw($Bin);
 use JSON::PP ();
-use POSIX qw(strftime);
+use POSIX qw(strftime WNOHANG);
 use Cwd ();
 
 require "$Bin/BpHook.pm"
@@ -884,6 +884,7 @@ sub _complete_disarm {
     my ($actor, $reason, $T, $broken, %o) = @_;
     my $tag    = $o{tag}    // 'off';
     my $logged_text = $o{logged} // $reason;
+    my $log_text = $o{log} // $logged_text;
     my $was_armed = BpHook::is_armed($SID);
     my $plan_ldir   = BpContinuityLease::legacy_dir();
     my $live_before = defined $plan_ldir ? (BpContinuityLease::any_active($plan_ldir) ? 1 : 0) : 0;
@@ -891,7 +892,7 @@ sub _complete_disarm {
     unless ($ok) {
         refuse("could not write continuity state (" . (BpHook::last_error() // '') . ").");
     }
-    my $logged = BpHook::log_reason($SID, $actor, $tag, $logged_text, $PROJECT);
+    my $logged = BpHook::log_reason($SID, $actor, $tag, $log_text, $PROJECT);
 
     my $note = $was_armed ? '' : '; was not armed';
     out("continuity off for session $S8 (actor $actor$note); reason logged.\n");
@@ -918,6 +919,18 @@ sub _complete_disarm {
     plan_after_off($plan_ldir)
         if $live_before && defined $plan_ldir && !BpContinuityLease::any_active($plan_ldir);
     return;
+}
+
+# _stored_goal() -- the sanitized goal recorded at $ROOT/armed/$SID, or
+# '(no goal recorded)' when absent (extracted from `off`'s old inline block,
+# judged-continuity-disarm pkg 03 E2, so `off-confirm`'s judge dispatch can
+# read the same goal `off` already shows the caller).
+sub _stored_goal {
+    my $goal = '';
+    my $d = read_json_file("$ROOT/armed/$SID");
+    $goal = (ref $d eq 'HASH' && defined $d->{goal} && !ref $d->{goal}) ? sanitize_text($d->{goal}) : '';
+    $goal = '(no goal recorded)' unless length $goal;
+    return $goal;
 }
 
 if ($verb eq 'off') {
@@ -948,13 +961,7 @@ if ($verb eq 'off') {
     my $otp = BpHook::mint_disarm_otp($SID, reason => $reason, gate_result => { thread => $T, broken => $broken });
     refuse("could not mint a disarm code (" . (BpHook::last_error() // '') . ").") unless defined $otp;
 
-    # Goal line: read exactly as status does (:956-958).
-    my $goal = '';
-    {
-        my $d = read_json_file("$ROOT/armed/$SID");
-        $goal = (ref $d eq 'HASH' && defined $d->{goal} && !ref $d->{goal}) ? sanitize_text($d->{goal}) : '';
-    }
-    $goal = '(no goal recorded)' unless length $goal;
+    my $goal = _stored_goal();
 
     binmode(STDERR, ':raw');
     print STDERR _bytes(join('',
@@ -993,8 +1000,117 @@ if ($verb eq 'off-confirm') {
         # degrades to the existing warning rather than a wrong hand-off.
         $broken = 1 unless _almanac_present() && eval { _load_thread(); 1 };
     }
-    _complete_disarm($actor, $reason, $T, $broken);
+    my $just = sanitize_text($flags{justification});
+    my $goal = _stored_goal();
+    my $v = _judge_disarm($flags{otp}, $goal, $reason, $just);    # hashref or undef
+    unless ($v) {
+        refuse("judge did not return a verdict; continuity is still on (details: $ROOT/disarm-judge/$flags{otp}.wrapper.log). "
+             . "Run butler-continuity off --reason '<why>' again for a fresh code to retry.");
+    }
+    if ($v->{verdict} eq 'reject') {
+        refuse("disarm rejected by the judge: " . sanitize_text($v->{reason})
+             . " -- continuity is still on. The code is used up; run butler-continuity off --reason '<why>' again for a fresh one.");
+    }
+    _complete_disarm($actor, $reason, $T, $broken, log => _judged_log_text($reason, $goal, $just, $flags{otp}));
     exit 0;
+}
+
+# _judge_disarm($otp, $goal, $reason, $just) -- judged-continuity-disarm pkg
+# 03 E4. Forks bp-judge-disarm.sh (no shell involved: exec with an argv
+# array), waits for its OTP-keyed verdict file up to T+5s, hard-kills the
+# wrapper itself if it overruns that bound, and returns the decoded verdict
+# hashref (only when its `otp` field matches), or undef on any failure
+# (missing/invalid verdict, fork failure, or deadline exceeded).
+sub _judge_disarm {
+    my ($otp, $goal, $reason, $just) = @_;
+    return undef unless defined $otp && length $otp;
+
+    # T (sec 2.1): same validation as the wrapper applies to its own copy of
+    # this var, so the two processes always agree.
+    my $traw = $ENV{CCPRAXIS_DISARM_JUDGE_TIMEOUT_SECONDS};
+    my $T = 90;
+    if (defined $traw && $traw =~ /^[0-9]+$/ && $traw >= 1 && $traw <= 90) {
+        $T = $traw + 0;
+    }
+
+    my $dir = "$ROOT/disarm-judge";
+    eval { require File::Path; File::Path::make_path($dir) };
+    my $vpath = "$dir/$otp.verdict.json";
+    unlink $vpath;    # clear before dispatch (DC8 stale-same-path defense).
+
+    my $proot = ($PROJECT ne '-') ? $PROJECT
+              : (defined $TICKET_CWD && length $TICKET_CWD) ? $TICKET_CWD
+              : Cwd::getcwd();
+
+    my $pid = fork();
+    return undef unless defined $pid;
+
+    if ($pid == 0) {
+        open(STDIN, '<', '/dev/null') or POSIX::_exit(127);
+        my $log = "$dir/$otp.wrapper.log";
+        open(STDOUT, '>', $log) or POSIX::_exit(127);
+        open(STDERR, '>>', $log) or POSIX::_exit(127);
+        exec('bash', "$Bin/bp-judge-disarm.sh", $otp, $vpath, $proot, $goal, $reason, $just);
+        POSIX::_exit(127);
+    }
+
+    my $deadline = time() + $T + 5;
+    my $wrapper_done = 0;
+    while (1) {
+        if (-e $vpath) { last }
+        my $w = waitpid($pid, POSIX::WNOHANG());
+        if (defined $w && $w == $pid) { $wrapper_done = 1; last }
+        if (time() >= $deadline) {
+            kill('TERM', $pid);
+            select(undef, undef, undef, 0.2);
+            kill('KILL', $pid);
+            waitpid($pid, 0);
+            $wrapper_done = 1;
+            last;
+        }
+        select(undef, undef, undef, 0.1);
+    }
+
+    unless ($wrapper_done) {
+        # The verdict file appeared before the wrapper exited: still reap it,
+        # bounded, so we never leave a zombie behind.
+        my $reap_deadline = time() + 2;
+        while (time() < $reap_deadline) {
+            my $w = waitpid($pid, POSIX::WNOHANG());
+            last if defined $w && $w == $pid;
+            select(undef, undef, undef, 0.1);
+        }
+        unless ((waitpid($pid, POSIX::WNOHANG()))[0]) {
+            kill('TERM', $pid);
+            select(undef, undef, undef, 0.2);
+            kill('KILL', $pid);
+            waitpid($pid, 0);
+        }
+    }
+
+    my $d = read_json_file($vpath);
+    return undef unless ref $d eq 'HASH';
+    return undef unless defined $d->{otp} && $d->{otp} eq $otp;
+    return undef unless defined $d->{verdict} && ($d->{verdict} eq 'approve' || $d->{verdict} eq 'reject');
+    return undef unless defined $d->{reason} && !ref $d->{reason} && length $d->{reason};
+    return $d;
+}
+
+# _judged_log_text($reason, $goal, $just, $otp) -- judged-continuity-disarm
+# pkg 03 E5. Each of reason/goal/just is cut to at most 70 characters
+# (substr(...,0,67).'...' when longer), so the combined text -- at most 280
+# characters -- always fits inside BpHook::log_reason's 300-character cut
+# without dropping a component (DC2). The pointer is relative to $ROOT, the
+# directory reasons.log itself lives in.
+sub _judged_log_text {
+    my ($reason, $goal, $just, $otp) = @_;
+    my $cut = sub {
+        my ($s) = @_;
+        $s = '' unless defined $s;
+        return length($s) > 70 ? (substr($s, 0, 67) . '...') : $s;
+    };
+    return $cut->($reason) . '; goal: ' . $cut->($goal) . '; justification: ' . $cut->($just)
+         . '; verdict: disarm-judge/' . $otp . '.verdict.json';
 }
 
 # emergency-stop (judged-continuity-disarm pkg 06, spec 2.2 j, Decisions 10,
