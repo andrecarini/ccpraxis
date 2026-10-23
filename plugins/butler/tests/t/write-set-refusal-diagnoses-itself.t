@@ -173,8 +173,10 @@ like($out_corrupt, qr/contains whitespace: not a path \(report 20260916-175013-3
 # it did not need.
 like($out_corrupt, qr/serialized wrong and the scope is already correct/,
      'refusal offers the serialization reading, not only the scope-dispute reading');
-like($out_corrupt, qr/nothing re-derives BP_WRITE_SET mid-session/,
-     'refusal says why an in-session ledger repair will not help -- relaunch is the only recovery');
+# Since 2026-10-23 the guard unions the ledger's live write_set/test_paths
+# into the launch snapshot, so an in-session widening is the recovery.
+like($out_corrupt, qr/ledger is re-read on every write: widen it with bp-ledger\.pl widen-write-set/,
+     'refusal names the in-session recovery (widen the ledger), not a relaunch');
 
 # ---- 6. no regression: a path genuinely outside scope is still denied --------
 {

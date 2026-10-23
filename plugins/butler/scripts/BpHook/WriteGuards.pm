@@ -611,6 +611,21 @@ sub _coordinator_worker {
     return defined($w) ? $w : '';
 }
 
+# _union_paths($a, $b) -> the ':'-joined union of two ':'-separated path
+# lists, $a's entries first, order kept, duplicates and empties dropped.
+sub _union_paths {
+    my ($a, $b) = @_;
+    my (@out, %seen);
+    for my $s ($a, $b) {
+        next unless defined $s && !ref $s && length $s;
+        for my $e (split /:/, $s) {
+            next unless length $e;
+            push @out, $e unless $seen{$e}++;
+        }
+    }
+    return join(':', @out);
+}
+
 # ---------------------------------------------------------------------------
 # resolve($p) -- sec 2.4. Exposed for tests.
 # ---------------------------------------------------------------------------
@@ -630,6 +645,22 @@ sub resolve {
         $pkg = (defined $pkg && length $pkg) ? $pkg : 'pkg';
         my $ws = defined($ENV{BP_WRITE_SET})  ? $ENV{BP_WRITE_SET}  : '';
         my $tp = defined($ENV{BP_TEST_PATHS}) ? $ENV{BP_TEST_PATHS} : '';
+        # The env pair is a snapshot from bp-launch.sh. A widening recorded
+        # mid-session through bp-ledger.pl widen-write-set / set-test-paths
+        # (which require a blueprint Decision naming the path) never reached
+        # it, so the coordinator was refused its own sanctioned paths and had
+        # to park for a relaunch that only re-reads this same ledger
+        # (judged-continuity-disarm/02 at 16:01Z and /03 at 02:11Z,
+        # 2026-10-22/23). The ledger's current fields are now unioned in:
+        # nothing a relaunch would not grant, and a narrowing still waits for
+        # one, exactly as before.
+        if (-f $ledger_b) {
+            my $fm = _read_frontmatter($ledger_b);
+            if (ref $fm eq 'HASH') {
+                $ws = _union_paths($ws, $fm->{write_set});
+                $tp = _union_paths($tp, $fm->{test_paths});
+            }
+        }
         my $worker = _coordinator_worker($bp_dir_b);
         return {
             mode       => 'coordinator',
@@ -956,8 +987,9 @@ sub _deny_write_set {
                 @pat_lines,
                 sprintf('  test_paths: %s', _test_paths_display($P->{test_paths})),
                 'This may be serialized wrong and the scope is already correct, rather than a real '
-              . 'scope dispute: nothing re-derives BP_WRITE_SET mid-session, so an in-session ledger '
-              . 'repair will not help -- relaunch is the only recovery.',
+              . 'scope dispute.',
+                'The ledger is re-read on every write: widen it with bp-ledger.pl widen-write-set '
+              . '(or set-test-paths) and retry; no relaunch is needed.',
                 'Record the scope problem under Next action and escalate; the orchestrator re-scopes packages.',
             );
             return [ map { _cfit($_) } @lines ];
