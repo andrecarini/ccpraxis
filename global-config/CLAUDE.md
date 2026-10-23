@@ -17,6 +17,21 @@ A skill's `description:` is a trigger contract, not just discovery metadata. Whe
 - Never arm for one interactive answer.
 - Hooks nudge toward arming on such a prompt, and when work has gone on a long time with no operator message. Nudges are advice; whether to arm stays your call.
 
+## What goes where
+
+Each kind of record has one home, written through its own skill or script.
+
+- **Thread and its tasks** (`/almanac:thread`): your handover for work under way, which the operator reads to see where things stand. Tasks are the steps actively under way; move a step's status rather than writing progress notes.
+- **Todo** (`/almanac:todo`): work not yet in a thread. Taking it up moves it into a thread (`todo promote`); it is never copied.
+- **Inbox** (`/almanac:inbox`): only what needs the operator, at product level: a question, a manual check, a taste call. A technical call you can settle from the code, the docs or a measurement never goes here.
+- **Note** (`/almanac:note`): a durable fact a future session needs; see "Durable facts go in almanac notes" below.
+- **Bug** (`/almanac:bug-report`): a ccpraxis tooling defect, scheduled against the blueprint package that fixes it.
+- **Blueprint** (`/blueprint:create`): planned multi-session work, split into packages that each keep a ledger.
+
+Links point one way, from an item to its blueprint package: a task or bug names its package, and a package ledger never names a task or bug. Answer the reverse question by scanning.
+
+Arming (previous section) attaches the session to a thread; how is in `/butler:continuity`. To check in, `/sitrep` reports the current project in full and `/pending` lists everything open across every project.
+
 ## House rules learned across projects
 
 Recurring preferences that surfaced in multiple project memories — promoted here so they apply everywhere, not just where they were first observed.

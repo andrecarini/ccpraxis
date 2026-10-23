@@ -105,7 +105,7 @@ reason: Package 16 flattened this file from the pre-cutover staging tree's guard
 
 ### file: guard-ask-operator.sh
 verdict: keep
-reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still refuses AskUserQuestion while unattended work runs and files the question as an almanac pending decision.
+reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still refuses AskUserQuestion while unattended work runs and files the question as an inbox item.
 
 ### file: guard-bash.sh
 verdict: keep
@@ -1105,9 +1105,9 @@ Other verbs, each printing one line unless noted: `on [--role driver|reporter]`,
 `silence --reason '<2+ words>' [--token <token>]` (marked `(escape hatch: use sparingly)` in the
 usage line), `status` (at most 4 lines: arm state and role, the
 holder and its items and deadline, any pending silence; holder read through `BpHook::holder`),
-`ask --text '<question>'` (files a pending decision in the almanac decision store via
-`Almanac::Decision::file`), `questions`, `answer --id <id> --answer '<text>'`, and the internal
-`lease --daemon`. `silence` on an unarmed session prints
+and the internal `lease --daemon`. The retired `ask`, `questions` and `answer` each refuse with one
+line naming the inbox command that replaced them (`almanac inbox file`, `almanac inbox list`,
+`almanac inbox answer`). `silence` on an unarmed session prints
 `continuity is off for this session; nothing to silence.`, exits 0 and records nothing. The command
 honours `CCPRAXIS_NO_WAKELOCK` exactly as `bp-continuity.pl` does, so tests never take the real lock.
 

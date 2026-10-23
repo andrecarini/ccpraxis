@@ -36,4 +36,4 @@ perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" inbox blocks <id>
 
 An item filed with `--choices` is answered with `--choice` (one of them) and an optional `--note`;
 any other item with `--answer`. A task waiting on an inbox item carries `--blocked-on <inbox-id>`
-(see /almanac:task); `answer` lists the tasks it unblocks.
+(see /almanac:thread); `answer` lists the tasks it unblocks.

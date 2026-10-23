@@ -1,6 +1,6 @@
 ---
 name: note
-description: Keep a durable fact as an almanac note, a pointer plus metadata for a file that holds the fact, in project or global scope. Use proactively when you learn something a future session needs and would otherwise lose, such as a platform quirk, a measured figure or an operator preference, and use when the operator says "remember this" or "make a note". Skip for work still to do (/almanac:todo), for task progress (/almanac:task), and for facts already written in CLAUDE.md or a tracked doc.
+description: Keep a durable fact as an almanac note, a pointer plus metadata for a file that holds the fact, in project or global scope. Use proactively when you learn something a future session needs and would otherwise lose, such as a platform quirk, a measured figure or an operator preference, and use when the operator says "remember this" or "make a note". Skip for work still to do (/almanac:todo), for steps of work under way (/almanac:thread), and for facts already written in CLAUDE.md or a tracked doc.
 allowed-tools: Bash, Read
 ---
 
