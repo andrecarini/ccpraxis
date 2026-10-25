@@ -14,6 +14,8 @@ use Getopt::Long qw(:config pass_through);
 use File::Path qw(make_path);
 use Cwd qw(abs_path getcwd);
 use MIME::Base64 qw(decode_base64);
+use Time::HiRes qw(time);
+use Encode ();
 
 my $JSON = JSON::PP->new->utf8->pretty->canonical;
 
@@ -21,10 +23,11 @@ my $JSON = JSON::PP->new->utf8->pretty->canonical;
 
 my $cmd = shift @ARGV // 'help';
 
-my ($opt_port, $opt_tab);
+my ($opt_port, $opt_tab, $opt_headless);
 GetOptions(
-    'port=i' => \$opt_port,
-    'tab=s'  => \$opt_tab,
+    'port=i'   => \$opt_port,
+    'tab=s'    => \$opt_tab,
+    'headless' => \$opt_headless,
 );
 
 # --- Dispatch ---
@@ -63,40 +66,132 @@ sub output {
     print $JSON->encode($data);
 }
 
-sub http_get {
-    my ($host, $port, $path) = @_;
+# Every caller talks to a DevTools endpoint on this machine, which accepts in
+# about a millisecond. Windows takes a full 2 s to report a refused localhost
+# connect (it retries the SYN), so a long connect timeout made every probe of
+# an empty port cost 2 s and a scan of 9222-9232 cost 22 s.
+use constant CONNECT_TIMEOUT => 0.5;
+use constant READ_TIMEOUT    => 5;     # whole response, not per read
 
-    my $sock = IO::Socket::INET->new(
+sub _connect {
+    my ($host, $port) = @_;
+    IO::Socket::INET->new(
         PeerAddr => $host,
         PeerPort => $port,
         Proto    => 'tcp',
-        Timeout  => 2,
-    ) or return undef;
+        Timeout  => CONNECT_TIMEOUT,
+    );
+}
 
+sub port_in_use {
+    my ($port) = @_;
+    my $sock = _connect('localhost', $port) or return 0;
+    close $sock;
+    1;
+}
+
+# One HTTP/1.1 request; returns the body of a 2xx response, else undef.
+#
+# The response ends where its framing says it does: Content-Length, or the
+# last chunk of a chunked body. Chrome ignores `Connection: close` and holds
+# the socket open, so waiting for EOF -- what this did before -- returned the
+# body only after the read timeout expired: 3 s on every call, for a body that
+# had arrived in 6 ms (measured on Chrome 151). EOF still ends a response that
+# carries neither header.
+sub http_request {
+    my ($method, $host, $port, $path) = @_;
+
+    my $sock = _connect($host, $port) or return undef;
     binmode $sock;
     # HTTP/1.1, not 1.0: as of Chrome 151 the DevTools HTTP endpoint
     # closes HTTP/1.0 connections without sending a response at all.
-    # `Connection: close` keeps this a single-shot request regardless.
-    syswrite($sock, "GET $path HTTP/1.1\r\nHost: $host:$port\r\nConnection: close\r\n\r\n")
-        or return undef;
+    syswrite($sock, "$method $path HTTP/1.1\r\nHost: $host:$port\r\n"
+                  . "Content-Length: 0\r\nConnection: close\r\n\r\n")
+        or do { close $sock; return undef };
 
-    my $sel = IO::Select->new($sock);
-    my $response = '';
-    while ($sel->can_read(3)) {
-        my $n = sysread($sock, my $chunk, 8192);
-        last unless $n;
-        $response .= $chunk;
+    my $sel      = IO::Select->new($sock);
+    my $deadline = time() + READ_TIMEOUT;
+    my $buf      = '';
+    my ($status, %hdr, $hlen);
+    my $eof = 0;
+
+    my $complete = sub {
+        return 0 unless defined $hlen;
+        my $body_len = length($buf) - $hlen;
+        if (defined $hdr{'content-length'}) {
+            return $body_len >= $hdr{'content-length'};
+        }
+        if (($hdr{'transfer-encoding'} // '') =~ /\bchunked\b/i) {
+            return defined _dechunk(substr($buf, $hlen));
+        }
+        return $eof;
+    };
+
+    until ($eof || $complete->()) {
+        my $left = $deadline - time();
+        last if $left <= 0 || !$sel->can_read($left);
+        my $n = sysread($sock, my $chunk, 65536);
+        if (!$n) { $eof = 1; last }
+        $buf .= $chunk;
+        if (!defined $hlen && $buf =~ /\r\n\r\n/) {
+            $hlen = $+[0];
+            my ($line, @lines) = split /\r\n/, substr($buf, 0, $hlen - 4);
+            ($status) = ($line // '') =~ m{^HTTP/\d\.\d\s+(\d{3})};
+            for (@lines) {
+                $hdr{lc $1} = $2 if /^([^:]+):\s*(.*?)\s*$/;
+            }
+        }
     }
     close $sock;
 
-    return $1 if $response =~ /\r\n\r\n(.*)/s;
-    undef;
+    return undef unless defined $hlen && defined $status && $status =~ /^2/;
+    return undef unless $eof || $complete->();
+    my $body = substr($buf, $hlen);
+    if (defined $hdr{'content-length'}) {
+        return substr($body, 0, $hdr{'content-length'});
+    }
+    if (($hdr{'transfer-encoding'} // '') =~ /\bchunked\b/i) {
+        return _dechunk($body);
+    }
+    $body;
+}
+
+sub http_get { http_request('GET', @_) }
+
+# A complete chunked body -> its payload; undef while chunks are still due.
+sub _dechunk {
+    my ($raw) = @_;
+    my ($out, $pos) = ('', 0);
+    while (1) {
+        my $eol = index($raw, "\r\n", $pos);
+        return undef if $eol < 0;
+        my ($size) = substr($raw, $pos, $eol - $pos) =~ /^([0-9a-fA-F]+)/;
+        return undef unless defined $size;
+        $size = hex $size;
+        $pos = $eol + 2;
+        return $out if $size == 0;
+        return undef if length($raw) < $pos + $size + 2;
+        $out .= substr($raw, $pos, $size);
+        $pos += $size + 2;
+    }
+}
+
+# A filesystem path is UTF-8 bytes; the JSON encoder takes characters, so a
+# path printed as-is came out double-encoded (AndrÃ© for André).
+sub disp {
+    my ($path) = @_;
+    my $copy = $path;
+    my $chars = eval { Encode::decode('UTF-8', $copy, Encode::FB_CROAK()) };
+    defined $chars ? $chars : $path;
 }
 
 sub to_native_path {
     my ($path) = @_;
-    # Convert msys /c/... to C:/... for Win32 programs like Chrome
-    if ($^O eq 'msys' && $path =~ m{^/([a-zA-Z])(/.*)?$}) {
+    # Convert msys /c/... to C:/... for Win32 programs like Chrome. Git for
+    # Windows' perl reports $^O as 'cygwin', not 'msys': testing for 'msys'
+    # alone left every path unconverted, and Chrome got the right profile only
+    # because MSYS happened to rewrite --user-data-dir=/c/... on exec.
+    if (($^O eq 'msys' || $^O eq 'cygwin') && $path =~ m{^/([a-zA-Z])(/.*)?$}) {
         return uc($1) . ':' . ($2 // '/');
     }
     $path;
@@ -120,17 +215,76 @@ sub detect_chrome {
     undef;
 }
 
-sub profile_dir {
-    to_native_path(getcwd() . '/.chrome-puppet/profile');
+# The directory holding .chrome-puppet/. Anchored on the project, not on the
+# current directory: a shell that drifted into a subdirectory used to get a
+# fresh profile there, and with it a second Chrome. The nearest .chrome-puppet/
+# between the current directory and the git toplevel wins; failing that the
+# toplevel; outside a git repo, the current directory.
+my $puppet_root;
+sub puppet_root {
+    return $puppet_root if defined $puppet_root;
+    my $cwd = to_native_path(getcwd());
+    chomp(my $top = `git rev-parse --show-toplevel 2>/dev/null` // '');
+    return $puppet_root = $cwd unless $? == 0 && length $top;
+    $top = to_native_path($top);
+    for (my $d = $cwd; length($d) >= length($top); ) {
+        return $puppet_root = $d if -d "$d/.chrome-puppet";
+        last if lc($d) eq lc($top);
+        (my $up = $d) =~ s{/[^/]+/?\z}{};
+        last if $up eq $d;
+        $d = $up;
+    }
+    $puppet_root = $top;
+}
+
+sub state_dir   { puppet_root() . '/.chrome-puppet' }
+sub profile_dir { state_dir() . '/profile' }
+sub port_file   { state_dir() . '/port' }
+
+# 1 if a Chrome is running on this profile, else 0.
+# Windows: Chrome holds <profile>/lockfile open without write sharing while it
+# runs, so an append-open fails ("Device or resource busy", measured); a
+# lockfile left behind by a crash opens fine. Elsewhere SingletonLock is a
+# symlink to "<host>-<pid>".
+sub profile_in_use {
+    my ($prof) = @_;
+    if ($^O eq 'MSWin32' || $^O eq 'msys' || $^O eq 'cygwin') {
+        my $lock = "$prof/lockfile";
+        return 0 unless -e $lock;
+        open(my $fh, '>>', $lock) or return 1;
+        close $fh;
+        return 0;
+    }
+    my $link = readlink("$prof/SingletonLock");
+    return 0 unless defined $link;
+    my ($pid) = $link =~ /-(\d+)\z/;
+    return 1 unless $pid;
+    (kill(0, $pid) || $!{EPERM}) ? 1 : 0;
+}
+
+# The CDP port of the Chrome running on this project's profile, or undef.
+# `launch` records the port it chose in .chrome-puppet/port. Chrome writes
+# DevToolsActivePort only when it picks the port itself
+# (--remote-debugging-port=0); with the fixed port used here it writes nothing
+# (measured, Chrome 151). Reading only that file, `launch` never found its own
+# instance and ran Chrome again, which Chrome hands to the running instance as
+# a new window. A recorded port counts only while the profile is in use, so a
+# stale file never attaches to some other Chrome that later took the port.
+sub running_port {
+    my $prof = profile_dir();
+    return undef unless profile_in_use($prof);
+    for my $file (port_file(), "$prof/DevToolsActivePort") {
+        my $port = _read_port_file($file) or next;
+        return $port if http_get('localhost', $port, '/json/version');
+    }
+    undef;
 }
 
 sub resolve_port {
     return $opt_port if $opt_port;
 
-    # Check DevToolsActivePort file first (fast path)
-    my $prof = profile_dir();
-    my $port_from_file = _read_active_port($prof);
-    return $port_from_file if $port_from_file;
+    my $port = running_port();
+    return $port if $port;
 
     # Fallback: scan port range for any CDP instance
     for my $p (9222..9232) {
@@ -158,20 +312,14 @@ sub resolve_tab {
     $tabs->[0]{id};
 }
 
-sub _read_active_port {
-    my ($prof_dir) = @_;
-    my $file = "$prof_dir/DevToolsActivePort";
-    return undef unless -f $file;
-
+# First line of a port file (ours or DevToolsActivePort), or undef.
+sub _read_port_file {
+    my ($file) = @_;
     open my $fh, '<', $file or return undef;
     my $port = <$fh>;
     close $fh;
-    chomp $port if defined $port;
-    return undef unless $port && $port =~ /^\d+$/;
-
-    # Verify CDP is actually responding on this port
-    my $body = http_get('localhost', $port, '/json/version');
-    $body ? int($port) : undef;
+    return undef unless defined $port && $port =~ /^\s*(\d+)\s*$/;
+    int($1);
 }
 
 sub with_cdp {
@@ -235,9 +383,9 @@ sub cmd_launch {
     }
 
     # 3. Add to .gitignore if this is a git repo
-    my $cwd = to_native_path(getcwd());
+    my $root = puppet_root();
     if (system("git rev-parse --git-dir >/dev/null 2>&1") == 0) {
-        my $gitignore = "$cwd/.gitignore";
+        my $gitignore = "$root/.gitignore";
         my $has_entry = 0;
         if (-f $gitignore) {
             if (open my $fh, '<', $gitignore) {
@@ -258,15 +406,16 @@ sub cmd_launch {
     }
 
     # 4. Check for already-running instance
-    my $existing_port = _read_active_port($prof);
+    my $existing_port = running_port();
     if ($existing_port) {
+        _write_port_file($existing_port);
         my $ver = _get_version($existing_port);
         output({
             ok             => \1,
             status         => 'existing',
             port           => $existing_port,
             cdp_endpoint   => "http://localhost:$existing_port",
-            profile_dir    => $prof,
+            profile_dir    => disp($prof),
             chrome_path    => $chrome,
             setup_actions  => \@setup_actions,
             chrome_version => $ver,
@@ -274,11 +423,21 @@ sub cmd_launch {
         return;
     }
 
-    # 5. Find a free port
+    # Running on this profile but unreachable over CDP (started by hand, or
+    # its port record is gone): launching again would only open another
+    # window in that instance and then wait for a CDP port that never comes.
+    if (profile_in_use($prof)) {
+        output({ ok => \0, profile_dir => disp($prof),
+                 error => "Chrome is already running on " . disp($prof) . " but its DevTools "
+                        . "endpoint is unreachable. Close that Chrome, then run "
+                        . "launch again (or pass --port if you know its port)." });
+        exit 1;
+    }
+
+    # 5. Find a free port: nothing listening at all, not merely no CDP.
     my $port;
     for my $p (9222..9232) {
-        my $body = http_get('localhost', $p, '/json/version');
-        unless ($body) {
+        unless (port_in_use($p)) {
             $port = $p;
             last;
         }
@@ -299,6 +458,7 @@ sub cmd_launch {
         '--window-size=1920,1080',
         '--disable-background-networking',
     );
+    push @args, '--headless=new' if $opt_headless;
 
     my $pid = fork();
     if (!defined $pid) {
@@ -326,17 +486,27 @@ sub cmd_launch {
         output({ ok => \0, error => "Chrome launched but CDP not responding on port $port after 10s" });
         exit 1;
     }
+    _write_port_file($port);
 
     output({
         ok             => \1,
         status         => 'launched',
         port           => $port,
         cdp_endpoint   => "http://localhost:$port",
-        profile_dir    => $prof,
+        profile_dir    => disp($prof),
         chrome_path    => $chrome,
         setup_actions  => \@setup_actions,
         chrome_version => _get_version($port),
     });
+}
+
+sub _write_port_file {
+    my ($port) = @_;
+    my $file = port_file();
+    return if (_read_port_file($file) // 0) == $port;
+    open(my $fh, '>', $file) or return;
+    print $fh "$port\n";
+    close $fh;
 }
 
 sub _get_version {
@@ -372,8 +542,10 @@ sub cmd_tab_new {
 
     my $url  = $ARGV[0] // '';
     $url =~ s/[\r\n]//g;  # Prevent HTTP request splitting
+    $url =~ s/ /%20/g;    # A space would end the request target
     my $path = $url ? "/json/new?$url" : '/json/new';
-    my $body = http_get('localhost', $port, $path);
+    # PUT: Chrome answers GET /json/new with 405 "Using unsafe HTTP verb GET".
+    my $body = http_request('PUT', 'localhost', $port, $path);
 
     unless ($body) {
         output({ ok => \0, error => "Failed to create new tab" });
@@ -409,7 +581,11 @@ sub cmd_status {
     }
 
     my $body = http_get('localhost', $port, '/json/version');
-    my $ver  = eval { JSON::PP->new->utf8->decode($body) } // {};
+    my $ver  = defined $body ? eval { JSON::PP->new->utf8->decode($body) } : undef;
+    unless (ref $ver eq 'HASH') {
+        output({ ok => \0, error => "No DevTools endpoint answering on port $port" });
+        exit 1;
+    }
     output({ ok => \1, result => { port => $port, version => $ver } });
 }
 
@@ -510,7 +686,7 @@ sub cmd_screenshot {
         close $fh;
 
         output({ ok => \1, result => {
-            file => to_native_path(abs_path($file)),
+            file => disp(to_native_path(abs_path($file))),
             size => length($data),
         }});
     });
@@ -656,7 +832,7 @@ sub cmd_help {
     output({ ok => \1, result => {
         usage    => 'chrome-puppet.pl <command> [--port PORT] [--tab ID] [args...]',
         commands => {
-            launch       => 'Detect Chrome, setup dirs, find port, launch, verify CDP',
+            launch       => "Reuse this project's running Chrome, or set up, launch and verify CDP [--headless]",
             tabs         => 'List open tabs',
             'tab-new'    => 'Open a new tab [url]',
             'tab-close'  => 'Close a tab <id>',

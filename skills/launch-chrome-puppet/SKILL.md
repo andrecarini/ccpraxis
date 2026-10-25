@@ -54,6 +54,7 @@ All subcommands output JSON. Parse the `ok` field to check success.
 
 **Common options:** `--port PORT` and `--tab ID` override auto-detection.
 When omitted, the script finds the running instance and first page tab automatically.
+`launch --headless` starts Chrome without a window.
 
 ## Usage pattern
 
@@ -73,7 +74,13 @@ perl "${CLAUDE_SKILL_DIR}/scripts/chrome-puppet.pl" screenshot results.png
 - The `eval` subcommand is the escape hatch — for anything the built-in commands
   don't cover, write JavaScript and run it via eval.
 - The profile persists at `.chrome-puppet/profile/` in the project directory,
-  so cookies and sessions survive across relaunches.
-- If Chrome is already running with this project's profile, `launch` reports the
-  existing instance instead of starting a second one.
+  so cookies and sessions survive across relaunches. The project directory is
+  the nearest one holding `.chrome-puppet/` up to the git toplevel, else the
+  toplevel, else the current directory, so running from a subdirectory reuses
+  the same profile.
+- `launch` records its port in `.chrome-puppet/port`. If Chrome is already
+  running with this project's profile, `launch` reports that instance
+  (`"status": "existing"`) instead of starting a second one. If that Chrome is
+  running but its DevTools endpoint is unreachable, `launch` fails and asks for
+  it to be closed, rather than opening another window in it.
 - Screenshots are saved relative to the current working directory.
