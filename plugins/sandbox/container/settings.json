@@ -89,6 +89,7 @@
    "showClearContextOnPlanAccept" : true,
    "showThinkingSummaries" : true,
    "skillOverrides" : {
+      "algorithmic-art" : "off",
       "artifact-capabilities" : "off",
       "artifact-design" : "off",
       "artifact-diagramming" : "off",
@@ -97,6 +98,7 @@
       "code-review" : "off",
       "dataviz" : "off",
       "fewer-permission-prompts" : "off",
+      "google-workspace" : "off",
       "loop" : "off",
       "run" : "off",
       "run-skill-generator" : "off",
