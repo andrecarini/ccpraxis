@@ -91,6 +91,7 @@ use File::Path qw(make_path);
 use File::Basename qw(dirname);
 use File::Temp ();
 use Cwd qw(abs_path);
+use Encode ();
 
 # ===========================================================================
 # phase_spec / run_phase -- the contract packages 01+02 share (spec S2.1/S2.2)
@@ -644,6 +645,7 @@ sub _do_u5 {
         return { failed => 'ccpraxis-helpers.pl sync-skills produced unparseable output: '
                           . substr($r->{out} // '', 0, 200) };
     }
+    $j = _sanitize_utf8($j);
 
     my $status  = $j->{status} // '';
     my @results = @{ $j->{results} // [] };
@@ -679,6 +681,7 @@ sub _do_u6 {
         return { failed => 'ccpraxis-helpers.pl check-claude-md produced unparseable output: '
                           . substr($r->{out} // '', 0, 200) };
     }
+    $j = _sanitize_utf8($j);
 
     my $status = $j->{status} // '';
     $ctx->{checkpoint}->('check_claude_md', {
@@ -1342,6 +1345,34 @@ sub _git_current_branch {
     return undef unless length($b);
     return undef if $b eq 'HEAD';
     return $b;
+}
+
+# UTF-8 discipline helpers -- duplicated from Export.pm/Closeout.pm VERBATIM,
+# as Closeout.pm's header explains (no shared helper module).
+#
+# decode_json() widens every non-ASCII string it returns, and neither the
+# run-state writer (Run.pm) nor backup.pl's stdout encoder uses ->utf8, so a
+# widened string reaching $ctx is written as a lone Latin-1 byte. That is how
+# U5's skills_synced note put "Andr\xE9" into backup.pl's stdout, which a
+# strict UTF-8 reader rejects whole (bug 20261026-020158-c0c2). Every
+# decode_json() result that reaches a note or checkpoint is downgraded to raw
+# UTF-8 bytes here first.
+sub _ensure_utf8_bytes {
+    my ($s) = @_;
+    return $s unless defined $s;
+    return Encode::encode('UTF-8', $s) if utf8::is_utf8($s);
+    my $probe = $s;
+    return $s if eval { Encode::decode('UTF-8', $probe, Encode::FB_CROAK()); 1 };
+    return Encode::encode('UTF-8', Encode::decode('ISO-8859-1', $s));
+}
+
+sub _sanitize_utf8 {
+    my ($v) = @_;
+    my $ref = ref($v);
+    if ($ref eq 'HASH')  { return { map { _sanitize_utf8($_) => _sanitize_utf8($v->{$_}) } keys %$v }; }
+    if ($ref eq 'ARRAY') { return [ map { _sanitize_utf8($_) } @$v ]; }
+    if ($ref eq '')      { return _ensure_utf8_bytes($v); }
+    return $v;   # JSON::PP::Boolean or any other blessed ref -- pass through
 }
 
 # N10 (MINOR)/N2 (NIT): U3 already clamped its captured detail at 4000
