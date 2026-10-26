@@ -1955,4 +1955,44 @@ for my $case (
     }
 }
 
+# ===========================================================================
+# Bug 20261026-020158-c0c2 -- U5's skills_synced note carried a skills path
+# widened by decode_json, which the run-state writer and backup.pl's stdout
+# encoder (both without ->utf8) wrote as a lone 0xE9 byte. A strict UTF-8
+# reader then rejected the driver's whole stdout object. The same for U6's
+# claude_md_status note, whose live/repo paths come from the same kind of
+# subprocess JSON.
+# ===========================================================================
+{
+    my $accented = "Andr\x{e9}";
+    my $skills_json = JSON::PP->new->utf8->canonical->encode({
+        status => 'ok', platform => 'unix', count => 1,
+        results => [ { action => 'copied', name => 'pending',
+                       src => "/c/Users/$accented/.claude/ccpraxis/skills/pending",
+                       dst => "/c/Users/$accented/.claude/skills/pending" } ],
+    });
+    my $claude_md_json = JSON::PP->new->utf8->canonical->encode({
+        status => 'differs', live => "/c/Users/$accented/.claude/CLAUDE.md",
+        repo => "/c/Users/$accented/.claude/ccpraxis/global-config/CLAUDE.md",
+    });
+    my $r = setup_root(with_origin => 0);
+    my $resp = run_backup($r, { STUB_SYNC_SKILLS_JSON => $skills_json, STUB_CLAUDE_MD_JSON => $claude_md_json });
+    ok((defined $resp->{json}), 'c0c2: the driver stdout parses as strict UTF-8 JSON')
+        or diag($resp->{out} . $resp->{err});
+
+    my $raw = read_text($r->{state_path});
+    my $valid = (defined $raw && eval { my $probe = $raw; Encode::decode('UTF-8', $probe, FB_CROAK); 1 }) ? 1 : 0;
+    ok($valid, 'c0c2: the run-state file is valid UTF-8 after a non-ASCII skills sync');
+    ok((defined $raw && index($raw, "Andr\xC3\xA9/.claude/skills/pending") >= 0),
+        'c0c2: the synced skill path is stored as UTF-8 bytes (C3 A9)');
+
+    my $state = read_state($r->{state_path});
+    my $note = defined $state ? find_note($state, 'skills_synced') : undef;
+    is((defined $note ? $note->{value}[0]{dst} : undef), "/c/Users/$accented/.claude/skills/pending",
+        'c0c2: the skills_synced note decodes back to the original path');
+    my $cm = defined $state ? find_note($state, 'claude_md_status') : undef;
+    is((defined $cm ? $cm->{value}{live} : undef), "/c/Users/$accented/.claude/CLAUDE.md",
+        'c0c2: the claude_md_status note decodes back to the original path');
+}
+
 done_testing();
