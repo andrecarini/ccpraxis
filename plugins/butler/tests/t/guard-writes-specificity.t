@@ -315,4 +315,47 @@ sub edit_payload {
         or diag("guard output: $out");
 }
 
+# ── bug 20260825-175738-5a8d: a downstream project's own test-file shape.
+#    test_paths functions/test/llm/ (20 chars) covers the file, and a write_set
+#    glob functions/test/llm/gemini* (27 chars) is the longer match. The
+#    test-writer was blocked from its own test file; a .test.ts under
+#    test_paths is a test whatever a write_set glob says. A fixture in the
+#    same directory stays the implementer's. ─────────────────────────────────
+{
+    my %base = (BP_PACKAGE => 'pkg',
+                BP_TEST_PATHS => 'functions/test/llm/',
+                BP_WRITE_SET  => 'functions/src/llm/gemini.ts:functions/test/llm/citations*:functions/test/llm/gemini*');
+    my $test_file = 'functions/test/llm/gemini-verbete-citations.test.ts';
+
+    my ($proj, $bpd) = mk_env();
+    write_marker($bpd, 'pkg', 'butler:bp-test-writer');
+    my ($rc, $out) = run_guard(edit_payload($proj, $test_file),
+        %base, BP_LEDGER => "$bpd/packages/pkg.md", BP_DIR => $bpd, BP_PROJECT_ROOT => $proj);
+    is($rc, 0, '5a8d: bp-test-writer may write a .test.ts that a longer write_set glob also matches')
+        or diag("guard output: $out");
+
+    ($proj, $bpd) = mk_env();
+    write_marker($bpd, 'pkg', 'butler:bp-implementer');
+    ($rc, $out) = run_guard(edit_payload($proj, $test_file),
+        %base, BP_LEDGER => "$bpd/packages/pkg.md", BP_DIR => $bpd, BP_PROJECT_ROOT => $proj);
+    is($rc, 2, '5a8d: bp-implementer may not modify that same test file');
+    like($out, qr/may not modify test files/, '5a8d: and is told it is a test file');
+
+    ($proj, $bpd) = mk_env();
+    write_marker($bpd, 'pkg', 'butler:bp-implementer');
+    ($rc, $out) = run_guard(edit_payload($proj, 'functions/test/llm/gemini-fixture.json'),
+        %base, BP_LEDGER => "$bpd/packages/pkg.md", BP_DIR => $bpd, BP_PROJECT_ROOT => $proj);
+    is($rc, 0, '5a8d: a non-test file the write_set glob claims (a fixture) stays the implementer\'s')
+        or diag("guard output: $out");
+
+    for my $shape (qw(functions/test/llm/a.spec.tsx functions/test/llm/a_test.go functions/test/llm/test_a.py)) {
+        ($proj, $bpd) = mk_env();
+        write_marker($bpd, 'pkg', 'butler:bp-test-writer');
+        ($rc, $out) = run_guard(edit_payload($proj, $shape),
+            %base, BP_WRITE_SET => 'functions/test/llm/a*:functions/test/llm/test_*',
+            BP_LEDGER => "$bpd/packages/pkg.md", BP_DIR => $bpd, BP_PROJECT_ROOT => $proj);
+        is($rc, 0, "5a8d: $shape is test-shaped for bp-test-writer") or diag("guard output: $out");
+    }
+}
+
 done_testing();

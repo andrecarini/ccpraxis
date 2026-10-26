@@ -867,6 +867,22 @@ sub _longest {
     return ($best_len, $best_pat);
 }
 
+# _is_test_shape($rel) -> 1 when the path LOOKS like a test file. Consulted
+# only for a path a test_paths pattern already covers: there it makes the
+# file a test even when a write_set pattern is the longer match, so a
+# write_set glob can never take a real test file away from bp-test-writer.
+#
+# ccpraxis's own tests/t/*.t was the only shape until bug 20260825-175738-5a8d:
+# a downstream package with test_paths functions/test/llm/ and a write_set
+# glob functions/test/llm/gemini* (27 chars against 20) had its test-writer
+# blocked from writing functions/test/llm/gemini-verbete-citations.test.ts.
+# The shapes are matched on the basename and are the common conventions:
+# foo.test.ts / foo.spec.tsx (JS/TS), x_test.go / x_test.py / x_spec.rb,
+# test_x.py. Java-style FooTest.java is left out on purpose: case-folded on a
+# case-insensitive host it reads *test.java and would claim latest.java.
+# A non-test file in a test directory (a fixture, a helper) keeps its
+# write_set ownership. A test-shaped file stays a test even when the
+# write_set names it literally, the rule MAJOR-2/MINOR-8 already set for .t.
 sub _is_test_shape {
     my ($rel) = @_;
     my $rel_m = _is_ci() ? _foldc($rel) : $rel;
@@ -874,6 +890,10 @@ sub _is_test_shape {
         my $re = _glob_to_regex($pat);
         return 1 if $rel_m =~ $re;
     }
+    (my $base = $rel_m) =~ s{\A.*/}{};
+    return 1 if $base =~ /\A[^.]+(?:\.[^.]+)*\.(?:test|spec)\.[A-Za-z0-9]+\z/;
+    return 1 if $base =~ /\A.+_(?:test|spec)\.[A-Za-z0-9]+\z/;
+    return 1 if $base =~ /\Atest_.+\.py\z/;
     return 0;
 }
 
