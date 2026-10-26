@@ -1535,18 +1535,9 @@ SKIP: {
         my $tp  = transcript_path_for($sid);
         write_transcript($tp);
 
-        write_ticket_for($sid, ['RACE1'], transcript_path => $tp, background => 1);
-        my ($pid, $outf, $errf) = spawn_hold(['RACE1'],
-            { BUTLER_HOLD_TEST_SECONDS => 20, BUTLER_HOLD_TEST_TICK => 0.2 });
-        my $h = wait_for_holder($sid, 10);
-        unless (defined $h) {
-            kill('KILL', $pid);
-            waitpid($pid, 0);
-            unlink $outf, $errf;
-            push @resurrected, "$sid (no initial become)";
-            next;
-        }
-
+        # Minted before RACE1 becomes, too: an agent off is refused while
+        # this session holds running work (bug 20260826-121852-3570), and
+        # the race below is off-confirm against an extend, not off itself.
         # judged-continuity-disarm package 02: agent `off` now only mints a
         # disarm OTP (two-step). The race this block drives is about
         # BpHook::disarm()'s own lock discipline, which now runs inside
@@ -1579,6 +1570,18 @@ SKIP: {
         unlink $out_mint, $err_mint;
         my ($otp) = ($mint_err =~ /^  butler-continuity off-confirm --otp ([0-9a-f]{8}) --justification '/m);
         ok(defined $otp, "R5-m1-$i: off minted an 8-hex-char disarm OTP") or diag("stderr: $mint_err");
+
+        write_ticket_for($sid, ['RACE1'], transcript_path => $tp, background => 1);
+        my ($pid, $outf, $errf) = spawn_hold(['RACE1'],
+            { BUTLER_HOLD_TEST_SECONDS => 20, BUTLER_HOLD_TEST_TICK => 0.2 });
+        my $h = wait_for_holder($sid, 10);
+        unless (defined $h) {
+            kill('KILL', $pid);
+            waitpid($pid, 0);
+            unlink $outf, $errf;
+            push @resurrected, "$sid (no initial become)";
+            next;
+        }
 
         # Force the EXACT window review m1 names: hold the SAME lock
         # become/extend serialise on (holder/<sid>.lock) from the test

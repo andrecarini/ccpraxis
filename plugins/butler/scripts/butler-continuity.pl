@@ -963,6 +963,22 @@ if ($verb eq 'off') {
 
     my ($T, $broken) = _off_doing_gate();
 
+    # Bug 20260826-121852-3570: a reporter whose fleet had settled disarmed,
+    # put a six-hour deploy in the background and ended its turn; nothing woke
+    # it for 5 h 43 min. Work the session itself still holds is unfinished
+    # work, so an agent's off waits for it. The holder already wakes the
+    # session when its items finish or at its deadline. The operator's own
+    # off stays a one-call override.
+    if ($actor eq 'agent') {
+        my $h = BpHook::holder($SID);
+        if (defined $h && BpHook::holder_live($SID, {})) {
+            my $items = (ref $h->{items} eq 'ARRAY') ? sanitize_text(join(', ', @{ $h->{items} })) : '';
+            $items = 'its items' unless length $items;
+            refuse("off refused: this session's holder is still waiting on running work ($items). "
+                 . "It wakes this session when that work finishes or its hold ends; act on what it reports, then run off again.");
+        }
+    }
+
     if ($actor eq 'operator') {
         # Decision 4: the operator path is unchanged -- disarms in one call,
         # never mints, never prints an OTP.
