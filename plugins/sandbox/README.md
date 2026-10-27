@@ -196,6 +196,37 @@ launch.
 
 ---
 
+## Project sandbox settings (`claude-sandbox.json`)
+
+A project may put a `claude-sandbox.json` at its root to (1) build its own image layer on top of
+the shared `claude-sandbox` image and (2) ask for a fixed allowlist of extra container settings.
+Read and validated by `scripts/ProjectSandbox.pm`; the rules are held by `tests/t/project-sandbox.t`.
+
+```json
+{
+  "image": { "context": "container/dev", "containerfile": "Containerfile",
+             "build_args": { "PIN_MODE": "strict" } },
+  "run":   { "devices": ["/dev/fuse"], "security_opt": ["label=disable"],
+             "volumes": [ { "name": "cells-storage", "target": "/var/lib/containers" } ] }
+}
+```
+
+- **Image layer.** The project's Containerfile gets the shared image as `--build-arg BASE_IMAGE`
+  (start it with `ARG BASE_IMAGE` and `FROM ${BASE_IMAGE}`). The layer is tagged
+  `localhost/<container>-image:<hash>`, the hash covering the base image id, the build args and
+  every file of the context, so an unchanged layer is reused and a changed one rebuilt. A failed
+  layer build stops the launch; the old container is untouched.
+- **Run settings, allowlisted only.** `devices` may contain `/dev/fuse`; `security_opt` may contain
+  `label=disable` (what podman inside the sandbox needs). `volumes` are named volumes, scoped to
+  the container (`<container>-<name>`), so their data survives a rebuild; targets may not cover
+  `/project`, `/root/.claude` or system directories. **There is no way to ask for anything else**
+  (no `--privileged`, capabilities, host binds or host network): the manifest is a file the agents
+  can edit, so an unknown key or value fails the launch closed, with the reason.
+- **Visible.** Every launch prints what the manifest grants. A changed manifest, or a changed file
+  of the image context, marks the container stale (the usual rebuild prompt).
+
+---
+
 ## Data durability
 
 | Event | Host's `.ccpraxis-local-data/claude-home/` state |
@@ -322,7 +353,7 @@ it stays alive + processing throughout.
 │   ├── claude-sandbox.ps1             # PowerShell shim → launcher.pl
 │   └── claude-sandbox.sh              # Bash shim → launcher.pl
 ├── container/
-│   ├── Containerfile                  # debian:bookworm-slim + claude install
+│   ├── Containerfile                  # debian:trixie-slim + claude install
 │   ├── CLAUDE.md                      # blueprint copied into each container
 │   └── settings.json                  # blueprint copied into each container
 ├── scripts/

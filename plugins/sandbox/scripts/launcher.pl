@@ -163,6 +163,7 @@ use ClaudeConfig ();      # self-heal .claude.json onboarding-bypass (0-byte / l
 use PluginSync ();  # Fix 2: copy-model plugin-store reconcile (copy/prune/reconcile)
 use PortAlloc ();         # fix-multiple-running-sandboxes: per-container port-block allocation
 use SandboxLock ();       # 04-build-race-lock: generalised mkdir lock + global build-race guard
+use ProjectSandbox ();    # claude-sandbox.json: a project's image layer + allowlisted run settings
 use JSON::PP ();          # parse backpack.json + write the approved install-set
 use Errno ();              # 04-run-panel-ledger-truth: %! (EPERM) for _pid_alive's kill(0,...) probe
 use File::Path qw(make_path);
@@ -2491,6 +2492,76 @@ sub build_image {
     _write_file("$LAUNCHER_DIR/containerfile-hash", containerfile_hash());
 }
 
+# ensure_project_image($spec, $force, $container_name) -> the image reference to create the container from.
+#
+# With no "image" in the project's claude-sandbox.json this is the shared image, unchanged. With
+# one, the project's Containerfile is built ON TOP of the shared image (passed as
+# --build-arg BASE_IMAGE) and tagged by a hash of everything it is built from (base image id,
+# build args, every context file -- ProjectSandbox::image_hash), so an unchanged project layer is
+# never rebuilt and a changed one never reused. $force (an explicit rebuild) builds regardless.
+# A failed build exits, like build_image: the old container, if any, is still there.
+sub ensure_project_image {
+    my ($spec, $force, $container_name) = @_;
+    return $IMAGE_LATEST unless $spec && $spec->{image};
+    my $base_id = do {
+        open my $fh, '-|', $PODMAN, 'image', 'inspect', '--format', '{{.Id}}', $IMAGE_LATEST
+            or die "cannot run $PODMAN: $!\n";
+        local $/;
+        my $out = <$fh> // '';
+        close $fh;
+        $out =~ s/\s+\z//;
+        $? == 0 ? $out : '';
+    };
+    unless (length $base_id) {
+        _launch_fail('image', 'shared image missing before the project layer', 1);
+        _fail_visibly("ERROR: the shared image $IMAGE_LATEST is missing, so the project layer cannot be built.");
+        LaunchLog::close_log($LAUNCH_LOG);
+        SandboxLock::release($LOCK_DIR);
+        exit 1;
+    }
+    my $img  = $spec->{image};
+    my $hash = ProjectSandbox::image_hash($PROJECT_PATH, $spec, $base_id);
+    my $tag  = ProjectSandbox::image_tag($container_name, $hash);
+    # Quiet existence probe: `image inspect` prints the whole image JSON on success.
+    my $have;
+    {
+        open my $null, '>', File::Spec->devnull;
+        open my $save_out, '>&', \*STDOUT; open my $save_err, '>&', \*STDERR;
+        open STDOUT, '>&', $null; open STDERR, '>&', $null;
+        $have = system($PODMAN, 'image', 'inspect', $tag) == 0;
+        open STDOUT, '>&', $save_out; open STDERR, '>&', $save_err;
+    }
+    if ($have && !$force) {
+        log_ev('project_image_reuse', { tag => $tag });
+        return $tag;
+    }
+    my $ctx = winify_path("$PROJECT_PATH/$img->{context}");
+    my $cf  = winify_path("$PROJECT_PATH/$img->{context}/" . ($img->{containerfile} // 'Containerfile'));
+    my $ba  = $img->{build_args} || {};
+    _emit_step(_c_step("Building the project image layer ($img->{context}) on $IMAGE_LATEST..."), "\n");
+    log_ev('project_image_build_start', { tag => $tag });
+    _tx("\n--- project image build ($tag) ---\n");
+    my $rc = _tee_system($PODMAN, 'build',
+        '--build-arg', "BASE_IMAGE=$IMAGE_LATEST",
+        (map { ('--build-arg', "$_=$ba->{$_}") } sort keys %$ba),
+        '-f', $cf, '-t', $tag, $ctx);
+    if ($rc != 0) {
+        log_ev('project_image_build_failed', { exit => $rc >> 8, tag => $tag });
+        _launch_fail('image', 'project image build failed', $rc >> 8);
+        _fail_visibly(
+            "ERROR: building the project image layer failed (exit @{[$rc >> 8]}).",
+            "  The output above is podman's own explanation; the file is $img->{context}/"
+                . ($img->{containerfile} // 'Containerfile') . " in this project.",
+            "  Full transcript: $CLAUDE_DATA/sandbox-logs/launch-$LAUNCH_ID.transcript.log",
+        );
+        LaunchLog::close_log($LAUNCH_LOG);
+        SandboxLock::release($LOCK_DIR);
+        exit 1;
+    }
+    log_ev('project_image_build_ok', { tag => $tag });
+    return $tag;
+}
+
 sub _write_file {
     my ($path, $contents) = @_;
     make_path(dirname($path)) unless -d dirname($path);
@@ -2935,6 +3006,48 @@ run_perl_to_file('MCP discovery snapshot',    $MCP_SNAPSHOT_FILE,    'discover-m
 # =====================================================================
 
 my @STALE_REASONS;
+
+# Project sandbox settings: an optional claude-sandbox.json at the project root may add the
+# project's own image layer and ask for a fixed allowlist of extra container settings
+# (ProjectSandbox.pm). The manifest is agent-editable, so anything it asks for outside the
+# allowlist fails the launch CLOSED, and what it grants is printed on every launch.
+my ($PROJECT_SPEC, $PROJECT_SPEC_ERRORS) = ProjectSandbox::load($PROJECT_PATH);
+if (@$PROJECT_SPEC_ERRORS) {
+    log_ev('project_sandbox_invalid', { errors => join('; ', @$PROJECT_SPEC_ERRORS) });
+    _launch_fail('create', 'claude-sandbox.json is not accepted', 1);
+    _fail_visibly(
+        "ERROR: this project's claude-sandbox.json is not accepted:",
+        (map { "  - $_" } @$PROJECT_SPEC_ERRORS),
+        "",
+        "  Fix or remove the file, then run claude-sandbox again.",
+    );
+    LaunchLog::close_log($LAUNCH_LOG);
+    SandboxLock::release($LOCK_DIR);
+    exit 1;
+}
+if ($PROJECT_SPEC) {
+    my @grants = ProjectSandbox::describe($PROJECT_SPEC);
+    _emit_step(_c_step("Project sandbox settings (claude-sandbox.json): " . join('; ', @grants)), "\n");
+    log_ev('project_sandbox', { grants => join('; ', @grants) });
+}
+# The image the container is created from: the shared image, or the project's layer on top of
+# it (set by ensure_project_image just before `podman create`).
+my $CREATE_IMAGE = $IMAGE_LATEST;
+# What the container must be recreated for: the manifest itself, or any file of the project
+# image's context. The base image is not part of it -- a base rebuild is already its own trigger.
+my $CURRENT_PROJECT_SIG = $PROJECT_SPEC
+    ? ProjectSandbox::spec_signature($PROJECT_SPEC)
+      . ($PROJECT_SPEC->{image} ? ':' . ProjectSandbox::image_hash($PROJECT_PATH, $PROJECT_SPEC, '') : '')
+    : 'none';
+{
+    my $saved = _read_file("$LAUNCHER_DIR/project-sandbox-signature");
+    chomp $saved if defined $saved;
+    # A container created before this record existed has, by construction, no project settings.
+    $saved = 'none' if !(defined $saved && length $saved) && _container_exists($CONTAINER_NAME);
+    if (defined $saved && length $saved && $saved ne $CURRENT_PROJECT_SIG) {
+        push @STALE_REASONS, "  - Project sandbox settings (claude-sandbox.json or its image files) changed since the container was created";
+    }
+}
 
 # A VERSION MISMATCH IS NOT A SUGGESTION.
 #
@@ -5046,6 +5159,10 @@ if (! _container_exists($CONTAINER_NAME)) {
     # a freshly-allocated port block and recreate the container. Reads the
     # current @pub_port_args / @PORT_ENV_ARGS, which $refresh_port_args
     # rewrites on each reallocation.
+    #
+    # The project's own image layer, if its claude-sandbox.json has one, is built (or reused)
+    # here, before create: the container must be created FROM it.
+    $CREATE_IMAGE = ensure_project_image($PROJECT_SPEC, $do_rebuild, $CONTAINER_NAME);
     $build_create_args = sub {
         my @args = (
             $PODMAN, 'create', '-it',
@@ -5124,7 +5241,10 @@ if (! _container_exists($CONTAINER_NAME)) {
         push @args, @PLUGIN_MOUNTS;
         push @args, @EXTRA_MOUNTS;
         push @args, @BACKPACK_MOUNTS;
-        push @args, $IMAGE_LATEST;
+        # The project's allowlisted extras (claude-sandbox.json "run": /dev/fuse, label=disable,
+        # container-scoped named volumes), validated at load; nothing else can be added here.
+        push @args, ProjectSandbox::create_args($PROJECT_SPEC, $CONTAINER_NAME);
+        push @args, $CREATE_IMAGE;
 
         # Rewrite every `-v HOST:CONTAINER[:opts]` pair into
         # `--mount type=bind,…` to defeat MSYS2's `:`-as-path-list mangling on
@@ -5198,6 +5318,8 @@ if (! _container_exists($CONTAINER_NAME)) {
     _write_file("$LAUNCHER_DIR/container-created",
         strftime("%Y-%m-%dT%H:%M:%S", gmtime(time)));
     _write_file("$LAUNCHER_DIR/launcher-hash",    launcher_hash());
+    # The project settings this container was created with, for the drift check above.
+    _write_file("$LAUNCHER_DIR/project-sandbox-signature", $CURRENT_PROJECT_SIG);
     {
         # Decision 19 (review M2): record the mask signature this container
         # was actually created with, so the drift check above has something

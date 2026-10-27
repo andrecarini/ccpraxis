@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # tzdata is here so the launcher's IANA TZ (sandbox-session-ux/01, Decision
 # 8: containers follow the host's CURRENT timezone, re-derived at every
@@ -9,15 +9,14 @@ FROM debian:bookworm-slim
 # (the launcher sets TZ per `podman exec`, never at `podman create`).
 #
 # CLDR legacy link names (e.g. Asia/Calcutta, which HostTz.pm's
-# windowsZones table can produce) rely on bookworm's tzdata still shipping
-# the `backward` compatibility links. If a future base-image bump moves to
-# a release that splits those into a separate `tzdata-legacy` package, that
-# package must be added here too, or a legacy-named lookup will resolve to
-# nothing inside the image.
+# windowsZones table can produce) need the `backward` compatibility links.
+# Debian 13 (trixie) moved those into a separate `tzdata-legacy` package, so
+# it is installed next to tzdata below; without it a legacy-named lookup
+# resolves to nothing inside the image.
 #
 # Manual check after a rebuild:
 #   podman run --rm --entrypoint ls claude-sandbox:latest /usr/share/zoneinfo/Europe/Berlin /usr/share/zoneinfo/Asia/Calcutta
-RUN DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata \
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata tzdata-legacy \
     git \
     curl \
     wget \

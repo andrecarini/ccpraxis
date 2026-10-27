@@ -44,8 +44,8 @@ my $IANA_RE       = qr{\A[A-Za-z0-9_+\-]+(?:/[A-Za-z0-9_+\-]+)*\z};
 # the host registry, absent from the prior table), and drop Mid-Atlantic
 # Standard Time and Kamchatka Standard Time, which release 48 no longer
 # lists under territory="001". Legacy CLDR link names (e.g. Asia/Calcutta)
-# are kept as CLDR gives them -- bookworm's tzdata still ships those links
-# (Containerfile comment).
+# are kept as CLDR gives them -- the image installs tzdata-legacy, which
+# ships those links on Debian 13 (Containerfile comment).
 # ---------------------------------------------------------------------------
 my %WINDOWS_TO_IANA = (
     'Dateline Standard Time'            => 'Etc/GMT+12',
