@@ -222,6 +222,13 @@ Read and validated by `scripts/ProjectSandbox.pm`; the rules are held by `tests/
   `/project`, `/root/.claude` or system directories. **There is no way to ask for anything else**
   (no `--privileged`, capabilities, host binds or host network): the manifest is a file the agents
   can edit, so an unknown key or value fails the launch closed, with the reason.
+- **Memory cap.** Every sandbox container and every image build gets a memory limit (with an
+  equal swap limit): `run.memory` (for example `"6g"`, at least `512m`) or, by default, three
+  quarters of the podman host's memory, so a runaway is killed inside its own container instead
+  of taking the shared VM down. `run.cpus` caps CPUs. **Only where the host can enforce it:** a
+  rootless podman host without the cgroup `memory` controller (the WSL podman machine, as
+  measured 2026-10-28: its cgroup tree sits outside systemd) fails every `--memory`, so there no
+  limit is passed and the launch prints a one-line note instead.
 - **Visible.** Every launch prints what the manifest grants. A changed manifest, or a changed file
   of the image context, marks the container stale (the usual rebuild prompt).
 

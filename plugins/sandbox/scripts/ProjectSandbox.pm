@@ -31,7 +31,7 @@ use JSON::PP ();
 use Digest::MD5 ();
 use File::Find ();
 
-our @EXPORT_OK = qw(load validate create_args spec_signature image_hash image_tag describe);
+our @EXPORT_OK = qw(load validate create_args resource_args memory_limit spec_signature image_hash image_tag describe);
 
 our $MANIFEST_NAME = 'claude-sandbox.json';
 
@@ -111,8 +111,18 @@ sub validate {
         if (ref $run ne 'HASH') { push @e, "run: must be an object" }
         else {
             for my $k (sort keys %$run) {
-                push @e, "run: unknown key '$k' (allowed: devices, security_opt, volumes)"
-                    unless $k =~ /\A(?:devices|security_opt|volumes)\z/;
+                push @e, "run: unknown key '$k' (allowed: devices, security_opt, volumes, memory, cpus)"
+                    unless $k =~ /\A(?:devices|security_opt|volumes|memory|cpus)\z/;
+            }
+            if (exists $run->{memory}) {
+                my $m = $run->{memory};
+                push @e, "run.memory: must look like 6g or 4096m (at least 512m)"
+                    unless defined $m && !ref $m && $m =~ /\A(\d{1,6})([mg])\z/ && ($2 eq 'g' ? $1 * 1024 : $1) >= 512;
+            }
+            if (exists $run->{cpus}) {
+                my $c = $run->{cpus};
+                push @e, "run.cpus: must be a number from 0.5 to 64"
+                    unless defined $c && !ref $c && $c =~ /\A\d{1,2}(?:\.\d{1,2})?\z/ && $c >= 0.5 && $c <= 64;
             }
             for my $d (@{ _list($run, 'devices', \@e) }) {
                 push @e, "run.devices: '" . _show($d) . "' is not allowed (allowed: "
@@ -177,6 +187,35 @@ sub create_args {
     return @a;
 }
 
+# memory_limit($spec, $host_mem_bytes) -> the memory limit for the sandbox container AND for image
+# builds, as a podman size ("6144m"), or undef when nothing is known.
+#
+# WHY EVERY SANDBOX GETS ONE. On Windows the containers share one podman VM. A container (or a
+# build) with no limit can use the whole VM, and when the VM runs out of memory it can go down
+# with every container in it. With a limit, only the offender is killed. Default: three quarters
+# of what the podman host has, so the VM always keeps headroom for itself and other containers;
+# a project may set its own value with run.memory.
+our $DEFAULT_MEMORY_FRACTION = 0.75;
+sub memory_limit {
+    my ($spec, $host_mem_bytes) = @_;
+    my $m = $spec && $spec->{run} ? $spec->{run}{memory} : undef;
+    return $m if defined $m;
+    return undef unless $host_mem_bytes && $host_mem_bytes =~ /\A\d+\z/ && $host_mem_bytes > 0;
+    my $mib = int($host_mem_bytes * $DEFAULT_MEMORY_FRACTION / 1048576);
+    return $mib >= 512 ? "${mib}m" : undef;
+}
+
+# resource_args($spec, $host_mem_bytes) -> `--memory`/`--cpus` args for `podman create`.
+# --memory-swap equals --memory, so a container cannot push the VM into heavy swapping either.
+sub resource_args {
+    my ($spec, $host_mem_bytes) = @_;
+    my @a;
+    my $m = memory_limit($spec, $host_mem_bytes);
+    push @a, '--memory', $m, '--memory-swap', $m if defined $m;
+    push @a, '--cpus', $spec->{run}{cpus} if $spec && $spec->{run} && defined $spec->{run}{cpus};
+    return @a;
+}
+
 # spec_signature($spec) -> a stable string of everything in the manifest; recorded at container
 # create, compared on the next launch (a change means the container must be recreated).
 sub spec_signature {
@@ -224,6 +263,8 @@ sub describe {
     push @l, 'device ' . join(', ', @{ $run->{devices} }) if @{ $run->{devices} || [] };
     push @l, 'security option ' . join(', ', @{ $run->{security_opt} }) if @{ $run->{security_opt} || [] };
     push @l, 'volume ' . join(', ', map { "$_->{name} at $_->{target}" } @{ $run->{volumes} }) if @{ $run->{volumes} || [] };
+    push @l, "memory $run->{memory}" if defined $run->{memory};
+    push @l, "cpus $run->{cpus}" if defined $run->{cpus};
     return @l;
 }
 

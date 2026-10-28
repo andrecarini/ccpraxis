@@ -2442,6 +2442,42 @@ sub _ensure_machine_ready {
     return 0;
 }
 
+# _podman_host_mem_bytes() -> total memory of the podman host (the VM on Windows), or undef.
+# Used to cap every sandbox container and image build (ProjectSandbox::memory_limit), so one that
+# runs away is killed on its own instead of taking the shared VM down with it. Asked once.
+#
+# ONLY WHERE THE HOST CAN ENFORCE IT. A rootless podman host without the cgroup `memory`
+# controller delegated -- measured 2026-10-28 on the WSL podman machine: `controllers=[]`,
+# because the WSL VM's cgroup tree sits outside systemd -- fails EVERY `podman create --memory`
+# ("crun: open `memory.max` for writing"). There, this returns undef, so no limit is passed and
+# the launch works exactly as before; _resource_limit_warning() says once that the cap is off.
+my ($PODMAN_HOST_MEM, $PODMAN_MEM_CONTROLLER);
+sub _podman_host_mem_bytes {
+    return $PODMAN_MEM_CONTROLLER ? $PODMAN_HOST_MEM : undef if defined $PODMAN_HOST_MEM;
+    my $out = '';
+    if (open my $fh, '-|', $PODMAN, 'info', '--format',
+            '{{.Host.MemTotal}} {{range .Host.CgroupControllers}}{{.}},{{end}}') {
+        local $/;
+        $out = <$fh> // '';
+        close $fh;
+    }
+    my ($mem, $ctl) = $out =~ /\A\s*(\d+)\s*(\S*)/;
+    $PODMAN_HOST_MEM       = $mem // 0;
+    $PODMAN_MEM_CONTROLLER = (defined $ctl && $ctl =~ /(?:\A|,)memory,/) ? 1 : 0;
+    log_ev('podman_host_mem', { bytes => $PODMAN_HOST_MEM, memory_controller => $PODMAN_MEM_CONTROLLER });
+    return $PODMAN_MEM_CONTROLLER ? $PODMAN_HOST_MEM : undef;
+}
+
+# Printed once per launch when limits cannot be enforced, so the missing protection is visible.
+my $RESOURCE_WARNING_SHOWN;
+sub _resource_limit_warning {
+    return if $RESOURCE_WARNING_SHOWN++;
+    _podman_host_mem_bytes();
+    return if $PODMAN_MEM_CONTROLLER;
+    _emit_step(_c_step("Note: this podman host cannot enforce memory limits (no cgroup memory controller "
+        . "for rootless containers), so the sandbox runs without one."), "\n");
+}
+
 sub build_image {
     # Before the build, not after it fails: a cold machine makes `podman build`
     # exit 125 with a socket error that reads like a broken install.
@@ -2465,7 +2501,9 @@ sub build_image {
     # staleness trigger below (`$age_days > 7`), rather than a new
     # independent timer: this value changes roughly weekly.
     my $ssh_host_keys_cachebust = int(time() / (7 * 86400));
+    my $build_mem = _podman_host_mem_bytes() ? ProjectSandbox::memory_limit(undef, _podman_host_mem_bytes()) : undef;
     my $rc = _tee_system($PODMAN, 'build',
+        (defined $build_mem ? ('--memory', $build_mem) : ()),
         '--build-arg', "CLAUDE_VERSION=${HOST_VERSION}",
         '--build-arg', "P02_SSH_HOST_KEYS_CACHEBUST=${ssh_host_keys_cachebust}",
         '-t', SandboxIdentity::image_ref($HOST_VERSION),
@@ -2541,7 +2579,9 @@ sub ensure_project_image {
     _emit_step(_c_step("Building the project image layer ($img->{context}) on $IMAGE_LATEST..."), "\n");
     log_ev('project_image_build_start', { tag => $tag });
     _tx("\n--- project image build ($tag) ---\n");
+    my $build_mem = _podman_host_mem_bytes() ? ProjectSandbox::memory_limit($spec, _podman_host_mem_bytes()) : undef;
     my $rc = _tee_system($PODMAN, 'build',
+        (defined $build_mem ? ('--memory', $build_mem) : ()),
         '--build-arg', "BASE_IMAGE=$IMAGE_LATEST",
         (map { ('--build-arg', "$_=$ba->{$_}") } sort keys %$ba),
         '-f', $cf, '-t', $tag, $ctx);
@@ -5162,6 +5202,7 @@ if (! _container_exists($CONTAINER_NAME)) {
     #
     # The project's own image layer, if its claude-sandbox.json has one, is built (or reused)
     # here, before create: the container must be created FROM it.
+    _resource_limit_warning();
     $CREATE_IMAGE = ensure_project_image($PROJECT_SPEC, $do_rebuild, $CONTAINER_NAME);
     $build_create_args = sub {
         my @args = (
@@ -5244,6 +5285,9 @@ if (! _container_exists($CONTAINER_NAME)) {
         # The project's allowlisted extras (claude-sandbox.json "run": /dev/fuse, label=disable,
         # container-scoped named volumes), validated at load; nothing else can be added here.
         push @args, ProjectSandbox::create_args($PROJECT_SPEC, $CONTAINER_NAME);
+        # A memory cap on EVERY sandbox (project value, or 3/4 of the podman host by default), so
+        # a runaway is killed inside its container instead of taking the shared VM down.
+        push @args, ProjectSandbox::resource_args($PROJECT_SPEC, _podman_host_mem_bytes()) if _podman_host_mem_bytes();
         push @args, $CREATE_IMAGE;
 
         # Rewrite every `-v HOST:CONTAINER[:opts]` pair into

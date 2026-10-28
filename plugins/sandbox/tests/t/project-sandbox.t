@@ -142,4 +142,31 @@ is_deeply([describe($good)],
           'describe lists every grant for the launch screen');
 is_deeply([describe(undef)], [], 'describe without a manifest is empty');
 
+# --- memory and CPU limits ------------------------------------------------------------------------
+
+{
+    use ProjectSandbox qw(memory_limit resource_args);
+    is(errs({ run => { memory => '6g', cpus => 3 } }), '', 'run.memory 6g and run.cpus 3 are valid');
+    is(errs({ run => { memory => '4096m', cpus => '1.5' } }), '', 'run.memory in m and fractional cpus are valid');
+    like(errs({ run => { memory => '256m' } }), qr/at least 512m/, 'run.memory below 512m is refused');
+    like(errs({ run => { memory => '6GB' } }), qr/must look like/, 'run.memory in another unit is refused');
+    like(errs({ run => { memory => 6 } }), qr/must look like/, 'run.memory without a unit is refused');
+    like(errs({ run => { cpus => 0 } }), qr/0.5 to 64/, 'run.cpus 0 is refused');
+    like(errs({ run => { cpus => 'all' } }), qr/0.5 to 64/, 'run.cpus that is not a number is refused');
+
+    my $ten_gib = 10 * 1024 ** 3;
+    is(memory_limit(undef, $ten_gib), '7680m', 'default memory limit is three quarters of the host');
+    is(memory_limit({ run => { memory => '6g' } }, $ten_gib), '6g', 'a project value wins over the default');
+    is(memory_limit(undef, undef), undef, 'no limit when the host size is unknown');
+    is(memory_limit(undef, 0), undef, 'no limit when the host size is zero');
+    is(memory_limit(undef, 600 * 1048576), undef, 'no default below 512m on a tiny host');
+    is_deeply([resource_args(undef, $ten_gib)], ['--memory', '7680m', '--memory-swap', '7680m'],
+              'resource_args: memory and an equal swap limit by default');
+    is_deeply([resource_args({ run => { memory => '6g', cpus => 3 } }, $ten_gib)],
+              ['--memory', '6g', '--memory-swap', '6g', '--cpus', 3], 'resource_args: project memory and cpus');
+    is_deeply([resource_args(undef, undef)], [], 'resource_args: nothing when nothing is known');
+    is_deeply([describe({ run => { memory => '6g', cpus => 3 } })], ['memory 6g', 'cpus 3'],
+              'describe lists memory and cpus');
+}
+
 done_testing();
