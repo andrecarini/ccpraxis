@@ -44,7 +44,10 @@ require Almanac::PackageLink;
 require Almanac::GlobalCounts;
 require "$S/almanac-inbox.pl";
 
-my $FOLD = ($^O =~ /\A(?:MSWin32|cygwin|msys)\z/) ? 1 : 0;
+# Case-insensitive filesystems: NTFS (Windows-family perls) and default APFS
+# (darwin). Only NTFS also strips a trailing dot from a path segment.
+my $FOLD  = ($^O =~ /\A(?:MSWin32|cygwin|msys|darwin)\z/) ? 1 : 0;
+my $DOTS  = ($^O =~ /\A(?:MSWin32|cygwin|msys)\z/) ? 1 : 0;
 
 sub mkroot {
     my $r = tempdir(CLEANUP => 1);
@@ -135,7 +138,9 @@ sub err_of { my $e = shift; return ref $e ? ($e->{detail} // $e->{kind}) : "$e" 
 # =============================================================================
 {
     is(Almanac::PackageLink::link_key('BP/01-x'), $FOLD ? 'bp/01-x' : 'BP/01-x', 'N3: link_key folds case only where the FS does');
-    is(Almanac::PackageLink::link_key('bp./01-x.'), $FOLD ? 'bp/01-x' : 'bp./01-x.', 'N3: link_key strips trailing dots only where the FS does');
+    is(Almanac::PackageLink::link_key('bp./01-x.'), $DOTS ? 'bp/01-x' : 'bp./01-x.', 'N3: link_key strips trailing dots only where the FS does');
+    is(Almanac::PackageLink::link_key('BP./01-X.'), $DOTS ? 'bp/01-x' : $FOLD ? 'bp./01-x.' : 'BP./01-X.',
+       'N3: case folding and dot stripping are independent (APFS folds case, keeps dots)');
     SKIP: {
         skip 'N3: case-sensitive filesystem; distinct spellings are distinct ledgers', 2 unless $FOLD;
         my $R = mkroot();
