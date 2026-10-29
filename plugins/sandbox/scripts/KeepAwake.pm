@@ -17,6 +17,11 @@ package KeepAwake;
 # lifecycle here (unit-tested); the real spawn/kill of the PS helper + the lease
 # read live in the launcher; whether the machine ACTUALLY stays awake is verified
 # on a real desktop (attended).
+#
+# On macOS the helper is `caffeinate -i -s -w <launcher pid>` instead: a system
+# binary that holds a power assertion for as long as it lives and exits on its
+# own when the launcher does, so it can never be orphaned. Hosts with neither
+# mechanism get no helper, and held() below says so.
 use strict;
 use warnings;
 
@@ -90,13 +95,17 @@ sub classify_lease_stat_failure {
 #     problem s17 fixes elsewhere). Defaults to a no-op so existing callers that
 #     don't pass it are unaffected. Never dies: a broken on_event coderef must
 #     not take down the keep-awake lifecycle it's merely observing.
-# All three default to no-ops so a holder is always safe to construct/sync.
+#   alive->($handle) -- OPTIONAL. 1 while the helper behind $handle is still
+#     running. Consulted only by held(); with no seam, a defined handle is
+#     taken on trust (the pre-existing behaviour, kept for Windows).
+# All of them default to no-ops so a holder is always safe to construct/sync.
 sub new {
     my ($class, %a) = @_;
     return bless {
         start    => $a{start}    || sub { undef },
         stop     => $a{stop}     || sub { },
         on_event => $a{on_event} || sub { },
+        alive    => (ref $a{alive} eq 'CODE' ? $a{alive} : undef),
         running  => 0,
         handle   => undef,
         # s21: consecutive 'probe-failed' streak seen by on_probe. Reset by
@@ -107,6 +116,30 @@ sub new {
 
 sub running { return $_[0]{running} ? 1 : 0 }
 sub handle  { return $_[0]{handle} }
+
+# held() -> 1|0: is a wake-lock ACTUALLY in force, as opposed to wanted?
+#
+# running() answers "did we decide to hold one", and it stays 1 even when the
+# start seam produced nothing -- a missing helper, a failed fork, or a host
+# with no wake-lock mechanism at all. The dashboard rendered running() as
+# "held", so a Mac (whose start seam exec'd a powershell.exe that does not
+# exist there) showed a wake-lock that was never taken. held() requires a real
+# handle, and, when an alive seam was supplied, a helper that is still alive.
+#
+# A helper found dead has its handle dropped here, so the eventual stop() can
+# never signal a pid the OS has since handed to an unrelated process. running
+# stays 1 until the next sync(0); the following sync(1) then starts a fresh
+# helper. Nothing is respawned from inside held() itself.
+sub held {
+    my ($self) = @_;
+    return 0 unless $self->{running} && defined $self->{handle};
+    my $alive = $self->{alive};
+    return 1 unless $alive;
+    my $ok = eval { $alive->($self->{handle}) };
+    return 1 if $ok;
+    $self->{handle} = undef;
+    return 0;
+}
 
 # sync($want, %extra) — converge the helper to the desired state. Idempotent:
 # starts when wanted and not running, stops when running and not wanted, else

@@ -6086,6 +6086,9 @@ sub enter_dashboard {
     $KEEPAWAKE = KeepAwake->new(
         start => sub { _keepawake_start($ka_helper, $ka_pidfile) },
         stop  => sub { _keepawake_stop($_[0], $ka_pidfile) },
+        # macOS: held() checks the caffeinate child is really alive. Not wired
+        # on Windows, whose holder behaviour stays exactly as it was.
+        ($^O eq 'darwin' ? (alive => \&_keepawake_child_alive) : ()),
     );
 
     # 03-resources-reader-model: detached resources sampler. Reap any helper
@@ -6584,7 +6587,7 @@ sub enter_dashboard {
                 # gather would like it to do. They diverge exactly when a probe
                 # failure is being held through, which is the case worth
                 # rendering honestly.
-                keepawake_held  => ($KEEPAWAKE && $KEEPAWAKE->running) ? 1 : 0,
+                keepawake_held  => ($KEEPAWAKE && $KEEPAWAKE->held) ? 1 : 0,
                 needs_you        => $cached_needs_you,
                 triage_queued    => $cached_triage_queued,
                 backpack         => $cached_backpack,
@@ -6652,7 +6655,7 @@ sub enter_dashboard {
                 $last_keepawake_log = $now_ka;
                 log_ev('keepawake_decision', {
                     want       => ($st->{stay_awake} ? 1 : 0),
-                    held       => ($KEEPAWAKE->running ? 1 : 0),
+                    held       => ($KEEPAWAKE->held ? 1 : 0),
                     busy_age   => $st->{busy_age},
                     stale      => $BUSY_STALE,
                     probe      => ($probe_state ne '' ? $probe_state : undef),
@@ -7179,6 +7182,16 @@ sub _trim_err {
 # The helper self-reports its WINDOWS pid into $pidfile for cross-crash reaping.
 sub _keepawake_start {
     my ($ps1, $pidfile) = @_;
+    # macOS has its own wake-lock binary; see _keepawake_start_caffeinate.
+    return _keepawake_start_caffeinate() if $^O eq 'darwin';
+    # Neither Windows nor macOS: no wake-lock mechanism is known for this host.
+    # This used to fork and exec the Windows helper regardless, which failed in
+    # the child while the holder recorded a pid and the dashboard reported the lock
+    # as held. Returning no handle makes KeepAwake::held() say what is true.
+    unless ($WINDOWS_FAMILY) {
+        log_ev('keepawake_unsupported', { os => $^O });
+        return undef;
+    }
     unless (-f $ps1) {
         log_ev('keepawake_start_failed', { reason => "helper missing: $ps1" });
         return undef;
@@ -7226,6 +7239,49 @@ sub _keepawake_start {
 }
 
 
+# _keepawake_start_caffeinate() -> child pid | undef. The macOS wake-lock:
+# `caffeinate -i -s -w <this launcher's pid>`. -i holds off idle sleep, -s
+# holds off system sleep while on AC power (macOS ignores it on battery), and
+# -w makes caffeinate exit by itself the moment its owner exits -- so a
+# crashed or killed launcher cannot leave a wake-lock behind, and there is no
+# orphan to reap (the Windows helper needs _keepawake_reap_orphan for that).
+# fork+exec with stdio on /dev/null, like the Windows helper, so nothing it
+# prints can reach the dashboard's alt-screen. The binary is checked before
+# forking: an exec that fails in the child would hand the holder a pid for a
+# lock that never existed.
+sub _keepawake_start_caffeinate {
+    my $bin = '/usr/bin/caffeinate';
+    unless (-x $bin) {
+        log_ev('keepawake_start_failed', { reason => "helper missing: $bin" });
+        return undef;
+    }
+    my $owner = $$;
+    my $pid = fork();
+    if (!defined $pid) {
+        log_ev('keepawake_start_failed', { reason => "fork: $!" });
+        return undef;
+    }
+    if ($pid == 0) {
+        open(STDIN,  '<', '/dev/null');
+        open(STDOUT, '>', '/dev/null');
+        open(STDERR, '>', '/dev/null');
+        exec($bin, '-i', '-s', '-w', $owner) or do { POSIX::_exit(127); };
+    }
+    log_ev('keepawake_started', { pid => $pid, helper => 'caffeinate', owner_pid => $owner });
+    return $pid;
+}
+
+# _keepawake_child_alive($pid) -> 1 while our helper child is still running.
+# waitpid(WNOHANG) is a syscall, not a spawn, so it is safe on the render tick;
+# it also reaps a helper that exited, which is then reported as gone.
+sub _keepawake_child_alive {
+    my ($pid) = @_;
+    return 0 unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
+    require POSIX;
+    my $r = waitpid($pid, POSIX::WNOHANG());
+    return $r == 0 ? 1 : 0;
+}
+
 # _keepawake_owner_winpid() -> positive WINDOWS pid of this process | undef.
 # Cygwin/MSYS exposes the native pid at /proc/<msys-pid>/winpid (measured on
 # this host: MSYS 1183523 -> WINPID 99496). Anything that is not a positive
@@ -7265,6 +7321,10 @@ sub _keepawake_reap_orphan {
     my $wpid = _read_file($pidfile);
     chomp $wpid if defined $wpid;
     unlink $pidfile;
+    # Only the Windows helper can outlive its launcher (the macOS caffeinate is
+    # bound to it with -w), and only Windows has the powershell.exe/taskkill.exe
+    # this reaper drives.
+    return unless $WINDOWS_FAMILY;
     return unless defined $wpid && $wpid =~ /^\d+$/;
     local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
     my $cmdline = `powershell.exe -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \\"ProcessId=$wpid\\" -ErrorAction SilentlyContinue).CommandLine" 2>/dev/null`;
