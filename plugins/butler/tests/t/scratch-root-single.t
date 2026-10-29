@@ -130,6 +130,14 @@
 use strict;
 use warnings;
 use Test::More;
+
+# The whole file is the oracle for scratch_root()'s WINDOWS-host derivation
+# (native path, ASCII, no 8.3, the drive-root strays). Off Windows the
+# contract is "returns undef" (Row 2), which this file already checks on
+# Windows by faking $^O, so a non-Windows host has nothing to run here.
+plan skip_all => 'Windows-only oracle: scratch_root() derives the Windows host scratch root; '
+    . 'elsewhere it returns undef by contract (Row 2, exercised on Windows with $^O faked)'
+    unless $^O =~ /^(MSWin32|cygwin|msys)$/;
 use FindBin qw($Bin);
 use File::Temp qw(tempdir tempfile);
 use File::Basename qw(dirname basename);
