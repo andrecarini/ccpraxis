@@ -21,6 +21,10 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+# bsd_glob, NOT the builtin glob(): the builtin splits its PATTERN on
+# whitespace, so a live install under a path with a space ('/Users/Jane Doe',
+# 'C:/Users/John Smith') discovered no hooks at all and installed nothing.
+use File::Glob qw(bsd_glob);
 # No `use utf8;` — literal bytes in the source (e.g. the em-dash) get
 # written straight to a :raw stdout, which is what we want for a UTF-8
 # console.
@@ -64,13 +68,13 @@ my $IS_CLAUDE    = $ENV{CLAUDECODE} ? 1 : 0;
 # standalone surface at the repo root, list it explicitly here.
 my @scripts;
 
-for my $dir (sort glob("$CCPRAXIS_DIR/plugins/*")) {
+for my $dir (sort { $a cmp $b } bsd_glob("$CCPRAXIS_DIR/plugins/*")) {
     next unless -d $dir;
     my $hook = "$dir/ccpraxis-install.pl";
     push @scripts, $hook if -f $hook;
 }
 
-for my $dir (sort glob("$CCPRAXIS_DIR/skills/*")) {
+for my $dir (sort { $a cmp $b } bsd_glob("$CCPRAXIS_DIR/skills/*")) {
     next unless -d $dir;
     my $hook = "$dir/ccpraxis-install.pl";
     push @scripts, $hook if -f $hook;
