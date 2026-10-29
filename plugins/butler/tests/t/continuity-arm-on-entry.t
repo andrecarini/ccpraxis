@@ -173,7 +173,11 @@ sub run_captured {
 my $REAL_BASH_ABS = do { my $p = `bash -c "command -v bash"`; chomp $p; $p };
 BAIL_OUT('cannot resolve a real bash on PATH') unless length $REAL_BASH_ABS;
 
-my $REAL_TIMEOUT_ABS = do { my $p = `bash -c "command -v timeout"`; chomp $p; $p };
+my $REAL_TIMEOUT_ABS = do { my $p = `bash -c "command -v timeout"`; chomp $p;
+    # macOS has no GNU timeout: fall back to the repo's pure-perl stand-in
+    # (scripts/run-tests.pl already puts it on PATH for a sweep).
+    unless (length $p) { (my $d = __FILE__) =~ s{[^/\\]+\z}{}; my $s = "${d}../../../../scripts/test-bin/timeout"; $p = $s if -x $s; }
+    $p };
 BAIL_OUT('cannot resolve a real timeout utility on PATH') unless length $REAL_TIMEOUT_ABS;
 
 my $REAL_PERL_ABS = do {

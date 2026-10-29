@@ -197,7 +197,17 @@ my $REAL_BASH_ABS = do { my $p = `bash -c "command -v bash"`; chomp $p; $p };
 Test::More::BAIL_OUT('GuardHarness: cannot resolve a real bash on PATH')
     unless length $REAL_BASH_ABS;
 
-my $REAL_TIMEOUT_ABS = do { my $p = `bash -c "command -v timeout"`; chomp $p; $p };
+my $REAL_TIMEOUT_ABS = do {
+    my $p = `bash -c "command -v timeout"`; chomp $p;
+    # macOS has no GNU timeout. scripts/run-tests.pl puts the repo's pure-perl
+    # stand-in on PATH for a sweep; a file run on its own falls back to it here.
+    unless (length $p) {
+        (my $self = __FILE__) =~ s{\\}{/}g;
+        my $shim = File::Spec->rel2abs(File::Basename::dirname($self) . '/../../../../scripts/test-bin/timeout');
+        $p = $shim if -x $shim;
+    }
+    $p;
+};
 Test::More::BAIL_OUT('GuardHarness: cannot resolve a real timeout utility on PATH')
     unless length $REAL_TIMEOUT_ABS;
 

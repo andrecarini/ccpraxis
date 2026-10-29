@@ -1,0 +1,109 @@
+#!/usr/bin/env perl
+# timeout -- a pure-perl stand-in for GNU coreutils' `timeout`, for test runs
+# on hosts that ship without it (macOS: no coreutils; BSD has no `timeout`).
+#
+# scripts/run-tests.pl puts this directory at the FRONT of PATH only when no
+# real `timeout` is found, so Git for Windows and Linux keep using their own.
+# The test harnesses (GuardHarness et al.) and a hundred-odd test files call
+# `timeout N cmd ...` directly; without this the whole hook suite bailed out
+# on macOS before asserting anything.
+#
+# Implements the GNU interface the tests use:
+#   timeout [-s SIG|--signal=SIG] [-k DUR|--kill-after=DUR] [-f|--foreground]
+#           [-p|--preserve-status] [-v|--verbose] [--] DURATION COMMAND [ARG]...
+# DURATION: a number (decimals allowed) with an optional s/m/h/d suffix; 0
+# disables the limit. Exit status as GNU documents it: 124 if the command
+# timed out (unless --preserve-status), 125 if timeout itself failed, 126 if
+# COMMAND was found but could not be run, 127 if it was not found, 128+9 if
+# it had to be KILLed, otherwise COMMAND's own status.
+#
+# Signal delivery follows GNU: unless --foreground, timeout makes itself a
+# process-group leader and signals the whole group, so a shell COMMAND's
+# children are timed out too.
+use strict;
+use warnings;
+use POSIX qw(:sys_wait_h setpgid);
+use Time::HiRes qw(time sleep);
+
+my $sig = 'TERM';
+my ($kill_after, $foreground, $preserve, $verbose) = (0, 0, 0, 0);
+
+sub fail { print STDERR "timeout: $_[0]\n"; exit 125 }
+
+sub duration {
+    my ($s) = @_;
+    fail("invalid time interval '$s'") unless defined $s && $s =~ /\A(\d+(?:\.\d*)?|\.\d+)([smhd]?)\z/;
+    return $1 * { '' => 1, s => 1, m => 60, h => 3600, d => 86400 }->{$2};
+}
+
+sub signame {
+    my ($s) = @_;
+    $s = uc $s;
+    $s =~ s/\ASIG//;
+    return $s if $s =~ /\A\d+\z/ || exists $SIG{$s};
+    fail("invalid signal '$_[0]'");
+}
+
+while (@ARGV && $ARGV[0] =~ /\A-/) {
+    my $a = shift @ARGV;
+    last if $a eq '--';
+    if    ($a =~ /\A(?:-s|--signal)\z/)        { $sig = signame(shift @ARGV) }
+    elsif ($a =~ /\A--signal=(.*)\z/)           { $sig = signame($1) }
+    elsif ($a =~ /\A-s(.+)\z/)                  { $sig = signame($1) }
+    elsif ($a =~ /\A(?:-k|--kill-after)\z/)     { $kill_after = duration(shift @ARGV) }
+    elsif ($a =~ /\A--kill-after=(.*)\z/)       { $kill_after = duration($1) }
+    elsif ($a =~ /\A-k(.+)\z/)                  { $kill_after = duration($1) }
+    elsif ($a =~ /\A(?:-f|--foreground)\z/)     { $foreground = 1 }
+    elsif ($a =~ /\A(?:-p|--preserve-status)\z/) { $preserve = 1 }
+    elsif ($a =~ /\A(?:-v|--verbose)\z/)        { $verbose = 1 }
+    else  { fail("unrecognized option '$a'") }
+}
+my $limit = duration(shift @ARGV);
+fail('missing operand') unless @ARGV;
+
+# Become a process-group leader so the signal reaches the command's children.
+setpgid(0, 0) unless $foreground;
+
+my $pid = fork;
+fail("fork failed: $!") unless defined $pid;
+if ($pid == 0) {
+    $SIG{$_} = 'DEFAULT' for qw(TERM INT HUP ALRM);
+    exec { $ARGV[0] } @ARGV;
+    my $code = ($!{ENOENT} || $!{ENOTDIR}) ? 127 : 126;
+    print STDERR "timeout: failed to run command '$ARGV[0]': $!\n";
+    POSIX::_exit($code);
+}
+
+# Our own signal must not kill us when we send it to our group.
+$SIG{$sig} = 'IGNORE' unless $foreground || $sig =~ /\A(?:KILL|STOP|9|19)\z/;
+
+my $status;
+my $timed_out = 0;
+my $killed = 0;
+my $deadline = $limit > 0 ? time + $limit : undef;
+my $kill_deadline;
+while (1) {
+    my $r = waitpid($pid, WNOHANG);
+    if ($r == $pid) { $status = $?; last }
+    if ($r < 0)     { $status = 0;  last }
+    my $now = time;
+    if (defined $deadline && !$timed_out && $now >= $deadline) {
+        $timed_out = 1;
+        print STDERR "timeout: sending signal $sig to command '$ARGV[0]'\n" if $verbose;
+        kill($sig, $foreground ? $pid : -$$);
+        kill('CONT', $foreground ? $pid : -$$) unless $sig =~ /\A(?:KILL|9)\z/;
+        $kill_deadline = $now + $kill_after if $kill_after > 0;
+    }
+    if (defined $kill_deadline && !$killed && $now >= $kill_deadline) {
+        $killed = 1;
+        print STDERR "timeout: sending signal KILL to command '$ARGV[0]'\n" if $verbose;
+        kill('KILL', $foreground ? $pid : -$$);
+    }
+    sleep 0.02;
+}
+
+if ($timed_out && !$preserve) {
+    exit 137 if $killed || ($status & 127) == 9;
+    exit 124;
+}
+exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);

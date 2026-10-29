@@ -881,7 +881,11 @@ SKIP: {
 # B1-B4 (DC3) -- the process budget, package-03 PATH-shim technique.
 # ===========================================================================
 {
-    my $REAL_TIMEOUT_ABS = do { my $p = `bash -c "command -v timeout"`; chomp $p; $p };
+    my $REAL_TIMEOUT_ABS = do { my $p = `bash -c "command -v timeout"`; chomp $p;
+    # macOS has no GNU timeout: fall back to the repo's pure-perl stand-in
+    # (scripts/run-tests.pl already puts it on PATH for a sweep).
+    unless (length $p) { (my $d = __FILE__) =~ s{[^/\\]+\z}{}; my $s = "${d}../../../../scripts/test-bin/timeout"; $p = $s if -x $s; }
+    $p };
     BAIL_OUT('cannot resolve a real timeout utility on PATH') unless length $REAL_TIMEOUT_ABS;
 
     use Config ();

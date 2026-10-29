@@ -900,7 +900,26 @@ sub _cores {
         close $c;
         return $n if $n;
     }
+    # macOS (and the BSDs) have neither of the above, which left an 18-core
+    # Mac at the fallback of 4, i.e. two workers after the cores-2 default.
+    for my $cmd ('getconf _NPROCESSORS_ONLN 2>/dev/null', 'sysctl -n hw.ncpu 2>/dev/null') {
+        my $n = `$cmd`;
+        return $1 if defined $n && $n =~ /^\s*(\d+)\s*$/ && $1 > 0;
+    }
     return 4;
+}
+
+# _ensure_timeout_on_path() -- see run_sweep()'s first statement. Only acts
+# when no `timeout` resolves on PATH; never shadows a real one.
+sub _ensure_timeout_on_path {
+    my $sep = ($^O eq 'MSWin32') ? ';' : ':';
+    for my $dir (split /\Q$sep\E/, $ENV{PATH} // '') {
+        next unless length $dir;
+        return if -x "$dir/timeout" && !-d "$dir/timeout";
+    }
+    my $bin = "$ROOT_ABS/scripts/test-bin";
+    return unless -x "$bin/timeout";
+    $ENV{PATH} = "$bin$sep" . ($ENV{PATH} // '');
 }
 
 # _resolve_jobs(%args) -> $jobs
@@ -1501,6 +1520,13 @@ sub _path_attributed {
 sub run_sweep {
     my @argv = @_;
     local @ARGV = @argv;
+
+    # macOS ships no GNU `timeout`, and the hook harnesses plus a hundred-odd
+    # test files call `timeout N cmd ...` directly. When none is on PATH, put
+    # scripts/test-bin (a pure-perl stand-in with GNU's interface and exit
+    # codes) in front for every file this sweep runs. Hosts that have a real
+    # one (Git for Windows, Linux) are left exactly as they were.
+    _ensure_timeout_on_path();
 
     my ($fast, $jobs, $nice, $state_mode, @targets) = (0, 0, 0, 0);
     while (@ARGV) {
