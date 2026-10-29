@@ -862,7 +862,8 @@ subtest 'T-H red-team surface (all criteria; cross-cutting)' => sub {
     # Non-ASCII path component (Andre), per the project CLAUDE.md landmine.
     {
         my $tmp = tempdir(CLEANUP => 1);
-        my $andre_dir = File::Spec->catdir($tmp, "Andr\x{e9}-data");
+        # UTF-8 on macOS, whose APFS refuses a non-UTF-8 name outright.
+        my $andre_dir = File::Spec->catdir($tmp, $^O eq 'darwin' ? "Andr\xc3\xa9-data" : "Andr\x{e9}-data");
         make_path($andre_dir);
         my ($rc, $out, $err) = run_cli(args => ['--data-dir', $andre_dir, 'non-ascii data-dir path']);
         is($rc, 0, 'red-team: --data-dir containing non-ASCII (Andre) works, path passed through unmodified');

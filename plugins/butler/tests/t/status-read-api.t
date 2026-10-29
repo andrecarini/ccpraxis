@@ -333,7 +333,10 @@ ok(defined &BpState::blueprint_lifecycle,  'DC2: BpState::blueprint_lifecycle is
 # ═════════════════════════════════════════════════════════════════════════
 {
     my $root = tempdir(CLEANUP => 1);
-    my $dir  = "$root/space dir Andr\x{e9}";
+    # APFS (macOS) refuses a file name that is not valid UTF-8 ("Illegal byte
+    # sequence"), so there the accented e is its UTF-8 encoding; elsewhere the
+    # original single Latin-1 byte, unchanged.
+    my $dir  = $^O eq 'darwin' ? "$root/space dir Andr\xc3\xa9" : "$root/space dir Andr\x{e9}";
     make_path($dir);
     write_ledger($dir, 'p', 'status: running');
     my $got = eval { BpState::package_status($dir, 'p') };
