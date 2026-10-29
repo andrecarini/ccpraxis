@@ -563,10 +563,27 @@ sub lacks_str{ my ($hay, $needle, $label) = @_; ok(index($hay, $needle) <  0, $l
 # `command -v jq || exit 0` (§2.13). One SKIP keeps this file useful on the jq-less
 # Git-for-Windows host, mirroring t/62:465 and t/64:404. AC-25's jq-scrubbed case lives INSIDE it
 # because it still needs the hook to run at all.
+#
+# RETIRED, NOT MERELY jq-GATED (macOS port, 2026-10-29). The group below pins the b15
+# BASH guard's contract, and the hook it drives is now BpHook::Guards::WaitShapeGuard. It
+# was only ever exercised where jq is installed; the Windows host has none, so none of it
+# ran after the remake and the contradiction never surfaced. macOS ships jq, the group ran,
+# and 45 assertions failed against three deliberate changes of the remake:
+#   - every message was ONE verbatim line; the remake's are two lines (spec 2.6 budget);
+#   - R1/R2/R3b were "stateless"; the repeat detector now lives in the same hook and logs
+#     every non-exempt call under $BP_DIR/runs/;
+#   - the guard was inert unless BP_LEDGER, BP_DIR and BP_PROJECT_ROOT were all set;
+#     BP_LEDGER alone selects it now.
+# guards-remake-wait-shape.t is the successor oracle and names exactly this block as not
+# re-expressed ("both old files' jq-gated SKIP blocks, as such" | JQ; the verbatim long
+# texts | MSG; the BP_DIR/BP_PROJECT_ROOT-unset cases | OTHER), with the CASES it gated
+# pinned there against the current contract. So the group is skipped on every host, with
+# that reason in the TAP output, rather than left to run on whichever host has jq.
 # =====================================================================================
+my $WS_RETIRED = 'pins the retired b15 bash guard (one-line messages, stateless R1/R2/R3b, '
+               . 'three-variable gate); the current contract is guards-remake-wait-shape.t';
 SKIP: {
-    skip "jq is not available on this host; every hook-behaviour group needs it present to get past `command -v jq`", 1
-        unless $have_jq;
+    skip $WS_RETIRED, 1;
 
     # =================================================================================
     # AC-1 / AC-3 / AC-5 [R1] the six textually-distinct wait constructs, each denied
@@ -1082,8 +1099,8 @@ SKIP: {
     # hook cannot run here" is missing coverage, not a defect. Keep the gate
     # wherever the hook is runnable; skip it, loudly, where it is not.
     SKIP: {
-        skip 'jq absent: no hook invocations were possible, so there is no aggregate to assert over '
-           . '(AC-28/AC-31 NOT exercised here)', 1 unless $have_jq;
+        skip 'no hook invocations were made, so there is no aggregate to assert over '
+           . "(AC-28/AC-31 NOT exercised here): the hook groups above $WS_RETIRED", 1 unless $n;
         ok($n > 0, "AC-31: this file made $n hook invocations to assert over");
     }
 
