@@ -375,6 +375,40 @@ sub capture_run {
         'AC-4(pause-token): a successful refresh carries the run on');
 }
 
+{   # pause-token on macOS → no refresh attempted, the run carries on.
+    #
+    # Claude Code keeps a Mac's grant in the login Keychain and refreshes it
+    # itself. The keeper's refresh rotates the refresh token, and there is no
+    # credentials file to write the new pair back to, so a refresh from here
+    # would log Claude Code out. The credentials path below does not exist: had
+    # the darwin branch fallen through to the keeper, the run would STOP with
+    # "no credentials file" -- which is exactly what it did before.
+    my $data = tempdir(CLEANUP => 1);
+    make_bp_dir($data, 'bp-x', [{key=>'p1',status=>'pending',write_set=>'x/p1/'}]);
+    my $dsdir = "$data/.drive-solo"; make_path($dsdir);
+    write_json("$dsdir/order.json", { order => ['bp-x'], recorded_at => $NOW });
+
+    my ($rc, $out) = capture_run(
+        ['next', '--scope', 'bp-x'],
+        { data_dir   => $data,
+          verdict    => sub { { action=>'pause-token', until_epoch=>undef, reason=>'token' } },
+          os         => 'darwin',
+          creds_path => "$data/no-such-credentials.json" }
+    );
+    is($rc, 0, 'AC-4(pause-token, macOS): exits 0');
+    chomp(my $line = $out);
+    my $act = eval { $J->decode($line) };
+    is($act->{action}, 'run-package',
+        'AC-4(pause-token, macOS): no refresh is attempted and the run carries on');
+    my $runlog = -e "$dsdir/run.md" ? do { open my $r,'<',"$dsdir/run.md"; local $/; <$r> } : '';
+    like($runlog, qr/token near expiry .*Keychain/,
+        'AC-4(pause-token, macOS): the log says the refresh was left to Claude Code');
+    unlike($runlog, qr/token refreshed/,
+        'AC-4(pause-token, macOS): the log does not claim a refresh that never happened');
+    ok(!-e "$data/no-such-credentials.json",
+        'AC-4(pause-token, macOS): no credentials file is written');
+}
+
 {   # pause-token + FAILED refresh → stop, release the wake-lock, log the error
     #
     # This is the branch that matters. The alternative behaviours were both

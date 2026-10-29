@@ -159,9 +159,9 @@ sub write_snapshot {
 # without a fork.
 #
 # WHY A SUBPROCESS AND NOT A REIMPLEMENTATION (blueprint Decision 12).
-# bp-usage-gate.pl already reads ~/.claude/.credentials.json, enforces a
-# token-life floor, and polls api.anthropic.com/api/oauth/usage with the right
-# oauth beta header. Duplicating that here would fork the handling of the
+# bp-usage-gate.pl already reads the credentials (~/.claude/.credentials.json,
+# or the macOS Keychain via BpCreds.pm), enforces a token-life floor, and polls
+# api.anthropic.com/api/oauth/usage with the right oauth beta header. Duplicating that here would fork the handling of the
 # broadest secret in the system -- the same constraint write_snapshot's field
 # whitelist exists to honour. So we call it and parse its one line.
 #

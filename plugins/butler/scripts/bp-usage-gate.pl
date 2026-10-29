@@ -58,7 +58,8 @@ BEGIN { $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/; }
 #   BP_KGS_SOFT_5H   soft 5h ceiling  (default 80; fleet hard wall 85)
 #   BP_KGS_SOFT_7D   soft 7d ceiling  (default 85; fleet hard wall 90)
 #   BP_KGS_TOKEN_FLOOR_H  re-login floor in hours (default 1)
-#   BP_CREDS_PATH    creds file       (default ~/.claude/.credentials.json)
+#   BP_CREDS_PATH    creds file       (default ~/.claude/.credentials.json,
+#                    else the macOS Keychain item -- see BpCreds.pm)
 #   BP_USER_AGENT    curl UA          (default claude-code/2.1.170)
 
 package BpUsageGate;
@@ -75,6 +76,7 @@ my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 require "$DIR/bp-govern.pl";
 require "$DIR/bp-http.pl";
 require "$DIR/bp-contract.pl";
+require "$DIR/BpCreds.pm";
 
 my $USAGE_URL  = 'https://api.anthropic.com/api/oauth/usage';
 my $USER_AGENT = $ENV{BP_USER_AGENT} // 'claude-code/2.1.170';
@@ -198,7 +200,8 @@ sub verdict_decision {
 }
 
 # ---------------------------------------------------------------------------
-# _read_creds($path) — I/O half: read + parse creds file.
+# _read_creds($path) — I/O half: read + parse the credentials. $path undef means
+# "wherever this host keeps them" (BpCreds: file, else the macOS Keychain).
 # Returns { ok, expires_ms, detail, tok } (tok is INTERNAL only — never emitted).
 # ---------------------------------------------------------------------------
 # --- the shared-endpoint cache (report 20260917-015851-1d58). Both halves are
@@ -270,14 +273,12 @@ sub _cache_write {
 
 sub _read_creds {
     my ($path) = @_;
-    my $raw = do {
-        local $/;
-        open my $fh, '<', $path or return { ok => 0, expires_ms => undef, detail => "cannot-open:$path", tok => undef };
-        <$fh>;
-    };
-    my $data = eval { JSON::PP->new->decode($raw) };
-    return { ok => 0, expires_ms => undef, detail => "invalid-json:$path", tok => undef }
-        unless ref $data eq 'HASH';
+    # An explicit path stays authoritative (a test fixture that is missing is
+    # reported missing); with none, BpCreds walks file -> macOS Keychain.
+    my $loaded = BpCreds::load(defined $path && length $path ? (path => $path) : ());
+    return { ok => 0, expires_ms => undef, detail => $loaded->{detail}, tok => undef }
+        unless $loaded->{ok};
+    my $data = $loaded->{data};
     my $oauth = $data->{claudeAiOauth};
     return { ok => 0, expires_ms => undef, detail => 'no-claudeAiOauth', tok => undef }
         unless ref $oauth eq 'HASH';
@@ -375,10 +376,14 @@ END_HELP
     # Those tests already redirect BP_CREDS_PATH to a temp file, so deriving from
     # it puts the cache in their temp dir with no test change at all, and the
     # derivation is the more correct rule on its own terms.
-    my $home       = $ENV{HOME} // $ENV{USERPROFILE} // '';
-    my $creds_path = $opts->{creds_path}
-                  // $ENV{BP_CREDS_PATH}
-                  // "$home/.claude/.credentials.json";
+    #
+    # On macOS the credentials normally live in the Keychain, not in a file
+    # (BpCreds). $creds_path is then the DEFAULT file location: nothing is ever
+    # read from or written to it, it only anchors the cache in ~/.claude.
+    # $creds_explicit is what _read_creds gets -- undef lets BpCreds choose.
+    my $creds_loc      = BpCreds::locate(path => $opts->{creds_path});
+    my $creds_path     = $creds_loc->{path};
+    my $creds_explicit = $creds_loc->{kind} eq 'file' ? $creds_path : undef;
 
     my $cache_path = $opts->{cache_path} // $ENV{BP_USAGE_CACHE_PATH};
     unless (defined $cache_path) {
@@ -422,7 +427,7 @@ END_HELP
         };
     }
 
-    # $home / $creds_path are resolved above, before the cache, because the cache
+    # $creds_path is resolved above, before the cache, because the cache
     # path is derived from the credentials path.
     my $rand_fn   = $opts->{rand} // sub { rand() };
     my $samples5  = $opts->{samples5} // [];
@@ -444,7 +449,7 @@ END_HELP
         };
 
         # I/O: read creds
-        my $cr = _read_creds($creds_path);
+        my $cr = _read_creds($creds_explicit);
         my $creds = { ok => $cr->{ok}, expires_ms => $cr->{expires_ms}, detail => $cr->{detail} };
 
         # I/O: poll usage (only when creds ok AND token not at floor). NOTE: this
@@ -507,7 +512,7 @@ END_HELP
         my $now = $now_fn->();
 
         # read creds
-        my $cr = _read_creds($creds_path);
+        my $cr = _read_creds($creds_explicit);
         unless ($cr->{ok}) {
             print "CREDS detail=$cr->{detail}\n";
             return 30;

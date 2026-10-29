@@ -71,6 +71,8 @@
 #   pause-token  → attempt a refresh (bp-token-keeper). Recovered → proceed;
 #                  failed → action=stop, wake-lock released, error logged.
 #                  Solo NEVER pauses for token expiry — see _token_recover.
+#                  macOS: no refresh at all (Claude Code owns its Keychain
+#                  token) — logged and proceed.
 #   unavailable  → retry a few times, then degrade-and-proceed (log "governance degraded")
 #
 # STATE  (<data>/.drive-solo/, all director-owned)
@@ -1233,11 +1235,24 @@ sub ac_check {
 # less-tested writer for the credential store, which is the last file in the
 # system that should have two.
 #
-# Returns ($recovered, $detail). $detail is always a short human string; it goes
-# to the run log and, on failure, out in the action, so a run that stops for
-# this reason explains itself without anyone reading code.
+# Returns ($recovered, $detail, $deferred). $detail is always a short human
+# string; it goes to the run log and, on failure, out in the action, so a run
+# that stops for this reason explains itself without anyone reading code.
+# $deferred is true when nothing was refreshed because the refresh is someone
+# else's job (macOS, below), so the log does not claim a refresh that never
+# happened.
+#
+# MACOS: NO REFRESH FROM HERE, EVER. Claude Code keeps the grant in the login
+# Keychain (see BpCreds.pm) and refreshes it itself, on its next request, in
+# this very session. The keeper's refresh ROTATES the refresh token; on a Mac
+# there is no credentials file to write the new pair back to, and writing one
+# would create a second, stale copy of the account's most sensitive secret. A
+# rotation without a write-back would log Claude Code out mid-run. So the floor
+# is reported and the run carries on: the only party that can refresh this
+# token safely is the one that is about to.
 #
 # The `refresh` opt is the test seam. Production default calls the keeper.
+# The `os` opt overrides $^O for the macOS branch, so it is testable anywhere.
 sub _token_recover {
     my ($opts, $now) = @_;
 
@@ -1249,6 +1264,11 @@ sub _token_recover {
         return (1, $act) if $act eq 'refreshed' || $act eq 'ok';
         return (0, "keeper said '$act'" . (defined $r->{detail} && !ref $r->{detail}
                                             ? ": $r->{detail}" : ''));
+    }
+
+    if (($opts->{os} // $^O) eq 'darwin') {
+        return (1, 'macOS: Claude Code refreshes its own Keychain token; '
+                 . 'butler never rotates or writes credentials here', 1);
     }
 
     my $creds = $opts->{creds_path}
@@ -1662,7 +1682,7 @@ sub _cmd_next {
 
         # Token floor: try to recover it ourselves before deciding anything.
         if ($mapped->{token_floor}) {
-            my ($recovered, $detail) = _token_recover($opts, $now);
+            my ($recovered, $detail, $deferred) = _token_recover($opts, $now);
             if (!$recovered) {
                 # Terminal, and deliberately NOT a pause. A pause implies
                 # "resume later"; there is nothing to resume to until a human
@@ -1676,7 +1696,9 @@ sub _cmd_next {
                 keepawake_apply('settled', $dsdir, $opts);
                 return 0;
             }
-            _append_run_log($dsdir, "token refreshed — continuing ($detail)");
+            _append_run_log($dsdir, $deferred
+                ? "token near expiry — continuing, refresh left to its owner ($detail)"
+                : "token refreshed — continuing ($detail)");
         }
 
         if ($mapped->{action} && $mapped->{action} eq 'pause') {
