@@ -143,7 +143,8 @@ my $V = '/c/H/.claude/claude-code-vault/almanac/note/n1.md';
 # =============================================================================
 # AC1 (DC1, 2.1) -- hooks.json gains exactly one new PreToolUse entry, matcher
 # "Bash", one hook object, type command, timeout 15, exact command string.
-# AC2 (DC1, 2.1) -- the Edit|Write|MultiEdit|NotebookEdit entry is untouched.
+# AC2 (DC1, 2.1) -- exactly one Edit|Write|MultiEdit|NotebookEdit entry, run
+# through the same bash wrapper (and timeout) as the Bash entry.
 # =============================================================================
 my $G = q{unset BASH_ENV ; f="${CLAUDE_PLUGIN_ROOT}/hooks/guard-almanac-write.sh" ; [ -f "$f" ] || exit 0 ; exec env -u SHELLOPTS bash "$f"};
 
@@ -181,16 +182,63 @@ my $G = q{unset BASH_ENV ; f="${CLAUDE_PLUGIN_ROOT}/hooks/guard-almanac-write.sh
         fail('AC1: hook command equals the spec string exactly');
     }
 
+    # AC2 originally pinned the Edit entry's bare form ("<root>/hooks/guard-
+    # almanac-write.sh", exec'd by path). That form depends on the file's exec
+    # bit and shebang, inherits BASH_ENV/SHELLOPTS, and carried no timeout; it
+    # now runs through the same bash wrapper as the Bash entry, with the same
+    # 15s timeout.
     is(scalar(@edit_entries), 1, 'AC2: exactly one entry has matcher Edit|Write|MultiEdit|NotebookEdit');
     if (@edit_entries) {
         my $hooks = $edit_entries[0]{hooks} || [];
         is(scalar(@$hooks), 1, 'AC2: still exactly one hook object');
-        is($hooks->[0]{command}, '${CLAUDE_PLUGIN_ROOT}/hooks/guard-almanac-write.sh',
-           'AC2: its command is unchanged (bare form)');
+        is($hooks->[0]{timeout}, 15, 'AC2: the Edit entry has a 15s timeout');
+        is($hooks->[0]{command}, $G,
+           'AC2: its command is the bash wrapper form the Bash entry uses');
     } else {
         fail('AC2: still exactly one hook object');
-        fail('AC2: its command is unchanged (bare form)');
+        fail('AC2: the Edit entry has a 15s timeout');
+        fail('AC2: its command is the bash wrapper form the Bash entry uses');
     }
+}
+
+# =============================================================================
+# AC2b -- the Edit entry's registration string, run the way Claude Code runs
+# a hook on macOS and Linux (/bin/sh -c, where sh may be bash 3.2 or dash),
+# denies an Edit on a bug report. The bare form exited 126 wherever the
+# script had lost its exec bit, and its stdin read was bash >= 4.1 only.
+# =============================================================================
+{
+    my $edit_cmd;
+    my $cfg = eval { JSON::PP->new->decode(slurp_raw($HOOKS_JSON) // '') };
+    if (ref $cfg eq 'HASH') {
+        for my $blk (@{ $cfg->{hooks}{PreToolUse} || [] }) {
+            next unless ($blk->{matcher} // '') eq 'Edit|Write|MultiEdit|NotebookEdit';
+            $edit_cmd = $blk->{hooks}[0]{command};
+        }
+    }
+    ok(defined $edit_cmd, 'AC2b: the Edit entry has a command to run');
+    my (undef, $script) = tempfile('alm-ac2b-XXXXXX', SUFFIX => '.sh', TMPDIR => 1);
+    open(my $sfh, '>', $script) or die "cannot write $script: $!";
+    print {$sfh} ($edit_cmd // 'exit 99') . "\n";
+    close $sfh;
+    my (undef, $in) = tempfile('alm-ac2b-in-XXXXXX', TMPDIR => 1);
+    open(my $ifh, '>:raw', $in) or die "cannot write $in: $!";
+    print {$ifh} $J->encode({ hook_event_name => 'PreToolUse', tool_name => 'Edit', tool_input => { file_path => $R } });
+    close $ifh;
+    my $errp = "$in.err";
+
+    local %ENV = %ENV;
+    delete $ENV{$_} for grep { /^BP_/ } keys %ENV;
+    $ENV{CLAUDE_PLUGIN_ROOT} = $ALM;
+    $ENV{HOME}               = $FRESH_HOME;
+    $ENV{USERPROFILE}        = $FRESH_HOME;
+    $ENV{ALMANAC_HOME}       = $FRESH_HOME;
+
+    my $rc = system(qq{sh "$script" < "$in" > /dev/null 2> "$errp"});
+    my $err = slurp_raw($errp) // '';
+    unlink $script, $in, $errp;
+    is($rc >> 8, 2, 'AC2b: the Edit registration string, run by sh, denies an Edit on a bug report') or diag($err);
+    like($err, qr/^BLOCKED: Edit on a bug report/, 'AC2b: ...with the bug-report denial') or diag($err);
 }
 
 # =============================================================================

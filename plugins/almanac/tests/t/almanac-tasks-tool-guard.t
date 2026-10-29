@@ -283,8 +283,13 @@ for my $case (
         if (@edit_entries) {
             is($edit_entries[0]{matcher}, 'Edit|Write|MultiEdit|NotebookEdit', 'G-6: its matcher is unchanged');
             is(scalar(@{ $edit_entries[0]{hooks} || [] }), 1, 'G-6: still exactly one hook object');
-            is($edit_entries[0]{hooks}[0]{command}, '${CLAUDE_PLUGIN_ROOT}/hooks/guard-almanac-write.sh',
-               'G-6: its command is unchanged (bare form)');
+            # The bare form (exec of the .sh by path) became the bash-wrapper
+            # form the Bash entry already used: a direct exec depends on the
+            # file's exec bit and shebang, inherits BASH_ENV/SHELLOPTS, and
+            # had no timeout. Pinned exactly in almanac-bash-write-guard.t AC2.
+            like($edit_entries[0]{hooks}[0]{command},
+                 qr{^unset BASH_ENV ; f="\$\{CLAUDE_PLUGIN_ROOT\}/hooks/guard-almanac-write\.sh" ; .*exec env -u SHELLOPTS bash "\$f"\z},
+                 'G-6: its command runs the guard through the bash wrapper');
         }
 
         my @all_added_cmds;
