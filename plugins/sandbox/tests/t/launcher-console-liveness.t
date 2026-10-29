@@ -496,7 +496,16 @@ SKIP: {
 # =============================================================================
 # AC-1 (DC-1, bounded exit against a real console)
 # =============================================================================
+# AC-1 and AC-3 drive a real native cmd.exe console and query it through
+# Get-CimInstance by WINPID: there is no such process, console or pid namespace
+# off a Windows host, so on macOS/Linux they are skipped rather than failed.
+# The source-level and seam-driven assertions in the rest of this file still run
+# everywhere.
+my $NATIVE_WINDOWS_CONSOLE = $^O =~ /^(MSWin32|cygwin|msys)$/;
+
 SKIP: {
+    skip 'AC-1: needs a native Windows console (cmd.exe + WINPID); this host is not Windows', 5
+        unless $NATIVE_WINDOWS_CONSOLE;
     skip 'AC-1: winpid_alive not available -- not yet implemented', 5
         unless defined $WINPID_ALIVE;
 
@@ -540,6 +549,8 @@ SKIP: {
 # >=10s -- every verdict must be 'alive'.
 # =============================================================================
 SKIP: {
+    skip 'AC-3: needs a native Windows console (cmd.exe + WINPID); this host is not Windows', 4
+        unless $NATIVE_WINDOWS_CONSOLE;
     skip 'AC-3: winpid_alive not available -- not yet implemented', 4
         unless defined $WINPID_ALIVE;
 
