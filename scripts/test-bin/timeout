@@ -68,7 +68,7 @@ my $pid = fork;
 fail("fork failed: $!") unless defined $pid;
 if ($pid == 0) {
     $SIG{$_} = 'DEFAULT' for qw(TERM INT HUP ALRM);
-    exec { $ARGV[0] } @ARGV;
+    { no warnings 'exec'; exec { $ARGV[0] } @ARGV; }   # the lines below run only if exec failed
     my $code = ($!{ENOENT} || $!{ENOTDIR}) ? 127 : 126;
     print STDERR "timeout: failed to run command '$ARGV[0]': $!\n";
     POSIX::_exit($code);
