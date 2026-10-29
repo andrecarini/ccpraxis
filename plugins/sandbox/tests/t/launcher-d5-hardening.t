@@ -252,7 +252,13 @@ sub _run_guard {
 # touches the real filesystem outside this tempdir; never the real HOME,
 # USERPROFILE, CLAUDE_CONFIG_DIR, or ~/.claude.
 # =====================================================================
-my $ROOT       = tempdir(CLEANUP => 1);
+# Resolved, because the launcher only ever asks about a RESOLVED target (it
+# abs_paths the project path first) while the guard resolves every protected
+# root it ingests. A raw tempdir is /var/folders/... on macOS, where /var is a
+# symlink into /private: the roots then resolve to /private/var/... and the
+# unresolved targets below compare as unrelated to them, which is a fixture
+# artefact, not the guard behaviour these cases pin.
+my $ROOT       = abs_path(tempdir(CLEANUP => 1));
 my $AUTH_HOME  = "$ROOT/auth_home";
 my $DECOY_HOME = "$ROOT/decoy_home";
 my $CFG_DIR    = "$ROOT/cfg_dir";
