@@ -1207,6 +1207,11 @@ sub _summary_for {
 # spawn a real Get-WinEvent, same idiom as probe_argv.
 sub _read_events_live {
     my ($since_e, $until_e) = @_;
+    # The System event log is a Windows thing. Off Windows this used to spawn
+    # powershell.exe anyway and report the failed spawn as a broken log; say
+    # what is actually true instead (the journal half of the report still runs).
+    return "the Windows System event log does not exist on $^O"
+        unless $^O =~ /^(MSWin32|msys|cygwin)$/;
     return 'refused: test guard' if defined $0 && $0 =~ /\.t\z/;
     my $since_iso = _utc_iso($since_e);
     my $until_iso = _utc_iso($until_e);

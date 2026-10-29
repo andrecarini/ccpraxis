@@ -970,6 +970,20 @@ sub flatten_values {
         my (undef, undef, $rc_nosuch) = run_cli($CLI, 'report', '--dir', $dir, '--session', 'nosuchsession');
         is($rc_nosuch, 1, 'AC9: --session with no resolvable transcript exits 1');
     }
+
+    # Off Windows there is no System event log: the report says so and still
+    # renders the journal, instead of spawning a powershell.exe that is not
+    # there and calling the log unreadable.
+    SKIP: {
+        skip 'AC9 (non-Windows): the live System log reader is real on Windows', 3
+            if $^O =~ /^(MSWin32|msys|cygwin)$/;
+        my ($out, $err, $rc) = run_cli($CLI, 'report', '--dir', $dir,
+            '--since', 1758899000, '--until', 1758900200, '--format', 'text');
+        is($rc, 0, 'AC9 (non-Windows): a live-events report exits 0') or diag("stderr: $err");
+        like($out, qr/the Windows System event log does not exist on \Q$^O\E/,
+            'AC9 (non-Windows): the note names the real reason');
+        unlike($out, qr/failed to spawn|exited nonzero/, 'AC9 (non-Windows): no powershell.exe was attempted');
+    }
 }
 
 # ===========================================================================
