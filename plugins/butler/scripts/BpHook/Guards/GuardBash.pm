@@ -2820,9 +2820,20 @@ sub _hyg_ctx {
         $R = _hyg_root_via_git($cwd);
     }
 
+    # Claude Code's own temp root is a temp root on every non-Windows host,
+    # whatever $TMPDIR says. macOS points $TMPDIR (and so File::Spec->tmpdir)
+    # at /var/folders/.../T, while Claude Code keeps its temp root -- the
+    # session scratchpad included -- at /private/tmp/claude-<uid>/, and /tmp
+    # is a symlink to /private/tmp there, so either spelling can arrive.
+    # Without these a worker's write to its own scratchpad read as "outside
+    # the repo and the temp dir" on a Mac. Only claude-<uid>, not all of
+    # /tmp: elsewhere under /tmp is outside unless $TMPDIR says otherwise,
+    # as before (the test runner's own /tmp/ccpraxis-sweep-* fixtures rely
+    # on exactly that).
+    my @posix_tmp = _hyg_is_winfam() ? () : ("/tmp/claude-$<", "/private/tmp/claude-$<");
     my @tmp;
     my %seen_tmp;
-    for my $v (eval { File::Spec->tmpdir }, $ENV{TMP}, $ENV{TEMP}, $ENV{TMPDIR}) {
+    for my $v (eval { File::Spec->tmpdir }, $ENV{TMP}, $ENV{TEMP}, $ENV{TMPDIR}, @posix_tmp) {
         next unless defined $v && length $v;
         my $b = BpHook::_to_bytes($v);
         next unless _hyg_is_abs($b);
