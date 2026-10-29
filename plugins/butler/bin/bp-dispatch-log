@@ -1,0 +1,13 @@
+#!/bin/bash
+# bp-dispatch-log -- extensionless alias for bp-dispatch-log.sh, so the bare name works on a
+# Linux/macOS PATH the way bp-dispatch-log.ps1 resolves through PATHEXT on Windows.
+#
+# Tracked on purpose. install.pl's helper used to create this as a symlink at
+# install time, inside the live install (~/.claude/ccpraxis); there it is an
+# untracked file, and promote.pl refuses to merge into a live tree with
+# untracked files, so every promotion on a macOS/Linux host was refused. The
+# helper skips any alias that already exists, so it now creates nothing.
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+
+BIN_DIR=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+exec bash "$BIN_DIR/bp-dispatch-log.sh" "$@"

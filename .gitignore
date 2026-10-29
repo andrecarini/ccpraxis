@@ -56,3 +56,9 @@ plugins/blueprint/templates/*.lock
 # file; a `git add -A` mid-run committed one (6a666db) and the test then removed
 # it, leaving a tracked path with no working copy. Ignore the shape, not the pid.
 plugins/*/tests/t/.hook-err.*
+
+# macOS Finder metadata. Never content; on a macOS host one Finder visit to
+# the live install would otherwise leave an untracked file there, and
+# promote.pl refuses a live tree with untracked files.
+.DS_Store
+._*
