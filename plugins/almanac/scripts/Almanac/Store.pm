@@ -218,6 +218,9 @@ sub _parent_of {
 # ---------------------------------------------------------------------------
 
 my $SW_IS_WIN = ($^O =~ /^(MSWin32|msys|cygwin)$/) ? 1 : 0;
+# macOS: APFS folds case and /tmp is a second temp root -- the same rules
+# BpDataRoot.pm applies (mirrored in lockstep, see unify-walkups.t).
+my $SW_IS_DARWIN = ($^O eq 'darwin') ? 1 : 0;
 
 sub _sw_fold_ascii {
     my ($s) = @_;
@@ -282,9 +285,9 @@ sub _sw_lex_canon {
 sub _sw_seg_eq {
     my ($x, $y, $allow_83) = @_;
     $allow_83 = 1 unless defined $allow_83;
-    return $x eq $y unless $SW_IS_WIN;
+    return $x eq $y unless $SW_IS_WIN || $SW_IS_DARWIN;
     return 1 if _sw_fold_ascii($x) eq _sw_fold_ascii($y);
-    return 0 unless $allow_83;
+    return 0 unless $SW_IS_WIN && $allow_83;
 
     for my $pair ([$x, $y], [$y, $x]) {
         my ($short, $long) = @$pair;
@@ -345,6 +348,7 @@ sub _sw_compute_stops {
     push @candidates, eval { File::Spec->tmpdir };
     push @candidates, $ENV{TMP}, $ENV{TEMP}, $ENV{TMPDIR};
     push @candidates, $ENV{HOME}, $ENV{USERPROFILE};
+    push @candidates, '/tmp', '/private/tmp' if $SW_IS_DARWIN;
 
     my @stops;
     for my $v (@candidates) {

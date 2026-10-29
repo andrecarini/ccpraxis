@@ -1438,6 +1438,7 @@ sub normalize_mirror_body {
     my ($body) = @_;
     return '' unless defined $body;
     $body =~ s/\bSW_IS_WIN\b/IS_WIN/g;
+    $body =~ s/\bSW_IS_DARWIN\b/IS_DARWIN/g;
     # Order matters: BpDataRoot's public same_path() dropped its leading
     # underscore when Decision 20 made it part of the public API, while
     # every other _sw_-prefixed mirror name maps to a still-PRIVATE

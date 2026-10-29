@@ -700,11 +700,40 @@ my $USAGE_RE = qr/usage:\s*bp-drive-next\.pl/;
         SKIP: { skip 'Windows-only path forms (Decision 11(12))', 1; }
         my ($r1, $d1) = try_call(sub { BpDataRoot::same_path('/home/A', '/home/a') });
         ok(!$d1, 'AC16(posix): same_path does not die') or diag($d1);
-        ok(!$r1, 'AC16(posix): /home/A NOT same_path /home/a (case-sensitive)') unless $d1;
+        if ($^O eq 'darwin') {
+            # APFS is case-insensitive and abs_path keeps the typed case, so
+            # on a Mac these two spellings are one directory.
+            ok($r1, 'AC16(macOS): /home/A same_path /home/a (APFS folds case)') unless $d1;
+            my ($r3) = try_call(sub { BpDataRoot::same_path('/Users/ANDR~1', '/Users/Andre') });
+            ok(!$r3, 'AC16(macOS): no 8.3 short-name tolerance off Windows');
+        } else {
+            ok(!$r1, 'AC16(posix): /home/A NOT same_path /home/a (case-sensitive)') unless $d1;
+        }
         my ($r2, $d2) = try_call(sub { BpDataRoot::same_path('/a/./b/..', '/a') });
         ok(!$d2, 'AC16(posix): same_path does not die') or diag($d2);
         ok($r2, 'AC16(posix): /a/./b/.. same_path /a (lexical collapse)') unless $d2;
     }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# macOS: /tmp (really /private/tmp) is a temp root too, and a stop
+# ═══════════════════════════════════════════════════════════════════════
+# $TMPDIR on a Mac is /var/folders/.../T; Claude Code's own per-session temp
+# dirs and scratchpads live under /private/tmp/claude-<uid>/. ancestors() is
+# the walk itself, so it shows directly whether the climb stops there.
+SKIP: {
+    skip 'the /tmp temp root is a macOS rule', 3 unless $^O eq 'darwin';
+    # A real, writable $TMPDIR elsewhere (File::Spec->tmpdir falls back to
+    # /tmp for one that is not, which would make /tmp a stop by accident).
+    local $ENV{TMPDIR} = File::Temp::tempdir(CLEANUP => 1);
+    my @a = BpDataRoot::ancestors(cwd => '/private/tmp/claude-501/-proj/sess/scratchpad');
+    ok(scalar(@a) >= 1, 'macOS: the walk from a scratchpad examines the start');
+    ok(!(grep { $_ eq '/private' || $_ eq '/' } @a),
+       'macOS: the walk from a /private/tmp scratchpad never climbs past /private/tmp')
+        or diag(join(' ', @a));
+    my @b = BpDataRoot::ancestors(cwd => '/tmp/some-run/x');
+    ok(!(grep { $_ eq '/' } @b), 'macOS: nor from a /tmp spelling of the same root')
+        or diag(join(' ', @b));
 }
 
 # ═══════════════════════════════════════════════════════════════════════
