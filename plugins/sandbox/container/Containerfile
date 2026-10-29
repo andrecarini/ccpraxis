@@ -164,9 +164,25 @@ ENV NODE_OPTIONS="--dns-result-order=ipv4first"
 # --connect-timeout/--max-time/--retry* added fix-batch step 7 (finding F4);
 # see the identical note above the Claude Code installer RUN step. --max-time
 # is larger here (the node tarball is a much bigger download).
-RUN curl -sSL --connect-timeout 10 --max-time 180 --retry 2 --retry-delay 3 --retry-all-errors https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz -o /tmp/node.tar.xz \
+#
+# THE TARBALL FOLLOWS THE IMAGE'S ARCHITECTURE. This used to fetch linux-x64
+# unconditionally, which is right on a Windows/WSL2 or Intel host and wrong on
+# an Apple Silicon Mac, whose podman machine builds a linux/arm64 image: the
+# x64 node binary then fails to exec ("Exec format error") at the very next
+# step, `npm install -g pnpm`. dpkg reports the architecture of the image being
+# built, so each host gets its native tarball and no emulation is involved.
+# Both filenames stay full literals, with ONE version: the butler pin auditor and
+# version-pin-currency.t read the pin out of the x64 literal, and
+# containerfile-portability.t fails if the two ever name different versions.
+# An unknown architecture fails the build loudly rather than guessing.
+RUN case "$(dpkg --print-architecture)" in \
+        amd64) NODE_TARBALL=node-v24.18.0-linux-x64.tar.xz ;; \
+        arm64) NODE_TARBALL=node-v24.18.0-linux-arm64.tar.xz ;; \
+        *) echo "Containerfile: no pinned Node tarball for architecture '$(dpkg --print-architecture)'" >&2; exit 1 ;; \
+    esac \
+    && curl -sSL --connect-timeout 10 --max-time 180 --retry 2 --retry-delay 3 --retry-all-errors "https://nodejs.org/dist/v24.18.0/${NODE_TARBALL}" -o /tmp/node.tar.xz \
     && tar -xf /tmp/node.tar.xz -C /tmp \
-    && mv /tmp/node-v24.18.0-linux-x64 /opt/node24 \
+    && mv "/tmp/${NODE_TARBALL%.tar.xz}" /opt/node24 \
     && ln -sf /opt/node24/bin/node /usr/local/bin/node \
     && ln -sf /opt/node24/bin/npm /usr/local/bin/npm \
     && rm -f /tmp/node.tar.xz \
@@ -255,20 +271,44 @@ WORKDIR /project
 # for a real worker: any process that opens /dev/null for redirection, or reads
 # /dev/urandom for entropy, will misbehave against an empty regular file.
 #
-# Baking the nodes here is the only place mknod is available (image build runs
-# privileged), so a jail built on a container from THIS image gets real devices
-# and bp-jail.pl's fallback never fires.
+# Baking the nodes here is the only place mknod CAN be available, so a jail
+# built on a container from THIS image gets real devices and bp-jail.pl's
+# fallback never fires.
+#
+# ...EXCEPT ON A ROOTLESS BUILD, where it is not available either. Measured on
+# a rootless podman machine (macOS, podman 6.1): `mknod c 1 3` inside `podman
+# build` fails with "Operation not permitted", because a user namespace may not
+# create device nodes, whatever capabilities it holds. This step used to read
+# `mknod ... && chmod && cp ... || true && cp ... || true && printf ...`, and
+# shell precedence made the first `|| true` swallow the mknod failure along
+# with everything chained before it: the build went green with no device
+# nodes, no 1777 /tmp and no nsswitch/hosts copies, and nothing said so.
+#
+# Now each part stands on its own. The /tmp, passwd and group skeleton is
+# built unconditionally and any failure there fails the build. The device
+# nodes are attempted as a group; if the builder cannot make them, the build
+# says so on its log and leaves a marker file naming why, rather than failing
+# every rootless host outright -- bp-jail.pl then uses its documented
+# empty-file fallback. The two cp's are optional by design and only they are
+# allowed to fail quietly, each in its own group.
 RUN mkdir -p /opt/bp-jail-skel/dev /opt/bp-jail-skel/etc/ssl /opt/bp-jail-skel/tmp \
-    && mknod -m 666 /opt/bp-jail-skel/dev/null    c 1 3 \
-    && mknod -m 666 /opt/bp-jail-skel/dev/zero    c 1 5 \
-    && mknod -m 444 /opt/bp-jail-skel/dev/random  c 1 8 \
-    && mknod -m 444 /opt/bp-jail-skel/dev/urandom c 1 9 \
     && chmod 1777 /opt/bp-jail-skel/tmp \
-    && cp -a /etc/nsswitch.conf /etc/hosts /opt/bp-jail-skel/etc/ 2>/dev/null || true \
-    && cp -a /etc/ssl/certs /opt/bp-jail-skel/etc/ssl/ 2>/dev/null || true \
     && printf 'root:x:0:0:root:/root:/bin/sh\nbpworker:x:4242:4242:bp jail worker:/work:/bin/sh\n' \
        > /opt/bp-jail-skel/etc/passwd \
-    && printf 'root:x:0:\nbpworker:x:4242:\n' > /opt/bp-jail-skel/etc/group
+    && printf 'root:x:0:\nbpworker:x:4242:\n' > /opt/bp-jail-skel/etc/group \
+    && { cp -a /etc/nsswitch.conf /etc/hosts /opt/bp-jail-skel/etc/ 2>/dev/null || true; } \
+    && { cp -a /etc/ssl/certs /opt/bp-jail-skel/etc/ssl/ 2>/dev/null || true; } \
+    && if mknod -m 666 /opt/bp-jail-skel/dev/null    c 1 3 \
+       && mknod -m 666 /opt/bp-jail-skel/dev/zero    c 1 5 \
+       && mknod -m 444 /opt/bp-jail-skel/dev/random  c 1 8 \
+       && mknod -m 444 /opt/bp-jail-skel/dev/urandom c 1 9; then \
+           echo 'bp-jail-skel: device nodes baked'; \
+       else \
+           rm -f /opt/bp-jail-skel/dev/null /opt/bp-jail-skel/dev/zero /opt/bp-jail-skel/dev/random /opt/bp-jail-skel/dev/urandom; \
+           echo 'mknod is not permitted in this image build (a rootless build cannot create device nodes); bp-jail.pl falls back to empty-file /dev stand-ins' \
+             > /opt/bp-jail-skel/dev/.no-device-nodes; \
+           echo 'WARNING: bp-jail-skel: mknod denied (rootless build?) -- jailed workers get bp-jail.pl empty-file /dev stand-ins; see /opt/bp-jail-skel/dev/.no-device-nodes' >&2; \
+       fi
 # resolv.conf is deliberately NOT baked: it is generated per-container by the
 # runtime, so a build-time copy would pin a stale nameserver. bp-jail.pl copies
 # the live /etc/resolv.conf into each jail at create time (DNS is criterion C6).

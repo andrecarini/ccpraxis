@@ -1,0 +1,137 @@
+#!/usr/bin/env perl
+# platform: any
+# The sandbox image must build natively on every host architecture the
+# launcher runs on, and a step that cannot do its job must say so rather than
+# go green. Two defects, both found porting the sandbox to an Apple Silicon Mac
+# (rootless podman machine, linux/arm64 image):
+#
+#   1. The Node toolchain step fetched node-*-linux-x64 unconditionally, so an
+#      arm64 build died at `npm install -g pnpm` with "Exec format error".
+#   2. The jail-skeleton step chained `mknod ... && cp ... || true && ...`.
+#      Shell precedence let that `|| true` swallow a mknod failure (which is
+#      what a rootless build always produces) together with every command
+#      before it, so the image shipped with no device nodes, no 1777 /tmp and
+#      no /etc copies while the build reported success.
+#
+# TEXT ONLY: never builds an image or starts a container (the real build is
+# exercised by the serial container tests and by hand; see the sandbox
+# README). Each detector is proven able to fire against a counter-fixture
+# holding the old shape, so a pass here cannot be vacuous.
+use strict;
+use warnings;
+use FindBin qw($Bin);
+use Test::More;
+
+my $CONTAINERFILE = "$Bin/../../container/Containerfile";
+open my $fh, '<:raw', $CONTAINERFILE or BAIL_OUT("cannot read $CONTAINERFILE: $!");
+my $SRC = do { local $/; <$fh> };
+close $fh;
+
+# run_instructions($text) -> list of RUN instruction bodies, each one logical
+# line (backslash continuations joined), comment lines dropped. A Containerfile
+# comment is a whole line starting with #, so trailing text after code is code.
+sub run_instructions {
+    my ($text) = @_;
+    my @out;
+    my $cur;
+    for my $line (split /\n/, $text) {
+        next if $line =~ /^\s*#/;
+        if (defined $cur) {
+            $cur .= ' ' . $line;
+        } elsif ($line =~ /^RUN\s+(.*)$/) {
+            $cur = $1;
+        } else {
+            next;
+        }
+        if ($cur =~ s/\\\s*$//) { next }
+        push @out, $cur;
+        undef $cur;
+    }
+    push @out, $cur if defined $cur;
+    return @out;
+}
+
+# unscoped_or_true($run) -> count of `|| true` that are NOT closed inside their
+# own `{ ...; }` group. Only a brace-scoped `|| true` is harmless in an &&
+# chain; anywhere else it absorbs the failure of everything chained before it.
+sub unscoped_or_true {
+    my ($run) = @_;
+    my $n = 0;
+    while ($run =~ /\|\|\s*true\b(?!\s*;\s*\})/g) { $n++ }
+    return $n;
+}
+
+# node_step($runs) -> the RUN body that installs the Node tarball, or undef.
+sub node_step {
+    my @runs = @_;
+    my ($r) = grep { /nodejs\.org\/dist\// } @runs;
+    return $r;
+}
+
+my @RUNS = run_instructions($SRC);
+ok(scalar(@RUNS) >= 5, 'harness: found the Containerfile RUN instructions (' . scalar(@RUNS) . ')');
+
+# ---------------------------------------------------------------------------
+# 1. Node tarball follows the image architecture.
+# ---------------------------------------------------------------------------
+{
+    my $node = node_step(@RUNS);
+    ok(defined $node, 'the Node install step exists');
+    $node //= '';
+    like($node, qr/dpkg --print-architecture/,
+        'the Node step picks its tarball from dpkg --print-architecture (the image arch, not the host shell)');
+    my ($x64)   = $node =~ /node-v(\d+\.\d+\.\d+)-linux-x64\.tar\.xz/;
+    my ($arm64) = $node =~ /node-v(\d+\.\d+\.\d+)-linux-arm64\.tar\.xz/;
+    ok(defined $x64,   'an amd64 (linux-x64) Node tarball literal is present');
+    ok(defined $arm64, 'an arm64 (linux-arm64) Node tarball literal is present');
+    is($arm64, $x64, 'both architectures pin the SAME Node version (a bump must move both)');
+    unlike($node, qr{https://nodejs\.org/dist/v[\d.]+/node-v[\d.]+-linux-x64\.tar\.xz},
+        'the download URL is not hard-wired to linux-x64');
+    like($node, qr/\*\)[^\n]*?exit 1\s*;;/,
+        'an unrecognised architecture fails the build instead of guessing');
+
+    # Counter-fixture: the pre-fix step must trip the detectors above.
+    my $old = 'curl -sSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz -o /tmp/node.tar.xz '
+            . '&& tar -xf /tmp/node.tar.xz -C /tmp && mv /tmp/node-v24.18.0-linux-x64 /opt/node24';
+    unlike($old, qr/dpkg --print-architecture/, 'counter-fixture: the old x64-only step is caught by the arch check');
+}
+
+# ---------------------------------------------------------------------------
+# 2. No `|| true` absorbs the failure of a chain it does not own.
+# ---------------------------------------------------------------------------
+{
+    my @bad = grep { unscoped_or_true($_) } @RUNS;
+    is(scalar(@bad), 0, 'every `|| true` in a RUN chain is scoped to its own { ...; } group')
+        or diag("offending RUN:\n  " . join("\n  ", @bad));
+
+    my $old = 'mkdir -p /opt/bp-jail-skel/dev && mknod -m 666 /opt/bp-jail-skel/dev/null c 1 3 '
+            . '&& chmod 1777 /opt/bp-jail-skel/tmp '
+            . '&& cp -a /etc/nsswitch.conf /etc/hosts /opt/bp-jail-skel/etc/ 2>/dev/null || true '
+            . '&& cp -a /etc/ssl/certs /opt/bp-jail-skel/etc/ssl/ 2>/dev/null || true '
+            . '&& printf x > /opt/bp-jail-skel/etc/passwd';
+    is(unscoped_or_true($old), 2, 'counter-fixture: the old jail-skeleton chain is flagged (two unscoped `|| true`)');
+    is(unscoped_or_true('a && { cp x y 2>/dev/null || true; } && b'), 0,
+        'paired negative: a brace-scoped `|| true` is not flagged');
+}
+
+# ---------------------------------------------------------------------------
+# 3. The jail skeleton: mknod failure is reported, the rest is built anyway.
+# ---------------------------------------------------------------------------
+{
+    my ($jail) = grep { /bp-jail-skel/ } @RUNS;
+    ok(defined $jail, 'the jail-skeleton step exists');
+    $jail //= '';
+    my $mknod_at = index($jail, 'mknod');
+    my $chmod_at = index($jail, 'chmod 1777');
+    my $passwd_at = index($jail, '/opt/bp-jail-skel/etc/passwd');
+    ok($chmod_at >= 0 && $chmod_at < $mknod_at,
+        'the 1777 /tmp skeleton is made BEFORE, and independently of, the mknod attempt');
+    ok($passwd_at >= 0 && $passwd_at < $mknod_at,
+        'passwd/group are written BEFORE, and independently of, the mknod attempt');
+    like($jail, qr/if\s+mknod\b.*;\s*then\b.*\belse\b.*\.no-device-nodes.*\bfi\b/,
+        'a failed mknod takes an explicit else branch that leaves a .no-device-nodes marker');
+    like($jail, qr/WARNING:[^']*mknod/,
+        'the else branch prints a WARNING naming mknod into the build log');
+}
+
+done_testing();
