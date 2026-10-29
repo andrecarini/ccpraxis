@@ -101,9 +101,12 @@ sub _safe_parents {
     return 1;
 }
 
+our $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/ ? 1 : 0;
+
 sub _copy_file {
     my ($src, $dst) = @_;
     open my $in, '<:raw', $src or do { warn "PluginSync: read $src: $!\n"; return; };
+    my $mode = (stat $in)[2];
     local $/;
     my $bytes = <$in>;
     close $in;
@@ -114,6 +117,16 @@ sub _copy_file {
     open my $out, '>:raw', $dst or do { warn "PluginSync: write $dst: $!\n"; return; };
     print $out (defined $bytes ? $bytes : '');
     close $out;
+    # CARRY THE PERMISSION BITS, which a read-then-write copy does not: the
+    # new file gets 0666 & ~umask, so every plugin script lost its executable
+    # bit on the way into claude-home. That was invisible on Windows, whose
+    # bind mount presents every file as 0777 inside the container; a macOS
+    # podman machine shares the host tree over virtiofs with its REAL modes,
+    # so a copied plugin's hook or bin/ shim became "Permission denied" in the
+    # sandbox. The owner-write bit is always kept on, so a read-only source
+    # (git object packs are 0444) cannot make the copy unrefreshable on the
+    # next reconcile. Windows hosts are left exactly as they were.
+    chmod((($mode & 07777) & ~06000) | 0200, $dst) if !$WINDOWS_FAMILY && defined $mode;
 }
 
 # prune_empty_parents($dest_root, $rel) — rmdir empty parent dirs of
