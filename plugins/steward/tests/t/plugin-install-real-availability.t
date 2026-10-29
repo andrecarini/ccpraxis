@@ -275,6 +275,35 @@ sub scratch_file {
         }
     }
 
+    # (d2) macOS/Linux: a Windows drive-letter path is RELATIVE there, as it
+    # is to the loader (Node's path.isAbsolute). The fixture makes the
+    # relative reading resolvable -- a real "C:/mkt" catalog under the run's
+    # cwd -- so the old "drive letter is absolute everywhere" rule would have
+    # served the plugin from it; the rule must refuse instead.
+    unless ($^O =~ /^(MSWin32|msys|cygwin)$/) {
+        my $cwd_root = temproot();
+        make_path("$cwd_root/C:/mkt/.claude-plugin");
+        wjson("$cwd_root/C:/mkt/.claude-plugin/marketplace.json",
+            { name => 'dm', plugins => [ { name => 'p', source => './p' } ] });
+        my $settings = scratch_file('settings.json');
+        wjson($settings, { enabledPlugins => { 'p@dm' => jtrue() } });
+        my $marketplaces = scratch_file('known_marketplaces.json');
+        wjson($marketplaces, { dm => { source => { source => 'directory', path => 'C:/mkt' } } });
+
+        my $orig = Cwd::getcwd();
+        chdir $cwd_root or die "chdir $cwd_root: $!";
+        my $r = run_check_plugins(settings => $settings, marketplaces => $marketplaces);
+        chdir $orig or die "chdir back: $!";
+        is($r->{exit}, 1, 'AC4 (B4d2 drive-letter path on POSIX): exit 1 -- not absolute, not served in place')
+            or diag($r->{out} . $r->{err});
+        if (ref($r->{json}) eq 'HASH') {
+            my @missing = grep { ($_->{plugin} // '') eq 'p@dm' } @{ $r->{json}{missing} // [] };
+            is(scalar(@missing), 1, 'AC4 (B4d2): p@dm is in missing[]');
+        } else {
+            ok(0, "AC4 (B4d2): stdout decodes as JSON ($r->{out})");
+        }
+    }
+
     # (e) source.path missing entirely.
     {
         my $settings = scratch_file('settings.json');

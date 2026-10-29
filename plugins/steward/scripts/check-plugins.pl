@@ -136,12 +136,18 @@ sub _is_json_number {
     return (($f & (B::SVf_IOK | B::SVf_NOK)) && !($f & B::SVf_POK)) ? 1 : 0;
 }
 
+# Mirrors the loader's own absoluteness test on each platform. A drive letter
+# or UNC prefix is absolute only on Windows; on macOS/Linux "C:/Users/..." is
+# a RELATIVE path (Node's path.isAbsolute says so too), which a payload or a
+# known_marketplaces.json copied from the Windows host can carry. Counting it
+# absolute there was harmless only by accident: the catalog read went to
+# <cwd>/C:/... and found nothing. The rule now says what the loader does.
 sub is_absolute_path {
     my ($p) = @_;
     return 0 unless defined $p && length $p;
-    return 1 if $p =~ m{^[A-Za-z]:[\\/]};
-    return 1 if $p =~ m{^\\\\};
     if ($^O =~ /^(MSWin32|msys|cygwin)$/) {
+        return 1 if $p =~ m{^[A-Za-z]:[\\/]};
+        return 1 if $p =~ m{^\\\\};
         return 0;
     }
     return 1 if $p =~ m{^/};
