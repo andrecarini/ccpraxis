@@ -138,6 +138,17 @@ unlike(defined $o1->{message} ? $o1->{message} : '', qr/declin/i, 'AC-R8a: messa
 unlike(defined $o1->{message} ? $o1->{message} : '', qr/worktree/i, 'AC-R8b: message does not mention "worktree"');
 unlike(defined $o1->{message} ? $o1->{message} : '', qr/\boffer\b/i, 'AC-R8c: message does not mention "offer"');
 
+# AC-R12 -- the advice for bringing changes back names the one promotion
+# command (plugins/sandbox/docs/working-on-ccpraxis.md). It used to offer
+# `git -C <live> pull <clone> main` and call that the whole promotion, which
+# skips promote.pl's global-config sync into ~/.claude.
+like(defined $o6->{message} ? $o6->{message} : '', qr{\Qscripts/promote.pl\E},
+     'AC-R12a: message names scripts/promote.pl as the way to bring changes back');
+unlike(defined $o6->{message} ? $o6->{message} : '', qr/\Qgit -C $DISTINCT_LIVE pull\E/,
+     'AC-R12b: message does not offer a bare git pull into the live install');
+unlike(defined $o6->{message} ? $o6->{message} : '', qr/alone promotes/i,
+     'AC-R12c: message does not present a pull as the whole promotion');
+
 # AC-R9 — graceful degradation: no args, and empty-hash args
 {
     my ($o_noargs, $err_noargs);

@@ -343,7 +343,7 @@ sub workcopy_refusal_outcome {
         . "\n"
         . "This is the ccpraxis installation Claude Code is running from — its plugins, skills and launcher are in use right now. Sandboxing it here would edit the tooling while it is running, and git inside the container would not work.\n"
         . "\n"
-        . "Work on a separate clone instead. Pick any ordinary directory outside this install (for example C:/Development/ccpraxis on Windows, or ~/src/ccpraxis on macOS or Linux), then run:\n"
+        . "Work on a separate clone instead. Pick any ordinary directory outside this install (for example ~/Projects/ccpraxis, or C:/Development/ccpraxis on Windows), then run:\n"
         . "\n"
         . "  git clone --no-hardlinks $live <your-clone-dir>\n"
         . "  cd <your-clone-dir>\n"
@@ -351,11 +351,11 @@ sub workcopy_refusal_outcome {
         . "\n"
         . "The --no-hardlinks flag is required: a local clone hardlinks the object store by default, which would silently re-couple the clone to this installation.\n"
         . "\n"
-        . "That clone is an ordinary project — git works normally inside the container, and nothing it does can reach this installation. To bring changes back, merge them into this install from the host:\n"
+        . "That clone is an ordinary project — git works normally inside the container, and nothing it does can reach this installation. To bring changes back, commit them on the clone's main and promote them from the host:\n"
         . "\n"
-        . "  git -C $live pull <your-clone-dir> main\n"
+        . "  perl <your-clone-dir>/scripts/promote.pl\n"
         . "\n"
-        . "That alone promotes them: this repo IS the installed plugin tree. Re-run install.pl only if the PATH wiring or the set of plugins changed. See plugins/sandbox/docs/working-on-ccpraxis.md.\n"
+        . "It merges the clone's main into this install and syncs global-config/ into ~/.claude; a bare git pull into this install would skip that sync. Re-run install.pl only if the PATH wiring or the set of plugins changed. See plugins/sandbox/docs/working-on-ccpraxis.md.\n"
         . "\n"
         . "Aborting.";
     return {
