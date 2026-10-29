@@ -163,11 +163,15 @@ sub _canonical_path {
 # callers that pass an explicit root/home (B1, AC-35) are compared against
 # the test oracle's own un-folded normalisation, and folding there would
 # create the opposite mismatch.
+#
+# The /x/ -> X:/ fold is Windows-family only. Elsewhere "/x/..." is just a
+# directory named x at the root, and rewriting it to "X:/..." (a relative
+# path there) sent the walk somewhere that does not exist.
 sub _fold_drive_form {
     my ($p) = @_;
     return $p unless defined $p;
     $p =~ s{\\}{/}g;
-    $p =~ s{^/([a-zA-Z])(?=/|\z)}{uc($1) . ':'}e;
+    $p =~ s{^/([a-zA-Z])(?=/|\z)}{uc($1) . ':'}e if $^O =~ /^(MSWin32|msys|cygwin)$/;
     $p =~ s{/\z}{} if length($p) > 1;
     return $p;
 }

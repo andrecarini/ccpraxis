@@ -11,6 +11,7 @@ use lib "$Bin/../../scripts";
 use Test::More;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
+use Cwd ();
 use Almanac::Store ();
 
 my $top  = tempdir(CLEANUP => 1);
@@ -40,6 +41,30 @@ sub same { my ($a, $b) = @_; return Almanac::Store::_canonical_path($a) eq Alman
 {
     local $ENV{ALMANAC_PROJECT_ROOT} = '';
     ok(same(Almanac::Store::resolve_project_root(cwd => "$repo/src"), $repo), 'an empty pin is ignored');
+}
+
+# The walk's starting point folds "/x/..." to the drive form "X:/..." only on
+# a Windows-family perl. On macOS/Linux that rewrite turned an absolute cwd
+# into a RELATIVE path ("X:/..."), so the walk probed under the process's
+# own working directory and could adopt an unrelated directory there.
+{
+    my $win = ($^O =~ /^(MSWin32|msys|cygwin)$/) ? 1 : 0;
+    is(Almanac::Store::_fold_drive_form('/q/some/where/'), $win ? 'Q:/some/where' : '/q/some/where',
+       'the /x/ -> X:/ drive fold applies on Windows only');
+    SKIP: {
+        skip 'the drive fold is correct on Windows', 1 if $win;
+        my $decoy = tempdir(CLEANUP => 1);
+        make_path("$decoy/Q:/proj/.git");
+        my $was = Cwd::getcwd();
+        chdir $decoy or die "chdir $decoy: $!";
+        local $ENV{ALMANAC_PROJECT_ROOT};
+        delete $ENV{ALMANAC_PROJECT_ROOT};
+        local $ENV{CLAUDE_PROJECT_DIR} = $top;
+        my $got = Almanac::Store::resolve_project_root(cwd => '/q/proj');
+        chdir $was or die "chdir back to $was: $!";
+        ok(same($got, $top), 'a /q/... cwd is never walked as a path relative to the process cwd')
+            or diag("got $got");
+    }
 }
 
 done_testing();
