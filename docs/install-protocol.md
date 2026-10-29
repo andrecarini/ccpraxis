@@ -54,8 +54,10 @@ with AskUserQuestion before the real run. Then act on what it reports:
   them from `~/.claude/CLAUDE.md`; step 5's copy still has them). Never replace the file with a
   symlink.
 - `kept-local <key>`: the user's own value was kept. For each, show both values (`perl
-  ~/.claude/ccpraxis/plugins/steward/scripts/json-diff.pl ~/.claude/settings.json
-  ~/Projects/ccpraxis/global-config/settings.json` lists them under `diverged`) and ask whether to
+  ~/.claude/ccpraxis/plugins/steward/scripts/json-diff.pl --host-live ~/.claude/ccpraxis
+  ~/.claude/settings.json ~/Projects/ccpraxis/global-config/settings.json` lists them under
+  `diverged`; `--host-live` makes it compare the settings as they apply to this machine, so the
+  marketplace-path placeholder and another platform's keys are not reported) and ask whether to
   keep theirs or take the repo's. Apply a "take the repo's" answer by editing that key in
   `~/.claude/settings.json`.
 
