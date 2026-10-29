@@ -26,6 +26,13 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+# macOS ships no `timeout`: the runner puts scripts/test-bin/timeout on PATH
+# for a sweep, and a file run on its own puts it there itself (the same rule
+# as GuardHarness.pm), so every `timeout` below resolves either way.
+unless (grep { -x "$_/timeout" } split /:/, ($ENV{PATH} // q{})) {
+    $ENV{PATH} = "$Bin/../../../../scripts/test-bin:" . ($ENV{PATH} // q{})
+        if -x "$Bin/../../../../scripts/test-bin/timeout";
+}
 use lib "$Bin/../../scripts";
 use Test::More;
 use File::Temp qw(tempdir tempfile);

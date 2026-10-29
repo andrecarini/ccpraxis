@@ -112,6 +112,13 @@ ok(length($LAUNCHER_SRC_TEXT) > 0, 'setup: launcher.pl was read as source text')
 # run_capped($cmd_list_or_str, %opts) -> ($stdout_and_stderr, $exit)
 # Bounded subprocess runner (never launcher.pl). Uses `timeout` per the
 # standing hazard.
+# macOS ships no `timeout`: the runner puts scripts/test-bin/timeout on PATH
+# for a sweep, and a file run on its own puts it there itself (the same rule
+# as GuardHarness.pm).
+unless (grep { -x "$_/timeout" } split /:/, ($ENV{PATH} // '')) {
+    $ENV{PATH} = "$Bin/../../../../scripts/test-bin:" . ($ENV{PATH} // '')
+        if -x "$Bin/../../../../scripts/test-bin/timeout";
+}
 sub run_capped {
     my ($cmd, %opts) = @_;
     my $secs = $opts{secs} // 10;

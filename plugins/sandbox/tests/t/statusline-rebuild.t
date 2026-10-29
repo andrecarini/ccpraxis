@@ -52,6 +52,14 @@ use Time::HiRes ();
 
 use_ok('Theme') or BAIL_OUT('Theme.pm did not load -- package 02 is a dependency of this one');
 
+# macOS ships no `timeout`: the runner puts scripts/test-bin/timeout on PATH
+# for a sweep, and a file run on its own puts it there itself (the same rule
+# as GuardHarness.pm), so every `timeout` below resolves either way.
+unless (grep { -x "$_/timeout" } split /:/, ($ENV{PATH} // '')) {
+    $ENV{PATH} = "$Bin/../../../../scripts/test-bin:" . ($ENV{PATH} // '')
+        if -x "$Bin/../../../../scripts/test-bin/timeout";
+}
+
 my $STATUSLINE    = "$Bin/../../../../scripts/statusline.pl";
 my $BP_STATUSLINE = "$Bin/../../../butler/scripts/bp-statusline.pl";
 my $SANDBOX_SCRIPTS = "$Bin/../../scripts";
