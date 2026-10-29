@@ -23,7 +23,7 @@ The blueprint directory path. Read `blueprint.md` and every ledger under `packag
 - **Write-set-implied checks** — REQUIRED pass. **You cannot run it, and you must not pretend to.**
 
   ```
-  perl plugins/butler/scripts/bp-checks.pl audit --blueprint <blueprint.md>
+  perl "${CLAUDE_PLUGIN_ROOT}"/../butler/scripts/bp-checks.pl audit --blueprint <blueprint.md>
   ```
 
   **This instruction used to read "run it, do not eyeball it", and you have no Bash tool** — your `tools:` line is `Read, Grep, Glob, Write`, deliberately, because your containment to the blueprint files is the instrument. So the instruction was unfollowable as written, and audit-07 of `butler-gate-ergonomics` found it had been hand-derived for **seven consecutive rounds**, each one reporting a result nobody executed.
@@ -42,7 +42,7 @@ The blueprint directory path. Read `blueprint.md` and every ledger under `packag
 - **Ledger model/effort values** — REQUIRED pass. **You cannot run it, and you must not pretend to.**
 
   ```
-  perl plugins/butler/scripts/bp-model-check.pl audit --blueprint <blueprint.md>
+  perl "${CLAUDE_PLUGIN_ROOT}"/../butler/scripts/bp-model-check.pl audit --blueprint <blueprint.md>
   ```
 
   `bp-ledger.pl create` refuses an unsupported `model:`/`effort:` at creation time, and

@@ -17,16 +17,22 @@ Steps:
 
    ```bash
    BP=<data>/blueprints/<name>/blueprint.md
-   perl plugins/butler/scripts/bp-blueprint.pl init --file "$BP" \
+   perl "${CLAUDE_PLUGIN_ROOT}/../butler/scripts/bp-blueprint.pl" init --file "$BP" \
         --template "${CLAUDE_PLUGIN_ROOT}/templates/blueprint.md" --name <kebab-name>
-   # prose sections — one call per section, body from a file:
-   perl plugins/butler/scripts/bp-blueprint.pl set-section --file "$BP" \
-        --section Objective --text-file /tmp/objective.md
+   # prose sections — one call per section, body from a file. Make the file with
+   # `mktemp` and write the body into the path it prints; never a fixed /tmp name,
+   # which another session authoring at the same moment would overwrite:
+   perl "${CLAUDE_PLUGIN_ROOT}/../butler/scripts/bp-blueprint.pl" set-section --file "$BP" \
+        --section Objective --text-file <path-from-mktemp>
    # decisions and package rows — typed verbs, validated against the real parser:
-   perl plugins/butler/scripts/bp-blueprint.pl add-decision --file "$BP" --id 1 --text "..."
-   perl plugins/butler/scripts/bp-blueprint.pl add-package  --file "$BP" --pkg 01-slug \
+   perl "${CLAUDE_PLUGIN_ROOT}/../butler/scripts/bp-blueprint.pl" add-decision --file "$BP" --id 1 --text "..."
+   perl "${CLAUDE_PLUGIN_ROOT}/../butler/scripts/bp-blueprint.pl" add-package  --file "$BP" --pkg 01-slug \
         --deliverable "..." --model sonnet --status pending
    ```
+
+   The butler scripts are reached through `${CLAUDE_PLUGIN_ROOT}/../butler/`, the sibling plugin
+   in the same ccpraxis tree, never as `plugins/butler/...`: that relative form only resolves when
+   the session's cwd happens to be a ccpraxis checkout, and authoring runs in any project.
 
    `init` refuses to overwrite an existing blueprint, requires a kebab-case name, and strips the template's illustrative rows (left in, `parse_dag` reads `01-<slug>` as a real package). `set-section` refuses the structured sections — `Package status`, `Decisions`, `Harvest log` have their own verbs.
 

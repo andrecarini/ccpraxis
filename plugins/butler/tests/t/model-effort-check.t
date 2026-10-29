@@ -313,12 +313,15 @@ sub fresh_bp {
         like($text, qr/Output NOT supplied/, "AC-20/B-50: ...and the literal 'Output NOT supplied'");
 
         # The EXISTING bp-checks.pl audit item, pinned verbatim (read from disk at authoring
-        # time, 2026-09-23) -- must survive this package's addition byte-for-byte.
+        # time, 2026-09-23) -- must survive this package's addition byte-for-byte. Its
+        # command line has since moved off the cwd-relative `plugins/butler/scripts/`
+        # (which resolves only inside a ccpraxis checkout) onto the sibling-plugin path
+        # (blueprint-skill-script-paths.t); everything else is the original text.
         my $existing_item = <<'ITEM';
 - **Write-set-implied checks** — REQUIRED pass. **You cannot run it, and you must not pretend to.**
 
   ```
-  perl plugins/butler/scripts/bp-checks.pl audit --blueprint <blueprint.md>
+  perl "${CLAUDE_PLUGIN_ROOT}"/../butler/scripts/bp-checks.pl audit --blueprint <blueprint.md>
   ```
 
   **This instruction used to read "run it, do not eyeball it", and you have no Bash tool** — your `tools:` line is `Read, Grep, Glob, Write`, deliberately, because your containment to the blueprint files is the instrument. So the instruction was unfollowable as written, and audit-07 of `butler-gate-ergonomics` found it had been hand-derived for **seven consecutive rounds**, each one reporting a result nobody executed.
