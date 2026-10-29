@@ -182,6 +182,9 @@ sub cyg {
 }
 
 my $IS_WINFAM = ($^O =~ /^(?:MSWin32|msys|cygwin)$/) ? 1 : 0;
+# Case-insensitive command lookup and paths: Windows-family perls AND darwin
+# (APFS). GuardBash's _hyg_is_ci; the 8.3/drive-letter cases stay $IS_WINFAM.
+my $IS_CI = ($IS_WINFAM || $^O eq 'darwin') ? 1 : 0;
 my $SKIP_WIN_REASON;
 if (!$IS_WINFAM)        { $SKIP_WIN_REASON = 'not a Windows-family perl' }
 elsif (!$HAVE_CYGPATH)  { $SKIP_WIN_REASON = 'cygpath is not available on this host' }
@@ -920,9 +923,12 @@ my @MVCP_SHAPES = (
             or diag("cmd: $cmd");
     }
     SKIP: {
-        skip('AC-23 case-insensitive names: not a Windows-family perl', 2) unless $IS_WINFAM;
-        is(run_for($driver_main, 'RM -rf .git')->{rc}, 2, 'AC-23 (redteam S3, SHOULD): RM -rf .git -> deny (case-insensitive on Windows-family)');
-        is(run_for($driver_main, "TOUCH $OUTSIDE/f")->{rc}, 2, 'AC-23 (redteam S3, SHOULD): TOUCH outside -> deny (case-insensitive on Windows-family)');
+        skip('AC-23 case-insensitive names: not a case-insensitive host (Windows-family or darwin)', 3) unless $IS_CI;
+        is(run_for($driver_main, 'RM -rf .git')->{rc}, 2, 'AC-23 (redteam S3, SHOULD): RM -rf .git -> deny (case-insensitive host)');
+        is(run_for($driver_main, "TOUCH $OUTSIDE/f")->{rc}, 2, 'AC-23 (redteam S3, SHOULD): TOUCH outside -> deny (case-insensitive host)');
+        # macOS port: the protected-root names fold too. APFS resolves .GIT to
+        # the repo's own .git, and darwin used to fold nothing here.
+        is(run_for($driver_main, 'rm -rf .GIT')->{rc}, 2, 'AC-23 (macOS port): rm -rf .GIT -> deny (protected root, case-folded)');
     }
 }
 
@@ -1224,7 +1230,7 @@ my @MVCP_SHAPES = (
             or diag("cmd: $cmd");
     }
     SKIP: {
-        skip('AC-36 uppercase wrapper names: not a Windows-family perl', 3) unless $IS_WINFAM;
+        skip('AC-36 uppercase wrapper names: not a case-insensitive host (Windows-family or darwin)', 3) unless $IS_CI;
         is(run_for($driver_main, 'ENV rm -rf .git')->{rc}, 2, 'AC-36 (redteam-2 S4, SHOULD): ENV rm -rf .git -> deny (case-insensitive wrapper)');
         is(run_for($driver_main, 'NICE rm -rf .git')->{rc}, 2, 'AC-36 (redteam-2 S4, SHOULD): NICE rm -rf .git -> deny (case-insensitive wrapper)');
         is(run_for($driver_main, 'TIMEOUT 5 rm -rf .git')->{rc}, 2, 'AC-36 (redteam-2 S4, SHOULD): TIMEOUT 5 rm -rf .git -> deny (case-insensitive wrapper)');
