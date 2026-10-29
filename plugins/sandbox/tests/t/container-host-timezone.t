@@ -688,9 +688,14 @@ for my $run_result ([1, ''], [-1, '']) {
 {
     my $lsrc = slurp($LAUNCHER);
     SKIP: {
-        skip 'AC21 (launcher side): launcher.pl not readable', 1 unless defined $lsrc;
-        my $needle21 = '"$CONTAINER_CONFIG/Containerfile"';
-        like($lsrc, qr/\Q$needle21\E/, 'AC21: containerfile_hash still hashes "$CONTAINER_CONFIG/Containerfile"');
+        skip 'AC21 (launcher side): launcher.pl not readable', 2 unless defined $lsrc;
+        # The hash moved to SandboxIdentity::image_inputs_hash so bootstrap.pl can stamp the
+        # same value on the image (shared-image-drift.t); the launcher hands it its container dir.
+        my $needle21 = 'SandboxIdentity::image_inputs_hash($CONTAINER_CONFIG)';
+        like($lsrc, qr/\Q$needle21\E/, 'AC21: containerfile_hash still hashes the $CONTAINER_CONFIG dir');
+        my $isrc = slurp("$Bin/../../scripts/SandboxIdentity.pm") // '';
+        my $cf_needle = '_md5_file("$dir/Containerfile")';
+        like($isrc, qr/\Q$cf_needle\E/, 'AC21: and that hash covers the Containerfile');
     }
 }
 

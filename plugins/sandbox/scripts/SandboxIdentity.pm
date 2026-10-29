@@ -6,7 +6,8 @@ package SandboxIdentity;
 # changes this file and nothing else:
 #
 #   * identity -- the names this launcher stamps on machine-wide things: the
-#     container image, container names, the in-container hostname, the
+#     container image (and the label recording what it was built from),
+#     container names, the in-container hostname, the
 #     Windows Terminal profile, and the id it presents to refusal markers
 #     (RefusalMarker.pm). Two launchers with different identities never build
 #     over each other's image or adopt each other's containers.
@@ -24,6 +25,7 @@ use warnings;
 use Exporter qw(import);
 use File::Basename qw(dirname);
 use Cwd ();
+use Digest::MD5 ();
 
 our @EXPORT_OK = qw(
     install_root
@@ -31,6 +33,8 @@ our @EXPORT_OK = qw(
     container_name
     is_sandbox_container_name
     directory_marketplace_source
+    image_inputs_hash
+    image_inputs_label
 );
 
 # ---- identity (a fork edits these lines) --------------------------------
@@ -144,6 +148,38 @@ sub directory_marketplace_source {
         return $own if -f "$own/.claude-plugin/marketplace.json";
     }
     return $registry_path;
+}
+
+# image_inputs_hash($container_dir) -> md5 of everything the shared image is built from: the
+# Containerfile AND every file it COPYs in (heartbeat.sh), so editing any build input, not only the
+# Containerfile, marks an image built before the edit as stale.
+#
+# EVERY build site (launcher and bootstrap) stamps it on the image as the image_inputs_label()
+# label. The per-project record ($LAUNCHER_DIR/containerfile-hash) says only what THAT project last
+# built. A project that never built has no record, so it could not tell that the shared image came
+# from an older Containerfile (bug report 20261029-100635-e6a7: a new project got a two-week-old
+# Debian 12 image after the switch to Debian 13). The label travels with the image, so every
+# project reads the same answer.
+sub image_inputs_hash {
+    my ($dir) = @_;
+    my $parts = _md5_file("$dir/Containerfile");
+    for my $f ('heartbeat.sh') {
+        my $p = "$dir/$f";
+        $parts .= ':' . (-f $p ? _md5_file($p) : 'absent');
+    }
+    return Digest::MD5::md5_hex($parts);
+}
+
+# The image label image_inputs_hash() is recorded under.
+sub image_inputs_label { return 'ccpraxis.containerfile-hash' }
+
+sub _md5_file {
+    my ($path) = @_;
+    open my $fh, '<:raw', $path or die "image_inputs_hash: open $path: $!\n";
+    my $ctx = Digest::MD5->new;
+    $ctx->addfile($fh);
+    close $fh;
+    return $ctx->hexdigest;
 }
 
 1;

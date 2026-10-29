@@ -2306,16 +2306,27 @@ sub md5_of_string {
 }
 
 sub containerfile_hash {
-    # Hash the Containerfile AND every file it COPYs into the image, so editing a
-    # build input (e.g. the entrypoint script heartbeat.sh) triggers a rebuild on
-    # the next launch. Hashing only the Containerfile would let a changed
-    # heartbeat.sh ship stale in a cached image.
-    my $parts = md5_of_file("$CONTAINER_CONFIG/Containerfile");
-    for my $f ('heartbeat.sh') {
-        my $p = "$CONTAINER_CONFIG/$f";
-        $parts .= ':' . (-f $p ? md5_of_file($p) : 'absent');
-    }
-    return md5_of_string($parts);
+    # The Containerfile AND every file it COPYs into the image (heartbeat.sh), so
+    # editing any build input triggers a rebuild on the next launch. Lives in
+    # SandboxIdentity because bootstrap.pl builds the same image and must stamp
+    # the same value on it (image_inputs_label).
+    return SandboxIdentity::image_inputs_hash($CONTAINER_CONFIG);
+}
+
+# image_inputs_label_of($image) -> the build-input hash the image was labelled
+# with, '' for an image built before the label existed, undef when podman
+# cannot answer (no image, podman unreachable). Fail-open: undef is "cannot
+# tell", never "stale".
+sub image_inputs_label_of {
+    my ($image) = @_;
+    my $fmt = '{{ index .Config.Labels "' . SandboxIdentity::image_inputs_label() . '" }}';
+    my ($rc, $out) = _capture_out_err($PODMAN, 'image', 'inspect', '--format', $fmt, $image);
+    return undef unless $rc == 0 && defined $out;
+    $out =~ s/\s+\z//;
+    $out =~ s/\A\s+//;
+    # Go templates print "<no value>" for a missing map key.
+    return '' if $out eq '' || $out eq '<no value>';
+    return $out;
 }
 
 sub launcher_hash {
@@ -2506,6 +2517,7 @@ sub build_image {
         (defined $build_mem ? ('--memory', $build_mem) : ()),
         '--build-arg', "CLAUDE_VERSION=${HOST_VERSION}",
         '--build-arg', "P02_SSH_HOST_KEYS_CACHEBUST=${ssh_host_keys_cachebust}",
+        '--label', SandboxIdentity::image_inputs_label() . '=' . containerfile_hash(),
         '-t', SandboxIdentity::image_ref($HOST_VERSION),
         '-t', $IMAGE_LATEST,
         $CONTAINER_CONFIG);
@@ -3149,6 +3161,46 @@ my $CURRENT_DF_HASH = containerfile_hash();
     if (defined $saved && length $saved && $saved ne $CURRENT_DF_HASH) {
         push @STALE_REASONS, "  - Containerfile has changed since last build";
     }
+}
+
+# Shared image drift, judged from the image itself.
+#
+# The check above reads a PER-PROJECT record, so a project that has never built
+# skips it, and it happily created its first container from a shared image
+# built from an older Containerfile (bug report 20261029-100635-e6a7: Debian 12
+# kept after the move to Debian 13). Every build stamps the build-input hash on
+# the image as a label; compare that, whatever this project has or has not
+# recorded.
+#
+# An image with NO label predates the label. Its inputs are unknown, so it
+# counts as stale only when this project has no record of its own to vouch for
+# it -- otherwise every project would be nagged once for an image the check
+# above already judges. undef (podman could not answer) is never drift.
+if ($IMAGE_EXISTS) {
+    my $label = image_inputs_label_of($IMAGE_LATEST);
+    my $saved = _read_file("$LAUNCHER_DIR/containerfile-hash");
+    chomp $saved if defined $saved;
+    my $reason = shared_image_stale_reason($IMAGE_LATEST, $label, $CURRENT_DF_HASH,
+                                           (defined $saved && length $saved) ? 1 : 0);
+    # Said once: the per-project check may already have reported the same change.
+    if (defined $reason && !grep { /Containerfile has changed/ } @STALE_REASONS) {
+        push @STALE_REASONS, "  - $reason";
+        log_ev('shared_image_stale', { label => $label, current => $CURRENT_DF_HASH });
+    }
+}
+
+# shared_image_stale_reason($image, $label, $current, $have_record) -> a reason
+# string, or undef when the image is current or nothing can be told. Pure, so
+# t/shared-image-drift.t drives it through every state.
+#   $label  -- image_inputs_label_of(): the hash, '' (no label), undef (unknown)
+sub shared_image_stale_reason {
+    my ($image, $label, $current, $have_record) = @_;
+    return undef unless defined $label && defined $current && length $current;
+    return "The shared image $image was built from an older Containerfile"
+        if length $label && $label ne $current;
+    return "The shared image $image predates build-input tracking; it may be from an older Containerfile"
+        if !length $label && !$have_record;
+    return undef;
 }
 
 # Launcher hash drift.

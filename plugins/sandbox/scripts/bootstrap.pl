@@ -442,8 +442,12 @@ if ($? == 0) {
     ($host_version) = split /\s+/, ($host_version // '');
     $host_version = SandboxIdentity::claude_version($host_version);   # a pinned identity wins
     $host_version //= 'latest';
+    # Same label as the launcher's build: without it the launcher could not tell
+    # this image's Containerfile from an older one (SandboxIdentity::image_inputs_hash).
     my $rc = system($PODMAN, 'build',
         '--build-arg', "CLAUDE_VERSION=$host_version",
+        '--label', SandboxIdentity::image_inputs_label() . '='
+                   . SandboxIdentity::image_inputs_hash($CONTAINER_CONFIG),
         '-t', SandboxIdentity::image_ref($host_version),
         '-t', $IMAGE_LATEST,
         $CONTAINER_CONFIG);
