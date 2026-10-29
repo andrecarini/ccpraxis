@@ -903,4 +903,34 @@ sub baseline_ref_exists {
     remove_tree($proj, { safe => 0 });
 }
 
+# ---------------------------------------------------------------------------
+# Host portability: the gate's per-file bound without GNU `timeout`, and the
+# v9fs location check without GNU `stat`.
+#
+# macOS ships no `timeout`, so the gate's `timeout 120 perl <file>` answered
+# 127 for every file and reported the whole suite as NEW RED. BSD stat reads
+# `stat -f -c %T` as "format -c", so _fstype_of returned the string "-c".
+# ---------------------------------------------------------------------------
+{
+    require Time::HiRes;
+    my ($ok, $out, $rc) = call_bpb('_run_bounded', 5, $^X, '-e', 'print "hello\n"; print STDERR "err\n"; exit 3');
+    ok($ok, 'portability: _run_bounded is callable') or diag($out);
+    is($rc, 3, 'portability: _run_bounded passes the exit code through');
+    like($out // '', qr/hello/, 'portability: ...and stdout');
+    like($out // '', qr/err/, 'portability: ...and stderr, combined like 2>&1');
+
+    my $t0 = Time::HiRes::time();
+    my (undef, undef, $rc2) = call_bpb('_run_bounded', 1, $^X, '-e', 'sleep 30');
+    my $dt = Time::HiRes::time() - $t0;
+    is($rc2, 124, 'portability: a run past its bound is 124, as GNU timeout reports it');
+    cmp_ok($dt, '<', 10, "portability: ...and is cut off promptly (${dt}s)");
+
+    my (undef, $fs) = call_bpb('_fstype_of', '/');
+    if ($^O eq 'linux') {
+        ok(defined $fs && $fs =~ /^[A-Za-z0-9_]+$/, "portability: _fstype_of('/') is a filesystem type name on Linux ($fs)");
+    } else {
+        ok(!defined $fs, "portability: _fstype_of answers undef off Linux (v9fs exists only there), not a misparse");
+    }
+}
+
 done_testing();
