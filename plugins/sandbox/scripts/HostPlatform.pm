@@ -185,7 +185,19 @@ sub parse_machine_inspect {
     my $name = $d->{Name};
     my $dir  = ref $d->{ConfigDir} eq 'HASH' ? $d->{ConfigDir}{Path} : undef;
     return undef unless defined $name && !ref $name && length $name;
-    return { name => $name, config_dir => $dir, mounts => _mount_sources_of($d) };
+    my $ci   = ref $d->{ConnectionInfo} eq 'HASH' ? $d->{ConnectionInfo} : {};
+    my $sock = ref $ci->{PodmanSocket} eq 'HASH' ? $ci->{PodmanSocket}{Path} : undef;
+    $sock = undef unless defined $sock && !ref $sock && $sock =~ m{\A/};
+    return { name => $name, config_dir => $dir, mounts => _mount_sources_of($d),
+             api_socket => $sock };
+}
+
+# owner_home() -> the home directory the OS records for this user (getpwuid),
+# whatever $ENV{HOME} says, or undef (native Windows perl has no getpwuid).
+sub owner_home {
+    return undef if $^O eq 'MSWin32';
+    my @pw = eval { getpwuid($<) };
+    return (@pw && defined $pw[7] && length $pw[7]) ? $pw[7] : undef;
 }
 
 # parse_machine_config($json) -> [ share sources ] | undef. Reads the

@@ -126,6 +126,7 @@ my $INSPECT = <<'JSON';
 [
      {
           "ConfigDir": { "Path": "/Users/u/.config/containers/podman/machine/applehv" },
+          "ConnectionInfo": { "PodmanSocket": { "Path": "/var/folders/xx/T/podman/podman-machine-default-api.sock" }, "PodmanPipe": null },
           "Name": "podman-machine-default",
           "State": "running",
           "Rootful": false
@@ -145,6 +146,13 @@ JSON
     my $info = HostPlatform::parse_machine_inspect($INSPECT);
     is($info->{name}, 'podman-machine-default', 'D: inspect parse: machine name');
     is($info->{config_dir}, '/Users/u/.config/containers/podman/machine/applehv', 'D: inspect parse: config dir');
+    is($info->{api_socket}, '/var/folders/xx/T/podman/podman-machine-default-api.sock',
+        'D: inspect parse: the API socket (what the test harness hands podman as CONTAINER_HOST)');
+  SKIP: {
+        skip 'getpwuid is unimplemented on native Windows perl', 1 if $^O eq 'MSWin32';
+        ok(defined HostPlatform::owner_home() && -d HostPlatform::owner_home(),
+            'D: owner_home() is the OS-recorded home, whatever $ENV{HOME} says');
+    }
 
     my @read;
     my $shares = HostPlatform::machine_shares(

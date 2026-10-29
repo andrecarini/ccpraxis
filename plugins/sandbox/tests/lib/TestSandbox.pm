@@ -83,6 +83,37 @@ sub _detect_container_cli {
 our $PODMAN = _detect_container_cli();
 our $PROBE_IMAGE = 'docker.io/library/debian:bookworm-slim';
 
+# A SANDBOXED HOME HIDES THE PODMAN MACHINE (macOS).
+#
+# scripts/run-tests.pl gives every test file its own throwaway HOME. On macOS
+# podman is a remote client: it finds its machine and connection under
+# ~/.config/containers, so with HOME moved it fell back to a local socket that
+# does not exist ("dial unix /tmp/ccpraxis-sweep-*/storage-run-501/podman/
+# podman.sock") and every container test skipped as "runtime unreachable"
+# while the machine was up. Point it at the machine's API socket instead
+# (CONTAINER_HOST, which podman reads before any config file): the socket path
+# comes from `podman machine inspect` run against the OS-recorded home, read
+# once, here. podman derives that socket's directory from TMPDIR, which the
+# runner moves too, so the inspect also gets macOS's own per-user temp dir
+# (`getconf DARWIN_USER_TEMP_DIR`, independent of the environment). Only when
+# HOME is not the OS-recorded home, only on darwin with podman, and never over
+# an explicit CONTAINER_HOST the caller already set.
+if (defined $PODMAN && $^O eq 'darwin' && $PODMAN =~ /podman/i
+    && !(defined $ENV{CONTAINER_HOST} && length $ENV{CONTAINER_HOST})) {
+    my $owner = HostPlatform::owner_home();
+    if (defined $owner && (($ENV{HOME} // '') ne $owner)) {
+        chomp(my $utmp = `getconf DARWIN_USER_TEMP_DIR 2>/dev/null` // '');
+        my $raw = do {
+            local $ENV{HOME} = $owner;
+            local $ENV{TMPDIR} = $utmp if length $utmp;
+            `$PODMAN machine inspect 2>/dev/null`;
+        };
+        my $info = HostPlatform::parse_machine_inspect($raw);
+        my $sock = $info ? $info->{api_socket} : undef;
+        $ENV{CONTAINER_HOST} = "unix://$sock" if defined $sock && -S $sock;
+    }
+}
+
 # Disable MSYS argv conversion process-wide. Same reasoning as launcher.pl:
 # without this, podman -v HOST:CONTAINER args get split on `:`, each side
 # POSIX→Windows-converted, and rejoined with `;` — yielding `;C`-suffixed
@@ -262,6 +293,17 @@ sub new_temp_dir {
     # loss. Leaving it at 1 costs nothing (both mechanisms check -d before
     # acting) and covers a caller that forgets to invoke cleanup_all().
     my $d = tempdir(DIR => $base, CLEANUP => 1);
+    # macOS, default root only: resolve symlinks. Under the runner HOME is
+    # /tmp/ccpraxis-sweep-*, and /tmp is a symlink into /private. A podman
+    # machine shares /private, not /tmp, and podman hands a bind source to the
+    # VM literally, so an unresolved /tmp/... source fails with "statfs: no
+    # such file or directory". The resolved path is the same directory. An
+    # explicit CCPRAXIS_SCRATCH_ROOT is used exactly as given (HostCaps refuses
+    # to canonicalise it, by design).
+    if ($^O eq 'darwin' && !defined $scratch) {
+        my $r = abs_path($d);
+        $d = $r if defined $r && length $r;
+    }
     $d = winify_path($d);
     register_cleanup_dir($d);
     return $d;
