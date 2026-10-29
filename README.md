@@ -107,7 +107,7 @@ Most of what accumulates around a project should not ship with it. Blueprints, t
 
 `/steward:setup-project` is what enrols a project: it finds the Claude files worth keeping, proposes a name, and either registers them fresh or links the project back to a slug an earlier machine already pushed, which is how a clone on new hardware gets its notes back.
 
-Two more of steward's commands are worth knowing about. `/steward:usage-audit` reads every transcript on the machine — the host plus each project's sandbox home, nested subagent transcripts included — separates what you spent talking to Claude from what unattended runs spent on your behalf, and prices the total against Anthropic's list rates and several cheaper providers. If a week disappeared, that report says where. And `/steward:ccpraxis-extend` is the single door for changing ccpraxis itself: it works out whether you're asking for something new or a change to something that exists, does the work inside your clone, and wires it in there: the marketplace registration, the settings entry. It stops there and says so, because the change is inert until you promote it, and a new skill or plugin still needs `install.pl` and `/steward:backup` on the host afterward before it actually loads. Skipping that leaves a skill sitting on disk that nothing ever loads.
+Two more of steward's commands are worth knowing about. `/steward:usage-audit` reads every transcript on the machine — the host plus each project's sandbox home, nested subagent transcripts included — separates what you spent talking to Claude from what unattended runs spent on your behalf, and prices the total against Anthropic's list rates and several cheaper providers. If a week disappeared, that report says where. And `/steward:ccpraxis-extend` is the single door for changing ccpraxis itself: it works out whether you're asking for something new or a change to something that exists, does the work inside your dev clone, and wires it in there: the marketplace registration, the settings entry. It stops there and says so, because the change is inert until you promote it (`perl scripts/promote.pl`, from the dev clone), and a new skill or plugin then still needs the live install's `install.pl` and a `/steward:backup` before it actually loads. Skipping that leaves a skill sitting on disk that nothing ever loads.
 
 ### Records that outlive a session
 
@@ -165,9 +165,11 @@ That is partly portability and partly the whole argument. Something whose job is
 
 ## On your machine
 
-Installing clones this repo to `~/.claude/ccpraxis`, symlinks (junctions on Windows) every skill into `~/.claude/skills/`, creates or merges `~/.claude/CLAUDE.md` and `~/.claude/settings.json`, installs the plugins listed there, and puts `claude-sandbox` on your PATH: on Windows via the User-scope `PATH`/`PATHEXT` registry values (no admin needed), on macOS/Linux by appending one line to your shell rc. If given a vault URL it also clones that repo to `~/.claude/claude-code-vault/`. It prints a plan of every change first and only touches your system once you re-run it with `--confirm`.
+Installing clones your fork twice. The **dev clone**, in a folder you pick (`~/Projects/ccpraxis` by default), is where you change ccpraxis. The **live install** at `~/.claude/ccpraxis` is what Claude Code runs, and you never edit it by hand. `scripts/promote.pl` is the only way from one to the other: it merges the dev clone's `main` into the live install, then syncs `~/.claude/CLAUDE.md` and `~/.claude/settings.json` from the repo's `global-config/`, merging settings key by key and backing up whatever it replaces.
 
-There's no automated uninstaller. To back out by hand: delete `~/.claude/ccpraxis`, remove the PATH entry (Windows: User Environment Variables in System Properties; macOS/Linux: the appended shell rc line), remove the symlinks/junctions under `~/.claude/skills/`, and restore `~/.claude/CLAUDE.md`/`settings.json` from the backup the install took before it touched them: both are copied to `<file>.pre-ccpraxis.<timestamp>` in `~/.claude/`, and the paths are printed during the install. Your vault repo is untouched either way.
+The install also symlinks (junctions on Windows) every skill into `~/.claude/skills/`, installs the plugins listed in the settings, and puts `claude-sandbox` on your PATH: on Windows via the User-scope `PATH`/`PATHEXT` registry values (no admin needed), on macOS/Linux by appending a line per plugin to your shell rc (`.zshrc` on a default Mac). If given a vault URL it also clones that repo to `~/.claude/claude-code-vault/`. Every step that changes your system prints its plan first. [Working on ccpraxis](plugins/sandbox/docs/working-on-ccpraxis.md) describes the model and the whole procedure.
+
+There's no automated uninstaller. To back out by hand: delete `~/.claude/ccpraxis` and the dev clone, remove the PATH entries (Windows: User Environment Variables in System Properties; macOS/Linux: the appended shell rc lines), remove the symlinks/junctions under `~/.claude/skills/`, and restore `~/.claude/CLAUDE.md`/`settings.json` from the backup the install took before it touched them: both are copied to `<file>.pre-ccpraxis.<timestamp>` in `~/.claude/`, and the paths are printed during the install. Your vault repo is untouched either way.
 
 ---
 
@@ -215,10 +217,12 @@ access        expires in 7h17m
 3. Open Claude Code and say:
    > Install ccpraxis from `https://github.com/<you>/ccpraxis`. My vault repo is
    > `git@github.com:<you>/claude-code-vault.git`.
-4. Stay at the terminal for the two confirmation gates (a settings diff, then the install
-plan described above), then restart Claude Code.
+4. Stay at the terminal for the confirmation gates (the first promotion's preview, then the
+skill and PATH plans), then open a new terminal and restart Claude Code.
 
-**Requirements:** Claude Code, Git, and Perl 5.14+ (already present on macOS/Linux and inside Git for Windows), plus Docker or Podman if you want the sandbox. Claude follows [`docs/install-protocol.md`](docs/install-protocol.md) to do the install; that page is the same procedure step by step if you'd rather drive it yourself.
+The install sets up two checkouts of your fork, described under [On your machine](#on-your-machine). [Working on ccpraxis](plugins/sandbox/docs/working-on-ccpraxis.md) has the step-by-step procedure if you'd rather drive the install yourself; Claude follows [`docs/install-protocol.md`](docs/install-protocol.md), which runs the same steps with confirmation gates.
+
+**Requirements:** Claude Code, Git, and Perl 5.14+ (already present on macOS/Linux and inside Git for Windows), plus Docker or Podman if you want the sandbox.
 
 ---
 
@@ -252,6 +256,7 @@ Plugins live under `plugins/<name>/` (`sandbox`, `backpack`, `blueprint`, `butle
 
 | Page | For |
 |---|---|
+| [Working on ccpraxis](plugins/sandbox/docs/working-on-ccpraxis.md) | Dev clone, live install and promotion; setting up a machine; the edit-promote loop |
 | [Reference](docs/reference.md) | How each surface works: install contract, commands, statusline, backup, vault sync, sandbox, backpack |
 | [Repo layout](docs/repo-layout.md) | Every file, annotated and generated from disk |
 | [Design conventions](docs/design-conventions.md) | Packaging, approval flows, and what gets enforced in code |
@@ -298,18 +303,20 @@ Anthropic's own warning about dev containers applies here too: *"dev containers 
 
 ccpraxis is meant to be forked. The rules here are opinions, and yours will differ.
 
-`~/.claude/ccpraxis` is a clone of *your* fork, so changes you make there are yours to commit and push. The install already added `upstream` pointing at this repo, so pulling fixes is:
+Your changes go in the dev clone and reach the live install by promotion, the same way they do on the machine ccpraxis itself is developed on. The install added an `upstream` remote to the dev clone, so pulling fixes from this repo is a merge there, then a promotion:
 
 ```bash
-git -C ~/.claude/ccpraxis fetch upstream
-git -C ~/.claude/ccpraxis merge upstream/main
+git -C ~/Projects/ccpraxis fetch upstream
+git -C ~/Projects/ccpraxis merge upstream/main
+perl ~/Projects/ccpraxis/scripts/promote.pl --dry-run
+perl ~/Projects/ccpraxis/scripts/promote.pl
 ```
 
-Two things that are easy to get wrong:
+Do not push the dev clone to your fork. `/steward:backup` pushes from the live install, which is how the fork comes to hold exactly what has been promoted; a push from the dev clone would reach the live install on the next backup without promotion's config sync.
 
-**That directory is the code Claude Code is running.** Merging into it changes the tooling underneath a live session, so restart Claude Code afterwards rather than carrying on in the session that was open.
+**Promotion changes the code underneath a live session.** Start a new Claude Code session afterwards rather than carrying on in the one that was open, which keeps the skill text it read when it started.
 
-**A merge can bring new surfaces with it.** New skills need linking into `~/.claude/skills/`, new plugins need installing, and settings may have gained keys. Run `perl ~/.claude/ccpraxis/install.pl` to see what a merge changed, re-run it with `--confirm` to apply, then `/steward:backup` to resync config and relink skills. A merge alone leaves new skills present on disk and invisible to Claude.
+**A merge can bring new surfaces with it.** New skills need linking into `~/.claude/skills/` and new plugins need installing; new settings keys are merged by the promotion. After promoting, run `perl ~/.claude/ccpraxis/install.pl` to see what the merge changed in the wiring, re-run it with `--confirm` to apply, then `/steward:backup` to resync config and relink skills. Promotion alone leaves new skills present on disk and invisible to Claude.
 
 If you have customised heavily, expect conflicts in `global-config/` and `.claude/settings.json` — those are the files both sides edit.
 

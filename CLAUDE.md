@@ -8,11 +8,16 @@ sandbox launches.
 
 | path | what it is |
 |---|---|
-| this repo | your **clone**. Develop here. Sandbox here. |
+| this repo | your **dev clone** (normally under `~/Projects`). Develop here. Sandbox here. |
 | `~/.claude/ccpraxis` | the **live install** — the plugin tree Claude Code is executing. Never develop here. |
 
 `claude-sandbox` refuses to launch against `~/.claude/ccpraxis`, by design. Editing the live install
 means editing tooling while it is in use.
+
+GitHub's `main` is fed from the live install: `/steward:backup` merges `origin/main` into it and
+pushes from there. Do not push this clone's `main`; the next backup would merge it into the live
+install without promotion's global-config sync. The model and the fresh-machine procedure:
+`plugins/sandbox/docs/working-on-ccpraxis.md`.
 
 ### ⚠ THE MACHINERY YOU ARE USING IS NOT THE MACHINERY YOU ARE EDITING
 
