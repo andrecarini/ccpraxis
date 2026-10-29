@@ -131,6 +131,55 @@ sub utc_timestamp {
     return strftime('%Y-%m-%dT%H%M%SZ', gmtime);
 }
 
+# File::Copy::copy creates its destination with the default 0666 & ~umask
+# mode, so on Linux/macOS a copied executable comes out 0644. Harmless for a
+# snapshot nobody runs, fatal for a restore: the restored `claude` would not be
+# executable. Give $dst the permission bits of $mode_src. Windows has no mode
+# bits worth carrying (and exec-ness is the .exe name), so it is left alone.
+sub copy_mode {
+    my ($mode_src, $dst) = @_;
+    return 1 if is_windows();
+    my @st = stat($mode_src);
+    return 0 unless @st;
+    return chmod($st[2] & 07777, $dst) ? 1 : 0;
+}
+
+# Mode for a restored binary when there is no live file to take it from: the
+# snapshot's own bits, plus an exec bit wherever there is a read bit (a
+# snapshot taken before copy_mode existed is 0644), and always owner-exec.
+sub restore_mode_from_snapshot {
+    my ($snap_bin) = @_;
+    my @st = stat($snap_bin);
+    my $m = @st ? ($st[2] & 07777) : 0644;
+    return $m | (($m & 0444) >> 2) | 0100;
+}
+
+# The file a restore must write when $path is a symlink. On macOS (and the
+# Linux native installer) ~/.local/bin/claude is a symlink into
+# ~/.local/share/claude/versions/<v>; renaming a staged file over the link
+# would replace the link itself with a plain file and orphan the layout the
+# installer manages. Restore THROUGH it instead: follow the chain (relative
+# targets resolve against the link's own directory) to the real file, which
+# may not exist any more. Returns $path unchanged for a non-link or on Windows.
+sub resolve_restore_target {
+    my ($path) = @_;
+    return $path if is_windows();
+    my $p = $path;
+    for (1 .. 40) {
+        last unless -l $p;
+        my $t = readlink($p);
+        last unless defined $t && length $t;
+        unless (File::Spec->file_name_is_absolute($t)) {
+            my ($vol, $dir) = File::Spec->splitpath($p);
+            $t = File::Spec->catpath($vol, $dir, $t);
+        }
+        $p = $t;
+    }
+    my ($vol, $dir, $file) = File::Spec->splitpath($p);
+    my $real_dir = abs_path(File::Spec->catpath($vol, $dir, ''));
+    return defined $real_dir ? File::Spec->catfile($real_dir, $file) : $p;
+}
+
 sub emit_json {
     my ($obj) = @_;
     # Normalize mixed char/byte strings up to chars, then ->utf8 emits UTF-8
@@ -194,16 +243,19 @@ sub free_bytes {
         return undef unless $out =~ /^\d+$/;
         return 0 + $out;
     }
-    # POSIX, cygwin, msys — `df -k` works fine
-    my $out = `df -k "$dir" 2>/dev/null`;
+    # POSIX, cygwin, msys. -P asks for the POSIX format: one line per
+    # filesystem, "Filesystem 1024-blocks Used Available Capacity Mounted on".
+    # Without it macOS df adds iused/ifree/%iused columns, so the old
+    # "third column from the end" read the free-INODE count as free bytes.
+    # Matched by shape rather than by column index because both ends can hold
+    # spaces: the mount point ("/Volumes/My Disk") and, on MSYS, the
+    # filesystem ("C:/Program Files/Git").
+    my $out = `df -kP "$dir" 2>/dev/null`;
     return undef unless $out;
     my @lines = split /\n/, $out;
     return undef unless @lines >= 2;
-    # POSIX df: Filesystem 1024-blocks Used Available Capacity Mounted
-    my @cols = split /\s+/, $lines[-1];
-    return undef unless @cols >= 4;
-    my $avail_k = $cols[-3];
-    return undef unless $avail_k =~ /^\d+$/;
+    my ($avail_k) = $lines[-1] =~ /\s(?:\d+)\s+(?:\d+)\s+(\d+)\s+\d+%\s/;
+    return undef unless defined $avail_k;
     return $avail_k * 1024;
 }
 
@@ -438,6 +490,11 @@ sub cmd_snapshot {
         my $err = $!;
         remove_tree($tmp);
         die_json(2, "Copy failed: $err");
+    }
+    unless (copy_mode($binary, $tmp_bin)) {
+        my $err = $!;
+        remove_tree($tmp);
+        die_json(2, "Cannot carry the binary's mode onto the snapshot: $err");
     }
 
     # Post-copy verification: re-hash the destination
@@ -714,6 +771,12 @@ sub cmd_restore {
             close $lfh;
             die_json(2, "Pre-restore copy failed: $e");
         }
+        unless (copy_mode($binary, $tmp_bin)) {
+            my $e = $!;
+            remove_tree($tmp);
+            close $lfh;
+            die_json(2, "Pre-restore copy could not take the binary's mode: $e");
+        }
         my $dst_sha = sha256_file($tmp_bin);
         unless (defined $dst_sha && $dst_sha eq $src_sha) {
             remove_tree($tmp);
@@ -752,15 +815,19 @@ sub cmd_restore {
     }
 
     # Copy snapshot binary to a .tmp next to the live binary, verify,
-    # then atomic rename.
-    my ($vol, $dir, undef) = File::Spec->splitpath($binary);
+    # then atomic rename. When $binary is a symlink (~/.local/bin/claude on
+    # macOS points into ~/.local/share/claude/versions/), the file written is
+    # the link's target and the link itself is left in place -- see
+    # resolve_restore_target.
+    my $target = resolve_restore_target($binary);
+    my ($vol, $dir, undef) = File::Spec->splitpath($target);
     my $tgt_dir = File::Spec->catpath($vol, $dir, '');
     unless (-d $tgt_dir) {
         close $lfh;
         die_json(2, "Target binary dir does not exist: $tgt_dir");
     }
 
-    my $stage = $binary . '.restore.tmp';
+    my $stage = $target . '.restore.tmp';
     # Clean up any leftover .restore.tmp from a prior killed restore
     if (-e $stage) { unlink $stage; }
 
@@ -770,6 +837,20 @@ sub cmd_restore {
         close $lfh;
         die_json(2, "Restore copy to staging failed: $e",
                   pre_restore_snapshot => $pre_snapshot_id);
+    }
+
+    # The live binary keeps the mode it had; a binary that is gone gets the
+    # snapshot's, made executable (restore_mode_from_snapshot). Without this
+    # the staged copy is 0644 and the restored claude cannot be run.
+    unless (is_windows()) {
+        my $mode = (-f $target) ? ((stat($target))[2] & 07777) : restore_mode_from_snapshot($snap_bin);
+        unless (chmod($mode, $stage)) {
+            my $e = $!;
+            unlink $stage if -e $stage;
+            close $lfh;
+            die_json(2, "Cannot set the restored binary's mode: $e",
+                      pre_restore_snapshot => $pre_snapshot_id);
+        }
     }
 
     my $stage_sha = sha256_file($stage);
@@ -799,7 +880,7 @@ sub cmd_restore {
         }
     }
 
-    unless (rename($stage, $binary)) {
+    unless (rename($stage, $target)) {
         my $e = $!;
         unlink $stage if -e $stage;
         close $lfh;
@@ -808,7 +889,7 @@ sub cmd_restore {
     }
 
     # Final verification: live binary should now match the manifest SHA.
-    my $live_sha = sha256_file($binary);
+    my $live_sha = sha256_file($target);
     unless (defined $live_sha && $live_sha eq $m->{sha256}) {
         close $lfh;
         die_json(2, "Post-restore SHA mismatch — live binary may be corrupted",
@@ -822,6 +903,7 @@ sub cmd_restore {
         status                 => 'restored',
         restored_from          => $entry->{id},
         target_binary          => $binary,
+        restored_path          => $target,
         sha256                 => $live_sha,
         pre_restore_snapshot   => $pre_snapshot_id,
         manifest               => $m,
