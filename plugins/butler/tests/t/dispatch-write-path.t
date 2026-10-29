@@ -151,7 +151,13 @@ sub run_hook {
     my $wall = delete $env{__wall} // 20;
     my $cwd  = delete $env{__cwd};
     $caseN++;
-    my $ti = "$ROOT/run$caseN";
+    # $$ as well as $caseN: AC32 forks five children that each call this with
+    # the SAME inherited $caseN, so without the pid they all wrote one
+    # payload.json and raced on it -- a child could run the hook on a
+    # sibling's payload, two hooks then saw one worker type, the second was
+    # deduplicated as already claimed, and AC32 counted fewer than five
+    # records (seen on macOS, where fork+exec is slow enough to interleave).
+    my $ti = "$ROOT/run$caseN-$$";
     make_path($ti);
     my ($pf, $out_f, $err_f) = ("$ti/payload.json", "$ti/out", "$ti/err");
     write_file($pf, defined $payload ? $payload : '{}');
@@ -660,7 +666,12 @@ SKIP: {
         unless $bg_supported;
     my ($env, $bp_dir, $proj) = fresh_env();
     my $logdir = logdir_of($proj);
-    my @types = qw(bp-implementer bp-test-writer bp-ui-prober bp-scout bp-architect);
+    # ONE write-capable type only. TrackDispatch's writer interlock (pinned by
+    # guards-remake-track-dispatch.t, "a write-capable worker ... is already
+    # in flight") denies a second concurrent writer by design, so the old
+    # list -- implementer, test-writer and ui-prober side by side -- made
+    # this a race over which writer won, never a test of the record path.
+    my @types = qw(bp-implementer bp-scout bp-architect bp-reviewer bp-redteam);
     my @pids;
     for my $t (@types) {
         my $pid = fork();
