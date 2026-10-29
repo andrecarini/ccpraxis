@@ -9351,6 +9351,8 @@ sub winpid_alive {
 # and return to the dashboard. find_wt asserts availability (PATH + the canonical
 # %LOCALAPPDATA%\Microsoft\WindowsApps app-execution-alias location).
 sub _spawn_session {
+    return _spawn_session_terminal_app() if $^O eq 'darwin';
+    return _spawn_session_hint('no new-window launcher for this platform') unless $WINDOWS_FAMILY;
     my @inner = ('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
                  '-File', $SANDBOX_PS1, '--session', $PROJECT_PATH);
 
@@ -9387,6 +9389,81 @@ sub _spawn_session {
     my $rc = system(@$argv);   # returns immediately (detached window)
     log_ev('launch_session_done', { mode => 'wt', exit => ($rc >> 8) });
     return;
+}
+
+# _spawn_session_terminal_app — the macOS [c]: open a new Terminal.app window
+# running the same connector entry (`launcher.pl --session <project>`).
+#
+# The window gets its command from a single-use, 0700 .command file written
+# into this launcher's own temp dir ($SAMPLER_TMPDIR, per project and owned by
+# this user) and opened with `open -a Terminal <file>`. That goes through
+# LaunchServices: no Apple Events, so no Automation permission and no TCC
+# prompt, which driving Terminal with osascript would raise. The file removes
+# itself as its first line and then execs the connector, so the window closes
+# with the session. If Terminal cannot be asked, the operator gets the exact
+# command to run instead (_spawn_session_hint).
+sub _spawn_session_terminal_app {
+    require Config;
+    my $perl = ($^X =~ m{\A/}) ? $^X : ($Config::Config{perlpath} || 'perl');
+    my %env;
+    for my $k (qw(CCPRAXIS_CONTAINER_CLI)) {
+        $env{$k} = $ENV{$k} if defined $ENV{$k} && length $ENV{$k};
+    }
+    my $script = Dashboard::terminal_command_script({
+        cmd => [ $perl, $LAUNCHER_PL, '--session', $PROJECT_PATH ],
+        cwd => $PROJECT_PATH,
+        env => \%env,
+    });
+    # File::Temp: a fresh, exclusively-created name per press (two presses in
+    # one second must not collide), mode 0600 at birth, widened to 0700 only
+    # once the content is in place.
+    my ($fh, $file) = eval {
+        File::Temp::tempfile('claude-session-XXXXXXXX', DIR => $SAMPLER_TMPDIR,
+                             SUFFIX => '.command', UNLINK => 0);
+    };
+    my $wrote = 0;
+    if ($fh && defined $script) {
+        print {$fh} $script;
+        $wrote = close($fh) ? 1 : 0;
+        $wrote = 0 unless chmod(0700, $file);
+    }
+    unless ($wrote) {
+        my $why = 'could not write a .command file in ' . $SAMPLER_TMPDIR . ($@ ? ": $@" : ": $!");
+        $why =~ s/\s+\z//;
+        unlink $file if defined $file;
+        log_ev('launch_session_failed', { mode => 'terminal', reason => $why });
+        return _spawn_session_hint($why);
+    }
+    my $argv = Dashboard::spawn_argv('terminal', { file => $file });
+    log_ev('launch_session', { mode => 'terminal' });
+    my ($status, undef, $err) = _capture_out_err(@$argv);   # returns before the window does
+    my $rc = $status < 0 ? $status : $status >> 8;
+    log_ev('launch_session_done', { mode => 'terminal', exit => $rc });
+    if ($status != 0) {
+        unlink $file;
+        my $why = "open -a Terminal failed (exit $rc)" . (defined $err && length $err ? ": " . _trim_err($err) : '');
+        log_ev('launch_session_failed', { mode => 'terminal', reason => $why });
+        return _spawn_session_hint($why);
+    }
+    return;
+}
+
+# _spawn_session_hint($why) -- when no new window can be opened, say how to get
+# the same session by hand, wait for a key, and repaint the dashboard.
+sub _spawn_session_hint {
+    my ($why) = @_;
+    print STDOUT "\e[?25h\e[?1049l";
+    eval { Term::ReadKey::ReadMode('restore') };
+    print STDERR "\n";
+    print STDERR "  [c] could not open a new terminal window" . (defined $why ? " ($why)." : '.') . "\n";
+    print STDERR "  Start the same session yourself: open a new terminal and run\n";
+    print STDERR "      claude-sandbox --session " . Dashboard::sh_quote($PROJECT_PATH) . "\n";
+    print STDERR "  (a second bare `claude-sandbox` opens another dashboard, not a session).\n";
+    print STDERR "\n  Press any key to return to the dashboard...";
+    eval { Term::ReadKey::ReadKey(0) };
+    eval { Term::ReadKey::ReadMode('cbreak') };
+    print STDOUT "\e[?1049h\e[?25l";
+    return 'redraw';
 }
 
 # plain_heartbeat_loop — the non-TTY fallback: the original scrolling manager

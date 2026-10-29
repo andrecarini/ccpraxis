@@ -45,11 +45,15 @@ claude-sandbox
 
 First run prompts for sandbox setup (bootstrap). On subsequent runs the
 launcher dispatches by container state: if the container is not yet
-running, this terminal becomes the **manager** — it runs the skill/plugin
-selector and then sits in the heartbeat loop keeping the sandbox alive.
-To start a claude session, open a **second terminal** in the same
-project and run `claude-sandbox` there — that one enters **connector**
-mode and drops into `claude` inside the container.
+running, this terminal becomes the **manager**: it runs the skill/plugin
+selector and then shows the dashboard, whose heartbeat keeps the sandbox
+alive. To start a claude session, press **`[c]`** in the dashboard: it
+opens a new window (Windows Terminal on Windows, Terminal.app on macOS)
+running `claude-sandbox --session`, the **connector** entry, which drops
+into `claude` inside the container. By hand, the same is
+`claude-sandbox --session` in a second terminal in the project. A second
+bare `claude-sandbox` while the sandbox runs opens another dashboard, not
+a session.
 
 To run the test suite:
 

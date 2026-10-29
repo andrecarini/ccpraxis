@@ -1462,7 +1462,56 @@ sub spawn_argv {
         return ['wt.exe', '-w', 'new', @cmd];
     }
     return [($ctx->{comspec} || 'cmd.exe'), '/c', 'start', '', @cmd] if $mode eq 'start';
+    # macOS: Terminal.app opens a .command file in a new window and runs it.
+    # `open -a` goes through LaunchServices, not Apple Events, so it needs no
+    # Automation permission and raises no TCC prompt (osascript to Terminal
+    # would). ctx.file is the script terminal_command_script() produced.
+    if ($mode eq 'terminal') {
+        return undef unless defined $ctx->{file} && length $ctx->{file};
+        return ['open', '-a', 'Terminal', $ctx->{file}];
+    }
     return undef;   # inline: caller runs the connector in-process
+}
+
+# sh_quote($s) -> $s as ONE single-quoted POSIX shell word. Pure.
+sub sh_quote {
+    my ($s) = @_;
+    $s = '' unless defined $s;
+    $s =~ s/'/'\\''/g;
+    return "'$s'";
+}
+
+# terminal_command_script(\%ctx) -> the text of the .command file the macOS
+# [c] press hands to Terminal, or undef if ctx is incomplete. Pure.
+#   ctx.cmd => [argv]   the connector command (perl, launcher.pl, --session, path)
+#   ctx.cwd => $dir     the directory the window starts in (the project)
+#   ctx.env => {K=>V}   variables to carry into the new window; Terminal starts a
+#                       fresh login shell, so anything the launcher was started
+#                       with (CCPRAXIS_CONTAINER_CLI, say) is otherwise lost.
+#                       Only [A-Za-z_][A-Za-z0-9_]* names are written.
+# The script deletes itself first (it lives in the launcher's temp dir and is
+# single-use), then execs the connector, so the window closes with the session.
+sub terminal_command_script {
+    my ($ctx) = @_;
+    return undef unless ref $ctx eq 'HASH' && ref $ctx->{cmd} eq 'ARRAY' && @{ $ctx->{cmd} };
+    my @lines = (
+        '#!/bin/bash',
+        '# claude-sandbox [c]: a connector session for this sandbox. Written by',
+        '# launcher.pl for one use; it removes itself before it starts.',
+        'rm -f -- "$0"',
+    );
+    if (ref $ctx->{env} eq 'HASH') {
+        for my $k (sort keys %{ $ctx->{env} }) {
+            next unless $k =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
+            my $v = $ctx->{env}{$k};
+            next unless defined $v;
+            push @lines, "export $k=" . sh_quote($v);
+        }
+    }
+    push @lines, 'cd -- ' . sh_quote($ctx->{cwd}) . ' || exit 1'
+        if defined $ctx->{cwd} && length $ctx->{cwd};
+    push @lines, 'exec ' . join(' ', map { sh_quote($_) } @{ $ctx->{cmd} });
+    return join("\n", @lines) . "\n";
 }
 
 # recent_events(\@json_lines, $n, $localtime_fn) -> arrayref of the last $n
