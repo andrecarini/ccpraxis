@@ -129,6 +129,7 @@ sub normalize_alm_mirror_body {
     my ($body) = @_;
     return '' unless defined $body;
     $body =~ s/\$ALMANAC_SW_IS_WIN\b/\$IS_WIN/g;
+    $body =~ s/\$ALMANAC_SW_IS_DARWIN\b/\$IS_DARWIN/g;
     $body =~ s/_alm_sw_same_path_any_form/_same_path_any_form/g;
     $body =~ s/_alm_sw_same_path\b/same_path/g;
     $body =~ s/_alm_sw_/_/g;

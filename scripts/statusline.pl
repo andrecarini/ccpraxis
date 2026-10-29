@@ -418,6 +418,7 @@ sub _alm_is_id {
 # .git). A parity test (statusline-bounded-walkup.t AC-3) asserts the 11
 # stop-rule subs below are source-identical to BpDataRoot.pm, modulo naming.
 my $ALMANAC_SW_IS_WIN = ($^O =~ /^(MSWin32|msys|cygwin)$/) ? 1 : 0;
+my $ALMANAC_SW_IS_DARWIN = ($^O eq 'darwin') ? 1 : 0;
 sub _alm_sw_fold_ascii {
     my ($s) = @_;
     return $s unless defined $s;
@@ -470,9 +471,9 @@ sub _alm_sw_lex_canon {
 sub _alm_sw_seg_eq {
     my ($x, $y, $allow_83) = @_;
     $allow_83 = 1 unless defined $allow_83;
-    return $x eq $y unless $ALMANAC_SW_IS_WIN;
+    return $x eq $y unless $ALMANAC_SW_IS_WIN || $ALMANAC_SW_IS_DARWIN;
     return 1 if _alm_sw_fold_ascii($x) eq _alm_sw_fold_ascii($y);
-    return 0 unless $allow_83;
+    return 0 unless $ALMANAC_SW_IS_WIN && $allow_83;
     for my $pair ([$x, $y], [$y, $x]) {
         my ($short, $long) = @$pair;
         next unless defined $short && $short =~ /^([^~\/]{1,6})~[0-9]+(?:\.[^.\/]{0,3})?$/;
@@ -528,6 +529,7 @@ sub _alm_sw_compute_stops {
     push @candidates, eval { File::Spec->tmpdir };
     push @candidates, $ENV{TMP}, $ENV{TEMP}, $ENV{TMPDIR};
     push @candidates, $ENV{HOME}, $ENV{USERPROFILE};
+    push @candidates, '/tmp', '/private/tmp' if $ALMANAC_SW_IS_DARWIN;
     my @stops;
     for my $v (@candidates) {
         next unless defined $v && length $v;
