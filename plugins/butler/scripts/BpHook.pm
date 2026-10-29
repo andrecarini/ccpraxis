@@ -589,11 +589,18 @@ my $HELD_QUIET_SECONDS = 60;
 # itself a running shell task and the gate must never tell the agent to
 # hold its own holder. Stats and at most one JSON read and one /proc read;
 # never a process.
+#
+# $launches (optional, from holder_launches) drops every background task that
+# is itself a butler-hold call, holder alive or not. A holder takes seconds to
+# write its record (measured: ~10 s on a 13 MB transcript), and a Stop inside
+# that window listed the starting holder as work and told the agent to hold
+# it, which butler-hold always refuses (bug report 20261027-201709-afa0).
 sub running_work {
-    my ($sid, $p) = @_;
+    my ($sid, $p, $launches) = @_;
     return () unless defined $sid && $sid =~ $SID_RE && ref $p eq 'HASH';
     my $h = holder($sid);
     my $holder_alive = (ref $h eq 'HASH' && _holder_proc_alive($h)) ? 1 : 0;
+    $launches = {} unless ref $launches eq 'HASH';
     my (@work, %have);
 
     my $bg = $p->{background_tasks};
@@ -605,6 +612,7 @@ sub running_work {
             next unless _is_plain_string($id) && $id =~ $AGENT_RE;
             my $type = _is_plain_string($e->{type}) ? $e->{type} : 'task';
             next if $holder_alive && $type ne 'subagent';
+            next if exists $launches->{$id};
             next if $have{$id}++;
             push @work, { id => $id, type => $type };
         }
@@ -637,6 +645,98 @@ sub running_work {
         }
     }
     return @work;
+}
+
+# How long after its launch a butler-hold task that has not yet written its
+# record still counts as a holder starting up. Startup is seconds (a 10 s lock
+# alarm and a transcript tail read are its slow parts); past this, a holder
+# that never became is broken and the gate stops trusting it.
+our $HOLDER_START_SECONDS = 120;
+my $HOLDER_SCAN_BYTES = 2 * 1024 * 1024;
+
+# holder_launches($p) -> { task_id => launch_epoch } for every background task
+# in the transcript tail that a Bash call started as EXACTLY one butler-hold
+# invocation (sole_invocation: no chained command, so `butler-hold a && sleep
+# 999` is not a holder). The epoch is undef when the record has no readable
+# timestamp. Read from the transcript because the Stop payload carries only
+# the agent-written description of a task, never its command.
+sub holder_launches {
+    my ($p) = @_;
+    my %out;
+    return \%out unless ref $p eq 'HASH' && _is_plain_string($p->{transcript_path}) && length $p->{transcript_path};
+    my $tp = _to_bytes($p->{transcript_path});
+    open(my $fh, '<:raw', $tp) or return \%out;
+    my $size = -s $fh;
+    if ($size && $size > $HOLDER_SCAN_BYTES) {
+        seek($fh, $size - $HOLDER_SCAN_BYTES, 0);
+        <$fh>;    # drop the partial first line
+    }
+    my %hold_use;
+    while (my $line = <$fh>) {
+        next unless $line =~ /"tool_(?:use|result)"/;
+        next unless $line =~ /butler-hold|backgroundTaskId|background with ID/;
+        my $rec = eval { JSON::PP->new->utf8->decode($line) };
+        next unless ref $rec eq 'HASH' && ref $rec->{message} eq 'HASH';
+        my $content = $rec->{message}{content};
+        next unless ref $content eq 'ARRAY';
+        for my $c (@$content) {
+            next unless ref $c eq 'HASH' && _is_plain_string($c->{type});
+            if ($c->{type} eq 'tool_use') {
+                next unless _is_plain_string($c->{id}) && _is_plain_string($c->{name}) && $c->{name} eq 'Bash';
+                my $in = $c->{input};
+                next unless ref $in eq 'HASH' && $in->{run_in_background} && _is_plain_string($in->{command});
+                $hold_use{$c->{id}} = 1 if defined sole_invocation($in->{command}, 'butler-hold');
+            }
+            elsif ($c->{type} eq 'tool_result') {
+                next unless _is_plain_string($c->{tool_use_id}) && $hold_use{$c->{tool_use_id}};
+                my $task;
+                my $tur = $rec->{toolUseResult};
+                if (ref $tur eq 'HASH' && _is_plain_string($tur->{backgroundTaskId})) {
+                    $task = $tur->{backgroundTaskId};
+                }
+                else {
+                    my $text = ref $c->{content} eq 'ARRAY'
+                        ? join("\n", map { (ref $_ eq 'HASH' && _is_plain_string($_->{text})) ? $_->{text} : () } @{ $c->{content} })
+                        : (_is_plain_string($c->{content}) ? $c->{content} : '');
+                    ($task) = $text =~ /background with ID: ([A-Za-z0-9_-]+)/;
+                }
+                next unless defined $task && $task =~ $AGENT_RE;
+                $out{$task} = _iso_to_epoch($rec->{timestamp});
+            }
+        }
+    }
+    close $fh;
+    return \%out;
+}
+
+# starting_holder($p, $launches) -> the id of a RUNNING background task that
+# is a butler-hold call launched within $HOLDER_START_SECONDS, else undef. It
+# is as good as a holder for the Stop gate: it either becomes one, or exits,
+# and a finished background task wakes the session either way.
+sub starting_holder {
+    my ($p, $launches) = @_;
+    return undef unless ref $p eq 'HASH' && ref $launches eq 'HASH' && %$launches;
+    my $bg = $p->{background_tasks};
+    return undef unless ref $bg eq 'ARRAY';
+    my $now = time();
+    for my $e (@$bg) {
+        next unless ref $e eq 'HASH' && _is_plain_string($e->{status}) && $e->{status} eq 'running';
+        next unless _is_plain_string($e->{id}) && exists $launches->{ $e->{id} };
+        my $at = $launches->{ $e->{id} };
+        next unless defined $at && $at <= $now + 5 && $now - $at <= $HOLDER_START_SECONDS;
+        return $e->{id};
+    }
+    return undef;
+}
+
+# _iso_to_epoch('2026-10-27T18:02:10.969Z') -> epoch seconds, or undef.
+sub _iso_to_epoch {
+    my ($s) = @_;
+    return undef unless _is_plain_string($s)
+        && $s =~ /\A(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?Z\z/;
+    require Time::Local;
+    my $e = eval { Time::Local::timegm($6, $5, $4, $3, $2 - 1, $1) };
+    return $e;
 }
 
 # _valid_work(\@work) -> arrayref of clean {id, type}; invalid entries dropped.

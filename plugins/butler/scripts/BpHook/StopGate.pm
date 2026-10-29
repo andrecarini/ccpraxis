@@ -127,6 +127,20 @@ sub run {
         return 0;
     }
 
+    # G8b: a holder still starting allows too (bug 20261027-201709-afa0). A
+    # butler-hold launched in the background takes seconds to write the
+    # record G8 reads, and a Stop inside that window used to list the holder
+    # as running work and suggest holding it, which butler-hold refuses
+    # ("a holder cannot hold itself"). The starting holder either becomes the
+    # holder or exits, and its exit wakes the session, so nothing is left
+    # unwatched by letting this stop through.
+    my $launches = eval { BpHook::holder_launches($p) } || {};
+    if (defined(my $starting = BpHook::starting_holder($p, $launches))) {
+        eval { _clear_streak($sid) };
+        eval { BpHook::log_reason($sid, 'gate', 'holder-starting', $starting, $p->{cwd}) };
+        return 0;
+    }
+
     # G9b: THE REFUSAL CAP (bug 20261021-202419-bf19). Every escape above is a
     # shell command; a session whose shell is broken (a PreToolUse hook that
     # errors on every call, say) cannot run any of them, and was refused more
@@ -185,7 +199,8 @@ sub run {
     # G11 (spec 38 sec 2.3, Decision 128): the text is built from the
     # session's running work. While work runs, the RUNNING text names the
     # work and offers hold, or off when it is no longer needed.
-    my @work = BpHook::running_work($sid, $p);
+    # A butler-hold task is never offered for holding: the holder refuses it.
+    my @work = BpHook::running_work($sid, $p, $launches);
     if (@work) {
         eval { BpHook::set_running_snapshot($sid, \@work) };
         my @ids  = map { $_->{id} } @work;
