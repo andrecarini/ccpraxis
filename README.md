@@ -222,7 +222,7 @@ skill and PATH plans), then open a new terminal and restart Claude Code.
 
 The install sets up two checkouts of your fork, described under [On your machine](#on-your-machine). [Working on ccpraxis](plugins/sandbox/docs/working-on-ccpraxis.md) has the step-by-step procedure if you'd rather drive the install yourself; Claude follows [`docs/install-protocol.md`](docs/install-protocol.md), which runs the same steps with confirmation gates.
 
-**Requirements:** Claude Code, Git, and Perl 5.14+ (already present on macOS/Linux and inside Git for Windows), plus Docker or Podman if you want the sandbox.
+**Requirements:** Claude Code, Git, and Perl 5.14+ (Perl is already present on macOS and Linux and inside Git for Windows; on a Mac, Git comes with the Xcode Command Line Tools), plus Docker or Podman if you want the sandbox (on a Mac, Podman from Homebrew).
 
 ---
 
@@ -264,7 +264,13 @@ Plugins live under `plugins/<name>/` (`sandbox`, `backpack`, `blueprint`, `butle
 
 ## Platforms
 
-macOS, Linux, and Windows are all supported; on Windows the launcher is PowerShell and locates Perl itself.
+| Host | Status | Runs on |
+|---|---|---|
+| Windows 10 | The original development host. | Git for Windows supplies Perl and bash. The `claude-sandbox` launcher is PowerShell and locates Perl itself; the sandbox runs on Podman with the WSL2 backend. |
+| macOS | Ported in 2026-10; tested on macOS 27 on Apple Silicon. | The Perl that ships with macOS and its `/bin/bash` 3.2, which every host-side shell script must run under. Nothing from Homebrew except Podman for the sandbox, which runs in a rootless `podman machine`. |
+| Linux | Everything inside the sandbox container runs on Linux, the test suite included. A Linux host install has not been confirmed end to end. | The distribution's Perl and bash. |
+
+The [reference's Platforms section](docs/reference.md#platforms) has the per-OS details: launchers, shells, terminals.
 
 > **Windows: use the WSL2 backend, not Hyper-V.** Microsoft's `Plan9FileServer` silently
 > breaks `O_APPEND` and `utimensat`, which fails `claude --resume` and wedges Bun's lock

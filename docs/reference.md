@@ -79,7 +79,7 @@ Opus 4.6 1M  22% |220k 780k| 5h 15%|3h 46m|  7d 12%|4d 22h|
 
 - Background `git fetch` every 30 min (non-blocking)
 - Wraps to 3 lines if terminal is too narrow
-- Requires: git, terminal with 24-bit color (Windows Terminal, iTerm2, WezTerm, Kitty)
+- Requires: git, terminal with 24-bit color (Windows Terminal, iTerm2, WezTerm, Kitty, and Terminal.app on macOS 27, which sets `COLORTERM=truecolor`)
 
 ## /steward:backup flow
 
@@ -287,5 +287,9 @@ The install pass runs after `release_lock`. In manager mode the launcher then en
 
 The launcher logic and every install hook are written in Perl 5.14+ (see prerequisites). The `.sh` / `.ps1` files under `plugins/*/bin/` are thin shims that locate Perl and exec the corresponding Perl script — they exist only so the user can type `claude-sandbox` directly from their shell.
 
-- **Linux/macOS:** `claude-sandbox.sh` (Bash) execs `plugins/sandbox/scripts/launcher.pl`. No Bash version requirement beyond what comes with any modern distribution.
+- **Linux/macOS:** `claude-sandbox.sh` (Bash) execs `plugins/sandbox/scripts/launcher.pl`; the extensionless `claude-sandbox` next to it is a tracked shim that execs the `.sh`, so the command works without its extension. `install.pl --confirm` puts each plugin's `bin/` on PATH by appending an `export PATH=...` line to `~/.zshrc` when `$SHELL` is zsh, otherwise to `~/.bashrc` if it exists or `~/.profile`. A shell that is already open does not re-read that file: open a new terminal.
 - **Windows:** `claude-sandbox.ps1` (PowerShell) locates Perl (PATH, Git for Windows, Strawberry, ActiveState) and execs `plugins/sandbox/scripts/launcher.pl`. PATH and `.PS1` PATHEXT wiring is handled by `perl install.pl --confirm` — no manual environment-variable edits required.
+
+**The bash floor is 3.2.** macOS's `/bin/bash` and `/bin/sh` are bash 3.2.57, and Claude Code starts hook commands there through `/bin/sh -c`. Every shell script that runs on a host (launcher shims, hook scripts, the `bp-*` helpers) must therefore work on 3.2: no associative arrays, `${var,,}`, `read -N`, `mapfile`, `$EPOCHSECONDS` or `globstar`, and no `"${arr[@]}"` on an empty array under `set -u`. Where a bash 4 feature is the fast path on Windows (Git for Windows ships bash 5), keep it behind a version check with a 3.2 fallback. Scripts that run only inside the Linux sandbox container may assume the container's bash.
+
+**macOS specifics.** Terminal.app and zsh, the default login shell, are what the port was tested with. Claude Code's Bash tool runs zsh as well, which changes how commands Claude writes behave: the macOS section of `global-config/CLAUDE.md` lists those rules, along with the BSD userland differences, the missing `timeout`, `setsid` and `flock`, `/tmp` resolving to `/private/tmp`, case-insensitive APFS, and Claude Code's credentials living in the login Keychain rather than in `~/.claude/.credentials.json`. Homebrew lives at `/opt/homebrew`; ccpraxis needs it only for Podman.
