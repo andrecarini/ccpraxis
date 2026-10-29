@@ -196,4 +196,52 @@ sub run_helper {
       . 'silently never happened pre-fix for any space-containing install path');
 }
 
+# ===========================================================================
+# B4 -- the rc line names a directory that exists, and lands in a file the
+# shell reads (macOS port, 2026-10-29). run_unix only, $^O forced.
+#
+#   (a) A bin dir outside $HOME used to become `$HOME//abs/path`: the strip of
+#       the $HOME prefix matched nothing and "$HOME/" was prepended anyway.
+#   (b) On macOS a login bash (what Terminal.app and iTerm2 start) reads the
+#       first of .bash_profile/.bash_login/.profile and never .bashrc, so a
+#       line appended to .bashrc never reached PATH.
+# ===========================================================================
+sub rc_after {
+    my (%o) = @_;
+    my $home = tempdir(CLEANUP => 1);
+    my $bindir = $o{bindir_under_home} ? "$home/.claude/ccpraxis/plugins/x/bin" : tempdir(CLEANUP => 1) . '/bin';
+    File::Path::make_path($bindir);
+    for my $f (@{ $o{seed} || [] }) { open my $s, '>', "$home/$f" or die $!; print {$s} "# seeded\n"; close $s; }
+    local $ENV{SHELL} = $o{shell};
+    delete local $ENV{ZSH_VERSION};
+    my ($out, $ok, $err) = run_helper(home => $home, bindir => $bindir, os => $o{os});
+    ok($ok, "B4 setup ($o{label}): apply completes") or diag("  died: $err");
+    my %rc = map { ($_ => slurp("$home/$_")) } grep { -f "$home/$_" } qw(.zshrc .bashrc .bash_profile .bash_login .profile);
+    return (\%rc, $bindir, $home);
+}
+{
+    require File::Path;
+    my ($rc, $bindir) = rc_after(label => 'outside HOME', os => 'linux', shell => '/bin/zsh');
+    unlike($rc->{'.zshrc'} // '', qr{\$HOME//}, 'B4(a): a bin dir outside $HOME never yields a $HOME// path');
+    like($rc->{'.zshrc'} // '', qr{^export PATH="\Q$bindir\E:\$PATH"$}m, 'B4(a): ...it is written as its absolute path');
+
+    ($rc, $bindir) = rc_after(label => 'under HOME', os => 'linux', shell => '/bin/zsh', bindir_under_home => 1);
+    like($rc->{'.zshrc'} // '', qr{^export PATH="\$HOME/\.claude/ccpraxis/plugins/x/bin:\$PATH"$}m,
+        'B4(a): a bin dir under $HOME stays $HOME-relative (unchanged)');
+
+    ($rc) = rc_after(label => 'darwin bash, no rc', os => 'darwin', shell => '/bin/bash', bindir_under_home => 1);
+    like($rc->{'.bash_profile'} // '', qr{^export PATH=}m, 'B4(b): darwin bash with no rc files writes .bash_profile');
+
+    ($rc) = rc_after(label => 'darwin bash, .bashrc only', os => 'darwin', shell => '/bin/bash', bindir_under_home => 1, seed => ['.bashrc']);
+    like($rc->{'.bash_profile'} // '', qr{^export PATH=}m, 'B4(b): darwin bash ignores .bashrc, which a login shell never reads');
+    unlike($rc->{'.bashrc'} // '', qr{export PATH}, 'B4(b): ...and leaves .bashrc alone');
+
+    ($rc) = rc_after(label => 'darwin bash, .profile', os => 'darwin', shell => '/bin/bash', bindir_under_home => 1, seed => ['.profile']);
+    like($rc->{'.profile'} // '', qr{^export PATH=}m, 'B4(b): darwin bash with an existing .profile appends there');
+    ok(!exists $rc->{'.bash_profile'}, 'B4(b): ...and does NOT create .bash_profile, which would stop .profile being read');
+
+    ($rc) = rc_after(label => 'linux bash, .bashrc', os => 'linux', shell => '/bin/bash', bindir_under_home => 1, seed => ['.bashrc']);
+    like($rc->{'.bashrc'} // '', qr{^export PATH=}m, 'B4: Linux bash keeps using .bashrc (unchanged)');
+}
+
 done_testing();

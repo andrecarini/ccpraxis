@@ -19,6 +19,7 @@ use strict;
 use warnings;
 use File::Basename qw(basename);
 use File::Glob qw(bsd_glob);
+use Cwd ();
 # No `use utf8;` — literal bytes flow straight to a :raw stdout (and
 # we don't have Unicode literals in this file anyway).
 use MIME::Base64 qw(encode_base64);
@@ -55,18 +56,47 @@ sub run_unix {
     my ($mode, $bindir) = @_;
 
     my $home = $ENV{HOME} // die "ERROR: \$HOME is not set\n";
+    $home =~ s{(?<=.)/+\z}{};
     my $shell_rc;
     if (defined $ENV{ZSH_VERSION} || (defined $ENV{SHELL} && $ENV{SHELL} =~ m{/zsh$})) {
         $shell_rc = "$home/.zshrc";
+    } elsif ($^O eq 'darwin' && defined $ENV{SHELL} && $ENV{SHELL} =~ m{/bash$}) {
+        # Terminal.app and iTerm2 start LOGIN shells, and a login bash reads the
+        # first of .bash_profile, .bash_login, .profile -- never .bashrc unless
+        # one of those sources it. A line appended to .bashrc never reached
+        # PATH there. Use the file a login bash actually reads; create
+        # .bash_profile only when none exists, because creating it beside an
+        # existing .profile would silently stop .profile from being read.
+        ($shell_rc) = grep { -f $_ } map { "$home/$_" } qw(.bash_profile .bash_login .profile);
+        $shell_rc //= "$home/.bash_profile";
     } elsif (-f "$home/.bashrc") {
         $shell_rc = "$home/.bashrc";
     } else {
         $shell_rc = "$home/.profile";
     }
 
-    # Make the rc line $HOME-relative so it stays portable across machines.
-    my $bindir_rel = $bindir;
-    $bindir_rel =~ s|^\Q$home\E/?||;
+    # Make the rc line $HOME-relative so it stays portable across machines --
+    # but only when the bin dir really is under $HOME. Otherwise the prefix
+    # strip did nothing and the line became `$HOME//abs/path`, a directory
+    # that does not exist (a live install outside $HOME, or $HOME spelled
+    # differently from the resolved path, e.g. /var vs /private/var). An
+    # out-of-HOME bin dir is written as its absolute path.
+    my ($bindir_rel, $path_expr);
+    {
+        my $b = $bindir;
+        $b =~ s{(?<=.)/+\z}{};
+        my @homes = ($home);
+        my $home_real = Cwd::abs_path($home);
+        push @homes, $home_real if defined $home_real && $home_real ne $home;
+        for my $h (@homes) {
+            if (index($b, "$h/") == 0) {
+                $bindir_rel = substr($b, length($h) + 1);
+                last;
+            }
+        }
+        $path_expr = defined $bindir_rel ? "\$HOME/$bindir_rel" : $b;
+        $bindir_rel //= $b;
+    }
 
     # Detect whether $bindir is already on PATH-from-rc.
     my $already_path = 0;
@@ -94,9 +124,9 @@ sub run_unix {
 
     if ($mode eq 'plan') {
         if ($already_path) {
-            print "  PATH: \$HOME/$bindir_rel already present in $shell_rc\n";
+            print "  PATH: $path_expr already present in $shell_rc\n";
         } else {
-            print "  PATH: would append `export PATH=\"\$HOME/$bindir_rel:\$PATH\"` to $shell_rc\n";
+            print "  PATH: would append `export PATH=\"$path_expr:\$PATH\"` to $shell_rc\n";
         }
         if (@launchers) {
             print "  chmod: would mark "
@@ -122,14 +152,14 @@ sub run_unix {
     }
 
     if ($already_path) {
-        print "  PATH: \$HOME/$bindir_rel already present in $shell_rc\n";
+        print "  PATH: $path_expr already present in $shell_rc\n";
     } else {
         open my $fh, '>>', $shell_rc
             or die "ERROR: cannot append to $shell_rc: $!\n";
         print $fh "\n# ccpraxis: $bindir_rel\n";
-        print $fh "export PATH=\"\$HOME/$bindir_rel:\$PATH\"\n";
+        print $fh "export PATH=\"$path_expr:\$PATH\"\n";
         close $fh;
-        print "  PATH: appended \$HOME/$bindir_rel to $shell_rc\n";
+        print "  PATH: appended $path_expr to $shell_rc\n";
     }
 }
 
