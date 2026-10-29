@@ -4426,8 +4426,8 @@ sub _run_silent {
     if ($pid == 0) {
         open STDOUT, '>', File::Spec->devnull;
         open STDERR, '>', File::Spec->devnull;
-        exec { $args[0] } @args;
-        exit 127;
+        { no warnings q{exec}; exec { $args[0] } @args; }
+        POSIX::_exit(127);   # not exit: END would release the PARENT's locks
     }
     waitpid $pid, 0;
     return $? >> 8;
@@ -4445,8 +4445,8 @@ sub _run_capture {
         close $r;
         open STDOUT, '>&', $w;
         open STDERR, '>', File::Spec->devnull;
-        exec { $args[0] } @args;
-        exit 127;
+        { no warnings q{exec}; exec { $args[0] } @args; }
+        POSIX::_exit(127);   # not exit: END would release the PARENT's locks
     }
     close $w;
     local $/;
@@ -4470,8 +4470,8 @@ sub _run_capture_both {
         close $r;
         open STDOUT, '>&', $w;
         open STDERR, '>&', $w;
-        exec { $args[0] } @args;
-        exit 127;
+        { no warnings q{exec}; exec { $args[0] } @args; }
+        POSIX::_exit(127);   # not exit: END would release the PARENT's locks
     }
     close $w;
     local $/;
@@ -4502,8 +4502,8 @@ sub _run_capture_close_fds {
         close $_ for @$close_fds;
         open STDOUT, '>&', $w;
         open STDERR, '>', File::Spec->devnull;
-        exec { $args[0] } @args;
-        exit 127;
+        { no warnings q{exec}; exec { $args[0] } @args; }
+        POSIX::_exit(127);   # not exit: END would release the PARENT's locks
     }
     close $w;
     local $/;

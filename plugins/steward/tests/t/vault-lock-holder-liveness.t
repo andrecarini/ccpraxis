@@ -188,4 +188,24 @@ SKIP: {
          'D7: an unresolvable holder says so plainly -- never silently guessed as alive');
 }
 
+# ===========================================================================
+# E. A FORKED CHILD MUST NOT RUN THE PARENT'S END BLOCK.
+#
+# vault-sync.pl releases every lock it holds in an END block. Its fork+exec
+# helpers used to follow the exec with a plain `exit 127`, and exit() runs END
+# blocks -- so a child whose exec failed (git missing from PATH, a bad argv)
+# unlinked the lock files its PARENT still held, mid-sync, letting a second
+# sync in. Source assertions: the children leave by POSIX::_exit, which skips
+# END. (A behavioural test would need a second process racing for the lock.)
+# ===========================================================================
+{
+    my @children = ($SRC =~ /(if \(\$pid == 0\) \{.*?\n    \})/sg);
+    ok(scalar(@children) >= 4, 'E1: the fork+exec children are extractable (' . scalar(@children) . ')');
+    my @bad  = grep { /\bexit\s+127\b/ && !/_exit/ } @children;
+    my @good = grep { /POSIX::_exit\(127\)/ } @children;
+    is(scalar(@bad), 0, 'E2: no child leaves through exit() after a failed exec (that ran END and dropped the parent\'s locks)');
+    is(scalar(@good), scalar(@children), 'E3: every child leaves through POSIX::_exit');
+    like($SRC, qr/^END \{ release_all_held_locks\(\); \}/m, 'E4: (premise) the END block that releases locks is still there');
+}
+
 done_testing();
