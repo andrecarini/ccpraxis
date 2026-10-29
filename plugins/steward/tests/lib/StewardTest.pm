@@ -163,6 +163,17 @@ sub temproot {
         die "StewardTest: no writable temp base found\n" unless $base;
     }
     my $root = tempdir('steward-test-XXXXXX', DIR => $base, CLEANUP => 1);
+    # Off Windows, hand back the PHYSICAL path. On macOS /tmp is a symlink to
+    # /private/tmp (and $TMPDIR lives under /var -> /private/var), while the
+    # code under test pins its cwd with Cwd::cwd()/abs_path, which resolve the
+    # link. A scenario that chdir()s into "/tmp/steward-test-X/proj" then sees
+    # "/private/tmp/steward-test-X/proj" come back, and every byte-identity
+    # assertion on the pinned cwd compares two spellings of one directory.
+    # Linux /tmp is a real directory, so this is a no-op there; Windows keeps
+    # the /c/-form contract described above untouched.
+    unless ($^O eq 'MSWin32' || $^O eq 'cygwin' || $^O eq 'msys') {
+        $root = abs_path($root) // $root;
+    }
     $root =~ s|\\|/|g;
     $root =~ s|^([a-zA-Z]):/|"/" . lc($1) . "/"|e;
     return $root;
