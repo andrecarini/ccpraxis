@@ -14,10 +14,40 @@ use File::Path qw(make_path);
 my $HB = "$Bin/../../container/heartbeat.sh";
 ok(-f $HB, 'heartbeat.sh exists');
 
+# heartbeat.sh is the CONTAINER's entrypoint, so it is written for GNU
+# coreutils: mtime_age reads `stat -c %Y`. A macOS host's BSD stat rejects
+# that, mtime_age falls back to 0, and every file reads as decades old -- a
+# fact about the host running this test, not about the script. When the
+# host's stat is not GNU, a minimal GNU-compatible `stat` (just -c %Y) is put
+# first on PATH for the sourced script, so the real logic is exercised as the
+# container runs it. heartbeat.sh itself is untouched: changing it would only
+# change the image (and prompt every sandbox for a rebuild) for no in-container
+# benefit.
+my $SHIM_PATH = '';
+{
+    my $probe = `stat -c %Y "$HB" 2>/dev/null`;
+    unless (defined $probe && $probe =~ /^\d+\s*$/) {
+        my $dir = tempdir(CLEANUP => 1);
+        open my $sh, '>', "$dir/stat" or die "stat shim: $!";
+        print {$sh} <<'SHIM';
+#!/usr/bin/env perl
+# GNU `stat -c %Y FILE` for a host whose stat is BSD; anything else is refused.
+if (@ARGV == 3 && $ARGV[0] eq '-c' && $ARGV[1] eq '%Y') {
+    my @st = stat $ARGV[2] or do { print STDERR "stat: cannot stat '$ARGV[2]': $!\n"; exit 1 };
+    print "$st[9]\n"; exit 0;
+}
+print STDERR "stat shim: only -c %Y is supported\n"; exit 2;
+SHIM
+        close $sh;
+        chmod 0755, "$dir/stat";
+        $SHIM_PATH = "$dir:";
+    }
+}
+
 # Source heartbeat.sh (main loop guarded off), then run $code; env passed via %ENV.
 sub hb_call {
     my ($env, $code) = @_;
-    local %ENV = (%ENV, HBFILE => $HB, %{ $env || {} });
+    local %ENV = (%ENV, HBFILE => $HB, PATH => $SHIM_PATH . ($ENV{PATH} // ''), %{ $env || {} });
     chomp(my $out = `bash -c 'source "\$HBFILE" >/dev/null 2>&1; $code' 2>&1`);
     return $out;
 }
