@@ -3,9 +3,12 @@ package HostPlatform;
 # the container-test harness used to make separately, each with its own copy:
 #
 #   * which container CLI to drive (and the CCPRAXIS_CONTAINER_CLI override);
-#   * what to tell an operator whose runtime is missing;
+#   * what to tell an operator whose runtime is missing or whose podman
+#     machine does not exist yet;
 #   * the case-canonical spelling of a directory on a case-insensitive
-#     filesystem (APFS).
+#     filesystem (APFS);
+#   * which host directories a podman machine actually shares with its VM,
+#     and which bind-mount sources fall outside them.
 #
 # WHY ONE MODULE. The CLI detection was three verbatim copies (launcher.pl,
 # bootstrap.pl, tests/lib/TestSandbox.pm) that all preferred docker. On macOS
@@ -24,6 +27,7 @@ package HostPlatform;
 use strict;
 use warnings;
 use Cwd ();
+use JSON::PP ();
 
 our $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/ ? 1 : 0;
 our $DARWIN         = $^O eq 'darwin' ? 1 : 0;
@@ -120,6 +124,27 @@ sub no_cli_message {
     );
 }
 
+# machine_remedy_lines($os, $machine_state) -> what to run when the podman
+# machine is not usable. $machine_state is one of Dashboard::
+# classify_machine_state's words ('absent', 'stopped', ...). 'absent' is the
+# case a bare "start it" cannot fix: there is nothing to start until
+# `podman machine init` has created one.
+sub machine_remedy_lines {
+    my ($os, $state) = @_;
+    $os = $^O unless defined $os;
+    $state = '' unless defined $state;
+    if ($state eq 'absent') {
+        return $os =~ /^(MSWin32|cygwin|msys)$/
+            ? ("  No podman machine exists yet. Create one (WSL2 provider), then start it:",
+               "    podman machine init --provider wsl",
+               "    podman machine start")
+            : ("  No podman machine exists yet. Create one (rootless is the default), then start it:",
+               "    podman machine init",
+               "    podman machine start");
+    }
+    return ("  Try, in a terminal:   podman machine start");
+}
+
 # canonical_dir($path) -> $path spelled with the case the filesystem stores.
 #
 # APFS is case-insensitive, so `cd ~/projects/foo` works for a directory named
@@ -144,6 +169,138 @@ sub canonical_dir {
     my $canon = Cwd::getcwd();
     chdir($orig);
     return (defined $canon && length $canon) ? $canon : $p;
+}
+
+# parse_machine_inspect($json) -> { name => ..., config_dir => ... } | undef.
+# `podman machine inspect` prints a JSON array with one element per machine.
+# The share list itself is NOT in that output on podman 6.x; it is in the
+# machine's own config file, ConfigDir.Path/<Name>.json.
+sub parse_machine_inspect {
+    my ($raw) = @_;
+    return undef unless defined $raw && !ref $raw && $raw =~ /\S/;
+    my $d = eval { JSON::PP->new->decode($raw) };
+    return undef unless defined $d;
+    $d = $d->[0] if ref $d eq 'ARRAY';
+    return undef unless ref $d eq 'HASH';
+    my $name = $d->{Name};
+    my $dir  = ref $d->{ConfigDir} eq 'HASH' ? $d->{ConfigDir}{Path} : undef;
+    return undef unless defined $name && !ref $name && length $name;
+    return { name => $name, config_dir => $dir, mounts => _mount_sources_of($d) };
+}
+
+# parse_machine_config($json) -> [ share sources ] | undef. Reads the
+# `Mounts[].Source` list from a machine config file (or an inspect document
+# that carries Mounts, as older podman versions printed).
+sub parse_machine_config {
+    my ($raw) = @_;
+    return undef unless defined $raw && !ref $raw && $raw =~ /\S/;
+    my $d = eval { JSON::PP->new->decode($raw) };
+    return undef unless defined $d;
+    $d = $d->[0] if ref $d eq 'ARRAY';
+    return undef unless ref $d eq 'HASH';
+    return _mount_sources_of($d);
+}
+
+sub _mount_sources_of {
+    my ($d) = @_;
+    return undef unless ref $d eq 'HASH' && ref $d->{Mounts} eq 'ARRAY';
+    my @src;
+    for my $m (@{ $d->{Mounts} }) {
+        next unless ref $m eq 'HASH';
+        my $s = $m->{Source};
+        next unless defined $s && !ref $s && $s =~ m{\A/};
+        $s =~ s{/+\z}{} unless $s eq '/';
+        push @src, $s;
+    }
+    return \@src;
+}
+
+# machine_shares(%seams) -> [ host directories shared into the VM ] | undef.
+#   inspect   => sub { raw `podman machine inspect` stdout, or undef }
+#   read_file => sub { $path -> contents or undef }
+# undef means "could not tell" and must be treated as such by the caller --
+# never as "nothing is shared", which would refuse every launch.
+sub machine_shares {
+    my (%o) = @_;
+    my $inspect = ref $o{inspect} eq 'CODE' ? $o{inspect} : sub { undef };
+    my $read    = ref $o{read_file} eq 'CODE' ? $o{read_file} : \&_slurp;
+    my $info = parse_machine_inspect(scalar $inspect->());
+    return undef unless $info;
+    return $info->{mounts} if ref $info->{mounts} eq 'ARRAY' && @{ $info->{mounts} };
+    return undef unless defined $info->{config_dir} && length $info->{config_dir};
+    return parse_machine_config(scalar $read->("$info->{config_dir}/$info->{name}.json"));
+}
+
+sub _slurp {
+    my ($p) = @_;
+    open my $fh, '<:raw', $p or return undef;
+    local $/;
+    my $c = <$fh>;
+    close $fh;
+    return $c;
+}
+
+# bind_sources(@podman_args) -> host paths of every bind mount in a podman
+# argv, from both spellings the launcher emits: `--mount type=bind,source=X,...`
+# and an unconverted `-v X:Y[:opts]`. Named volumes are not host paths and are
+# skipped.
+sub bind_sources {
+    my @args = @_;
+    my @out;
+    for (my $i = 0; $i < @args; $i++) {
+        my $a = $args[$i];
+        next unless defined $a;
+        if ($a eq '--mount' && defined $args[$i + 1]) {
+            my %kv = map { /\A([^=]+)=(.*)\z/ ? ($1 => $2) : ($_ => 1) } split /,/, $args[$i + 1];
+            my $type = $kv{type} // '';
+            my $src  = $kv{source} // $kv{src};
+            push @out, $src if $type eq 'bind' && defined $src && length $src;
+            $i++;
+        } elsif ($a eq '-v' && defined $args[$i + 1]) {
+            my ($src) = $args[$i + 1] =~ m{\A(/[^:]*):};
+            push @out, $src if defined $src;
+            $i++;
+        }
+    }
+    return @out;
+}
+
+# sources_outside_shares(\@sources, \@shares) -> the sources no share covers.
+# A share covers a source that is the share itself or lies beneath it, by
+# whole path components (/Users covers /Users/a, never /Users2). Compared
+# LITERALLY: podman hands the path to the VM as written, so /tmp/x is NOT
+# covered by a /private share even though /tmp is a symlink into it on macOS
+# (measured: `statfs /tmp/x: no such file or directory`).
+sub sources_outside_shares {
+    my ($sources, $shares) = @_;
+    return () unless ref $sources eq 'ARRAY' && ref $shares eq 'ARRAY';
+    my @out;
+    my %seen;
+    SRC: for my $s (@$sources) {
+        next unless defined $s && length $s;
+        for my $sh (@$shares) {
+            next unless defined $sh && length $sh;
+            next SRC if $sh eq '/' || $s eq $sh || index($s, "$sh/") == 0;
+        }
+        push @out, $s unless $seen{$s}++;
+    }
+    return @out;
+}
+
+# outside_shares_message(\@outside, \@shares) -> the refusal text.
+sub outside_shares_message {
+    my ($outside, $shares) = @_;
+    my @l = (
+        "ERROR: the podman machine cannot see " . (@$outside == 1 ? 'this directory' : 'these directories')
+            . ", so the sandbox cannot bind-mount " . (@$outside == 1 ? 'it' : 'them') . ":",
+        (map { "         $_" } @$outside),
+        "       A podman machine only shares the host folders it was created with:",
+        (map { "         $_" } @$shares),
+        "       Move the project under one of those folders, or recreate the machine sharing it too:",
+        "         podman machine rm, then podman machine init with one --volume <dir>:<dir> per folder",
+        "         to share (an explicit --volume replaces the default list, so repeat the ones above).",
+    );
+    return @l;
 }
 
 1;

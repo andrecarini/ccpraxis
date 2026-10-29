@@ -7,9 +7,11 @@
 #   A. container CLI choice: darwin prefers podman (a Mac may carry an
 #      unrelated docker wrapper on PATH); Windows and Linux orders unchanged;
 #      CCPRAXIS_CONTAINER_CLI is the only candidate when set.
-#   B. the no-CLI message is platform-aware: a Mac is told how to install
-#      podman and create its machine, not sent to Docker Desktop.
+#   B. operator-facing remedies name `podman machine init` when there is no
+#      machine to start.
 #   C. canonical_dir: the stored case of a directory on APFS (darwin only).
+#   D. machine shares + bind sources: which bind mounts a podman machine
+#      cannot see. Fixtures are the real shapes podman 6.1.4 printed on macOS.
 #   E. TestSandbox with no container CLI: a clean skip_all, not a load-time die.
 use strict;
 use warnings;
@@ -87,6 +89,14 @@ is_deeply([HostPlatform::cli_candidates('linux')], ['docker', 'podman'],
     my $win = join "\n", HostPlatform::no_cli_message('cygwin');
     like($win, qr/Docker Desktop.*Podman Desktop/s, 'B: Windows no-CLI message is the established wording');
 
+    my $absent = join "\n", HostPlatform::machine_remedy_lines('darwin', 'absent');
+    like($absent, qr/podman machine init\b/, 'B: an absent machine is remedied with `podman machine init`');
+    like($absent, qr/podman machine start/, 'B: ...followed by `podman machine start`');
+    my $absent_win = join "\n", HostPlatform::machine_remedy_lines('cygwin', 'absent');
+    like($absent_win, qr/--provider wsl/, 'B: on Windows the init remedy keeps the WSL2 provider');
+    my $stopped = join "\n", HostPlatform::machine_remedy_lines('darwin', 'stopped');
+    unlike($stopped, qr/machine init/, 'B: a merely stopped machine is NOT told to init a new one');
+    like($stopped, qr/podman machine start/, 'B: ...it is told to start it');
 }
 
 # ---------------------------------------------------------------------------
@@ -107,6 +117,77 @@ is_deeply([HostPlatform::cli_candidates('linux')], ['docker', 'podman'],
             'C: darwin: a case-mismatched spelling resolves to the stored case');
         is(Cwd::getcwd(), $cwd_before, 'C: ...and the caller\'s working directory is restored');
     }
+}
+
+# ---------------------------------------------------------------------------
+# D. machine shares and bind sources
+# ---------------------------------------------------------------------------
+my $INSPECT = <<'JSON';
+[
+     {
+          "ConfigDir": { "Path": "/Users/u/.config/containers/podman/machine/applehv" },
+          "Name": "podman-machine-default",
+          "State": "running",
+          "Rootful": false
+     }
+]
+JSON
+my $CONFIG = <<'JSON';
+{ "Name": "podman-machine-default",
+  "Mounts": [
+    { "Source": "/Users", "Target": "/Users", "Type": "virtiofs" },
+    { "Source": "/private", "Target": "/private", "Type": "virtiofs" },
+    { "Source": "/var/folders", "Target": "/var/folders", "Type": "virtiofs" },
+    { "Source": "/Users/u/.config/containers", "Target": "/etc/containers", "Type": "virtiofs" }
+  ] }
+JSON
+{
+    my $info = HostPlatform::parse_machine_inspect($INSPECT);
+    is($info->{name}, 'podman-machine-default', 'D: inspect parse: machine name');
+    is($info->{config_dir}, '/Users/u/.config/containers/podman/machine/applehv', 'D: inspect parse: config dir');
+
+    my @read;
+    my $shares = HostPlatform::machine_shares(
+        inspect   => sub { $INSPECT },
+        read_file => sub { push @read, $_[0]; $CONFIG });
+    is_deeply(\@read, ['/Users/u/.config/containers/podman/machine/applehv/podman-machine-default.json'],
+        'D: shares are read from <ConfigDir>/<Name>.json (podman 6.x inspect omits them)');
+    is_deeply($shares, ['/Users', '/private', '/var/folders', '/Users/u/.config/containers'],
+        'D: every share source is returned');
+
+    my $older = '[{"Name":"m","Mounts":[{"Source":"/Users/"}]}]';
+    is_deeply(HostPlatform::machine_shares(inspect => sub { $older }, read_file => sub { die 'not read' }),
+        ['/Users'], 'D: an inspect document that carries Mounts is used directly (trailing slash trimmed)');
+
+    ok(!defined HostPlatform::machine_shares(inspect => sub { undef }),
+        'D: no inspect output -> undef ("cannot tell"), never an empty share list');
+    ok(!defined HostPlatform::machine_shares(inspect => sub { $INSPECT }, read_file => sub { undef }),
+        'D: unreadable machine config -> undef');
+    ok(!defined HostPlatform::machine_shares(inspect => sub { 'Error: VM does not exist' }),
+        'D: an error message instead of JSON -> undef');
+
+    my @args = ('podman', 'create', '-it', '--name', 'c',
+        '--mount', 'type=bind,source=/Users/u/proj,target=/project',
+        '--mount', 'type=bind,source=/opt/homebrew/share/x,target=/x,readonly',
+        '--mount', 'type=volume,source=named-vol,target=/v',
+        '-v', '/tmp/legacy:/legacy:ro',
+        '-p', '9000-9019:9000-9019',
+        'claude-sandbox:latest');
+    is_deeply([HostPlatform::bind_sources(@args)], ['/Users/u/proj', '/opt/homebrew/share/x', '/tmp/legacy'],
+        'D: bind_sources reads --mount bind sources and -v host paths, skipping named volumes and -p');
+
+    my @out = HostPlatform::sources_outside_shares([HostPlatform::bind_sources(@args)], $shares);
+    is_deeply(\@out, ['/opt/homebrew/share/x', '/tmp/legacy'],
+        'D: sources outside every share are reported; /tmp is NOT covered by /private (podman passes it literally)');
+    is_deeply([HostPlatform::sources_outside_shares(['/Users2/x', '/Users'], ['/Users'])], ['/Users2/x'],
+        'D: coverage is by whole path component (/Users does not cover /Users2)');
+    is_deeply([HostPlatform::sources_outside_shares(['/anything'], ['/'])], [],
+        'D: a "/" share covers everything');
+
+    my $msg = join "\n", HostPlatform::outside_shares_message(\@out, $shares);
+    like($msg, qr{/opt/homebrew/share/x}, 'D: the refusal names the unshared source');
+    like($msg, qr{/var/folders}, 'D: ...and lists what the machine does share');
+    like($msg, qr/podman machine init.*--volume <dir>:<dir>/s, 'D: ...and says how to add a share');
 }
 
 # ---------------------------------------------------------------------------

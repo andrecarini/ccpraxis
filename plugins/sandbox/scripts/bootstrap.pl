@@ -386,8 +386,14 @@ log_step("Step 2/6: ensure $RUNTIME_NAME is reachable and the container image ex
             print STDERR "           podman machine start\n";
             print STDERR "\n";
             print STDERR "       ⚠  HYPER-V BACKEND IS NOT SUPPORTED. Microsoft's 9p host-share silently breaks O_APPEND (claude session resume fails with EIO) and utimensat (Bun's lock manager wedges → TUI freezes every ~60s). WSL2 is the only reliable Windows backend for both docker and podman.\n";
+        } elsif ($^O eq 'darwin') {
+            # A fresh macOS podman install has NO machine, and "start it" cannot
+            # fix that; `podman machine list` tells the two cases apart.
+            my $list  = `$PODMAN machine list --format json 2>/dev/null`;
+            my $state = (defined $list && $list =~ /\A\s*\[\s*\]\s*\z/) ? 'absent' : 'stopped';
+            print STDERR "$_\n" for HostPlatform::machine_remedy_lines('darwin', $state);
         } else {
-            print STDERR "       Start the podman backend (`podman machine start` on macOS, or check the rootless socket on Linux).\n";
+            print STDERR "       Start the podman backend (check the rootless podman socket on Linux).\n";
         }
         print STDERR "\n";
         die_bootstrap("$RUNTIME_NAME backend not reachable — see above");

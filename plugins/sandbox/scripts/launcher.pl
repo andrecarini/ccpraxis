@@ -2428,6 +2428,21 @@ sub _ensure_machine_ready {
     my $state = eval { _machine_state() } // 'unknown';
     return 1 if $state eq 'n/a' || $state eq 'running';
 
+    # NO MACHINE AT ALL is not a stopped one. `podman machine start` has nothing
+    # to start, so attempting it only produces podman's own "VM does not exist"
+    # and a "try podman machine start" remedy that cannot work. The operator's
+    # one missing step is `podman machine init` -- the normal state of a fresh
+    # macOS install -- so say exactly that.
+    if ($state eq 'absent') {
+        log_ev('machine_absent', {});
+        _fail_visibly(
+            "ERROR: podman is installed but no podman machine exists.",
+            HostPlatform::machine_remedy_lines($^O, 'absent'),
+            "  Then run claude-sandbox again.",
+        );
+        return 0;
+    }
+
     # 'unknown' degrades toward TRYING rather than aborting: _machine_state
     # answers 'unknown' for an unparseable probe, and refusing to launch on an
     # unrecognised schema would be worse than attempting a start that reports
@@ -2445,10 +2460,49 @@ sub _ensure_machine_ready {
         "ERROR: the podman machine is not running and could not be started.",
         "  reason: " . ($r->{detail} // 'unknown error'),
         "",
-        "  Try, in a terminal:   podman machine start",
+        HostPlatform::machine_remedy_lines($^O, $state),
         "  Then run claude-sandbox again.",
     );
     return 0;
+}
+
+# _machine_shares() -> [ host dirs the podman machine shares into its VM ] |
+# undef. Memoized for the launch. darwin + podman only: a macOS podman machine
+# (applehv/libkrun) sees ONLY the folders it was created with -- /Users,
+# /private and /var/folders by default -- and a bind source anywhere else
+# fails `podman create` with "statfs <path>: no such file or directory", which
+# names neither the machine nor the remedy. On Windows the WSL machine reaches
+# every drive through /mnt, and Linux has no machine at all, so neither is
+# asked. undef ("could not tell") never refuses anything.
+my ($MACHINE_SHARES, $MACHINE_SHARES_DONE);
+sub _machine_shares {
+    return $MACHINE_SHARES if $MACHINE_SHARES_DONE;
+    $MACHINE_SHARES_DONE = 1;
+    return undef unless $^O eq 'darwin' && $PODMAN =~ /podman/i;
+    $MACHINE_SHARES = eval {
+        HostPlatform::machine_shares(
+            inspect => sub { _run_timed(qq{$PODMAN machine inspect 2>/dev/null}, 10) });
+    };
+    return $MACHINE_SHARES;
+}
+
+# _refuse_unshared_mounts($stage, @host_paths) -- exit with an explanation if
+# any of @host_paths lies outside the podman machine's shares. Returns quietly
+# when every path is covered or when the shares cannot be determined.
+sub _refuse_unshared_mounts {
+    my ($stage, @paths) = @_;
+    my $shares = _machine_shares();
+    return unless ref $shares eq 'ARRAY' && @$shares;
+    my @outside = HostPlatform::sources_outside_shares(\@paths, $shares);
+    return unless @outside;
+    log_ev('launch_failed', { reason => 'bind source outside the podman machine shares',
+                              outside => join(' ', @outside) });
+    _launch_fail($stage, 'a bind-mount source is outside the podman machine shares', undef);
+    _fail_visibly(HostPlatform::outside_shares_message(\@outside, $shares));
+    LaunchLog::close_log($LAUNCH_LOG);
+    SandboxLock::release($LOCK_DIR);
+    reset_terminal();
+    exit 1;
 }
 
 sub build_image {
@@ -2597,12 +2651,12 @@ my $IMAGE_EXISTS;
     # cannot be brought up aborts.
     if (!$IMAGE_EXISTS && $probe =~ /cannot connect|connection refused|unable to connect|no such host|dial tcp/i) {
         unless (_ensure_machine_ready()) {
+            # _ensure_machine_ready has already explained the failure and named
+            # the remedy (start for a stopped machine, init for a missing one),
+            # and held the screen for it. A second "start it" message here
+            # contradicted the init remedy and asked for Enter twice.
             log_ev('launch_failed', { reason => 'podman machine unavailable at preflight' });
             _launch_fail('preflight', 'podman machine unavailable', 125);
-            _fail_visibly(
-                "ERROR: cannot reach podman.",
-                "  The sandbox cannot be built, created or started without it.",
-                "  Start it with `podman machine start` and re-run claude-sandbox.");
             LaunchLog::close_log($LAUNCH_LOG);
             SandboxLock::release($LOCK_DIR);
             reset_terminal();
@@ -2614,6 +2668,13 @@ my $IMAGE_EXISTS;
         $IMAGE_EXISTS = ($? == 0) ? 1 : 0;
     }
 }
+
+# A project the podman machine cannot see is refused HERE, before the skills
+# picker and the rebuild prompt, rather than after the operator has answered
+# them and `podman create` fails with a bare statfs error. The project tree
+# (which holds claude-home) and this checkout (statusline, plugin tree) are
+# the sources every launch mounts; the full list is checked again at create.
+_refuse_unshared_mounts('preflight', $PROJECT_PATH, $INSTALL_ROOT);
 
 # =====================================================================
 # Container name (generate + persist)
@@ -5145,6 +5206,7 @@ if (! _container_exists($CONTAINER_NAME)) {
     };
 
     @podman_args = $build_create_args->();
+    _refuse_unshared_mounts('create', HostPlatform::bind_sources(@podman_args));
 
     # _tee_system: `podman create`'s diagnostics are the whole content of a
     # create failure, and a bare system() writes them into the alt buffer that
