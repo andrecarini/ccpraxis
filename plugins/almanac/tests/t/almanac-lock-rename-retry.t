@@ -150,6 +150,17 @@ NATIVEHOLDER
     close $fh;
 }
 
+# AC-15 and AC-18's first half need a rename() that another process can
+# BLOCK by holding the destination open. That is a Windows sharing-mode
+# behaviour: a POSIX rename (macOS, Linux) replaces the directory entry no
+# matter who has the old file open, so there is nothing there to retry
+# against and no powershell.exe to stand in as the holder. Those blocks are
+# skipped off Windows; the rest of this file is platform-neutral and runs
+# everywhere.
+my $NATIVE_HOLDER_OS = ($^O =~ /^(MSWin32|cygwin|msys)$/) ? 1 : 0;
+my $NO_NATIVE_HOLDER = 'Windows only: a POSIX rename() is never blocked by another process holding '
+                     . 'the destination open, so there is no native holder (powershell.exe) to retry against';
+
 sub powershell_available {
     local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
     system('powershell.exe', '-NoProfile', '-NonInteractive', '-Command', 'exit 0');
@@ -258,7 +269,8 @@ for my $case (
 # =============================================================================
 # AC-15 (DC5) -- the retry succeeds against a real, native exclusive holder.
 # =============================================================================
-{
+{ SKIP: {
+    skip("AC-15: $NO_NATIVE_HOLDER", 4) unless $NATIVE_HOLDER_OS;
     my $ps_ok = powershell_available();
     unless ($ps_ok) {
         fail('AC-15: prerequisite -- powershell.exe must be resolvable on this host (a native holder is '
@@ -298,7 +310,7 @@ for my $case (
         # still has the file open when File::Temp tries to clean up $WORK.
         bounded_wait_for_file($released15, 10);
     }
-}
+} }
 
 # =============================================================================
 # AC-18 (DC5) -- a rename failure is reported specifically, not as "write failed".
@@ -317,6 +329,8 @@ for my $case (
 #     "write failed" string becomes "write failed: $LAST_ERROR".
 # =============================================================================
 {
+    SKIP: {
+    skip("AC-18 (real holder half): $NO_NATIVE_HOLDER", 6) unless $NATIVE_HOLDER_OS;
     my $ps_ok = powershell_available();
     if ($ps_ok) {
         my $target18 = "$WORK/ac18-target.md";
@@ -362,6 +376,7 @@ for my $case (
     } else {
         fail('AC-18: prerequisite -- powershell.exe must be resolvable to force a real rename failure');
         fail('AC-18: _write_atomic returns 0 when the rename cannot succeed before its deadline') for 1 .. 5;
+    }
     }
 
     # Part 2: cas_write's message wrapping, isolated from _write_atomic's own
