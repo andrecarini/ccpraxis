@@ -224,8 +224,11 @@ ccpraxis/
 │   │   │   └── bp-ui-prober.md                                  # bp-ui-prober worker - finder-based UI scenarios and screenshot reads for packages that touch UI.
 │   │   ├── bin/
 │   │   │   ├── bp-denials
+│   │   │   ├── bp-dispatch-log                                  # bare `bp-dispatch-log` command on a Linux/macOS PATH; execs bp-dispatch-log.sh
 │   │   │   ├── bp-dispatch-log.sh                               # thin shim so the dispatch-log verbs are reachable by name instead of by a path…
+│   │   │   ├── bp-drive-next                                    # bare `bp-drive-next` command on a Linux/macOS PATH; execs bp-drive-next.sh
 │   │   │   ├── bp-drive-next.sh                                 # thin shim so the drive-next verbs are reachable by name instead of by a path…
+│   │   │   ├── bp-ledger                                        # bare `bp-ledger` command on a Linux/macOS PATH; execs bp-ledger.sh
 │   │   │   ├── bp-ledger.sh                                     # thin shim so the ledger verbs are reachable by name instead of by a path…
 │   │   │   ├── bp-power-journal
 │   │   │   ├── bp-power-plan
@@ -678,6 +681,7 @@ ccpraxis/
 │   │   ├── .claude-plugin/                                      # Plugin manifest directory
 │   │   │   └── plugin.json                                      # Plugin manifest -- name, description, version
 │   │   ├── bin/                                                 # User-invoked CLI lives here; shell-native wrappers are required so users can type `claude-sandbox` from any terminal.
+│   │   │   ├── claude-sandbox                                   # bare `claude-sandbox` command on a Linux/macOS PATH; execs claude-sandbox.sh
 │   │   │   ├── claude-sandbox.ps1                               # Thin shim — locates Perl + execs launcher.pl (Windows/PowerShell)
 │   │   │   └── claude-sandbox.sh                                # Thin shim — execs into plugins/sandbox/scripts/launcher.pl (Linux/macOS)
 │   │   ├── ccpraxis-install.pl                                  # Install hook — wires plugins/sandbox/bin/ into user PATH (delegates to _install-bin-helper.pl)
@@ -903,6 +907,7 @@ ccpraxis/
 │       ├── .claude-plugin/                                      # Plugin manifest directory
 │       │   └── plugin.json                                      # Plugin manifest -- name, description, version
 │       ├── bin/
+│       │   ├── ccpraxis                                         # bare `ccpraxis` command on a Linux/macOS PATH; execs ccpraxis.sh
 │       │   ├── ccpraxis.ps1                                     # thin dispatcher shim for steward's host-side scripts.
 │       │   └── ccpraxis.sh                                      # thin dispatcher shim for steward's host-side scripts.
 │       ├── ccpraxis-install.pl                                  # steward plugin install hook.
@@ -1004,6 +1009,8 @@ ccpraxis/
 │   ├── run-tests-container.pl                                   # a throwaway, CPU- and memory-capped run-mode that executes a given set of .t…
 │   ├── run-tests.pl                                             # the repo-wide test runner.
 │   ├── statusline.pl                                            # Custom two-line status bar (model, context, rate limits)
+│   ├── test-bin/                                                # test-only helper binaries the sweep can put on PATH (macOS has no GNU timeout)
+│   │   └── timeout                                              # pure-perl stand-in for GNU timeout; scripts/run-tests.pl puts it on PATH only when the host has none (macOS)
 │   ├── tui-preview.pl                                           # a live, resizable preview of the sandbox dashboard, driven by synthetic state.
 │   ├── update-bootstrap-monitor.pl                              # /steward:update support: versioned archive + drift check for upstream bootstrap.ps1
 │   ├── update-install.pl                                        # /steward:update support: direct-binary install pipeline (detect / manifest / install / verify)
