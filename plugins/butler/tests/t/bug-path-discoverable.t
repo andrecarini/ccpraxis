@@ -133,11 +133,15 @@ sub sentence_matches {
 # ===========================================================================
 {
     # Baseline: ordered MD5 hashes of every line in global-config/CLAUDE.md
-    # as of 2026-09-22, AFTER the SendFeedback pointer was deliberately
-    # removed per operator instruction (see section B above) and bug
-    # 20260922-205201-f421. Regenerated against the post-removal file
-    # content -- this IS the new floor additive-only checks against, not a
-    # historical snapshot. 103 lines.
+    # as of 2026-10-29, regenerated when the file was made platform-aware:
+    # the Windows-only sections moved under "## Windows host" (headings
+    # demoted to ###, bodies byte-identical), a "## macOS host" section and
+    # a "## Host platform" rule were added, and the python house rule lost
+    # its Windows-only claim. The previous floor (2026-09-22, 103 lines) was
+    # itself a regeneration after the SendFeedback pointer was removed per
+    # operator instruction (section B above, bug 20260922-205201-f421). This
+    # IS the floor additive-only checks against, not a historical snapshot.
+    # 149 lines.
     my @BASELINE_LINE_HASHES = (
         '39dbf6c7953b868bed9faa8584f53aa8',
         'd41d8cd98f00b204e9800998ecf8427e',
@@ -152,11 +156,32 @@ sub sentence_matches {
         'd41d8cd98f00b204e9800998ecf8427e',
         'f95cdefa621195db8ab58b063845b522',
         'd41d8cd98f00b204e9800998ecf8427e',
+        'ad79d37c2f3987734918e057945a7356',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        'c3c9d7ed3685dd18ba038fe29f21c4db',
+        '71a9ec0eff5b2d2b88c2095dff18464f',
+        'eab874c2e736192f1d833b230156cf2f',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        'fa9d197f74bc48c847dc70b5d7bfa460',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        '6795c68c1697bfba5413dee42d4b4973',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        '65ac19f4fbf85918ab695cf5747a1e47',
+        'e61888658e1b228a89ffd7267657b76e',
+        '8ab8189ea04d3204c47d7ed9cfd7c2a7',
+        '0897df65d2242b4013ab48d1820786af',
+        'cc197e05b96fa328958f898cd558e438',
+        '2a564dc64e2518a0b3eaa9429e44c6f5',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        '0e9e24723f07977060690e5341ed0262',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        '707e228d58961bd5612e32f47f81c820',
+        'd41d8cd98f00b204e9800998ecf8427e',
         '3350b37fc0674ecf914b82bbf8c09f94',
         'd41d8cd98f00b204e9800998ecf8427e',
         '5f35a6b57dc01953c216143005077495',
         'd41d8cd98f00b204e9800998ecf8427e',
-        'c8b7080f344b4aa0454cb548aef62c4f',
+        'dc13154b9f12c51aeb985b69eb605066',
         '113485088cd95f98b7f152df317d1c7c',
         '0e28a87a7c1e2ace9d012e97c057ee16',
         '55ef4bf5f0d04b943d333f2ffe6a837a',
@@ -183,23 +208,35 @@ sub sentence_matches {
         'd41d8cd98f00b204e9800998ecf8427e',
         'cefaa52865fd0c6942580de7cfa4952d',
         'd41d8cd98f00b204e9800998ecf8427e',
-        '9aade65c57767bcd1ddb7850bbb8e66c',
+        '62da7702a48084a3482ead4e2510fc01',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        'bea1f6e5836460d48afa9ba45c074ae6',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        'ad7e3ed279653ffb42a7965db303c7d0',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        '0c7b0b1538d13a734e5553195269ae15',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        'c033b17b8e4215336ce603f595d3c80e',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        'cc36fe138db6d52c6949ba7c2db91774',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        '79f6069d25f7374974dad3229211c935',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        '640bcf0eba4bf0be54e1dfab20f81303',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        'bce35cf9e065541867c4b08e02af5da4',
         'd41d8cd98f00b204e9800998ecf8427e',
         '4406441c9717f82a8d07fa40f004432f',
         'd41d8cd98f00b204e9800998ecf8427e',
         '12a0c8bba47bba0020ac4dccc3cdc907',
         'd41d8cd98f00b204e9800998ecf8427e',
-        'c5869142ad18052c0f4d26fedc015e23',
+        'c620060a032ac4277a86bcffa0ed6a9f',
         'd41d8cd98f00b204e9800998ecf8427e',
         '99977daad8b4bd9b5b5bef92584ef4f2',
         'd41d8cd98f00b204e9800998ecf8427e',
         'a8b76dc77ce2e831797ff39d2a33a028',
         'd41d8cd98f00b204e9800998ecf8427e',
-        '62da7702a48084a3482ead4e2510fc01',
-        'd41d8cd98f00b204e9800998ecf8427e',
-        'bea1f6e5836460d48afa9ba45c074ae6',
-        'd41d8cd98f00b204e9800998ecf8427e',
-        'faadc03818975b008fc5e20c18297cd9',
+        '4a57b909cc7d6414e0e416f2b5ab9fb0',
         'd41d8cd98f00b204e9800998ecf8427e',
         'dfa1786988e8348ca648e7ad7244d8dd',
         'd41d8cd98f00b204e9800998ecf8427e',
@@ -232,7 +269,7 @@ sub sentence_matches {
         'd41d8cd98f00b204e9800998ecf8427e',
         'b439c1dcc51965aaa12b26a3bc4ec002',
         'd41d8cd98f00b204e9800998ecf8427e',
-        '6293e178c220777e5ea8b21bb74ccf3a',
+        'b5aefdcba3f3921ee1c4c9a02c58eecb',
         'd41d8cd98f00b204e9800998ecf8427e',
         '6e01962e0fb8e6c8c50a3d15f3c526cc',
         'd41d8cd98f00b204e9800998ecf8427e',
@@ -242,10 +279,23 @@ sub sentence_matches {
         'c25754e0c6c5e180f9c8bb0b6ef50cb4',
         'e4c45f96d1a4aacdbe6c5deb0760c009',
         'b81a80ad04ee375504da3b8d523d7ce3',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        'a37cdee939e47d363e4ff5d0feabd2f7',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        'd41a010f6f00405202e74637f2e8b4af',
+        '8c1e8526a8755b42df35561f8c75766e',
+        '20f04fcb322afef6f33d21d3f6ea5487',
+        'd0421f842d5c47aadcd61567d60f121e',
+        '21475491bb80442b8e1898a9b656be61',
+        '87bf35d4769a4d66e3a6fafa92764845',
+        '9cec9540823250b67625027216d6597f',
+        'f47f86b0d1909d5fdb9d9ecaddbb9936',
+        '37c30bc1c22a55a004d6213c0af98a5e',
+        'aaa9e793f53bcd08b2674602414d7953',
     );
 
-    is(scalar(@BASELINE_LINE_HASHES), 103,
-        'C0: baseline itself carries the expected 103 lines (sanity check on this test, not the fixture)');
+    is(scalar(@BASELINE_LINE_HASHES), 149,
+        'C0: baseline itself carries the expected 149 lines (sanity check on this test, not the fixture)');
 
     # Re-hash the CURRENT file's lines the same way the baseline was produced:
     # split on \n, strip a trailing \r (tolerate either line-ending style),
@@ -269,7 +319,7 @@ sub sentence_matches {
     $first_missing_baseline_index = $bi if $bi <= $#BASELINE_LINE_HASHES;
 
     ok(!defined($first_missing_baseline_index),
-        'C2: every pre-existing line (baseline, 103 lines) is still present in the current file, '
+        'C2: every pre-existing line (baseline, 149 lines) is still present in the current file, '
       . 'in its original relative order -- an additive-only diff')
         or diag(defined($first_missing_baseline_index)
             ? "first baseline line not found as a subsequence element: baseline index $first_missing_baseline_index "

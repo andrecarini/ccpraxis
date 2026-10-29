@@ -36,7 +36,7 @@ Arming (previous section) attaches the session to a thread; how is in `/butler:c
 
 Recurring preferences that surfaced in multiple project memories — promoted here so they apply everywhere, not just where they were first observed.
 
-- **No python/pip on the host — use perl.** Python is not installed on this Windows host. For ad-hoc scripting (parsing JSON/HAR, file munging, one-off transformations) reach for `perl` (Git-for-Windows ships it; `JSON::PP` is core) instead of `python`/`python3`/`pip`. Reserve Bash for actual shell operations. (`pip install` is also a host-side dev-tooling install — see the section below.)
+- **No python/pip on the host — use perl.** For ad-hoc scripting (parsing JSON/HAR, file munging, one-off transformations) reach for `perl` instead of `python`/`python3`/`pip`, even where a `python3` exists (macOS ships one). Perl is on every host ccpraxis supports (Git for Windows carries it; macOS has `/usr/bin/perl`) and `JSON::PP` is core. Reserve Bash for actual shell operations. (`pip install` is also a host-side dev-tooling install — see the section below.)
 - **Never add `Co-Authored-By` to commits.** Do not append `Co-Authored-By: Claude ...` (or any co-author trailer) to git commit messages. The user does not want Claude credited in the git history.
 - **Don't chain `cd` in git/shell commands.** Never write `cd /path && git ...` — chaining forces a fresh approval prompt every time. Run commands from the working directory directly; if a different directory is genuinely needed, `cd` once in its own call, then run subsequent commands separately.
 - **Delegate heavy mechanical work to cheaper-model subagents.** When a task will burn lots of tokens in the main context (large WebFetches, full-site mirrors, reading big downloaded files, long-output commands, batch reconnaissance), spawn a subagent overridden to a cheaper, faster model rather than running it inline on the session's large model. Only the subagent's summary returns, so the heavy raw content never lands in the expensive context. Keep synthesis, judgement, edits, and final go/no-go calls on the large model; don't subagent trivial work (the overhead beats the saving).
@@ -63,23 +63,35 @@ This includes but is not limited to:
 
 🐳 If a project needs dev tooling, **offer to set up a sandbox**: tell the user to exit Claude and run `claude-sandbox` in this project. The launcher detects no sandbox is configured and walks them through bootstrap interactively (image build, git auth, PATH wiring). Do not run it automatically — let the user decide.
 
-## ⚠️ `NUL` is a Windows device name — never redirect to it from Bash
+## ⚠️ Path-scoped `Bash(...)` permissions do not work in skill frontmatter
+
+`permissions.allow` entries like `Bash(perl ~/.claude/scripts/*)` match correctly in `settings.json`, but silently fail to match when written into a skill's `allowed-tools:` frontmatter — only the broadest form (`Bash(perl *)`) takes effect there, which is too permissive to want. To pre-approve a specific command a skill invokes, add it to `settings.json` (use the `update-config` skill) and leave the frontmatter as bare `Bash, Read, Write, …`.
+
+## Durable facts go in almanac notes
+
+Claude Code memory is disabled; record a durable cross-project fact as a global almanac note (`perl ~/.claude/ccpraxis/plugins/almanac/scripts/almanac-note.pl create --global --title "..." --content -`, the fact on stdin), never as a memory. Your notes index is imported on the next line from `~/.claude/almanac-notes.md`, which `almanac-migrate-memories.pl render-index` generates from your own vault; every `target` in it is relative to `~/.claude/claude-code-vault/`.
+
+@~/.claude/almanac-notes.md
+
+## Host platform
+
+Some rules hold on one operating system only. The environment block at the start of each session names the host in its `Platform:` line (`win32`, `darwin` or `linux`) and the Bash tool's shell in `Shell:`. Follow the section below that matches and ignore the other; `linux` has none.
+
+## Windows host
+
+### ⚠️ `NUL` is a Windows device name — never redirect to it from Bash
 
 From Bash, redirecting to `NUL` creates a literal file of that name which Explorer cannot delete. Use `/dev/null` from Bash and `$null` from PowerShell.
 
 **This is hook-enforced** — `~/.claude/ccpraxis/scripts/hooks/block-nul-redirect.pl` denies the Bash call before it runs, in every project on this machine, so the mistake is not available to make. Kept as one line only because the *right* form is worth knowing; the rule itself needs no teaching. If a stray `NUL` file already exists, remove it from Bash (`rm -- NUL`) — PowerShell resolves the device name instead of the file.
 
-## ⚠️ Write `.ps1` files as ASCII only
+### ⚠️ Write `.ps1` files as ASCII only
 
 The Write tool saves UTF-8 without a BOM; PowerShell 5.1 reads a BOM-less script as CP1252. A multi-byte character like `—` or `→` decodes into stray bytes — one of them (0x94) is a smart quote, which PowerShell treats as a **string delimiter**. That opens a phantom string, swallows the following braces, and reports `Missing closing '}'` at a line far from the real problem.
 
 Use `--` and `->`. If non-ASCII is genuinely required, prepend a UTF-8 BOM. Check with `perl -nle 'print "L$.: $_" if /[^\x00-\x7f]/' file.ps1` — no output means clean. `.sh` files are unaffected; Git Bash handles UTF-8 fine.
 
-## ⚠️ Path-scoped `Bash(...)` permissions do not work in skill frontmatter
-
-`permissions.allow` entries like `Bash(perl ~/.claude/scripts/*)` match correctly in `settings.json`, but silently fail to match when written into a skill's `allowed-tools:` frontmatter — only the broadest form (`Bash(perl *)`) takes effect there, which is too permissive to want. To pre-approve a specific command a skill invokes, add it to `settings.json` (use the `update-config` skill) and leave the frontmatter as bare `Bash, Read, Write, …`.
-
-## ⚠️ MSYS2 path-conversion mangles `:`-separated args (Git-for-Windows perl + podman)
+### ⚠️ MSYS2 path-conversion mangles `:`-separated args (Git-for-Windows perl + podman)
 
 When Git-for-Windows perl (or any MSYS2-based tool) spawns a **native Windows** binary, MSYS2 silently translates argv elements that look like POSIX paths into Windows paths. For arguments that **contain a colon**, MSYS2 treats them as `:`-separated PATH-style lists, converts each piece independently, and **re-joins them with `;`** (Windows's PATH separator). This silently corrupts:
 
@@ -112,7 +124,7 @@ bare git repo under `C:\c\Users\Public\`.
 
 **The complementary technique — translate, and stop caring about the variable.** `plugins/steward/scripts/vault-sync.pl`'s `git_path()` rewrites `/c/...` → `C:/...` before every git call. `git.exe` and `podman.exe` both accept that form whether or not MSYS later rewrites it, so the script is correct under *either* conversion state instead of depending on one. Prefer this when you can: it cannot be broken by a caller's environment. Where a harness must control the environment instead, scrub the variable for the child rather than the whole session — see `plugins/steward/tests/lib/StewardTest.pm`'s `_msys_convert_on`.
 
-## ⚠️ Modifying the Windows User PATH
+### ⚠️ Modifying the Windows User PATH
 
 The user's Windows PATH and other registry env vars contain paths with non-ASCII characters (e.g. `C:\Users\André\...`). Mishandling Unicode when reading/writing those vars via PowerShell from perl will scramble every existing entry — a system-breaking class of bug that previously hit this machine and took manual fix-up to recover.
 
@@ -123,8 +135,15 @@ If you must write new code that reads/writes Windows registry env vars:
 - **Round-trip-test on a throwaway variable** (e.g. `CCPRAXIS_ENC_TEST`) containing `André` BEFORE touching PATH/PATHEXT. Verify byte-perfect read-back. Only then operate on the real var.
 - **Snapshot the current PATH to a file** before modifying (e.g. `~/.claude/.path-snapshots/<timestamp>.txt`), so the user can restore manually if anything goes wrong.
 
-## Durable facts go in almanac notes
+## macOS host
 
-Claude Code memory is disabled; record a durable cross-project fact as a global almanac note (`perl ~/.claude/ccpraxis/plugins/almanac/scripts/almanac-note.pl create --global --title "..." --content -`, the fact on stdin), never as a memory. Your notes index is imported on the next line from `~/.claude/almanac-notes.md`, which `almanac-migrate-memories.pl render-index` generates from your own vault; every `target` in it is relative to `~/.claude/claude-code-vault/`.
-
-@~/.claude/almanac-notes.md
+- The Bash tool's shell is zsh. A glob that matches nothing aborts the command (`no matches found`), so quote a pattern meant for another program (`find . -name '*.md'`); a word starting with `=` expands to a command's path (`=====` fails), so quote it; an unquoted `$var` is not word-split. Run bash syntax through `bash -c '...'` or a script file.
+- `/bin/bash` and `/bin/sh` are bash 3.2: no `declare -A`, `${var,,}`, `read -N`, `mapfile`, `$EPOCHSECONDS` or `globstar`; `"${arr[@]}"` of an empty array is unbound under `set -u`; a heredoc inside `$(...)` with an unbalanced `)` misparses. Hook scripts must work on 3.2.
+- The userland is BSD: `sed -i ''`, `stat -f %m` (not `stat -c %Y`), `date -v-1d` and `date -r <epoch>` (not `date -d`), `ps -o etime=` (no `etimes`). There is no `timeout`, `setsid` or `flock`; use perl: `perl -e 'alarm shift; exec @ARGV' 30 cmd` (exit 142 on timeout), `perl -MPOSIX -e 'fork && exit; setsid; exec @ARGV' cmd`, and `flock` from `Fcntl` in a perl script.
+- `grep` and `find` in the Bash tool are Claude Code's own wrappers and skip gitignored files. Search gitignored directories (`.ccpraxis-local-data/`, for one) with `command grep -r` and `command find`.
+- `/tmp` is `/private/tmp`, `/var` is `/private/var`, and `$TMPDIR` is under `/var/folders/`. `realpath`, `pwd -P` and perl's `abs_path` return the `/private` form: canonicalise both sides before comparing or prefix-matching paths.
+- APFS is case-insensitive: `Foo` and `foo` are one file. Compare paths case-insensitively; perl's `Cwd::abs_path` keeps the case you typed.
+- Claude Code's credentials are in the login Keychain (item `Claude Code-credentials`), not in `~/.claude/.credentials.json`. Never read the secret (`security find-generic-password -w`): it can raise a GUI prompt and prints the token.
+- Never run `pbcopy` or `pbpaste` unasked: they touch the user's clipboard, and even `pbcopy </dev/null` empties it.
+- Homebrew is at `/opt/homebrew`. A `brew install` is a host install like any other; the dev-tooling rule above applies.
+- A PATH change reaches the Bash tool only in a new Claude Code session, which takes a fresh snapshot of the shell. A line added to `~/.zshrc`, or a `brew install`, is invisible until then.
