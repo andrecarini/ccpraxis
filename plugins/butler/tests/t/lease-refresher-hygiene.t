@@ -41,6 +41,18 @@ use Time::HiRes qw(sleep time);
 
 BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 
+# Genuinely Windows-only: every integration group below runs real
+# keep-awake.ps1 helpers and judges them by WINPID (/proc/<pid>/winpid,
+# tasklist, taskkill, CIM command lines) under a %TEMP% that falls back to
+# C:/Windows/Temp. None of that exists on macOS or Linux. The macOS holder's
+# own contract (pid file identity, ASSERTED line, lease expiry, release on
+# TERM) is pinned in keepawake-shared.t. Decided in BEGIN so the END cleanup
+# below (which sweeps by WINPID through powershell.exe) is never even compiled.
+BEGIN {
+    plan skip_all => 'Windows-only: drives real keep-awake.ps1 helpers by WINPID (tasklist/taskkill/CIM)'
+        unless $^O =~ /^(MSWin32|msys|cygwin)$/;
+}
+
 # Captured BEFORE anything in this file ever touches HOME/USERPROFILE, for
 # AC-17(c)'s read-only check of the operator's REAL registry lease.log. This
 # process's own %ENV is never overridden below -- only forked children's are

@@ -795,7 +795,12 @@ sub off_env {
 # ===========================================================================
 # AC11/AC12 -- off, last live arm (DC2, DC3).
 # ===========================================================================
-{
+SKIP: {
+    # A SUBPROCESS decides its platform from $^O (the PLATFORM seam is
+    # in-process only), and power plans exist only on Windows: anywhere else
+    # off-confirm correctly skips the plan step altogether.
+    skip 'AC11: off restores a power plan only on the Windows host', 1
+        unless $^O =~ /^(MSWin32|msys|cygwin)$/;
     my $fx = off_fixture();
     local $ENV{BUTLER_STATE_DIR} = $fx->{home};
     my $sid = 'ac11offsid';
@@ -833,8 +838,13 @@ sub off_env {
         is($recs[0]{armed}, 0, 'AC11: armed is 0');
     }
 }
-{
+SKIP: {
     # AC12 -- plan already Balanced: one noop record, no /setactive.
+    # A SUBPROCESS decides its platform from $^O (the PLATFORM seam is
+    # in-process only), and power plans exist only on Windows: anywhere else
+    # off-confirm correctly skips the plan step altogether.
+    skip 'AC12: off restores a power plan only on the Windows host', 1
+        unless $^O =~ /^(MSWin32|msys|cygwin)$/;
     my $fx = off_fixture();
     my $sid = 'ac12offsid';
     local $ENV{BUTLER_STATE_DIR} = $fx->{home};
@@ -909,7 +919,12 @@ sub off_env {
 # AC15 -- off, /setactive fails: exit 0, stdout unchanged, one stderr
 # warning, one error record.
 # ===========================================================================
-{
+SKIP: {
+    # A SUBPROCESS decides its platform from $^O (the PLATFORM seam is
+    # in-process only), and power plans exist only on Windows: anywhere else
+    # off-confirm correctly skips the plan step altogether.
+    skip 'AC15: off restores a power plan only on the Windows host', 1
+        unless $^O =~ /^(MSWin32|msys|cygwin)$/;
     my $fx = off_fixture();
     local $ENV{BUTLER_STATE_DIR} = $fx->{home};
     my $sid = 'ac15offsid';

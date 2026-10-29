@@ -938,6 +938,11 @@ PERLSRC
 
     SKIP: {
         skip 'AC12: bp-power-plan.pl does not exist yet', 12 unless -f $CLI;
+        # A SUBPROCESS decides its platform from $^O (the PLATFORM seam is
+        # in-process only), and power plans exist only on Windows: anywhere
+        # else reconcile() correctly answers skipped/not-windows.
+        skip 'AC12: the CLI subprocess reconciles a power plan only on the Windows host', 12
+            unless $^O =~ /^(MSWin32|msys|cygwin)$/;
         my ($out, $err, $rc) = run_cli($CLI, 'reconcile');
         is($rc, 0, 'AC12: reconcile exits 0 against a corrected fake plan') or diag("stderr: $err");
         like($out, qr/^armed: 1 \(ac12sid\)$/m, 'AC12: stdout has the armed: line') or diag($out);
@@ -1480,6 +1485,12 @@ sub require_bpp {
 }
 
 subtest 'Decision 24: the structural live-install rule' => sub {
+    # The rule under test sits BEHIND the platform check (reconcile() answers
+    # not-windows first off Windows), so pin the platform the way every other
+    # in-process block here does; otherwise a non-Windows host would test the
+    # platform check instead of this rule. Every call still goes through the
+    # CCPRAXIS_POWERCFG fake.
+    local $BpContinuityLease::PLATFORM = 'windows';
     my $healthy_fake_behavior = sub {
         return (
             getactivescheme => ok_result(ga_bytes($BAL_GUID, 'Balanced')),
