@@ -82,10 +82,6 @@ my %CLEAN_ENV = map { ($_ => $ENV{$_}) } grep { !/^BP_/ } keys %ENV;
 # answer whenever the GNU form is unavailable.
 sub realpath_m {
     my ($p) = @_;
-    # BSD realpath (macOS) has no -m; every path this file canonicalises
-    # already exists, so perl's own realpath gives the same answer there --
-    # including the /var -> /private/var resolution the hook will see.
-    if ($^O eq 'darwin') { require Cwd; my $r = Cwd::realpath($p); return defined $r ? $r : $p }
     local %ENV = (%CLEAN_ENV, P => $p);
     open(my $f, '-|', 'bash', '-c', 'realpath -m "$P" 2>/dev/null') or die "bash: $!";
     my $o = do { local $/; <$f> }; close $f; $o = '' unless defined $o; $o =~ s/\s+\z//;
