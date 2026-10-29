@@ -847,6 +847,12 @@ for my $T ('', "A\n", "A\n\nB\n", "# H\n\npara\n") {
 
     # non-ASCII tempdir component
     my $ND = "$D/Andr\x{e9}";
+    # The directory is created from $ND's UTF-8 bytes below, but $ND itself
+    # holds e-acute as the single byte 0xE9, and that byte form is what
+    # apply_file hands the filesystem. APFS (macOS) only has the UTF-8 name,
+    # so on darwin $ND is utf8::upgrade'd: same characters, UTF-8 bytes on
+    # the way to the filesystem, as a real macOS path would arrive.
+    utf8::upgrade($ND) if $^O eq 'darwin';
     my $ok_mkdir = eval { File::Path::make_path(Encode::encode('UTF-8', $ND)); 1 };
     SKIP: {
         skip('could not create a non-ASCII directory on this filesystem', 3) unless $ok_mkdir && -d Encode::encode('UTF-8', $ND);
