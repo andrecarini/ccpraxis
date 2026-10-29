@@ -39,28 +39,31 @@ BEGIN {
 }
 use RefusalMarker ();
 use SandboxIdentity ();
+use HostPlatform ();
 
 binmode STDOUT, ':raw';
 binmode STDERR, ':raw';
 
-# Detect docker OR podman — both are supported. Prefer docker if both
-# present (more widely installed). Use `<cli> --version` exit code as the
-# probe; PATH-lookup heuristics get fooled on Windows by extensionless
-# shell-wrapper shims (Docker Desktop historically dropped one alongside
-# docker.exe that Git-for-Windows perl's POSIX PATH search would find
-# first and fail to spawn). Always name the .exe explicitly.
+# Detect docker OR podman — both are supported. The choice is
+# HostPlatform::detect_container_cli, shared with launcher.pl so the two can
+# never pick different runtimes: CCPRAXIS_CONTAINER_CLI wins when set; the
+# Windows family probes docker.exe then podman.exe (named with .exe because
+# Git-for-Windows perl's POSIX PATH search finds an extensionless shim first
+# and fails to spawn it); macOS probes podman first; Linux docker first.
 my $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/;
+my $CLI_DETECT_ERROR;
 sub _detect_container_cli {
-    for my $candidate ($WINDOWS_FAMILY ? ('docker.exe', 'podman.exe') : ('docker', 'podman')) {
-        my $rc = system("$candidate --version > /dev/null 2>&1");
-        return $candidate if $rc == 0;
-    }
-    return undef;
+    my ($cli, $err) = HostPlatform::detect_container_cli();
+    $CLI_DETECT_ERROR = $err;
+    return $cli;
 }
 my $PODMAN = _detect_container_cli();
 unless (defined $PODMAN) {
-    print STDERR "ERROR: no container CLI on PATH (looked for docker, podman).\n";
-    print STDERR "       Install Docker Desktop (https://docker.com) or Podman Desktop (https://podman-desktop.io/) and re-run.\n";
+    if (defined $CLI_DETECT_ERROR) {
+        print STDERR "ERROR: $CLI_DETECT_ERROR\n";
+    } else {
+        print STDERR "$_\n" for HostPlatform::no_cli_message();
+    }
     exit 1;
 }
 my $RUNTIME_NAME = ($PODMAN =~ /docker/) ? 'docker' : 'podman';

@@ -49,6 +49,7 @@ use CcpraxisWorkCopy qw(workcopy_route workcopy_refusal_outcome);
 use ProtectedPaths qw(path_relation protected_roots target_self_codes normalize_path);
 use RefusalMarker ();  # .claude-sandbox-refuse markers: refuse before anything is written
 use SandboxIdentity ();  # launcher identity + this checkout's own install root
+use HostPlatform ();     # container CLI choice, machine shares, darwin path case
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
 use WtProfile ();   # sandbox-wt-profile/02: [c]-press profile fragment ensure + name
@@ -183,25 +184,28 @@ binmode STDERR, ':raw';
 
 my $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/;
 
-# Detect which container CLI is installed: prefer docker (Docker Desktop's
-# `docker.exe` is the more universally installed runtime), fall back to
-# podman. Probing by spawning `<cli> --version` is the only reliable check
-# on Windows — relying on file-existence in $PATH is fragile because of
-# .exe vs extensionless shim hijacks (Docker Desktop historically dropped
-# an extensionless `docker` shell-wrapper alongside `docker.exe` that
-# Git-for-Windows perl's POSIX `PATH` search would find first and fail to
-# spawn). Always name the .exe explicitly on Windows.
+# Detect which container CLI is installed. The decision lives in
+# HostPlatform::detect_container_cli, shared with bootstrap.pl and the test
+# harness: CCPRAXIS_CONTAINER_CLI wins when set; otherwise the Windows family
+# probes docker.exe then podman.exe (unchanged -- named with .exe because
+# Git-for-Windows perl's PATH search finds an extensionless shim first and
+# fails to spawn it), macOS probes podman then docker (podman is the supported
+# runtime there, and a Mac can carry an unrelated docker wrapper on PATH), and
+# Linux keeps docker then podman. Probing by spawning `<cli> --version` is the
+# only reliable check on Windows.
+my $CLI_DETECT_ERROR;
 sub _detect_container_cli {
-    for my $candidate ($WINDOWS_FAMILY ? ('docker.exe', 'podman.exe') : ('docker', 'podman')) {
-        my $rc = system("$candidate --version > /dev/null 2>&1");
-        return $candidate if $rc == 0;
-    }
-    return undef;
+    my ($cli, $err) = HostPlatform::detect_container_cli();
+    $CLI_DETECT_ERROR = $err;
+    return $cli;
 }
 my $PODMAN = _detect_container_cli();
 unless (defined $PODMAN) {
-    print STDERR "ERROR: no container CLI on PATH (looked for docker, podman).\n";
-    print STDERR "       Install Docker Desktop (https://docker.com) or Podman Desktop (https://podman-desktop.io/) and re-run.\n";
+    if (defined $CLI_DETECT_ERROR) {
+        print STDERR "ERROR: $CLI_DETECT_ERROR\n";
+    } else {
+        print STDERR "$_\n" for HostPlatform::no_cli_message();
+    }
     exit 1;
 }
 

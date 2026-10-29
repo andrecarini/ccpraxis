@@ -58,17 +58,29 @@ our @EXPORT_OK = qw(
     container_unreachable_reason
 );
 
+# HostPlatform.pm, resolved from THIS file's own location for the same reason
+# HostCaps is above: $Bin belongs to whichever test loaded us.
+use lib dirname(abs_path(__FILE__)) . "/../../scripts";
+require HostPlatform;
+
 our $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/;
-# Detect docker OR podman — both supported. Same detection as
-# launcher.pl / bootstrap.pl: probe `<cli> --version`, prefer docker.
+# Detect docker OR podman — both supported. The SAME detection launcher.pl
+# and bootstrap.pl use (HostPlatform::detect_container_cli): the
+# CCPRAXIS_CONTAINER_CLI override, then the platform's own preference order.
+#
+# NO CLI IS NOT A LOAD-TIME DEATH ANY MORE. This used to `die` here, which
+# killed every caller at `use TestSandbox` with exit 255 -- including callers
+# that only wanted catalog helpers (new_temp_dir) and callers whose own
+# reachability skip (import(), below) would have said exactly why. Now $PODMAN
+# is undef, the catalog helpers keep working, and a caller that imports a
+# symbol that needs a runtime gets a clean skip_all naming the cause.
+my $CLI_ERROR;
 sub _detect_container_cli {
-    for my $candidate ($WINDOWS_FAMILY ? ('docker.exe', 'podman.exe') : ('docker', 'podman')) {
-        my $rc = system("$candidate --version > /dev/null 2>&1");
-        return $candidate if $rc == 0;
-    }
-    return undef;
+    my ($cli, $err) = HostPlatform::detect_container_cli();
+    $CLI_ERROR = $err;
+    return $cli;
 }
-our $PODMAN = _detect_container_cli() // die "TestSandbox: no container CLI on PATH (docker / podman)\n";
+our $PODMAN = _detect_container_cli();
 our $PROBE_IMAGE = 'docker.io/library/debian:bookworm-slim';
 
 # Disable MSYS argv conversion process-wide. Same reasoning as launcher.pl:
@@ -109,6 +121,13 @@ sub probe_image { $PROBE_IMAGE }
 my ($REACHABLE, $REACHABLE_REASON);
 sub container_runtime_reachable {
     return $REACHABLE if defined $REACHABLE;
+    unless (defined $PODMAN) {
+        $REACHABLE = 0;
+        $REACHABLE_REASON = defined $CLI_ERROR
+            ? "no usable container CLI: $CLI_ERROR"
+            : 'no container CLI on PATH (looked for ' . join(', ', HostPlatform::cli_candidates()) . ')';
+        return $REACHABLE;
+    }
     my $quoted_podman = _arg_quote($PODMAN);
     my $cmd = "$quoted_podman info " . _arg_quote('--format') . ' ' . _arg_quote('{{.Host.Arch}}') . ' 2>&1';
     my $out;
@@ -161,6 +180,12 @@ sub container_unreachable_reason {
 # did before this probe existed.
 my %NEEDS_REACHABLE_RUNTIME = (podman_run_capture => 1, create_probe_container => 1);
 
+# Symbols that are meaningless without SOME container CLI on PATH, reachable or
+# not: podman_bin hands the caller the CLI name to spawn, and the sweep/orphan
+# helpers drive it. With no CLI at all, importing one of these is a clean
+# skip_all rather than the load-time die this module used to perform.
+my %NEEDS_CLI = (%NEEDS_REACHABLE_RUNTIME, podman_bin => 1, sweep_orphan_containers => 1);
+
 # Custom import (Decision 120(a), package 36): still exports symbols exactly
 # as Exporter's default import would, THEN -- only when the CLI exists (the
 # pre-existing die above already covers "no CLI at all", unchanged) but
@@ -175,6 +200,11 @@ sub import {
     my $class = shift;
     my @syms = @_;
     $class->export_to_level(1, $class, @syms);
+    if (!defined $PODMAN && grep { exists $NEEDS_CLI{$_} } @syms) {
+        container_runtime_reachable();
+        require Test::More;
+        Test::More::plan(skip_all => container_unreachable_reason());
+    }
     if (grep { exists $NEEDS_REACHABLE_RUNTIME{$_} } @syms) {
         unless (container_runtime_reachable()) {
             require Test::More;
@@ -241,6 +271,7 @@ sub new_temp_dir {
 # Uses system() with a list arg so MSYS doesn't get a second crack at the
 # command string; captures stdout+stderr via a temp file redirect.
 sub podman_run_capture {
+    die "TestSandbox::podman_run_capture: no container CLI on PATH\n" unless defined $PODMAN;
     my @args = convert_v_to_mount(@_);
     require File::Temp;
     my ($fh, $tmp) = File::Temp::tempfile();
@@ -296,6 +327,7 @@ sub register_cleanup_container { push @CLEANUP_CONTAINERS, $_[0] }
 sub register_cleanup_dir       { push @CLEANUP_DIRS,       $_[0] }
 
 sub cleanup_all {
+    @CLEANUP_CONTAINERS = () unless defined $PODMAN;
     for my $c (@CLEANUP_CONTAINERS) {
         system("$PODMAN rm -f " . _arg_quote($c) . " > /dev/null 2>&1");
     }
@@ -384,6 +416,7 @@ sub orphan_container_names {
 # or erroring must never fail a test run, so every failure path returns empty
 # rather than dying.
 sub sweep_orphan_containers {
+    return () unless defined $PODMAN;
     my ($rc, $out) = eval { podman_run_capture('ps', '-a', '--format', '{{.Names}}') };
     return () if $@ || !defined $rc || $rc != 0;
     my @names = grep { length } map { s/\s+\z//r } split /\n/, ($out // '');
