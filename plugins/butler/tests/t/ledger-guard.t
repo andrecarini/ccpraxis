@@ -60,7 +60,12 @@ my $HOOK      = "$HOOKS/ledger-guard.sh";
 my $HOOKSJSON = "$HOOKS/hooks.json";
 
 my $J    = JSON::PP->new->canonical;
-my $ROOT = tempdir(CLEANUP => 1);
+# macOS's per-user temp root (/var/folders/../T, /private/var/... once
+# realpath'd) is long enough that a ledger path under it overflows the
+# guard's 90-char path echo, and AC-4/AC-5 read that path back out of the
+# message. /tmp keeps it short there, as the temp root already is on Windows
+# and Linux.
+my $ROOT = tempdir(CLEANUP => 1, ($^O eq 'darwin' && -d '/tmp' ? (DIR => '/tmp') : ()));
 my $pn   = 0;
 my $bpn  = 0;
 
@@ -71,11 +76,19 @@ sub fwd { (my $p = shift) =~ s{\\}{/}g; $p }
 # A hook test must control the hook's environment COMPLETELY (wait-shape-guard.t:54-58).
 my %CLEAN_ENV = map { ($_ => $ENV{$_}) } grep { !/^BP_/ } keys %ENV;
 
+# `realpath -m` is GNU coreutils; BSD realpath (macOS) has no -m and prints
+# its usage instead, which left every fixture path empty there. Every path
+# this file normalises already exists, so Cwd::realpath gives the same
+# answer whenever the GNU form is unavailable.
 sub realpath_m {
     my ($p) = @_;
     local %ENV = (%CLEAN_ENV, P => $p);
-    open(my $f, '-|', 'bash', '-c', 'realpath -m "$P"') or die "bash: $!";
-    my $o = do { local $/; <$f> }; close $f; $o =~ s/\s+\z//; return $o;
+    open(my $f, '-|', 'bash', '-c', 'realpath -m "$P" 2>/dev/null') or die "bash: $!";
+    my $o = do { local $/; <$f> }; close $f; $o = '' unless defined $o; $o =~ s/\s+\z//;
+    return $o if length $o;
+    require Cwd;
+    my $r = Cwd::realpath($p);
+    return defined $r ? fwd($r) : $p;
 }
 
 diag("subject under test: $HOOK "
