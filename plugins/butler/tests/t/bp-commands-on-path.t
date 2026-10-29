@@ -292,6 +292,10 @@ SKIP: {
         my ($mode) = @_;
         local $ENV{HOME} = $fake_home;
         local $^O = 'linux'; # force the file-based branch; never the registry one
+        # Pin the rc choice to the seeded .bashrc: the helper picks ~/.zshrc
+        # whenever SHELL ends in /zsh, which it does by default on macOS.
+        local $ENV{SHELL} = '/bin/bash';
+        delete local $ENV{ZSH_VERSION};
         local @ARGV = ($mode, $bindir);
         my $capture;
         my ($ofh, $ofile) = File::Temp::tempfile(UNLINK => 1);
@@ -378,6 +382,8 @@ SKIP: {
     {
         local $ENV{HOME} = $fake_home;
         local $^O = 'linux'; # force the file-based branch; never the registry one
+        local $ENV{SHELL} = '/bin/bash';   # same .bashrc pin as AC4 (macOS defaults to zsh)
+        delete local $ENV{ZSH_VERSION};
         local @ARGV = ('apply', $bindir);
         my ($ofh, $ofile) = File::Temp::tempfile(UNLINK => 1);
         open(my $saved_stdout, '>&', \*STDOUT) or die $!;
