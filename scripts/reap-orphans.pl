@@ -70,10 +70,13 @@ BEGIN { $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/ }
 
 # A scratchpad path, as the harness builds it:
 #   <temp>/claude/<project-slug>/<session-uuid>/scratchpad/...
-# The uuid is what ties a process back to a session, so it is CAPTURED rather
-# than merely matched -- --session-id has to be able to exclude by it.
+# On macOS (and Linux) the temp root carries the uid --
+#   /private/tmp/claude-501/<project-slug>/<session-uuid>/scratchpad/...
+# -- so the directory is claude or claude-<digits>. The uuid is what ties a
+# process back to a session, so it is CAPTURED rather than merely matched --
+# --session-id has to be able to exclude by it.
 our $SCRATCHPAD_RE = qr{
-    [/\\] claude [/\\] [^/\\]+ [/\\]
+    [/\\] claude (?: -\d+ )? [/\\] [^/\\]+ [/\\]
     ( [0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12} )
     [/\\] scratchpad [/\\]
 }x;
@@ -90,7 +93,10 @@ sub scratchpad_session {
 #
 # @procs is [ { pid, ppid, age, cmd }, ... ]; `age` undef means the platform
 # could not supply a start time. %opt takes min_age, session_id, self (a hashref
-# of pids that must never be selected).
+# of pids that must never be selected) and reparented (a hashref of ppids that
+# mean "the real parent is gone": on macOS and Linux an orphan is adopted by
+# pid 1, which is alive, so without this no POSIX orphan ever had a gone
+# parent. Windows does not reparent and passes none).
 #
 # ALL THREE CONDITIONS ARE REQUIRED, and the order below is the order they are
 # argued for in the header. The parent-gone test is the load-bearing one; the
@@ -101,6 +107,7 @@ sub select_orphans {
     return [] unless ref $procs eq 'ARRAY';
     my $min_age = defined $o{min_age} && $o{min_age} =~ /^\d+$/ ? $o{min_age} + 0 : 0;
     my $self    = ref $o{self} eq 'HASH' ? $o{self} : {};
+    my $adopted = ref $o{reparented} eq 'HASH' ? $o{reparented} : {};
     # ref-checked BEFORE dereferencing: a single malformed row must not abort
     # the sweep. A die here does not degrade the reaper, it STOPS it, and the
     # leak silently resumes -- which is indistinguishable from the bug this
@@ -114,12 +121,23 @@ sub select_orphans {
         next unless defined $uuid;                          # 1. names a scratchpad
         next if $self->{ $p->{pid} // -1 };                 #    never ourselves
         next if defined $o{session_id} && lc($uuid) eq lc($o{session_id});
-        next if $alive{ $p->{ppid} // -1 };                 # 2. parent is gone
+        next if $alive{ $p->{ppid} // -1 }                  # 2. parent is gone
+             && !$adopted->{ $p->{ppid} // -1 };            #    (adopted by init counts)
         next unless defined $p->{age};                      #    unknown age != old
         next unless $p->{age} >= $min_age;                  # 3. old enough
         push @out, { %$p, session => $uuid };
     }
     return \@out;
+}
+
+# parse_etime($s) -> seconds | undef. PURE. BSD/macOS `ps -o etime` prints
+# [[dd-]hh:]mm:ss (macOS has no `etimes`); anything else is undef, which the
+# selector treats as unknown age and never reaps.
+sub parse_etime {
+    my ($s) = @_;
+    return undef unless defined $s;
+    my ($d, $h, $m, $sec) = $s =~ /^\s*(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)\s*\z/ or return undef;
+    return ((($d // 0) * 24 + ($h // 0)) * 60 + $m) * 60 + $sec;
 }
 
 package main;
@@ -201,21 +219,40 @@ sub enumerate_windows {
 }
 
 sub enumerate_posix {
-    # etimes (elapsed seconds) is Linux; macOS ps has no such column. Ask for it
-    # and fall back to no age rather than parsing the several formats of etime.
-    my @lines = `ps -eo pid=,ppid=,etimes=,args= 2>/dev/null`;
-    my $have_age = 1;
+    # etimes (elapsed seconds) is Linux. macOS ps has no such column, and used
+    # to fall straight through to "no age", which spared everything: the
+    # reaper was inert there. It now asks for etime ([[dd-]hh:]mm:ss) and
+    # parses it (ReapOrphans::parse_etime). -ww: never truncate args, which is
+    # where the scratchpad path is.
+    # NOT detected by "no output": macOS ps reports the unknown keyword on
+    # stderr and then prints the other columns anyway, so the args landed in
+    # the age slot. Chosen by platform, and the etimes output is still checked
+    # for a numeric third column before it is believed.
+    my @lines;
+    my $age_kind = 'etime';
+    if ($^O ne 'darwin') {
+        @lines = `ps -eo pid=,ppid=,etimes=,args= 2>/dev/null`;
+        $age_kind = 'etimes';
+        @lines = () unless grep { /^\s*\d+\s+\d+\s+\d+\s/ } @lines;
+    }
+    if (!@lines) {
+        @lines = `ps -ww -eo pid=,ppid=,etime=,args= 2>/dev/null`;
+        $age_kind = 'etime';
+    }
     if (!@lines) {
         @lines = `ps -eo pid=,ppid=,args= 2>/dev/null`;
-        $have_age = 0;
+        $age_kind = '';
     }
     my @out;
     for my $l (@lines) {
         chomp $l;
         $l =~ s/^\s+//;
         my ($pid, $ppid, $age, $cmd);
-        if ($have_age) { ($pid, $ppid, $age, $cmd) = split /\s+/, $l, 4 }
-        else           { ($pid, $ppid, $cmd) = split /\s+/, $l, 3; $age = undef }
+        if ($age_kind) {
+            ($pid, $ppid, $age, $cmd) = split /\s+/, $l, 4;
+            $age = ReapOrphans::parse_etime($age) if $age_kind eq 'etime';
+        }
+        else { ($pid, $ppid, $cmd) = split /\s+/, $l, 3; $age = undef }
         next unless defined $cmd && length $cmd;
         push @out, { pid => $pid, ppid => $ppid,
                      age => (defined $age && $age =~ /^\d+$/ ? $age + 0 : undef),
@@ -256,6 +293,8 @@ my @candidates = @{ ReapOrphans::select_orphans(\@procs,
     min_age    => $opt{'min-age-seconds'},
     session_id => $opt{'session-id'},
     self       => \%self,
+    # POSIX reparents an orphan to pid 1; Windows keeps the dead parent's pid.
+    reparented => ($^O =~ /^(MSWin32|cygwin|msys)$/ ? {} : { 1 => 1 }),
 ) };
 
 # ---------------------------------------------------------------------------

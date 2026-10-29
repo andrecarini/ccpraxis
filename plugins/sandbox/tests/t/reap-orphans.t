@@ -161,6 +161,47 @@ sub pad {
         'AC9: an unrelated command yields no session');
 }
 
+# ---------------------------------------------------------------------------
+# AC10 -- macOS/Linux. The reaper was inert off Windows for three reasons, each
+# pinned here: the temp root is claude-<uid>, an orphan is ADOPTED by pid 1
+# (alive, so "parent gone" never held), and macOS ps has no etimes column.
+# ---------------------------------------------------------------------------
+{
+    my $mac = "/usr/bin/perl /private/tmp/claude-501/-Users-x-Projects-ccpraxis/$UUID/scratchpad/probe.pl";
+    is(ReapOrphans::scratchpad_session($mac), $UUID,
+        'AC10: a macOS scratchpad under /private/tmp/claude-501/ is recognised');
+    is(ReapOrphans::scratchpad_session("/usr/bin/perl /tmp/claudex/p/$UUID/scratchpad/x.pl"), undef,
+        'AC10: ...but only claude or claude-<digits>, not any directory starting with claude');
+
+    my @procs = (
+        { pid => 1,    ppid => 0,    age => 999999, cmd => '/sbin/launchd' },
+        { pid => 4242, ppid => 1,    age => 7200,   cmd => $mac },          # adopted by launchd
+        { pid => 777,  ppid => 1,    age => 7200,   cmd => '/usr/libexec/logd' },
+        { pid => 900,  ppid => 4242, age => 7200,   cmd => "sh /private/tmp/claude-501/p/$OTHER/scratchpad/live.sh" },
+    );
+    my $without = ReapOrphans::select_orphans(\@procs, min_age => 3600);
+    is(scalar @$without, 0, 'AC10: without the reparented set, an orphan adopted by pid 1 looks parented (the old darwin behaviour)');
+    my $with = ReapOrphans::select_orphans(\@procs, min_age => 3600, reparented => { 1 => 1 });
+    is_deeply([ map { $_->{pid} } @$with ], [4242], 'AC10: with pid 1 as the adopter, exactly the adopted scratchpad process is selected');
+    my $young = ReapOrphans::select_orphans(\@procs, min_age => 9999, reparented => { 1 => 1 });
+    is(scalar @$young, 0, 'AC10: the age floor still applies to an adopted process');
+    my $mine = ReapOrphans::select_orphans(\@procs, min_age => 3600, reparented => { 1 => 1 }, session_id => $UUID);
+    is(scalar @$mine, 0, 'AC10: --session-id still excludes an adopted process of the live session');
+
+    is(ReapOrphans::parse_etime('05:07'), 307, 'AC10: etime mm:ss');
+    is(ReapOrphans::parse_etime('1:00:00'), 3600, 'AC10: etime hh:mm:ss');
+    is(ReapOrphans::parse_etime('08-12:29:06'), 8 * 86400 + 12 * 3600 + 29 * 60 + 6, 'AC10: etime dd-hh:mm:ss');
+    is(ReapOrphans::parse_etime('/sbin/launchd'), undef, 'AC10: anything else is unknown age, never old');
+
+    open my $fh, '<', $SCRIPT or BAIL_OUT("cannot read $SCRIPT");
+    my $src = do { local $/; <$fh> };
+    close $fh;
+    like($src, qr/reparented\s*=>\s*\(\$\^O\s*=~\s*\/\^\(MSWin32\|cygwin\|msys\)\$\/\s*\?\s*\{\}\s*:\s*\{\s*1\s*=>\s*1\s*\}\s*\)/,
+        'AC10: the CLI treats pid 1 as the adopter off Windows only (Windows keeps the dead parent\'s pid)');
+    like($src, qr/\$\^O ne 'darwin'.*?etimes=/s,
+        'AC10: darwin never trusts the etimes query (macOS ps prints the other columns anyway)');
+}
+
 # ===========================================================================
 # THE PID NAMESPACE. Bug 20260917-033101-c455.
 #
