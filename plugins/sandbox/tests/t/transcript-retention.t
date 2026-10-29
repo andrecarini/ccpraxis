@@ -48,7 +48,8 @@
 #   AC-1  : both files parse and keep $schema (covered by existing A3)
 #   AC-2  : B-1 -- disableArtifact/disableRemoteControl/disableClaudeAiConnectors
 #           are JSON boolean true, in both files
-#   AC-3  : B-2 -- skillOverrides is exactly the 15 names -> 'off', in both files
+#   AC-3  : B-2 -- skillOverrides is exactly the 17 names -> 'off', in both files
+#           (15 at authoring; two more exported by /steward:backup, eee2780)
 #   AC-4  : B-3 -- skillOverrides has no update-config/keybindings-help/`:`-key
 #   AC-5  : B-4 -- the four env keys are exactly '1', in both files
 #   AC-6  : B-5 -- disableFastMode absent; no anthropic-skills enabledPlugins key
@@ -234,9 +235,15 @@ ok(!exists $container_data->{todoFeatureEnabled},
 my @BOOL_SWITCHES = qw(disableArtifact disableRemoteControl disableClaudeAiConnectors);
 my @ENV_SWITCHES  = qw(CLAUDE_CODE_DISABLE_ADVISOR_TOOL CLAUDE_CODE_DISABLE_FAST_MODE
                        DISABLE_BUG_COMMAND DISABLE_FEEDBACK_COMMAND);
+# The original 15 (03-strip-claude-code-bloat, 2026-09-27) plus algorithmic-art
+# and google-workspace, which the operator switched off on the live host and
+# /steward:backup exported to both payloads on 2026-10-26 (eee2780). The
+# payloads are the newer statement of intent; this list followed them.
 my @SKILL_NAMES = qw(
+    algorithmic-art
     artifact-capabilities artifact-design artifact-diagramming batch claude-api
-    code-review dataviz fewer-permission-prompts loop run run-skill-generator
+    code-review dataviz fewer-permission-prompts google-workspace
+    loop run run-skill-generator
     security-review simplify team-onboarding verify
 );
 my %EXPECTED_SKILL_OVERRIDES = map { $_ => 'off' } @SKILL_NAMES;
@@ -255,7 +262,7 @@ for my $case (
 
     # B-2
     is_deeply($data->{skillOverrides}, \%EXPECTED_SKILL_OVERRIDES,
-        "B-2: $label skillOverrides is exactly the 15-name object, every value 'off'");
+        "B-2: $label skillOverrides is exactly the 17-name object, every value 'off'");
 
     # B-3
     SKIP: {
@@ -531,7 +538,10 @@ my $HOST_BASELINE = {
     # keybindings-help are deliberately NOT keys here (they are not on the
     # operator's list and must stay "on" -- see B-3 below). Re-check this
     # list on every Claude Code update, since skillOverrides matches by name.
+    # algorithmic-art and google-workspace: switched off by the operator on the
+    # live host and exported here by /steward:backup on 2026-10-26 (eee2780).
     skillOverrides => {
+        'algorithmic-art'          => 'off',
         'artifact-capabilities'    => 'off',
         'artifact-design'          => 'off',
         'artifact-diagramming'     => 'off',
@@ -540,6 +550,7 @@ my $HOST_BASELINE = {
         'code-review'              => 'off',
         'dataviz'                  => 'off',
         'fewer-permission-prompts' => 'off',
+        'google-workspace'         => 'off',
         'loop'                     => 'off',
         'run'                      => 'off',
         'run-skill-generator'      => 'off',
@@ -690,7 +701,10 @@ my $CONTAINER_BASELINE = {
     # keybindings-help are deliberately NOT keys here (they are not on the
     # operator's list and must stay "on" -- see B-3 below). Re-check this
     # list on every Claude Code update, since skillOverrides matches by name.
+    # algorithmic-art and google-workspace: switched off by the operator on the
+    # live host and exported here by /steward:backup on 2026-10-26 (eee2780).
     skillOverrides => {
+        'algorithmic-art'          => 'off',
         'artifact-capabilities'    => 'off',
         'artifact-design'          => 'off',
         'artifact-diagramming'     => 'off',
@@ -699,6 +713,7 @@ my $CONTAINER_BASELINE = {
         'code-review'              => 'off',
         'dataviz'                  => 'off',
         'fewer-permission-prompts' => 'off',
+        'google-workspace'         => 'off',
         'loop'                     => 'off',
         'run'                      => 'off',
         'run-skill-generator'      => 'off',
