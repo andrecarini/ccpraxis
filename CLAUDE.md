@@ -89,7 +89,8 @@ words, no numeric prefix — enforced by `plugins/butler/tests/t/test-naming-hyg
 `Test::More`, no harness config.
 
 **`prove` does not exist on the Git-for-Windows host** — that perl ships no `TAP::Harness`
-(`Can't locate TAP/Harness/Env.pm`). Run one file directly and judge by exit code plus `not ok`
+(`Can't locate TAP/Harness/Env.pm`). macOS's system perl does have it (`/usr/bin/prove`), but keep
+the habit that works on every host: run one file directly and judge by exit code plus `not ok`
 count:
 
 ```bash
@@ -116,7 +117,7 @@ here drift every time a test is added, so prefer deriving them:
 `grep -lE 'TestSandbox|podman_run_capture|podman_bin|probe_image' plugins/*/tests/t/*.t | wc -l`.
 
 The work here is dominated by PROCESS CREATION, not CPU — a bare statusline spawn costs ~292ms on
-this host — so parallelism buys more than the core count suggests.
+the Windows host — so parallelism buys more than the core count suggests.
 
 **The runner keeps the container tests SERIAL, deliberately** (13 at time of writing — derive it,
 do not trust the number). They start real podman containers
@@ -136,7 +137,10 @@ absolute count.
 
 **Never let a test spawn `launcher.pl` unguarded.** It will build an image and start a container
 inside your test run. Interlock any such test on the behaviour already being wired (grep the
-launcher source first) and bound it with `timeout`. This has fired repeatedly.
+launcher source first) and bound it with `timeout`. This has fired repeatedly. macOS has no
+`timeout`: `run-tests.pl` puts the pure-perl `scripts/test-bin/timeout` on PATH when the host lacks
+one, and a test that must also pass when run on its own falls back to that file itself, as
+`plugins/butler/tests/lib/GuardHarness.pm` does.
 
 ## Windows landmines
 
@@ -197,6 +201,46 @@ These have each cost real debugging time. Details in the user-global `CLAUDE.md`
   will consume; when the host runs low on commit, Windows terminates the VM and every container in
   it dies at once, with no reap record. A missing `.launcher/last-reap.txt` is the signature of a
   hard kill rather than a graceful reap.
+
+## macOS landmines
+
+Measured during the 2026-10 port (macOS 27, Apple Silicon). The rules for commands typed in a
+session (zsh quoting, BSD flags) are in the user-global `CLAUDE.md`; these are the ones that break
+code in this repo.
+
+- **Every host-side shell script runs on bash 3.2.** Claude Code starts hook commands through
+  `/bin/sh -c`, and macOS's `/bin/sh` and `/bin/bash` are bash 3.2.57. Missing there: `read -N`
+  (the almanac guards failed open on it), `${var,,}`, `declare -A`, `mapfile`, `$EPOCHSECONDS`,
+  `printf '%(...)T'`. `"${arr[@]}"` of an empty array is unbound under `set -u`, and
+  `${P//pattern/}` is super-linear on a large string (10 KB took 44 s). Where a bash 4 feature is
+  the Windows fast path, keep it behind a version check with a 3.2 fallback, as
+  `plugins/butler/hooks/run-hook.sh` does.
+- **BSD userland.** `stat -f %m`, not `stat -c %Y`; `sed -i ''`; `date -v`; no `ps -o etimes`;
+  no `/proc`. A script that shells out to these needs both forms or a perl replacement.
+- **No `timeout`, `setsid` or `flock(1)`.** Tests use `scripts/test-bin/timeout` (see Tests above).
+  Production code must not depend on any of the three: use perl's `alarm`, `POSIX::setsid` and
+  `Fcntl` `flock`.
+- **APFS is case-insensitive, and `Cwd::abs_path` keeps the case you typed.** A comparison that
+  folds case only on `$^O =~ /^(MSWin32|cygwin|msys)$/` misses on a Mac: fold on `darwin` too, or
+  compare device and inode. `getcwd` after a `chdir` does return the on-disk case.
+- **`/tmp` and `/var` are symlinks into `/private`.** `$TMPDIR` is `/var/folders/.../T`, Claude
+  Code's temp root is `/private/tmp/claude-<uid>/<slug>/<session>/`, and `abs_path` and `realpath`
+  return the `/private` form. Canonicalise both sides before a prefix check; the scratchpad and
+  temp-root allowlists were caught by this.
+- **File names must be valid UTF-8.** APFS refuses anything else with `EILSEQ` ("Illegal byte
+  sequence"), so a fixture that builds a Latin-1 `Andr\xe9` name dies before asserting anything.
+  Build non-ASCII fixture names from UTF-8 bytes.
+- **Exec bits matter.** A Mac clone runs with `core.fileMode=true` and honours the mode in the
+  index, which Git for Windows ignores. A script run by path (a hook registration, a `bin/` shim)
+  at 100644 fails with exit 126, and an install-time `chmod` inside the live install makes the
+  next promotion refuse a dirty tree. Commit shebang scripts as 100755
+  (`git update-index --chmod=+x`), as 69efdbb did for 134 of them.
+- **Claude Code's credentials are in the login Keychain** (item `Claude Code-credentials`); there
+  is no `~/.claude/.credentials.json`. Code that reads that file must treat its absence as normal
+  on `darwin`, and tests stub `security` rather than read the real item, which can raise a GUI
+  prompt.
+- **The Bash tool's `grep` and `find` skip gitignored files** (Claude Code wraps them), and
+  `.ccpraxis-local-data/` is gitignored. Search it with `command grep -r`.
 
 ## `.ccpraxis-local-data/` — gitignored, and it does not travel
 
