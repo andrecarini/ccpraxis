@@ -62,7 +62,7 @@ When the AC monitor exits 0 or 2: `butler-continuity on --thread <your thread> -
 
 ## Preflight
 
-Run `perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-preflight.pl"` once, before the loop. Non-zero exit → stop and surface the itemized report. (Host is a supported platform; an unsupported environment = stop — butler's env-support policy.)
+Run `perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-preflight.pl"` once, before the loop. Non-zero exit → stop and surface the itemized report. (Supported: a Windows host, a macOS host, the sandbox; a bare Linux host is not. An unsupported environment = stop — butler's env-support policy.)
 
 ## The director loop
 
@@ -186,11 +186,11 @@ exactly like success.
 
 ## Keep-awake (director-managed)
 
-> The director auto-starts the wake-lock when active work or a pending usage-resume begins, and auto-stops it when the run settles. In sandbox, keep-awake is a no-op. The session does nothing (Decision #7/#19).
+> The director auto-starts the wake-lock when active work or a pending usage-resume begins, and auto-stops it when the run settles (Windows: `keep-awake.ps1`; macOS: `caffeinate -i`). In sandbox, keep-awake is a no-op. The session does nothing (Decision #7/#19).
 
 ## Host or sandbox
 
-> Runs identically host OR sandbox — perl + hooks only, no platform-specific spawns in the prompt (Decision #8).
+> Runs identically on a Windows or macOS host OR in the sandbox — perl + hooks only, no platform-specific spawns in the prompt (Decision #8).
 
 ## Commit mechanics
 

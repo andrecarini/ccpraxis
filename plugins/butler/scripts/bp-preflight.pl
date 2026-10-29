@@ -35,6 +35,9 @@ for (@ARGV) {
 sub detect_platform {
     return $opt{platform} if defined $opt{platform};       # test override (raw, still validated below)
     return 'win32'        if $^O =~ /^(MSWin32|cygwin|msys)$/;
+    # A Mac HOST. Never a container: the sandbox is Linux, so darwin can only
+    # mean the operator's own machine, which is where drive-solo runs.
+    return 'macos'        if $^O eq 'darwin';
     if ($^O eq 'linux') {
         # 'sandbox-linux' means INSIDE OUR sandbox, not "any linux". The Containerfile
         # sets IS_SANDBOX=1 (the same marker bp_require_sandbox keys off). A bare linux
@@ -52,6 +55,18 @@ sub mod_ok   { my $m = shift; return eval "require $m; 1" ? 1 : 0; }
 sub read_json { my $f = shift; open my $fh,'<:raw',$f or return undef; local $/; my $r=<$fh>; close $fh;
                 return eval { JSON::PP->new->decode($r) }; }
 sub home { $ENV{USERPROFILE} // $ENV{HOME} // '' }
+
+# creds() -> BpCreds::load result. The ONE lookup every creds check shares:
+# BP_CREDS_PATH, else ~/.claude/.credentials.json, else (macOS) the Keychain
+# item Claude Code keeps its grant in. Memoized so a run reads the secret once.
+my $_CREDS;
+sub creds {
+    return $_CREDS if $_CREDS;
+    require "$Bin/BpCreds.pm";
+    # USERPROFILE before HOME, as home() above, so the file this reports is the
+    # one the checks have always meant on the Windows host.
+    return $_CREDS = BpCreds::load(home => home());
+}
 
 # ---- run_git($root, @args) -> ($rc, $squeezed_output) ---------------------
 # Runs `git -C $root @args`, capturing combined stdout+stderr and collapsing
@@ -136,15 +151,22 @@ my %CHECK = (
     } },
 
     'creds.path' => { run => sub {
-        my $c = home()."/.claude/.credentials.json";
+        my $r = creds();
+        if ($r->{kind} eq 'keychain') {
+            return ('fail', "creds not readable from the macOS Keychain item '" . BpCreds::keychain_service() . "' ($r->{detail})")
+                unless $r->{ok};
+            return ('ok', "creds present + parseable (macOS Keychain)");
+        }
+        my $c = $r->{path};
         return ('fail', "creds file not found at $c") unless -f $c;
-        return ('fail', "creds file not parseable JSON: $c") unless read_json($c);
+        return ('fail', "creds file not parseable JSON: $c") unless $r->{ok};
         ('ok', "creds present + parseable");
     } },
 
     'creds.shape' => { run => sub {
-        my $c = home()."/.claude/.credentials.json";
-        my $d = read_json($c) or return ('fail', "creds unreadable for shape check");
+        my $r = creds();
+        my $d = $r->{ok} ? $r->{data} : undef;
+        return ('fail', "creds unreadable for shape check") unless $d;
         require "$Bin/bp-contract.pl";
         my ($ok,$probs) = BpContract::validate_creds($d);
         $ok ? ('ok','creds shape valid') : ('fail', "creds shape drift: ".join('; ',@$probs));
@@ -167,8 +189,9 @@ my %CHECK = (
     'api.usage' => { deep => 1, run => sub {
         # live single probe — only with --deep. curl transport (bp-http.pl),
         # reusing the contract validator.
-        my $c = home()."/.claude/.credentials.json";
-        my $d = read_json($c) or return ('fail','no creds for usage probe');
+        my $r = creds();
+        my $d = $r->{ok} ? $r->{data} : undef;
+        return ('fail','no creds for usage probe') unless $d;
         my $tok = $d->{claudeAiOauth}{accessToken} or return ('fail','no accessToken');
         require "$Bin/bp-http.pl";
         my $res = BpHttp::request('GET', 'https://api.anthropic.com/api/oauth/usage', {
@@ -190,8 +213,8 @@ my %CHECK = (
     } },
 
     'oauth.sandbox_login' => { run => sub {
-        my $d = read_json(home()."/.claude/.credentials.json");
-        my ($ok, $reason) = oauth_usable($d);
+        my $r = creds();
+        my ($ok, $reason) = oauth_usable($r->{ok} ? $r->{data} : undef);
         return ('fail', "$reason — run \`claude-sandbox\` and \`/login\` first, then re-run dispatch-fleet") unless $ok;
         ('ok', "sandbox login usable: $reason");
     } },
