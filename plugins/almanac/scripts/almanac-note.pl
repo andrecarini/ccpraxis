@@ -446,13 +446,13 @@ sub _validate_target {
             unless _target_is_internal_shaped($store, $t);
     } elsif ($audience eq 'external') {
         my $unv = _unversioned_prefix($store);
-        # Compared case-insensitively on Windows (and other case-insensitive
-        # filesystems): NTFS resolves '.CCPRAXIS-LOCAL-DATA/x.md' and
+        # Compared case-insensitively on Windows and macOS: NTFS and default
+        # APFS resolve '.CCPRAXIS-LOCAL-DATA/x.md' and
         # '.ccpraxis-local-data/x.md' to the same file, so a case-sensitive
         # prefix check here would let an "external" note point right back
         # into the unversioned area it exists to escape (redteam MEDIUM).
         my ($tt, $uu) = ($t, $unv);
-        if ($^O =~ /^(MSWin32|cygwin|msys)$/) { $tt = lc($tt); $uu = lc($uu); }
+        if ($^O =~ /^(MSWin32|cygwin|msys|darwin)$/) { $tt = lc($tt); $uu = lc($uu); }
         _usage('external_target_unversioned') if $tt =~ m{\A\Q$uu\E/};
     }
     return $t;
@@ -1086,13 +1086,14 @@ sub _cmd_delete {
     # any file under the internal prefix, including another live note's
     # content file, so without this check a delete here can destroy a
     # different note's content. Compared case-insensitively because this
-    # runs on Windows, where 'notes/a.md' and 'notes/A.md' are one file.
-    my $target_cmp = ($^O =~ /^(MSWin32|cygwin|msys)$/) ? lc($target) : $target;
+    # runs on Windows and macOS, where 'notes/a.md' and 'notes/A.md' are one
+    # file (NTFS, default APFS).
+    my $target_cmp = ($^O =~ /^(MSWin32|cygwin|msys|darwin)$/) ? lc($target) : $target;
     for my $other (@{ $store->list }) {
         next if $other->{id} eq $rec->{id};
         my $other_target = $other->{fields}{target};
         next unless defined $other_target;
-        my $other_cmp = ($^O =~ /^(MSWin32|cygwin|msys)$/) ? lc($other_target) : $other_target;
+        my $other_cmp = ($^O =~ /^(MSWin32|cygwin|msys|darwin)$/) ? lc($other_target) : $other_target;
         if ($other_cmp eq $target_cmp) {
             print "content: kept\n";
             return;
