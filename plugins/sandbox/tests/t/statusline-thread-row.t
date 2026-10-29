@@ -136,6 +136,12 @@ sub make_tput {
     my ($cols) = @_;
     spew_raw("$SHIM_DIR/tput", "#!/bin/sh\necho $cols\n");
     chmod 0755, "$SHIM_DIR/tput";
+    # statusline.pl asks $COLUMNS and the controlling terminal (stty size
+    # </dev/tty) before tput off Windows; pin both so the shim decides the
+    # width even when this file is run from an interactive terminal.
+    spew_raw("$SHIM_DIR/stty", "#!/bin/sh\nexit 1\n");
+    chmod 0755, "$SHIM_DIR/stty";
+    delete $ENV{COLUMNS};
 }
 sub make_git_absent {
     # No toplevel/branch files -> the shim's git always exits 1. The thread

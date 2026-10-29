@@ -59,6 +59,12 @@ sub make_tput {
     my ($cols) = @_;
     spew_raw("$SHIM_DIR/tput", "#!/bin/sh\necho $cols\n");
     chmod 0755, "$SHIM_DIR/tput";
+    # statusline.pl asks $COLUMNS and the controlling terminal (stty size
+    # </dev/tty) before tput off Windows; pin both so the shim decides the
+    # width even when this file is run from an interactive terminal.
+    spew_raw("$SHIM_DIR/stty", "#!/bin/sh\nexit 1\n");
+    chmod 0755, "$SHIM_DIR/stty";
+    delete $ENV{COLUMNS};
 }
 # A git shim that always reports "not a repo" -- this file's assertions are
 # about the marker glyph and the badge relocation, not git rendering, so the

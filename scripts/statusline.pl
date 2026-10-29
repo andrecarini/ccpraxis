@@ -319,6 +319,14 @@ sub cmd_out {
 # list form removes; fork + exec is the shell-free equivalent. A platform
 # without fork simply skips the spawn -- both callers are opportunistic
 # refreshes whose absence costs nothing this render.
+#
+# Off Windows the child also leaves the statusline's session (POSIX::setsid)
+# and gets GIT_TERMINAL_PROMPT=0. It outlives this render by design, so it must
+# not share the terminal's process group (a Ctrl-C or the host tearing the
+# render down would reach it) and must never stop to ask for a password on
+# /dev/tty -- a background `git fetch` against an expired credential otherwise
+# sits on the terminal indefinitely. Windows is unchanged: no sessions there,
+# and Git Credential Manager reads GIT_TERMINAL_PROMPT too.
 sub spawn_detached {
     my (@argv) = @_;
     my $pid = fork();
@@ -327,6 +335,10 @@ sub spawn_detached {
     open(STDIN,  '<', $DEVNULL);
     open(STDOUT, '>', $DEVNULL);
     open(STDERR, '>', $DEVNULL);
+    unless ($^O =~ /^(MSWin32|msys|cygwin)$/) {
+        $ENV{GIT_TERMINAL_PROMPT} = '0';
+        eval { require POSIX; POSIX::setsid(); };
+    }
     { no warnings 'exec'; exec { $argv[0] } @argv; }
     CORE::exit(127);
 }
@@ -1485,7 +1497,15 @@ $marker .= "${R} ${WARN}${badge_glyph}${R}" if length $badge_glyph;
 # ── Git (with background fetch every 30 min) ────────────────
 my $git_str = '';
 eval {
-    my $branch = cmd_out('git', '-C', $workspace, 'rev-parse', '--abbrev-ref', 'HEAD');
+    # One spawn answers three questions: where FETCH_HEAD and the fetch
+    # throttle stamp live, and the branch. --git-path resolves through a
+    # linked worktree's .git FILE and from any subdirectory; the old literal
+    # "$workspace/.git/FETCH_HEAD" was never a file in either case, so every
+    # render there counted as stale and spawned another fetch.
+    my @rp = split /\n/, cmd_out('git', '-C', $workspace, 'rev-parse',
+        '--git-path', 'FETCH_HEAD', '--git-path', 'ccpraxis-statusline-fetch', '--abbrev-ref', 'HEAD');
+    my ($fetch_head, $fetch_stamp, $branch) = (@rp == 3) ? @rp : (undef, undef, $rp[-1] // '');
+    $branch = '' unless defined $branch;
     chomp $branch;
     # Decoded for the same reason $toplevel is: git writes UTF-8 BYTES, and
     # the adjacent \x{2325}/\x{200A} upgrade $git_str to a character string,
@@ -1493,13 +1513,25 @@ eval {
     # `feature/AndrA(c)`. The sibling call got this treatment; this one did not.
     utf8::decode($branch) if length($branch) && !utf8::is_utf8($branch);
     if ($branch) {
-        # Fetch remote if stale (>30 min since last fetch)
-        my $fetch_stamp = "$workspace/.git/FETCH_HEAD";
-        my $stale = 1;
-        if (-f $fetch_stamp) {
-            $stale = (time() - (stat($fetch_stamp))[9]) > 1800;
-        }
-        if ($stale) {
+        # Fetch remote if stale (>30 min since the last fetch OR the last
+        # attempt). git rewrites FETCH_HEAD at the start of every fetch, even
+        # one that then fails, but only once the detached child reaches git
+        # -- renders arriving in that gap each spawned another fetch -- and
+        # never when the file cannot be written. The stamp (a file in the git
+        # dir, invisible to `git status`) is touched HERE, before the spawn,
+        # and throttles attempts on its own.
+        my $abs_git_path = sub {
+            my ($p) = @_;
+            return undef unless defined $p && length $p;
+            return ($p =~ m{^(?:/|[A-Za-z]:[\\/])}) ? $p : "$workspace/$p";
+        };
+        $fetch_head  = $abs_git_path->($fetch_head)  // "$workspace/.git/FETCH_HEAD";
+        $fetch_stamp = $abs_git_path->($fetch_stamp);
+        my $fresh = sub { my ($f) = @_; defined $f && -f $f && (time() - (stat($f))[9]) <= 1800 };
+        unless ($fresh->($fetch_head) || $fresh->($fetch_stamp)) {
+            if (defined $fetch_stamp && open(my $sfh, '>', $fetch_stamp)) {
+                close $sfh;
+            }
             # Fire-and-forget background fetch (no blocking)
             spawn_detached('git', '-C', $workspace, 'fetch', '--quiet');
         }
@@ -1693,9 +1725,46 @@ if ($rl) {
 }
 
 # ── Row 1 ────────────────────────────────────────────────────
-my $cols = cmd_out('tput', 'cols');
-chomp $cols if defined $cols;
-$cols = 120 unless defined($cols) && $cols =~ /^\d+$/ && $cols > 0;
+my $cols = term_cols();
+
+# term_cols() -> the terminal's width in columns.
+#
+# Claude Code runs this with stdout on a pipe, and `tput cols` then answers
+# from the environment or terminfo's default, never the terminal: on macOS it
+# says 80 whatever the window is, so every Mac render was laid out for 80
+# columns. Off Windows the order is: $COLUMNS when the host exports it; the
+# controlling terminal itself, `stty size` with stdin on /dev/tty (the window
+# size, readable without a tty on stdout); then `tput cols`; then 120.
+# Windows keeps its tput-then-120 path unchanged.
+sub term_cols {
+    my $ok = sub { my ($v) = @_; defined($v) && $v =~ /^\s*(\d+)\s*\z/ && $1 > 0 ? $1 + 0 : undef };
+    unless ($^O =~ /^(MSWin32|msys|cygwin)$/) {
+        my $c = $ok->($ENV{COLUMNS});
+        return $c if defined $c;
+        if (open(my $tty, '<', '/dev/tty')) {
+            my $restore = quiet_stderr();
+            my $pid = open(my $fh, '-|');
+            if (defined $pid && $pid == 0) {
+                open(STDIN, '<&', $tty);
+                { no warnings 'exec'; exec { 'stty' } 'stty', 'size'; }
+                CORE::exit(127);
+            }
+            if (defined $pid) {
+                my $out = do { local $/; <$fh> };
+                close $fh;
+                $restore->();
+                close $tty;
+                return $1 + 0 if defined($out) && $out =~ /^\s*\d+\s+(\d+)\s*$/ && $1 > 0;
+            } else {
+                $restore->();
+                close $tty;
+            }
+        }
+    }
+    my $t = cmd_out('tput', 'cols');
+    chomp $t if defined $t;
+    return $ok->($t) // 120;
+}
 
 # row1(...) -- render the four fields in their binding order. A field with
 # no text contributes neither itself nor its separator.
