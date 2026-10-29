@@ -239,7 +239,9 @@ sub _monitor_tick {
 
 sub enabled {
     return 1 if _seam_active();
-    return ($^O =~ /^(?:MSWin32|msys|cygwin)$/) ? 1 : 0;
+    # A host that can lose AC: Windows (the PowerShell probe) and macOS
+    # (pmset). The Linux sandbox has no battery of its own to watch.
+    return ($^O =~ /^(?:MSWin32|msys|cygwin)$/ || $^O eq 'darwin') ? 1 : 0;
 }
 
 # ---------------------------------------------------------------------------
@@ -271,6 +273,7 @@ sub probe_source {
         $line = lc($line);
         return ($line eq 'ac' || $line eq 'dc' || $line eq 'unknown') ? $line : 'unknown';
     }
+    return _probe_darwin() if $^O eq 'darwin';
     my $ok = eval {
         require "$DIR/BpPowerJournal.pm" unless defined &BpPowerJournal::probe_argv;
         1;
@@ -289,6 +292,37 @@ sub probe_source {
     # regardless of the overall status rather than discarded as unknown.
     my $ps = $parsed->{power_source};
     return (defined $ps && ($ps eq 'ac' || $ps eq 'dc')) ? $ps : 'unknown';
+}
+
+# _probe_darwin() -> 'ac' | 'dc' | 'unknown' -- one bounded `pmset -g ps`.
+# Refused under a .t and under CCPRAXIS_NO_WAKELOCK, the same rule (and the
+# same reason) as BpPowerJournal::probe_argv on Windows: a test must read the
+# probe-file seam, never the real machine's power source.
+sub _probe_darwin {
+    return 'unknown' if defined $0 && $0 =~ /\.t\z/;
+    return 'unknown' if $ENV{CCPRAXIS_NO_WAKELOCK};
+    my $ok = eval {
+        require "$DIR/BpPowerJournal.pm" unless defined &BpPowerJournal::run_bounded;
+        1;
+    };
+    return 'unknown' unless $ok;
+    my $r = eval { BpPowerJournal::run_bounded(['pmset', '-g', 'ps'], 10) };
+    return 'unknown' unless ref $r eq 'HASH' && ($r->{status} // '') eq 'ok' && ($r->{rc} // 1) == 0;
+    return parse_pmset_ps($r->{out});
+}
+
+# parse_pmset_ps($text) -> 'ac' | 'dc' | 'unknown'. PURE. Only the FIRST line
+# decides ("Now drawing from 'AC Power'" / 'Battery Power' / 'UPS Power'); the
+# battery rows below it describe a battery, not the source. A UPS is mains
+# that has already been lost, so it counts as DC.
+sub parse_pmset_ps {
+    my ($text) = @_;
+    return 'unknown' unless defined $text && !ref $text;
+    my ($first) = split /\r?\n/, $text, 2;
+    return 'unknown' unless defined $first;
+    return 'ac' if $first =~ /'AC Power'/;
+    return 'dc' if $first =~ /'(?:Battery|UPS) Power'/;
+    return 'unknown';
 }
 
 # ---------------------------------------------------------------------------
