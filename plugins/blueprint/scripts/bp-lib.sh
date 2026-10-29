@@ -3,6 +3,8 @@
 # HOST-SAFE SUBSET: bash + coreutils + awk only. No jq, no flock, no
 # process machinery — authoring runs on the host (where jq may be absent) as
 # well as in the sandbox. The execution-side helpers live in the butler plugin.
+# "coreutils" means GNU OR BSD: a Mac host has bash 3.2 and BSD stat/date, so
+# nothing here may need a GNU-only flag without a BSD fallback.
 #
 # SUBSET/SUPERSET RELATIONSHIP: This file contains the 7 shared base helpers
 # (bp_project_root, bp_data_dir, bp_dir, bp_ledger, fm_get, iso_now,
@@ -64,7 +66,10 @@ fm_get() {
 iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 file_age_min() {  # minutes since last mtime of $1
+  # GNU stat (Linux, Git for Windows) first, then BSD stat (macOS), whose -c
+  # does not exist; a file neither can read counts as age 0.
   local now mt
-  now=$(date +%s); mt=$(stat -c %Y "$1" 2>/dev/null || echo "$now")
+  now=$(date +%s)
+  mt=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo "$now")
   echo $(( (now - mt) / 60 ))
 }

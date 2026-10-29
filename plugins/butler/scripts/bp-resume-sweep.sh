@@ -74,7 +74,10 @@ revive() {  # BP_NAME PKG SID PID AGE STATUS
   fi
   printf '%-28s %-12s DEAD -> %s\n' "$bp/$pkg" "$status" "$mode"
   if [ "$APPLY" -eq 1 ]; then
-    "$SCRIPT_DIR/bp-launch.sh" "$bp" "$pkg" "${args[@]}" || \
+    # ${args[@]+...}: a cold start has no extra args, and "${args[@]}" of an
+    # EMPTY array is an unbound-variable error under set -u on bash < 4.4 --
+    # macOS's /bin/bash is 3.2 -- which killed the sweep at its first revival.
+    "$SCRIPT_DIR/bp-launch.sh" "$bp" "$pkg" ${args[@]+"${args[@]}"} || \
       printf '%-28s %-12s LAUNCH FAILED (parallel cap? see message above)\n' "$bp/$pkg" "$status"
   fi
 }
@@ -97,7 +100,11 @@ for BPDIR in "$DATA"/blueprints/*/; do
       done)
         printf '%-28s %-12s DONE\n' "$BP_NAME/$PKG" "$STATUS" ;;
       blocked|parked)
-        NEXT=$(awk '/^## Next action/{getline; while ($0 ~ /^[[:space:]]*$/) getline; print; exit}' "$LEDGER" 2>/dev/null || true)
+        # The first non-blank line under "## Next action". getline's return value
+        # is checked: at EOF it returns 0 and leaves $0 as it was, so a loop on $0
+        # alone spun forever on a ledger whose heading is followed only by blank
+        # lines -- and took the whole status read with it.
+        NEXT=$(awk '/^## Next action/{ while ((getline line) > 0) if (line !~ /^[[:space:]]*$/) { print line; exit }; exit }' "$LEDGER" 2>/dev/null || true)
         printf '%-28s %-12s NEEDS ATTENTION — %s\n' "$BP_NAME/$PKG" "$STATUS" "${NEXT:-see ledger}" ;;
       pending)
         if [ -z "$SID$PID" ]; then
