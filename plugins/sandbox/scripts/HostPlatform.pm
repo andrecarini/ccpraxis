@@ -106,8 +106,7 @@ sub no_cli_message {
     if ($os eq 'darwin') {
         return (
             "ERROR: no container CLI on PATH (looked for podman, docker).",
-            "       Install podman (for example `brew install podman`), then create and start its",
-            "       rootless VM once:  podman machine init && podman machine start",
+            "       Install podman (for example `brew install podman`), then create and start its rootless VM once: podman machine init && podman machine start",
             "       To use a CLI under another name or path, set $var.",
         );
     }
@@ -135,12 +134,8 @@ sub machine_remedy_lines {
     $state = '' unless defined $state;
     if ($state eq 'absent') {
         return $os =~ /^(MSWin32|cygwin|msys)$/
-            ? ("  No podman machine exists yet. Create one (WSL2 provider), then start it:",
-               "    podman machine init --provider wsl",
-               "    podman machine start")
-            : ("  No podman machine exists yet. Create one (rootless is the default), then start it:",
-               "    podman machine init",
-               "    podman machine start");
+            ? ("  No podman machine exists yet. Create one (WSL2 provider), then start it: podman machine init --provider wsl && podman machine start")
+            : ("  No podman machine exists yet. Create one (rootless is the default), then start it: podman machine init && podman machine start");
     }
     return ("  Try, in a terminal:   podman machine start");
 }
@@ -308,9 +303,7 @@ sub outside_shares_message {
         (map { "         $_" } @$outside),
         "       A podman machine only shares the host folders it was created with:",
         (map { "         $_" } @$shares),
-        "       Move the project under one of those folders, or recreate the machine sharing it too:",
-        "         podman machine rm, then podman machine init with one --volume <dir>:<dir> per folder",
-        "         to share (an explicit --volume replaces the default list, so repeat the ones above).",
+        "       Move the project under one of those folders, or recreate the machine sharing it too: podman machine rm, then podman machine init with one --volume <dir>:<dir> per folder to share (an explicit --volume replaces the default list, so repeat the ones above).",
     );
     return @l;
 }

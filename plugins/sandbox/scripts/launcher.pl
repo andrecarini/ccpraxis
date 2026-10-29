@@ -9500,8 +9500,7 @@ sub _spawn_session_hint {
     eval { Term::ReadKey::ReadMode('restore') };
     print STDERR "\n";
     print STDERR "  [c] could not open a new terminal window" . (defined $why ? " ($why)." : '.') . "\n";
-    print STDERR "  Start the same session yourself: open a new terminal and run\n";
-    print STDERR "      claude-sandbox --session " . Dashboard::sh_quote($PROJECT_PATH) . "\n";
+    print STDERR "  Start the same session yourself, in a new terminal: claude-sandbox --session " . Dashboard::sh_quote($PROJECT_PATH) . "\n";
     print STDERR "  (a second bare `claude-sandbox` opens another dashboard, not a session).\n";
     print STDERR "\n  Press any key to return to the dashboard...";
     eval { Term::ReadKey::ReadKey(0) };
