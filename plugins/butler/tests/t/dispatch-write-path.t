@@ -692,6 +692,55 @@ SKIP: {
 }
 
 # ===========================================================================
+# AC32b -- the race AC32 can only hit by chance, made deterministic: another
+# hook creates <proj>/.ccpraxis-local-data between this hook's -d check and
+# its own mkdir, so that mkdir fails with EEXIST. The record must still be
+# written. BpDispatchLog::_mkdir_p gives up on that first EEXIST, and before
+# TrackDispatch retried it the record write went to a directory that did
+# not exist yet and was lost without a trace (no stderr, rc 0). Runs the
+# module in a perl child, the way run-hook.sh does, with a CORE::GLOBAL
+# mkdir that plays the other hook exactly once. Any OS: no fork.
+# ===========================================================================
+{
+    my ($env, $bp_dir, $proj) = fresh_env();
+    my $logdir = logdir_of($proj);
+    $caseN++;
+    my $ti = "$ROOT/run$caseN-race";
+    make_path($ti);
+    my ($pf, $out_f, $err_f) = ("$ti/payload.json", "$ti/out", "$ti/err");
+    write_file($pf, task_payload('butler:bp-scout'));
+    my $code = <<'PERL';
+use Errno ();
+BEGIN {
+    my $raced = 0;
+    *CORE::GLOBAL::mkdir = sub {
+        my ($d, @mode) = @_;
+        if (!$raced && defined $d && $d =~ m{/\.ccpraxis-local-data\z}) {
+            $raced = 1;
+            CORE::mkdir($d);            # the concurrent hook wins the race
+            $! = Errno::EEXIST();
+            return 0;
+        }
+        return @mode ? CORE::mkdir($d, $mode[0]) : CORE::mkdir($d);
+    };
+}
+require BpHook;
+my $r = BpHook::main('Guards::TrackDispatch');
+exit((defined $r && $r == 2) ? 2 : 0);
+PERL
+    local %ENV = (%CLEAN_ENV, BUTLER_STATE_DIR => fwd("$ROOT/butler-state"), %$env,
+        RACECODE => $code, SCRIPTSDIR => $SCRIPTS, PFILE => fwd($pf),
+        OUTFILE => fwd($out_f), ERRFILE => fwd($err_f));
+    system('bash', '-c', 'perl -I"$SCRIPTSDIR" -e "$RACECODE" < "$PFILE" > "$OUTFILE" 2> "$ERRFILE"');
+    my $exit = WIFEXITED($?) ? WEXITSTATUS($?) : -1;
+    is($exit, 0, 'AC32b: a log dir another hook created mid-mkdir -> exit 0');
+    ok(-d "$proj/.ccpraxis-local-data", 'AC32b: fixture sanity -- the simulated racer did create the data dir');
+    is(scalar(json_record_files($logdir)), 1,
+       'AC32b: the record is still written when the first mkdir of the log dir hits EEXIST')
+        or diag('stderr: ' . (read_file($err_f) // ''));
+}
+
+# ===========================================================================
 # AC33 -- bash -n clean.
 # ===========================================================================
 {
