@@ -291,6 +291,19 @@ sub is_alive {
 }
 
 # orchestrator_live(root => $R, blueprint => $bp) -> 1|0
+#
+# A held marker flock is live. A FREE one is dead only when the reader sits on
+# the same side of the container boundary as the orchestrator that wrote it: a
+# flock taken inside the sandbox (Linux, podman VM) is invisible to a Windows
+# host process opening the same file through the bind mount, so from the host
+# every sandboxed run used to read as dead and the sitrep advised resuming a
+# running fleet (bug report 20261029-114219-b403). When the side record says
+# the marker came from the OTHER side, the answer is the freshness of
+# runs/orchestrator.log, which a live orchestrator appends a busy_lease_tick to
+# on every ~10 s tick (the 90 s window of the sandbox dashboard's RunState.pm).
+# With no side record, or a stale one, the lock stays authoritative: a marker
+# left by a crash must read dead at once so its thread can be taken over.
+our $ORCH_LOG_FRESH_SECONDS = 90;
 sub orchestrator_live {
     my (%a) = @_;
     my $bp = $a{blueprint};
@@ -298,16 +311,45 @@ sub orchestrator_live {
         && $bp =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/ && $bp !~ /\.\./;
     my $root = $a{root};
     return 0 unless defined $root && length $root;
-    my $marker = _to_bytes($root) . "/.ccpraxis-local-data/blueprints/" . _to_bytes($bp) . "/runs/.orchestrator";
+    my $runs = _to_bytes($root) . "/.ccpraxis-local-data/blueprints/" . _to_bytes($bp) . "/runs";
+    my $marker = "$runs/.orchestrator";
     return 0 unless -f $marker;
     open(my $fh, '<', $marker) or return 0;
-    if (flock($fh, LOCK_SH | LOCK_NB)) {
-        flock($fh, LOCK_UN);
+    unless (flock($fh, LOCK_SH | LOCK_NB)) {
         close($fh);
-        return 0;
+        return 1;
     }
+    flock($fh, LOCK_UN);
     close($fh);
-    return 1;
+
+    my $side = _marker_side($runs, $marker);
+    my $here = (-e '/run/.containerenv' || -e '/.dockerenv') ? 'container' : 'host';
+    return 0 unless defined $side && $side ne $here;
+    my $mtime = (stat("$runs/orchestrator.log"))[9];
+    return 0 unless defined $mtime;
+    my $age = time() - $mtime;
+    # A small negative age is host/container clock skew; a large one is not trusted.
+    return ($age >= -300 && $age <= $ORCH_LOG_FRESH_SECONDS) ? 1 : 0;
+}
+
+# _marker_side($runs, $marker) -> 'host' | 'container' | undef, from the
+# runs/.orchestrator-side.json sidecar bp-orchestrator.pl writes beside the
+# marker. undef when missing, malformed, or about another pid than the
+# marker's (a sidecar from an earlier run says nothing about this one).
+sub _marker_side {
+    my ($runs, $marker) = @_;
+    my ($pid, $blob);
+    if (open(my $mf, '<', $marker)) { my $l = <$mf>; close $mf; ($pid) = (defined $l ? $l : '') =~ /\A(\d{1,10})/ }
+    return undef unless defined $pid;
+    open(my $sf, '<', "$runs/.orchestrator-side.json") or return undef;
+    { local $/; $blob = <$sf> }
+    close $sf;
+    return undef unless defined $blob && length($blob) <= 4096;
+    my $d = eval { JSON::PP->new->decode($blob) };
+    return undef unless ref $d eq 'HASH';
+    return undef unless defined $d->{pid} && !ref $d->{pid} && $d->{pid} =~ /\A\d{1,10}\z/ && $d->{pid} == $pid;
+    my $s = $d->{side};
+    return (defined $s && !ref $s && ($s eq 'host' || $s eq 'container')) ? $s : undef;
 }
 
 1;
