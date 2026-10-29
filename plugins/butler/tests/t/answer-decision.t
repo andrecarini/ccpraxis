@@ -231,6 +231,52 @@ sub run_cli {
     ok($res->{ok},              'reset: JSON ok=true');
 }
 
+# ===========================================================================
+# The recorded pids belong to the SANDBOX's pid namespace (coordinators and
+# judges are launched in the container). Answered from the HOST through the
+# project mount, the same number names some unrelated host process, and
+# kill_pid TERMs/KILLs by process group. From the host nothing is signalled
+# and the pid is reported; inside the sandbox (IS_SANDBOX=1) it is killed.
+# A live child of this test stands in for "a process that pid names here".
+# ===========================================================================
+for my $case (['host', {}], ['sandbox', { IS_SANDBOX => '1' }]) {
+    my ($where, $env) = @$case;
+    if ($where eq 'host' && (-e '/run/.containerenv' || -e '/.dockerenv')) {
+        SKIP: { skip 'pid namespace (host): this run is inside a container, which IS the pids\' namespace', 2 }
+        next;
+    }
+    my $bpdir = tempdir(CLEANUP => 1);
+    my $pkg   = 'alpha';
+    write_file("$bpdir/packages/$pkg.md",
+        "---\npackage: $pkg\nstatus: running\nwrite_set: p/$pkg/\n---\n\n# $pkg\n\n## Next action\n\ngo\n");
+    my $child = fork();
+    die "fork: $!" unless defined $child;
+    if ($child == 0) { setpgrp(0, 0); sleep 60; exit 0 }
+    write_file("$bpdir/runs/registry.json",
+        $J->encode({ packages => { $pkg => { attempt => 5, pid => $child } } }));
+    my ($rc, $out);
+    {
+        local %ENV = %ENV;
+        delete @ENV{qw(IS_SANDBOX BP_ALLOW_HOST)};
+        $ENV{$_} = $env->{$_} for keys %$env;
+        ($rc, $out) = run_cli($bpdir, '--package', $pkg, '--action', 'reset');
+    }
+    my $res = eval { JSON::PP->new->decode($out) } || {};
+    my $deadline = time + 5;
+    select(undef, undef, undef, 0.1) while time < $deadline && waitpid($child, 1) == 0;
+    my $alive = (waitpid($child, 1) == 0) ? 1 : 0;
+    if ($where eq 'host') {
+        ok($alive, 'pid namespace (host): the process the recorded pid names here is NOT signalled');
+        is_deeply($res->{superseded}, ["not-signalled:coordinator:$child"],
+            'pid namespace (host): ...and the answer says so') or diag($out);
+    } else {
+        ok(!$alive, 'pid namespace (sandbox): the recorded coordinator is killed, as before');
+        is_deeply($res->{superseded}, ["coordinator:$child"], 'pid namespace (sandbox): reported as superseded')
+            or diag($out);
+    }
+    if ($alive) { kill 'KILL', $child; waitpid($child, 0) }
+}
+
 # guard: --package and --decision together -> exit 2
 {
     my ($bpdir, $id) = mk_bp(kind => 'stuck-package');

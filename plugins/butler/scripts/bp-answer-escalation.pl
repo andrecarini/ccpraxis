@@ -417,12 +417,33 @@ sub update_next_action_with_note {
 # clear the judges' on-disk markers (pid/.inflight/verdict) so the orchestrator
 # doesn't act on a stale verdict from the one we just killed. Reuses BpOrch's
 # setsid-group-aware kill + zombie-aware liveness. Dead/absent pids are no-ops.
+#
+# THE PIDS ARE THE SANDBOX'S. Coordinators and judges are launched inside the
+# container (bp-launch.sh / bp-judge.sh refuse to run elsewhere unless
+# BP_ALLOW_HOST=1), so every pid in registry.json and runs/<kind>/<pkg>.pid is
+# a number in the CONTAINER's pid namespace. The same blueprint dir is visible
+# from the host through the project mount, and on the host that number names
+# some unrelated process -- which kill_pid would TERM and KILL by process
+# GROUP. So signals are sent only from the namespace that wrote the pids;
+# from the host the recorded pids are reported as not-signalled and left
+# alone (registry pid included), while the judge markers are still cleared.
+sub pids_in_our_namespace {
+    return 1 if ($ENV{IS_SANDBOX} // '') eq '1';
+    return 1 if ($ENV{BP_ALLOW_HOST} // '') eq '1';
+    return 1 if -e '/run/.containerenv' || -e '/.dockerenv';
+    return 0;
+}
+
 sub supersede_package_work {
     my ($runs, $pkg) = @_;
     my @killed;
+    my $ours = pids_in_our_namespace();
     my $reg = BpOrch::_read_json("$runs/registry.json");
     my $cpid = (ref $reg eq 'HASH') ? ($reg->{packages}{$pkg}{pid}) : undef;
-    if (defined $cpid && BpOrch::pid_alive($cpid)) {
+    if (defined $cpid && $cpid =~ /^\d+$/ && $cpid > 0 && !$ours) {
+        push @killed, "not-signalled:coordinator:$cpid";
+    }
+    elsif (defined $cpid && BpOrch::pid_alive($cpid)) {
         BpOrch::kill_pid($cpid);
         push @killed, "coordinator:$cpid";
         # BLOCKER 2 (fixbatch step7): nothing else in this write set ever clears
@@ -437,7 +458,10 @@ sub supersede_package_work {
         my $pidf = "$runs/$kind/$pkg.pid";
         if (-f $pidf) {
             my ($jpid) = (BpOrch::_read_file($pidf) // '') =~ /^(\d+)/;
-            if (defined $jpid && BpOrch::pid_alive($jpid)) {
+            if (defined $jpid && $jpid > 0 && !$ours) {
+                push @killed, "not-signalled:$kind-judge:$jpid";
+            }
+            elsif (defined $jpid && BpOrch::pid_alive($jpid)) {
                 BpOrch::kill_pid($jpid);
                 push @killed, "$kind-judge:$jpid";
             }
