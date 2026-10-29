@@ -4,6 +4,11 @@
 # ("C:/x" vs "/c/x") used to double-count every report under it, because the
 # root dedupe compared raw strings rather than a canonical form. Also pins
 # that the plain single-spelling case is unchanged.
+#
+# macOS has its own two-spellings shape: default APFS is case-insensitive
+# and Cwd::abs_path keeps the case it was given, so "<tmp>/CaseRoot" and
+# "<tmp>/caseroot" are one directory under two canonical_root values unless
+# that folds case on darwin.
 use strict;
 use warnings;
 use FindBin qw($Bin);
@@ -15,8 +20,10 @@ use JSON::PP;
 my $A = "$S/almanac-bug.pl";
 ok(-f $A, 'almanac-bug.pl exists') or BAIL_OUT('script missing');
 
-plan skip_all => 'requires a Windows-style drive-lettered filesystem'
-    unless $^O =~ /^(MSWin32|cygwin|msys)$/;
+my $WIN = ($^O =~ /^(MSWin32|cygwin|msys)$/) ? 1 : 0;
+my $MAC = ($^O eq 'darwin') ? 1 : 0;
+plan skip_all => 'requires a Windows-style drive-lettered filesystem or macOS'
+    unless $WIN || $MAC;
 
 my $HOME = tempdir(CLEANUP => 1);
 my $PROJ = tempdir(CLEANUP => 1);
@@ -41,6 +48,9 @@ sub write_registry {
     close $fh;
 }
 
+SKIP: {
+    skip 'the drive-letter spelling exists only on Windows', 4 unless $WIN;
+
 # One report, filed under the Windows-drive spelling of the root.
 my ($rc_f, $out_f) = run('file', '--project', qq{"$PROJ_WIN"}, '--title', '"one report, one root"',
                           '--body', '"should be counted exactly once"');
@@ -60,6 +70,30 @@ my @mine = grep { ($_->{title} // '') eq 'one report, one root' } @$rows;
 is(scalar(@mine), 1,
    'collect: a root reachable under two spellings (--project + registry) yields the report ONCE, not twice')
     or diag(explain_rows($rows));
+}
+
+# ---- macOS: two CASE spellings of one root ----------------------------------
+SKIP: {
+    skip 'case spellings of one root are a macOS (APFS) shape', 4 unless $MAC;
+    my $base = tempdir(CLEANUP => 1);
+    my $UPPER = "$base/CaseRoot";
+    mkdir $UPPER or die "fixture: mkdir $UPPER: $!";
+    my $LOWER = "$base/caseroot";
+    skip 'this volume is case-sensitive: the two spellings are two directories', 4 unless -d $LOWER;
+
+    my ($rc_m, $out_m) = run('file', '--project', qq{"$UPPER"}, '--title', '"one report, two cases"',
+                              '--body', '"should be counted exactly once"');
+    is($rc_m, 0, 'macOS fixture: report filed under the mixed-case spelling') or diag $out_m;
+    write_registry('case-fixture' => $LOWER);
+    my ($rc_mc, $out_mc) = run('collect', '--project', qq{"$UPPER"}, '--json');
+    is($rc_mc, 0, 'macOS collect: succeeds') or diag $out_mc;
+    my $rows_m = eval { JSON::PP->new->decode($out_mc) };
+    ok(ref $rows_m eq 'ARRAY', 'macOS collect --json: parses') or diag $out_mc;
+    my @mine_m = grep { ($_->{title} // '') eq 'one report, two cases' } @{ $rows_m || [] };
+    is(scalar(@mine_m), 1,
+       'macOS collect: a root reachable under two case spellings (--project + registry) yields the report ONCE')
+        or diag(explain_rows($rows_m || []));
+}
 
 # ---- simple, single-spelling case is unchanged -----------------------------
 my $PROJ2 = tempdir(CLEANUP => 1);
