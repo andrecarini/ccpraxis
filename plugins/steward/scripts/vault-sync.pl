@@ -1803,7 +1803,7 @@ sub finalize_commit {
     # Update project metadata last_synced_*
     my $pmeta_path = project_metadata_path($cwd);
     my $pmeta = read_json($pmeta_path);
-    $pmeta->{last_synced_at} = iso_now();
+    $pmeta->{last_synced_at} = iso_now_after($pmeta->{last_synced_at});
     # Rebuild last_synced_hashes from the cache (it's authoritative for what was synced)
     $pmeta->{last_synced_hashes} = build_hash_map_from_cache($cwd);
     write_json($pmeta_path, $pmeta);
@@ -4288,6 +4288,30 @@ sub require_opt {
 
 sub iso_now {
     return strftime("%Y-%m-%dT%H:%M:%SZ", gmtime());
+}
+
+# iso_now(), but strictly later than $prev (a previous iso_now() value).
+#
+# last_synced_at has one-second resolution, and the backup driver
+# (scripts/backup/Vault.pm) only believes a commit-and-push that ADVANCES it
+# strictly past the value frozen before the push -- otherwise it records
+# push_unconfirmed. Two syncs of one project inside the same wall-clock second
+# (a no-op re-run straight after a sync; measured on an Apple Silicon Mac,
+# where a whole backup run takes well under a second) stamped the same value
+# twice, and a push that really happened was reported as unconfirmed. Waiting
+# for the next second keeps every stamp distinct without changing the format
+# other machines compare against. Bounded: a $prev in the future (clock skew
+# between machines) is not waited out.
+sub iso_now_after {
+    my ($prev) = @_;
+    my $now = iso_now();
+    return $now unless defined $prev && !ref($prev) && $prev =~ /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\z/;
+    my $deadline = Time::HiRes::time() + 1.5;
+    while ($now le $prev && Time::HiRes::time() < $deadline) {
+        Time::HiRes::sleep(0.05);
+        $now = iso_now();
+    }
+    return $now;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
