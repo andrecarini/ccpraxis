@@ -7628,6 +7628,13 @@ sub _timeout_prefix {
     return $bin ? qq{$bin $secs } : q{};
 }
 
+#
+# macOS SHIPS NO `timeout` AT ALL, so on a Mac every probe used to run
+# unbounded. Off Windows the search therefore continues: a GNU timeout on PATH
+# (`gtimeout` / `timeout`, Homebrew coreutils), and failing that this
+# plugin's own bounded-run.pl, a perl fork/alarm/kill watchdog with the same
+# `N cmd...` form and the same exit 124 -- so a probe is bounded on every
+# host, with nothing to install. Windows resolution is unchanged.
 my $GNU_TIMEOUT_MEMO;
 sub _gnu_timeout_bin {
     return $GNU_TIMEOUT_MEMO if defined $GNU_TIMEOUT_MEMO;
@@ -7637,10 +7644,22 @@ sub _gnu_timeout_bin {
         push @candidates, "$bin/timeout.exe", "$bin/timeout";
     }
     push @candidates, '/usr/bin/timeout', '/bin/timeout';
+    if (!$WINDOWS_FAMILY) {
+        for my $dir (grep { length } split /:/, ($ENV{PATH} // '')) {
+            push @candidates, "$dir/gtimeout", "$dir/timeout";
+        }
+    }
     for my $c (@candidates) {
         next unless -x $c || -f $c;
         # Quoted: Git for Windows installs under "C:\Program Files\Git".
         $GNU_TIMEOUT_MEMO = qq{"$c"};
+        return $GNU_TIMEOUT_MEMO;
+    }
+    my $bounded = "$SANDBOX_PLUGIN/scripts/bounded-run.pl";
+    if (!$WINDOWS_FAMILY && -f $bounded) {
+        require Config;
+        my $perl = ($^X =~ m{\A/}) ? $^X : ($Config::Config{perlpath} || 'perl');
+        $GNU_TIMEOUT_MEMO = qq{"$perl" "$bounded"};
         return $GNU_TIMEOUT_MEMO;
     }
     $GNU_TIMEOUT_MEMO = '';
@@ -7779,6 +7798,24 @@ sub _resources_probes {
             return _df_believe_cached($now, $DF_OK_AT) ? $DF_TEXT : undef;
         },
     );
+    if ($^O eq 'darwin') {
+        # The macOS host and its podman machine. The machine probe is the same
+        # one Windows uses; the three host probes read sysctl / vm_stat / ps /
+        # df and are turned into the CIM JSON shapes by Resources::darwin_*,
+        # so the parsers and the panel are shared with Windows. Each probe is
+        # one bounded shell spawn, like its Windows counterpart.
+        $p{machine}  = sub { my $e = _probe_err_path('machine'); my $t = _timeout_prefix(5);
+                             scalar `${t}$PODMAN machine list --format json 2>"$e"` }
+            if $PODMAN =~ /podman/i;
+        $p{cim_mem}  = sub { my $e = _probe_err_path('cim_mem'); my $t = _timeout_prefix(5);
+                             Resources::darwin_memory_json(scalar `${t}/bin/sh -c 'sysctl -n hw.memsize vm.swapusage; vm_stat' 2>"$e"`) };
+        $p{cim_cpu}  = sub { my $e = _probe_err_path('cim_cpu'); my $t = _timeout_prefix(5);
+                             Resources::darwin_cpu_json(scalar `${t}/bin/sh -c 'sysctl -n hw.logicalcpu; ps -A -o %cpu=' 2>"$e"`) };
+        my $proj = _shell_quote($PROJECT_PATH);
+        $p{cim_disk} = sub { my $e = _probe_err_path('cim_disk'); my $t = _timeout_prefix(5);
+                             Resources::darwin_disk_json(scalar `${t}df -kP $proj 2>"$e"`) };
+        return \%p;
+    }
     return \%p unless $WINDOWS_FAMILY;
     my %cmd = _ps_commands();
     $p{machine}  = sub { my $e = _probe_err_path('machine'); my $t = _timeout_prefix(5);
@@ -8181,6 +8218,13 @@ sub _resources_sampler_main {
     delete $ENV{MSYS2_ARG_CONV_EXCL};
     my $device;
     $device = ($PROJECT_PATH =~ m{^([A-Za-z]):}) ? uc($1) . ':' : 'C:' if $WINDOWS_FAMILY;
+    # macOS: the disk row is the volume the project lives on, named by its
+    # mount point. Asked once, here, off the render tick.
+    if ($^O eq 'darwin') {
+        my $q = _shell_quote($PROJECT_PATH);
+        my $t = _timeout_prefix(5);
+        $device = Resources::darwin_disk_device(scalar `${t}df -kP $q 2>/dev/null`);
+    }
     while (1) {
         last unless kill(0, $owner_pid);                     # owner gone -> self-exit within one cadence
         eval { _write_file_atomic($RESOURCES_SAMPLER_PID, "$$ $owner_pid " . time . "\n"); 1 };

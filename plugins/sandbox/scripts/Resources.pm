@@ -277,6 +277,115 @@ sub parse_cim_cpu {
 }
 
 # ---------------------------------------------------------------------------
+# macOS host probes. The host facts come from sysctl, vm_stat, ps and df there,
+# and each darwin_* function below turns that text into the SAME JSON shape the
+# Windows CIM probe yields, so parse_cim_memory / parse_cim_cpu / parse_cim_disk
+# and build() serve both hosts unchanged and the closed key set cannot drift.
+# All PUBLIC, pure, total: anything unparseable is undef, never a zero.
+# ---------------------------------------------------------------------------
+
+my $JSON_CANON = JSON::PP->new->canonical(1);
+my %MAC_UNIT = (K => 1024, M => 1024 ** 2, G => 1024 ** 3, T => 1024 ** 4);
+
+# darwin_memory_json($text) -> CIM Win32_OperatingSystem-shaped JSON (KB) | undef.
+# $text is `sysctl -n hw.memsize vm.swapusage; vm_stat`:
+#   51539607552
+#   total = 1024.00M  used = 0.25M  free = 1023.75M  (encrypted)
+#   Mach Virtual Memory Statistics: (page size of 16384 bytes)
+#   Pages free:   15378.
+#   ...
+# FREE IS free + inactive + speculative pages. "Pages free" alone is a few
+# hundred MB on any Mac that has been up for a while, because macOS keeps
+# file cache in inactive pages and hands them back on demand; reading only it
+# would show a 48 GB machine as 99% used. This matches what Activity Monitor
+# calls memory used (app + wired + compressed) to within the purgeable pages.
+# Swap is vm.swapusage's total and free (MiB-suffixed).
+sub darwin_memory_json {
+    my ($text) = @_;
+    return undef if !defined $text || ref $text;
+    my ($memsize) = $text =~ /\A\s*(\d+)\s*$/m;
+    my ($page)    = $text =~ /page size of (\d+) bytes/;
+    my %pg;
+    while ($text =~ /^Pages ([a-z ]+?):\s+(\d+)\.?\s*$/mg) { $pg{$1} = $2 }
+    my %out;
+    if (defined $memsize && $memsize > 0) {
+        $out{TotalVisibleMemorySize} = int($memsize / 1024);
+        if (defined $page && defined $pg{free}) {
+            my $free = ($pg{free} + ($pg{inactive} // 0) + ($pg{speculative} // 0)) * $page;
+            $free = $memsize if $free > $memsize;
+            $out{FreePhysicalMemory} = int($free / 1024);
+        }
+    }
+    if ($text =~ /total\s*=\s*([\d.]+)([KMGT])\b.*?free\s*=\s*([\d.]+)([KMGT])\b/) {
+        $out{SizeStoredInPagingFiles} = int($1 * $MAC_UNIT{$2} / 1024);
+        $out{FreeSpaceInPagingFiles}  = int($3 * $MAC_UNIT{$4} / 1024);
+    }
+    return undef unless %out;
+    return $JSON_CANON->encode(\%out);
+}
+
+# darwin_cpu_json($text) -> CIM Win32_Processor-shaped JSON | undef.
+# $text is `sysctl -n hw.logicalcpu; ps -A -o %cpu=`: the logical core count,
+# then one %CPU per process (each 0..100 of ONE core). Their sum over the core
+# count is the machine's utilisation, clamped to 0..100 and rounded like CIM's
+# integer LoadPercentage.
+sub darwin_cpu_json {
+    my ($text) = @_;
+    return undef if !defined $text || ref $text;
+    my @lines = grep { /\S/ } split /\n/, $text;
+    return undef unless @lines;
+    my $cores = shift @lines;
+    $cores =~ s/^\s+|\s+$//g;
+    return undef unless $cores =~ /^\d+$/ && $cores > 0;
+    my ($sum, $n) = (0, 0);
+    for my $l (@lines) {
+        next unless $l =~ /^\s*(\d+(?:\.\d+)?)\s*$/;
+        $sum += $1;
+        $n++;
+    }
+    my %out = (NumberOfLogicalProcessors => 0 + $cores);
+    if ($n) {
+        my $pct = $sum / $cores;
+        $pct = 100 if $pct > 100;
+        $out{LoadPercentage} = int($pct + 0.5);
+    }
+    return $JSON_CANON->encode(\%out);
+}
+
+# darwin_df_rows($text) -> [ { mount, size, avail } ] | undef, from
+# `df -kP <path>` (POSIX format, 1024-byte blocks). The mount point may hold
+# spaces, so it is everything after the capacity column.
+sub darwin_df_rows {
+    my ($text) = @_;
+    return undef if !defined $text || ref $text;
+    my @rows;
+    for my $l (split /\n/, $text) {
+        next unless $l =~ /^\S.*?\s+(\d+)\s+(\d+)\s+(\d+)\s+\d+%\s+(\/.*?)\s*$/;
+        push @rows, { size => $1 * 1024, avail => $3 * 1024, mount => $4 };
+    }
+    return @rows ? \@rows : undef;
+}
+
+# darwin_disk_json($text) -> CIM Win32_LogicalDisk-shaped JSON | undef. The
+# DeviceID is the mount point (on an APFS Mac, /System/Volumes/Data for
+# anything under /Users), FreeSpace the space AVAILABLE to the user -- APFS
+# volumes share one container, so "free" in any other sense double-counts.
+sub darwin_disk_json {
+    my ($text) = @_;
+    my $rows = darwin_df_rows($text);
+    return undef unless $rows;
+    return $JSON_CANON->encode([ map { { DeviceID => $_->{mount}, Size => $_->{size}, FreeSpace => $_->{avail} } } @$rows ]);
+}
+
+# darwin_disk_device($text) -> the mount point `df -kP <path>` reports | undef.
+# The sampler asks once, at start, so parse_cim_disk knows which row it wants.
+sub darwin_disk_device {
+    my ($text) = @_;
+    my $rows = darwin_df_rows($text);
+    return $rows ? $rows->[0]{mount} : undef;
+}
+
+# ---------------------------------------------------------------------------
 # S2.2 -- the assembler.
 # ---------------------------------------------------------------------------
 
