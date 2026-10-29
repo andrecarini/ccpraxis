@@ -19,11 +19,18 @@
 # which is how the keeper silently ran a 1-hour floor after the gate had moved
 # to ten minutes. So this file pins BOTH properties: one definition, and both
 # drivers using it.
+#
+# MACOS (bottom of the file): the same apply() contract with `caffeinate -i`
+# held by this file's own `hold` command. Every holder started here runs a
+# FAKE caffeinate (CCPRAXIS_CAFFEINATE_BIN) that asserts nothing, and the
+# holder refuses to start a real one under CCPRAXIS_NO_WAKELOCK.
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use strict;
 use warnings;
 use FindBin qw($Bin);
 use Test::More;
 use File::Temp qw(tempdir);
+use Time::HiRes ();
 
 (my $S = "$Bin/../../scripts") =~ s{\\}{/}g;
 
@@ -156,8 +163,15 @@ is(BpKeepAwake::should_be_on('nonsense'),      0, 'unknown phase -> released (fa
     # 576 drive-root strays from exactly that.
     my $dir  = tempdir(CLEANUP => 1);
     my $out  = BpKeepAwake::winify_out("$dir/keepawake.pid");
-    unlike($out, qr{^/},      'winify_out never yields a leading-slash POSIX path');
-    like($out,   qr{^[A-Za-z]:/}, 'winify_out yields a drive-letter path even though the file does not exist');
+    SKIP: {
+        # Only an MSYS path has a drive-letter form to translate to; on macOS
+        # and Linux there is no powershell.exe to hand it and a temp dir is
+        # legitimately "/...".
+        skip 'winify_out maps MSYS paths to drive letters; only a Windows host has them', 2
+            unless $^O =~ /^(MSWin32|msys|cygwin)$/;
+        unlike($out, qr{^/},      'winify_out never yields a leading-slash POSIX path');
+        like($out,   qr{^[A-Za-z]:/}, 'winify_out yields a drive-letter path even though the file does not exist');
+    }
     like($out,   qr{/keepawake\.pid$}, '...and preserves the basename');
 
     # Behavioural: a pid file holding a pid from ANOTHER process must be
@@ -172,6 +186,95 @@ is(BpKeepAwake::should_be_on('nonsense'),      0, 'unknown phase -> released (fa
     });
     is(scalar @spawned, 0,
        'a pid file holding a REAL, cross-process-valid pid suppresses the respawn');
+}
+
+# ---- a host that cannot hold a lock says so ONCE ------------------------------
+{
+    my $dir = tempdir(CLEANUP => 1);
+    my @logged;
+    my %o = (spawn => sub { 1 }, powershell_available => sub { 0 }, log => sub { push @logged, $_[0] });
+    BpKeepAwake::apply('active', $dir, {%o}) for 1 .. 3;
+    if ($^O =~ /^(MSWin32|msys|cygwin)$/ || $^O eq 'darwin') {
+        is(scalar @logged, 1, 'no helper on a host: one warning across three director ticks, not three');
+        like($logged[0] // '', qr/WARN keepawake unsupported here/, '...naming the gap');
+    } else {
+        is(scalar @logged, 0, 'no helper in the Linux sandbox: silent (keep-awake is a documented no-op there)');
+        pass('(no warning to inspect)');
+    }
+    ok(!-e "$dir/keepawake.pid", 'no helper: still no pid file');
+}
+
+# ---- macOS: the release path checks identity before signalling ----------------
+{
+    my @signalled;
+    my $r = BpKeepAwake::stop_holder_darwin(424242,
+        command_of => sub { '/usr/bin/vim notes.txt' }, pid_f => '/x/keepawake.pid');
+    is($r, 'not-ours', 'macOS release: a reused pid running something else is not signalled');
+    $r = BpKeepAwake::stop_holder_darwin(424242, command_of => sub { undef });
+    is($r, 'gone', 'macOS release: a pid that no longer exists is simply gone');
+    $r = BpKeepAwake::stop_holder_darwin(424242,
+        command_of => sub { "/usr/bin/perl /p/bp-keepawake.pl hold --pid-file /other/keepawake.pid" },
+        pid_f => '/x/keepawake.pid');
+    is($r, 'not-ours', 'macOS release: a holder for ANOTHER pid file is not ours to stop');
+}
+
+# ---- macOS: the holder itself, against a fake caffeinate ----------------------
+SKIP: {
+    skip 'the caffeinate holder runs on macOS (exercised wherever POSIX ps/fork exist)', 12
+        if $^O =~ /^(MSWin32|msys|cygwin)$/;
+    my $dir  = tempdir(CLEANUP => 1);
+    my $fake = "$dir/fake-caffeinate";
+    my $args = "$dir/caffeinate.args";
+    open my $f, '>', $fake or die $!;
+    print {$f} "#!/bin/sh\nprintf '%s\\n' \"\$@\" > '$args'\nexec sleep 300\n";
+    close $f;
+    chmod 0755, $fake;
+    local $ENV{CCPRAXIS_CAFFEINATE_BIN} = $fake;
+
+    my $slurp = sub { open my $h, '<', $_[0] or return ''; local $/; my $x = <$h>; close $h; $x // '' };
+    my $wait_for = sub {
+        my ($cond, $secs) = @_;
+        my $end = Time::HiRes::time() + $secs;
+        while (Time::HiRes::time() < $end) { return 1 if $cond->(); Time::HiRes::sleep(0.05) }
+        return $cond->() ? 1 : 0;
+    };
+    my $start = sub {
+        my ($pid_f, @extra) = @_;
+        my $pid = fork();
+        die "fork: $!" unless defined $pid;
+        if ($pid == 0) {
+            exec($^X, "$S/bp-keepawake.pl", 'hold', '--pid-file', $pid_f,
+                 '--log-file', "$dir/keepawake.log", '--poll', '0.1', @extra) or exit 127;
+        }
+        return $pid;
+    };
+
+    # (a) lease expiry: nobody refreshes the pid file, so the hold lets go.
+    my $pid_f = "$dir/keepawake.pid";
+    my $h = $start->($pid_f, '--lease', '2');
+    ok($wait_for->(sub { $slurp->("$dir/keepawake.log") =~ /pid=$h ASSERTED/ }, 5),
+        'holder: logs ASSERTED once caffeinate is up (what replace() waits for)');
+    is($slurp->($pid_f), "$h\n", 'holder: writes ITS OWN pid into the pid file, as keep-awake.ps1 does');
+    is($slurp->($args), "-i\n-w\n$h\n", 'holder: runs caffeinate -i -w <holder pid>, so the assertion dies with it');
+    ok($wait_for->(sub { waitpid($h, 1) == $h }, 8), 'holder: exits once the lease goes stale');
+    ok(!-e $pid_f, 'holder: removes the pid file it owned');
+    like($slurp->("$dir/keepawake.log"), qr/RELEASE reason=lease-expired/, 'holder: says why it let go');
+
+    # (b) the director's release path: identity check, TERM, clean exit.
+    my $h2 = $start->($pid_f, '--lease', '600');
+    ok($wait_for->(sub { $slurp->($pid_f) eq "$h2\n" }, 5), 'holder 2: up');
+    my @logged;
+    BpKeepAwake::apply('settled', $dir, { log => sub { push @logged, $_[0] } });
+    ok($wait_for->(sub { waitpid($h2, 1) == $h2 }, 8), 'release: apply(settled) stops the holder');
+    ok(!-e $pid_f, 'release: the pid file is gone');
+    like(join("\n", @logged), qr/keepawake stop winpid=$h2 result=gone/, 'release: logged as a clean stop');
+    like($slurp->("$dir/keepawake.log"), qr/pid=$h2 RELEASE reason=signal-term/, 'release: the holder released on TERM');
+
+    # (c) never a real caffeinate from a test environment.
+    local $ENV{CCPRAXIS_CAFFEINATE_BIN};
+    delete $ENV{CCPRAXIS_CAFFEINATE_BIN};
+    my $rc = system($^X, "$S/bp-keepawake.pl", 'hold', '--pid-file', "$dir/never.pid") >> 8;
+    is($rc, 3, 'holder: refuses the real caffeinate under CCPRAXIS_NO_WAKELOCK');
 }
 
 done_testing();

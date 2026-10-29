@@ -30,6 +30,8 @@ package BpContinuityLease;
 #
 #   Windows host      -> the wake-lock (BpKeepAwake -> keep-awake.ps1). There is
 #                        no container to keep alive; the risk is S0 standby.
+#   macOS host        -> the same wake-lock, actuated as `caffeinate -i` held by
+#                        BpKeepAwake's `hold` process. The risk is idle sleep.
 #   Linux (a sandbox) -> the busy-lease (/tmp/.butler-busy). There is no
 #                        SetThreadExecutionState to call, and the risk is
 #                        heartbeat.sh reaping the container. Touching the lease
@@ -41,8 +43,8 @@ package BpContinuityLease;
 # ENDS of it — which is what "must work inside a sandbox and outside on the
 # host" actually requires.
 #
-# There is a THIRD case, and it holds nothing: a Linux or macOS HOST. No
-# SetThreadExecutionState, and no heartbeat.sh or dashboard reading
+# There is a THIRD case, and it holds nothing: a Linux HOST. No
+# SetThreadExecutionState, no caffeinate, and no heartbeat.sh or dashboard reading
 # /tmp/.butler-busy — so writing that file there would be a lease in name only,
 # and state() would then report "held" off the file it had just created. That is
 # the one thing bp-keepawake.pl's header forbids outright, so platform() names
@@ -163,13 +165,14 @@ our $BUSY_STALE_SECONDS = 600;
 # 'windows', or 'unsupported'). Production never sets it; platform() answers.
 our $PLATFORM;
 
-# platform() -> 'windows' | 'posix' | 'unsupported'
+# platform() -> 'windows' | 'darwin' | 'posix' | 'unsupported'
 #
 #   windows      a Windows host. The wake-lock is the mechanism.
+#   darwin       a macOS host. The wake-lock is the mechanism (caffeinate).
 #   posix        INSIDE A CONTAINER. The busy-lease is the mechanism, and it is
 #                read by heartbeat.sh and by launcher.pl's dashboard.
-#   unsupported  a Linux or macOS HOST. Neither mechanism exists here: there is
-#                no SetThreadExecutionState to call, and /tmp/.butler-busy is a
+#   unsupported  a Linux HOST. Neither mechanism exists here: there is no
+#                SetThreadExecutionState to call, and /tmp/.butler-busy is a
 #                file nobody reads, so writing one would be a lease in name only.
 #
 # THE THIRD CASE IS NOT PEDANTRY. Without it, `sync` on a Linux host creates
@@ -182,10 +185,15 @@ sub platform {
     return $PLATFORM if defined $PLATFORM;
     return 'windows' if $^O =~ /^(MSWin32|msys|cygwin)$/;
     return 'posix'   if in_container();
+    return 'darwin'  if $^O eq 'darwin';
     return 'unsupported';
 }
 
 sub is_windows { return platform() eq 'windows' ? 1 : 0 }
+
+# host_wakelock() -- the platforms whose lease IS BpKeepAwake's wake-lock pid
+# file (a host helper), as opposed to the container's busy-lease.
+sub host_wakelock { my $p = platform(); return ($p eq 'windows' || $p eq 'darwin') ? 1 : 0 }
 
 # in_container() — podman and docker both leave a marker at the filesystem root,
 # and the sandbox image is built from one of them. Checked in that order and
@@ -577,7 +585,7 @@ sub live_script_path {
     }
     my $plat = platform();
     return undef if $plat eq 'unsupported';
-    my $suffix = $plat eq 'windows'
+    my $suffix = host_wakelock()
         ? '.claude/ccpraxis/plugins/butler/scripts/BpContinuityLease.pm'
         : '.claude/plugins/marketplaces/ccpraxis-local/butler/scripts/BpContinuityLease.pm';
     for my $var (qw(HOME USERPROFILE)) {
@@ -597,7 +605,9 @@ sub is_live_script {
     my $a = Cwd::abs_path($path) // $path;
     my $b = Cwd::abs_path($live) // $live;
     $a =~ tr{\\}{/}; $b =~ tr{\\}{/};
-    return is_windows() ? ((lc($a) eq lc($b)) ? 1 : 0) : (($a eq $b) ? 1 : 0);
+    # Case-folded where the filesystem folds case: NTFS, and APFS (whose
+    # abs_path keeps whatever case it was typed with).
+    return host_wakelock() ? ((lc($a) eq lc($b)) ? 1 : 0) : (($a eq $b) ? 1 : 0);
 }
 
 # ---------------------------------------------------------------------------
@@ -648,7 +658,7 @@ sub state {
     my $plat = platform();
     return 'unsupported' if $plat eq 'unsupported';
 
-    if ($plat eq 'windows') {
+    if (host_wakelock()) {
         my $pf = wakelock_pid_file($dir);
         return 'released' unless -e $pf;
         # An empty pid file is BpKeepAwake's atomic claim and the helper has not
@@ -688,8 +698,9 @@ sub refresh {
     my $plat = platform();
     return 0 if $plat eq q{unsupported};   # nothing here reads either lease
 
-    if ($plat eq q{windows}) {
-        # keep-awake.ps1 polls this file's mtime and exits once it goes stale.
+    if (host_wakelock()) {
+        # keep-awake.ps1 (and the macOS holder) polls this file's mtime and
+        # exits once it goes stale.
         # Touching it is the whole of "a run still wants this". If it is absent
         # the helper is not running, and only sync() may start one.
         #
@@ -755,7 +766,7 @@ sub sync {
     my $plat = platform();
     return ($active ? q{held} : q{released}) if $plat eq q{unsupported};
 
-    if ($plat eq q{windows}) {
+    if (host_wakelock()) {
         my %ka = map { $_ => $opts{$_} }
                  grep { exists $opts{$_} }
                  qw(spawn kill_pid powershell_available log owner_winpid owner_desc);
@@ -1065,7 +1076,8 @@ sub _do_handover {
 # daemon_loop($dir, %opts) — the refresher itself. Blocks.
 #
 # %opts: tick, max_iterations (tests), handover (bool), handover_spawn (seam),
-# owner_winpid (default BpKeepAwake::self_winpid()), owner_desc, log (default
+# owner_winpid (default BpKeepAwake::self_owner_pid(): our Windows pid, or $$
+# on macOS, so the helper lets go if this refresher dies), owner_desc, log (default
 # lease_log), plus sync()'s seams.
 sub daemon_loop {
     my ($dir, %opts) = @_;
@@ -1086,7 +1098,7 @@ sub daemon_loop {
     # KEEPAWAKE token).
     my $ka_log = sub { my ($msg) = @_; $log->('KEEPAWAKE', $msg) };
     my $handover_spawn = $opts{handover_spawn} // \&_spawn_successor;
-    my $owner_winpid = exists $opts{owner_winpid} ? $opts{owner_winpid} : BpKeepAwake::self_winpid();
+    my $owner_winpid = exists $opts{owner_winpid} ? $opts{owner_winpid} : BpKeepAwake::self_owner_pid();
 
     make_path($dir) unless -d $dir;
 
@@ -1172,6 +1184,12 @@ sub daemon_loop {
     $log->('START', sprintf('script=%s dir=%s live=%s is_live=%d tick=%ds winpid=%s handover=%d platform=%s',
         $own_script, $dir, (defined $live_at_start ? $live_at_start : 'unresolved'), $is_live, $tick,
         (defined $owner_winpid ? $owner_winpid : 'none'), $handover_flag, platform()));
+    # Said once per refresher, not per tick: on a host with no mechanism every
+    # tick is the same no-op. The arm is still worth keeping (the Stop gate and
+    # the holder do not depend on it), but nobody should believe this machine
+    # is being held awake.
+    $log->('UNSUPPORTED', 'no keep-awake mechanism on this host; the arm holds nothing awake')
+        if platform() eq 'unsupported';
 
     my $released = 0;
     my $handing_over = 0;

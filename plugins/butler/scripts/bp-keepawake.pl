@@ -56,6 +56,17 @@
 # logged warning — never a false claim of holding one. That failure mode is the
 # whole reason 3c661a0 exists (the production spawn/kill defaults were empty
 # subs, so the director REPORTED managing a lock while holding none).
+#
+# MACOS. The same contract, with `caffeinate -i` as the assertion and this file's
+# own `hold` command (hold_main, below) in the role keep-awake.ps1 plays on
+# Windows: a small detached process that writes ITS OWN pid into the pid file,
+# runs `caffeinate -i -w <its pid>` as a child, and lets go when the lease goes
+# stale (nobody touched the pid file for 900s), when the pid file stops naming
+# it (released or replaced), or when its owner exits. `-w` ties the assertion to
+# the holder, so a holder killed by any means -- SIGKILL included -- takes the
+# assertion with it; nothing can orphan a caffeinate. `-i` prevents idle system
+# sleep only: the display may sleep and the lid still sleeps the machine, which
+# is the same scope ES_SYSTEM_REQUIRED has on Windows.
 
 package BpKeepAwake;
 use strict;
@@ -100,6 +111,29 @@ sub should_be_on {
 }
 
 sub helper_path { return "$DIR/../../sandbox/scripts/keep-awake.ps1" }
+
+sub _is_windows { return $^O =~ /^(MSWin32|msys|cygwin)$/ ? 1 : 0 }
+
+# caffeinate_bin() -> path | undef. CCPRAXIS_CAFFEINATE_BIN names a substitute
+# (the test seam: a fake that asserts nothing); otherwise the system binary.
+sub caffeinate_bin {
+    my $o = $ENV{CCPRAXIS_CAFFEINATE_BIN};
+    return $o if defined $o && length $o;
+    return '/usr/bin/caffeinate' if -x '/usr/bin/caffeinate';
+    for my $d (split /:/, $ENV{PATH} // '') {
+        next unless length $d;
+        return "$d/caffeinate" if -x "$d/caffeinate";
+    }
+    return undef;
+}
+
+# helper_available() -> 0|1 -- can THIS host take a wake-lock at all? The
+# default `powershell_available` seam of apply(). Same PATH-only rule as
+# ps_available: nothing is executed to answer it.
+sub helper_available {
+    return defined(caffeinate_bin()) ? 1 : 0 if $^O eq 'darwin';
+    return ps_available();
+}
 
 # POSIX -> forward-slash Windows form ("/c/x" -> "C:/x").
 #
@@ -176,7 +210,7 @@ sub ps_available {
 sub spawn {
     my ($pid_f, $owner) = @_;
     $owner //= {};
-    return undef unless $^O =~ /^(MSWin32|msys|cygwin)$/;
+    return undef unless _is_windows() || $^O eq 'darwin';
 
     # A TEST MUST NEVER SPAWN A REAL, IMMORTAL OS WAKE-LOCK.
     #
@@ -198,6 +232,8 @@ sub spawn {
     # test that DID reach the real spawn was, by definition, leaking.
     return undef if $ENV{CCPRAXIS_NO_WAKELOCK};
     return undef if defined $0 && $0 =~ /\.t\z/;
+
+    return _spawn_darwin($pid_f, $owner) if $^O eq 'darwin';
 
     my $ps1 = helper_path();
     unless (-f $ps1) { die "keep-awake helper missing: $ps1\n" }
@@ -252,6 +288,169 @@ sub spawn {
     return $pid;
 }
 
+# _spawn_darwin($pid_f, \%owner) -> pid. Starts `perl bp-keepawake.pl hold` as
+# a detached process. EXEC, not just fork: a forked child would inherit every
+# descriptor the caller holds -- the continuity refresher's lease.lock flock
+# among them -- and keep that lock alive after the refresher exits, so its
+# successor could never take it. exec drops them (perl marks every descriptor
+# above $^F close-on-exec). The parent writes nothing into the pid file; the
+# holder writes its own pid, exactly as keep-awake.ps1 does.
+#
+# On macOS there is one pid namespace, so owner_winpid -- the name the callers
+# already pass -- is simply the owner's pid (see self_owner_pid).
+#
+# DOUBLE fork: the holder is a grandchild, reparented to launchd at once. The
+# continuity refresher lives for hours and never waits on what it spawns, so a
+# direct child that exits would sit in its process table as a zombie -- one per
+# holder lifetime -- and a zombie answers kill(0) as if it were alive.
+sub _spawn_darwin {
+    my ($pid_f, $owner) = @_;
+    my $script = "$DIR/bp-keepawake.pl";
+    die "keep-awake helper missing: $script\n" unless -f $script;
+    die "caffeinate not found\n" unless defined caffeinate_bin();
+    my $log_f = $pid_f;
+    $log_f =~ s{keepawake\.pid$}{keepawake.log};
+    my @argv = ($^X, $script, 'hold', '--pid-file', $pid_f, '--log-file', $log_f,
+                '--lease', 900);
+    if (defined $owner->{owner_winpid} && $owner->{owner_winpid} =~ /^[1-9]\d*$/) {
+        push @argv, '--owner-pid', $owner->{owner_winpid};
+    }
+    my $clean_desc = owner_desc_clean($owner->{owner_desc});
+    push @argv, '--owner-desc', $clean_desc if defined $clean_desc;
+    require POSIX;
+    my $pid = fork();
+    die "fork: $!\n" unless defined $pid;
+    if ($pid == 0) {
+        open(STDIN,  '<', '/dev/null');
+        open(STDOUT, '>', '/dev/null');
+        open(STDERR, '>', '/dev/null');
+        # Out of the caller's process group: an interrupted Bash tool call
+        # must not take the wake-lock down with it.
+        eval { POSIX::setsid() };
+        my $g = fork();
+        POSIX::_exit(defined $g ? 0 : 1) if !defined $g || $g > 0;
+        exec(@argv) or POSIX::_exit(127);
+    }
+    waitpid($pid, 0);
+    die "fork (holder): failed\n" if $? != 0;
+    return $pid;
+}
+
+# hold_main(@argv) -> exit code. The macOS holder (see the header). Blocks.
+#
+#   hold --pid-file F [--log-file L] [--lease S] [--owner-pid P]
+#        [--owner-desc D] [--poll S]
+#
+# Exit 0 after a release, 2 on bad arguments, 3 when refused (a test
+# environment with no substitute caffeinate), 4 when caffeinate would not start.
+sub hold_main {
+    my (@argv) = @_;
+    my %a = (lease => 900, poll => undef);
+    while (@argv) {
+        my $k = shift @argv;
+        my $v = shift @argv;
+        return 2 unless defined $v;
+        if    ($k eq '--pid-file')   { $a{pid_f} = $v }
+        elsif ($k eq '--log-file')   { $a{log_f} = $v }
+        elsif ($k eq '--lease')      { return 2 unless $v =~ /^\d+(?:\.\d+)?$/; $a{lease} = $v }
+        elsif ($k eq '--owner-pid')  { return 2 unless $v =~ /^[1-9]\d*$/; $a{owner} = $v }
+        elsif ($k eq '--owner-desc') { $a{desc} = owner_desc_clean($v) }
+        elsif ($k eq '--poll')       { return 2 unless $v =~ /^\d+(?:\.\d+)?$/ && $v > 0; $a{poll} = $v }
+        else                         { return 2 }
+    }
+    return 2 unless defined $a{pid_f} && length $a{pid_f};
+    # The real assertion is never taken from a test environment; a substitute
+    # binary asserts nothing, so it is what a test of this loop runs.
+    return 3 if $ENV{CCPRAXIS_NO_WAKELOCK} && !(defined $ENV{CCPRAXIS_CAFFEINATE_BIN}
+                                                && length $ENV{CCPRAXIS_CAFFEINATE_BIN});
+    my $bin = caffeinate_bin();
+    return 4 unless defined $bin;
+    my $poll = $a{poll} // ($a{lease} >= 60 ? 15 : ($a{lease} / 4 || 0.25));
+
+    require POSIX;
+    require Time::HiRes;
+    my $pid_f = $a{pid_f};
+    my $log = sub {
+        my ($msg) = @_;
+        return unless defined $a{log_f};
+        my @t = localtime(time);
+        open(my $fh, '>>', $a{log_f}) or return;
+        printf {$fh} "%04d-%02d-%02d %02d:%02d:%02d pid=%d %s\n",
+            $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0], $$, $msg;
+        close $fh;
+    };
+    my $names_me = sub {
+        my $p = _read_pid($pid_f);
+        return (defined $p && $p eq "$$") ? 1 : 0;
+    };
+
+    # Identity first, the way keep-awake.ps1 does it: overwrite whatever claim
+    # or predecessor the file named. The mtime this sets is the lease's start.
+    open(my $pfh, '>', $pid_f) or do { $log->("FAILED cannot write $pid_f: $!"); return 4 };
+    print {$pfh} "$$\n";
+    close $pfh;
+
+    my $me = $$;
+    my $caf = fork();
+    unless (defined $caf) {
+        $log->("FAILED fork: $!");
+        unlink $pid_f if $names_me->();
+        return 4;
+    }
+    if ($caf == 0) {
+        exec($bin, '-i', '-w', $me) or POSIX::_exit(127);
+    }
+
+    my $stop = 0;
+    local $SIG{TERM} = sub { $stop = 'signal-term' };
+    local $SIG{INT}  = sub { $stop = 'signal-int' };
+    local $SIG{HUP}  = sub { $stop = 'signal-hup' };
+
+    my $release = sub {
+        my ($why) = @_;
+        if (waitpid($caf, POSIX::WNOHANG()) == 0) {
+            kill('TERM', $caf);
+            my $deadline = Time::HiRes::time() + 5;
+            while (waitpid($caf, POSIX::WNOHANG()) == 0 && Time::HiRes::time() < $deadline) {
+                Time::HiRes::sleep(0.05);
+            }
+            kill('KILL', $caf) if kill(0, $caf);
+            waitpid($caf, 0);
+        }
+        unlink $pid_f if $names_me->();
+        $log->("RELEASE reason=$why");
+        return 0;
+    };
+
+    # A caffeinate that dies at once never asserted anything; say so rather
+    # than log a hold that is not there.
+    Time::HiRes::sleep(0.2);
+    if (waitpid($caf, POSIX::WNOHANG()) == $caf) {
+        $log->('FAILED caffeinate exited at start rc=' . ($? >> 8));
+        unlink $pid_f if $names_me->();
+        return 4;
+    }
+    # The log prefix already says pid=<us>, which makes this the
+    # "pid=<pid> ASSERTED" line _log_has_asserted (and so replace()) waits for.
+    $log->(sprintf('ASSERTED caffeinate=%d lease=%ss owner=%s%s', $caf, $a{lease},
+        $a{owner} // 'none', defined $a{desc} ? " desc=$a{desc}" : ''));
+
+    while (1) {
+        return $release->($stop) if $stop;
+        if (waitpid($caf, POSIX::WNOHANG()) == $caf) {
+            unlink $pid_f if $names_me->();
+            $log->('RELEASE reason=caffeinate-exited rc=' . ($? >> 8));
+            return 0;
+        }
+        return $release->(-e $pid_f ? 'replaced' : 'pid-file-removed') unless $names_me->();
+        my $mtime = (stat($pid_f))[9];
+        return $release->('lease-expired') if defined $mtime && (time() - $mtime) > $a{lease};
+        return $release->('owner-exited')
+            if defined $a{owner} && !kill(0, $a{owner}) && $!{ESRCH};
+        Time::HiRes::sleep($poll);
+    }
+}
+
 # winpid_of($msys_pid) -> positive int | undef -- reads /proc/<pid>/winpid, the
 # only reliable way to map an MSYS pid to the Windows pid Windows tools accept.
 # Never falls back to the MSYS pid; returns undef off Windows.
@@ -268,6 +467,15 @@ sub winpid_of {
 }
 
 sub self_winpid { return winpid_of($$) }
+
+# self_owner_pid() -> the pid a helper should treat as its owner when THIS
+# process owns it: the Windows pid on Windows (keep-awake.ps1 lives in that
+# namespace), $$ on macOS (one namespace), undef elsewhere (nothing to own).
+sub self_owner_pid {
+    return self_winpid() if _is_windows();
+    return $$ if $^O eq 'darwin';
+    return undef;
+}
 
 # owner_started_before(\%owner, $self_winpid?, $now?) -> FILETIME ticks string | undef
 #
@@ -429,9 +637,55 @@ sub kill_pid {
     if ($^O =~ /^(MSWin32|msys|cygwin)$/) {
         return stop_helper($pid, defined $pid_f ? (pid_f => $pid_f) : ());
     }
+    return stop_holder_darwin($pid, pid_f => $pid_f) if $^O eq 'darwin';
     kill('KILL', $pid);
     waitpid($pid, 0);
     return 'gone';
+}
+
+# _production_command_of($pid) -> command line | undef (undef = no such
+# process, or a zombie: an exited process nobody has reaped yet is not running
+# anything, and treating it as alive would escalate to SIGKILL for nothing).
+sub _production_command_of {
+    my ($pid) = @_;
+    return undef unless defined $pid && $pid =~ /^\d+$/;
+    open(my $fh, '-|', 'ps', '-o', 'stat=', '-o', 'command=', '-p', $pid) or return undef;
+    my $out = do { local $/; <$fh> };
+    close $fh;
+    return undef unless defined $out;
+    $out =~ s/^\s+|\s+$//g;
+    my ($stat, $cmd) = $out =~ /^(\S+)\s+(.*)\z/s;
+    return undef unless defined $stat && length $cmd;
+    return undef if $stat =~ /Z/;
+    return $cmd;
+}
+
+# stop_holder_darwin($pid, %seams) -> 'gone' | 'not-ours' | 'still-alive' | 'invalid'
+#
+# The macOS release path. A pid file can outlive its holder (a crash, a reboot)
+# and pids are reused, so the recorded number is checked BEFORE anything is
+# signalled: it must still be `bp-keepawake.pl hold` for THIS pid file. Then
+# TERM, which lets the holder release caffeinate and remove its own pid file;
+# KILL only if it is still there after the wait (caffeinate -w follows it down).
+# %seams: command_of, wait_seconds, pid_f.
+sub stop_holder_darwin {
+    my ($pid, %seams) = @_;
+    return 'invalid' unless defined $pid && $pid =~ /^[1-9]\d*$/;
+    my $command_of = $seams{command_of} // \&_production_command_of;
+    my $wait = defined $seams{wait_seconds} ? $seams{wait_seconds} : 5;
+    my $cmd = $command_of->($pid);
+    return 'gone' unless defined $cmd;
+    return 'not-ours' unless $cmd =~ /bp-keepawake\.pl\s+hold\b/
+                          && (!defined $seams{pid_f} || index($cmd, $seams{pid_f}) >= 0);
+    kill('TERM', $pid);
+    my $deadline = time() + $wait;
+    while (time() < $deadline) {
+        return 'gone' unless defined $command_of->($pid);
+        select(undef, undef, undef, 0.1);
+    }
+    kill('KILL', $pid);
+    select(undef, undef, undef, 0.2);
+    return defined $command_of->($pid) ? 'still-alive' : 'gone';
 }
 
 # _log_has_asserted($log_file, $pid) -> 0|1
@@ -581,7 +835,7 @@ sub apply {
     $opts //= {};
     my $spawn = $opts->{spawn}                // \&spawn;
     my $killp = $opts->{kill_pid}             // \&kill_pid;
-    my $ps_ok = $opts->{powershell_available} // \&ps_available;
+    my $ps_ok = $opts->{powershell_available} // \&helper_available;
     my $log   = $opts->{log}                  // sub { };
     my $pid_f = "$dir/keepawake.pid";
     my %owner = (owner_winpid => $opts->{owner_winpid}, owner_desc => $opts->{owner_desc});
@@ -641,7 +895,10 @@ sub apply {
             # it so the atomic claim below can be taken.
             unlink $pid_f;
         }
-        return unless $ps_ok->();
+        unless ($ps_ok->()) {
+            _note_unavailable($dir, $log);
+            return;
+        }
 
         # CLAIM THE FILE ATOMICALLY, THEN SPAWN. O_EXCL is what makes "is a
         # helper already coming up?" and "I am the one starting it" a single
@@ -669,6 +926,7 @@ sub apply {
 
         my $started = eval { $spawn->($pid_f, \%owner) };
         $log->("WARN keepawake spawn failed: $@") if $@;
+        unlink "$dir/keepawake.unavailable" if defined $started;
 
         # A CLAIM NOBODY WILL FILL MUST NOT SURVIVE THE CALL THAT MADE IT.
         # spawn() returns undef when it declined — inside a .t, or under
@@ -711,5 +969,31 @@ sub apply {
     }
 }
 
+# _note_unavailable($dir, $log) -- a host that should hold a wake-lock and
+# cannot says so ONCE, not on every director tick. The marker beside the pid
+# file is the "already said" flag; a later successful spawn clears it, so a
+# recurrence is reported again. The Linux sandbox stays silent: keep-awake is a
+# documented no-op there (its busy-lease is BpContinuityLease's job).
+sub _note_unavailable {
+    my ($dir, $log) = @_;
+    return unless _is_windows() || $^O eq 'darwin';
+    my $marker = "$dir/keepawake.unavailable";
+    return if -e $marker;
+    my $what = $^O eq 'darwin' ? 'caffeinate not found' : 'powershell.exe not on PATH';
+    $log->("WARN keepawake unsupported here ($what); nothing is holding this machine awake");
+    if (open my $fh, '>', $marker) { close $fh }
+}
+
 package main;
+
+# `perl bp-keepawake.pl hold ...` -- the macOS holder's entry point. Requiring
+# this file (every other use) never reaches it.
+unless (caller) {
+    if (@ARGV && $ARGV[0] eq 'hold') {
+        shift @ARGV;
+        exit BpKeepAwake::hold_main(@ARGV);
+    }
+    print STDERR "usage: perl bp-keepawake.pl hold --pid-file F [--log-file L] [--lease S] [--owner-pid P]\n";
+    exit 2;
+}
 1;

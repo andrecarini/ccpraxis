@@ -578,4 +578,41 @@ sub slurp {
      . 'of a legacy marker -- the legacy fallback is gone');
 }
 
+# ===========================================================================
+# L-macOS -- a Mac host holds the WAKE-LOCK (BpKeepAwake -> caffeinate), the
+# same pid-file lease Windows uses. It used to be 'unsupported': arming
+# continuity on a Mac held nothing awake and said so only in `state`.
+# ===========================================================================
+{
+    local $BpContinuityLease::PLATFORM = 'darwin';
+    my $legacy = fresh_legacy();
+    my $tmp = tempdir(CLEANUP => 1);
+    local $ENV{BP_BUSY_PATH} = "$tmp/butler-busy";
+    is(BpContinuityLease::host_wakelock(), 1, 'L-macOS: darwin is a wake-lock host');
+
+    my @spawned;
+    my $v = BpContinuityLease::sync($legacy, active => 1,
+        spawn => sub { push @spawned, $_[0]; open my $w, '>', $_[0] or die $!; print {$w} "$$\n"; close $w; $$ },
+        powershell_available => sub { 1 });
+    is($v, 'held', 'L-macOS: sync(active) reports held');
+    is_deeply(\@spawned, ["$legacy/keepawake.pid"], 'L-macOS: ...by asking BpKeepAwake for the wake-lock helper');
+    ok(!-e "$tmp/butler-busy", 'L-macOS: the container busy-lease is NOT what a Mac host writes');
+    is(BpContinuityLease::state($legacy, pid_alive => sub { 1 }), 'held', 'L-macOS: state reads the helper pid file');
+
+    my $old = time - 600;
+    utime($old, $old, "$legacy/keepawake.pid");
+    is(BpContinuityLease::refresh($legacy), 1, 'L-macOS: refresh re-asserts the lease');
+    cmp_ok(time - (stat("$legacy/keepawake.pid"))[9], '<', 5, 'L-macOS: ...by touching the helper pid file');
+
+    my @killed;
+    BpContinuityLease::sync($legacy, active => 0, kill_pid => sub { push @killed, $_[0]; 'gone' });
+    is_deeply(\@killed, ["$$"], 'L-macOS: release stops the recorded helper');
+    is(BpContinuityLease::state($legacy, pid_alive => sub { 1 }), 'released', 'L-macOS: and state is released');
+}
+SKIP: {
+    skip 'platform() detection is checked on a real macOS host', 1 unless $^O eq 'darwin';
+    local $BpContinuityLease::PLATFORM;
+    is(BpContinuityLease::platform(), 'darwin', 'L-macOS: a Mac host is detected as darwin, not unsupported');
+}
+
 done_testing();
