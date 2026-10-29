@@ -658,6 +658,14 @@ sub _validation_shaped {
 # declaration cannot see it.
 my $HYG_DEADLINE_MARKER = { hyg_deadline_exceeded => 1 };
 
+# The deadline of the scan in progress, for loops below _hyg_commands that are
+# not handed one: _hyg_find_word_redirects walks a word with one redirect per
+# step, and a single 250 KiB word glued from ~87,000 redirects ("x>a>a>a...")
+# ran 4.5 s past a deadline that only segment boundaries checked
+# (worker-bash-hygiene.t AC-71 shape 2). Set with local by every caller that
+# holds a deadline; undef (no deadline) checks nothing.
+our $HYG_SCAN_DEADLINE;
+
 # ---------------------------------------------------------------------------
 # never-halt 03 -- shape-normalising test-run predicate (bug 8288, spec sec
 # 2.3). Purely ADDITIVE to $VALIDATION_RE above: it only ever turns "not
@@ -876,6 +884,7 @@ sub _perl_test_run {
                 || ($cmd =~ /\bw?perl/i && ($cmd =~ /\bxargs\b/i || $cmd =~ /\bfind\b/i));
 
         my $deadline = _hyg_deadline_at(2);
+        local $HYG_SCAN_DEADLINE = $deadline;
         my $is_winfam = _hyg_is_winfam();
         for my $e (_hyg_commands($cmd, 0, $deadline)) {
             next unless ref $e eq 'HASH';
@@ -2300,6 +2309,7 @@ sub _hyg_find_word_redirects {
     my ($lead, $digits, $op, $rest) = @first;
     my @redirs;
     while (1) {
+        _hyg_deadline_check($HYG_SCAN_DEADLINE);
         my @next = _hyg_find_word_redirect($rest);
         if (@next) {
             my ($target_raw, $ndigits, $nop, $nrest) = @next;
@@ -3386,6 +3396,7 @@ sub _hyg_commands {
 # and re-checked once per command below.
 sub hyg_targets {
     my ($cmd, $deadline_at) = @_;
+    local $HYG_SCAN_DEADLINE = $deadline_at;
     my @out;
     my @commands = _hyg_commands($cmd, 0, $deadline_at);
     for my $entry (@commands) {
