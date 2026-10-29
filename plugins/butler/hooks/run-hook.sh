@@ -178,10 +178,17 @@ fi
 # nor above 128, so the wrapper would continue with an empty BP_PAYLOAD.
 # Exiting 0 there instead would make every hook a silent no-op on that
 # host -- continuity would quietly never fire. So an old bash reads with
-# -d '' instead: a builtin, slower on large input, but correct. Its return
-# codes line up with the -N mapping below: 1 at a normal EOF, >128 on
-# timeout, and 0 only if it stopped early at a NUL (never valid JSON), which
-# is treated as truncated.
+# -d '' instead: a builtin, slower on large input, but correct. It returns 1
+# at a normal EOF and 0 only if it stopped early at a NUL (never valid JSON),
+# which is treated as truncated. A timeout is the one code that does NOT line
+# up: bash 3.2's read -t returns 1 on a timeout too (bash >= 4 returns >128)
+# and throws away what it had read, so the result looks exactly like an empty
+# payload at EOF and every --pre text: clause quietly skipped perl (measured
+# on macOS /bin/bash 3.2.57). Elapsed time is the only thing that tells the
+# two apart there: a 1 that took the whole budget is mapped to 142. $SECONDS
+# ticks in whole seconds, so a real timeout always reads >= t; the converse
+# (a payload that legitimately took over t-1 seconds to arrive) is judged
+# truncated, which fails toward running perl, never toward skipping it.
 read_n=0
 if [ "${BASH_VERSINFO[0]:-0}" -gt 4 ]; then
     read_n=1
@@ -193,8 +200,12 @@ if [ "$read_n" -eq 1 ]; then
     IFS= read -r -N 8388608 -t "$t" BP_PAYLOAD
     rc=$?
 else
+    read_t0=$SECONDS
     IFS= read -r -d '' -t "$t" BP_PAYLOAD
     rc=$?
+    if [ "$rc" -eq 1 ] && (( SECONDS - read_t0 >= t )); then
+        rc=142
+    fi
 fi
 if [ "$rc" -eq 0 ] || [ "$rc" -gt 128 ]; then
     export BP_PAYLOAD_TRUNCATED=1
