@@ -1229,4 +1229,26 @@ subtest 'AC-32 a config path that is a directory fails loudly, not silently' => 
     done_testing();
 };
 
+subtest 'AC-33 the /root default is refused outside the sandbox' => sub {
+    # /root is the sandbox container's own overlay storage. On a host it names
+    # nothing useful (macOS: the read-only system volume), so using the default
+    # there is a usage error up front, never a half-configured project.
+    # IS_SANDBOX is unset in every child here (%CLEAN_ENV), i.e. a host.
+    my $p = mk_proj('hostdefault');
+    my $P = abs_path($p);
+    my ($rc, $out, $err) = run_fs(args => ['--project', $p]);
+    is($rc, 2, 'AC-33: no --native-root on a host -> exit 2') or diag($err);
+    like($err, qr/^bp-fast-store: the default --native-root \/root is the sandbox container's storage/m,
+         'AC-33: the message says why');
+    is($out, '', 'AC-33: stdout is empty');
+    ok(!-e "$P/pnpm-workspace.yaml", 'AC-33: no pnpm-workspace.yaml was written');
+    ok(!-e "$P/.gitignore", 'AC-33: no .gitignore was written');
+
+    # Both explicit native paths make the default irrelevant: no refusal.
+    my $nat = mk_native();
+    my ($rc2, undef, $err2) = run_fs(args => ['--project', $p, '--store', "$nat/s", '--virtual-store', "$nat/v"]);
+    is($rc2, 0, 'AC-33: --store + --virtual-store on a host need no --native-root') or diag($err2);
+    done_testing();
+};
+
 done_testing();

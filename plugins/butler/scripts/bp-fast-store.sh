@@ -28,7 +28,7 @@ usage() {                     # printf only: reachable with an empty PATH (2.2)
 "NOTE: pnpm 10+ silently IGNORES kebab-case store-dir/virtual-store-dir written to .npmrc (confirmed broken, spec b38-node-pnpm-toolchain 1.3) -- the camelCase keys must live in pnpm-workspace.yaml, which pnpm actually honours." \
 '' \
 '  --project DIR          project dir to configure               (default: the current directory)' \
-'  --native-root DIR      parent of the derived native dirs      (default: /root)' \
+'  --native-root DIR      parent of the derived native dirs      (default: /root; required outside the sandbox)' \
 '  --store DIR            pnpm storeDir, global CAS               (default: <native-root>/.pnpm-store)' \
 '  --virtual-store DIR    pnpm virtualStoreDir, per project       (default: <native-root>/<slug>-vstore)' \
 '  -h, --help             this help' \
@@ -107,6 +107,36 @@ safe_target() {
   return 0
 }
 
+# copy_mode SRC DEST -- give DEST the permission bits SRC has. GNU chmod's
+# --reference first (Linux, Git for Windows); BSD chmod (macOS) has no such
+# option, so there the octal mode is read with BSD stat and applied directly.
+copy_mode() {
+  chmod --reference="$1" -- "$2" 2>/dev/null && return 0
+  local m
+  m=$(stat -f %Lp "$1" 2>/dev/null) || return 1
+  [ -n "$m" ] || return 1
+  chmod "$m" "$2" 2>/dev/null
+}
+
+# _lower VALUE -> LOWERED: ASCII A-Z folded to a-z with builtins only (step 3
+# must reach the pnpm check with an empty PATH, 2.2). bash 3.2 -- macOS's
+# /bin/bash -- has no ${v,,}; it fails there as "bad substitution", which
+# this script's EXIT trap turned into a silent exit 0 with nothing written.
+LOWERED=''
+_lower() {
+  local s=$1 c head
+  local U=ABCDEFGHIJKLMNOPQRSTUVWXYZ L=abcdefghijklmnopqrstuvwxyz
+  LOWERED=''
+  while [ -n "$s" ]; do
+    c=${s:0:1}
+    s=${s:1}
+    case $U in
+      *"$c"*) head=${U%%"$c"*}; c=${L:${#head}:1} ;;
+    esac
+    LOWERED+=$c
+  done
+}
+
 # write_atomic DEST CONTENT -- temp file inside <PROJECT> then mv (2.5 step 5).
 write_atomic() {
   local dest=$1 content=$2
@@ -130,7 +160,7 @@ write_atomic() {
   # mv carries the TEMP file's umask mode onto the destination, so an existing
   # mode (a 0600 .npmrc holding a registry _authToken -- see 2.5's own example)
   # has to be replicated first or every run world-readables the credentials.
-  if [ -f "$dest" ] && ! chmod --reference="$dest" -- "$TMPFILE" 2>/dev/null; then
+  if [ -f "$dest" ] && ! copy_mode "$dest" "$TMPFILE"; then
     say "failed to write $dest"
     exit 6
   fi
@@ -225,7 +255,11 @@ fi
 # ------------------------------------------- 3. slug + native derivations ----
 
 SLUG=${PROJECT##*/}
-SLUG=${SLUG,,}
+if [ "${BASH_VERSINFO[0]}" -ge 4 ]; then
+  SLUG=${SLUG,,}
+else
+  _lower "$SLUG"; SLUG=$LOWERED
+fi
 SLUG=${SLUG//[^a-z0-9]/-}
 while [[ $SLUG == *--* ]]; do SLUG=${SLUG//--/-}; done
 while [ -n "$SLUG" ] && [ "${SLUG:0:1}" = '-' ]; do SLUG=${SLUG#-}; done
@@ -245,6 +279,17 @@ check_safe "$STORE"
 check_safe "$VSTORE"
 if [ "$STORE" = "$VSTORE" ]; then
   die_usage "--store and --virtual-store must be different paths: $STORE"
+fi
+
+# After the path checks, so an unsafe explicit path is reported as such.
+# /root is the SANDBOX container's own overlay storage, which is the whole
+# point of this script. On a host it names nothing useful (macOS: read-only
+# system volume; Git for Windows: a directory under Program Files), so a
+# default that would actually be used outside the sandbox is a usage error,
+# not a half-written configuration.
+if [ "$NATIVE_ROOT_SET" = 0 ] && { [ "$STORE_SET" = 0 ] || [ "$VSTORE_SET" = 0 ]; } \
+   && [ "${IS_SANDBOX:-}" != 1 ]; then
+  die_usage "the default --native-root /root is the sandbox container's storage; outside the sandbox pass --native-root (or both --store and --virtual-store)"
 fi
 
 # ------------------------------------------------------- 5. pnpm required ----
