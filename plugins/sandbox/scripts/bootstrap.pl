@@ -113,6 +113,9 @@ my $PROJECT_PATH;
 $PROJECT_PATH //= Cwd::getcwd();
 $PROJECT_PATH = abs_path($PROJECT_PATH)
     or die "ERROR: cannot resolve project path\n";
+# Same canonicalisation as launcher.pl (case-insensitive APFS; no-op elsewhere),
+# so both scripts write under the one spelling of the project path.
+$PROJECT_PATH = HostPlatform::canonical_dir($PROJECT_PATH);
 $PROJECT_PATH =~ s|\\|/|g;
 $PROJECT_PATH =~ s|/+$||;
 $PROJECT_PATH = winify_path($PROJECT_PATH);

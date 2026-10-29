@@ -3,7 +3,9 @@ package HostPlatform;
 # the container-test harness used to make separately, each with its own copy:
 #
 #   * which container CLI to drive (and the CCPRAXIS_CONTAINER_CLI override);
-#   * what to tell an operator whose runtime is missing.
+#   * what to tell an operator whose runtime is missing;
+#   * the case-canonical spelling of a directory on a case-insensitive
+#     filesystem (APFS).
 #
 # WHY ONE MODULE. The CLI detection was three verbatim copies (launcher.pl,
 # bootstrap.pl, tests/lib/TestSandbox.pm) that all preferred docker. On macOS
@@ -21,6 +23,7 @@ package HostPlatform;
 # probes.
 use strict;
 use warnings;
+use Cwd ();
 
 our $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/ ? 1 : 0;
 our $DARWIN         = $^O eq 'darwin' ? 1 : 0;
@@ -115,6 +118,32 @@ sub no_cli_message {
         "       Install podman or docker with your package manager and re-run.",
         "       To use a CLI under another name or path, set $var.",
     );
+}
+
+# canonical_dir($path) -> $path spelled with the case the filesystem stores.
+#
+# APFS is case-insensitive, so `cd ~/projects/foo` works for a directory named
+# ~/Projects/foo -- and Cwd::abs_path keeps the TYPED case on macOS. Every
+# identity the launcher derives from the project path (the container name's
+# hash, the claude-home location it reports, the host session directory that
+# Claude Code itself names from getcwd()) would then differ between two
+# spellings of one directory. getcwd() after a chdir reports the stored case,
+# so that is the canonical form.
+#
+# darwin only; everywhere else, and for anything that is not a directory we
+# can enter, the input is returned unchanged. The caller's working directory
+# is restored before returning.
+sub canonical_dir {
+    my ($p, %o) = @_;
+    my $os = defined $o{os} ? $o{os} : $^O;
+    return $p unless $os eq 'darwin';
+    return $p unless defined $p && !ref $p && length $p && -d $p;
+    my $orig = Cwd::getcwd();
+    return $p unless defined $orig && length $orig;
+    chdir($p) or return $p;
+    my $canon = Cwd::getcwd();
+    chdir($orig);
+    return (defined $canon && length $canon) ? $canon : $p;
 }
 
 1;

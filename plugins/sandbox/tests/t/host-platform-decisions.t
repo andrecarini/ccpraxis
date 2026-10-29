@@ -9,13 +9,15 @@
 #      CCPRAXIS_CONTAINER_CLI is the only candidate when set.
 #   B. the no-CLI message is platform-aware: a Mac is told how to install
 #      podman and create its machine, not sent to Docker Desktop.
+#   C. canonical_dir: the stored case of a directory on APFS (darwin only).
 #   E. TestSandbox with no container CLI: a clean skip_all, not a load-time die.
 use strict;
 use warnings;
 use FindBin qw($Bin);
 use lib "$Bin/../../scripts";
 use Test::More;
-use File::Temp qw(tempfile);
+use File::Temp qw(tempdir tempfile);
+use Cwd ();
 use HostPlatform ();
 
 # ---------------------------------------------------------------------------
@@ -85,6 +87,26 @@ is_deeply([HostPlatform::cli_candidates('linux')], ['docker', 'podman'],
     my $win = join "\n", HostPlatform::no_cli_message('cygwin');
     like($win, qr/Docker Desktop.*Podman Desktop/s, 'B: Windows no-CLI message is the established wording');
 
+}
+
+# ---------------------------------------------------------------------------
+# C. canonical_dir
+# ---------------------------------------------------------------------------
+{
+    my $root = tempdir(CLEANUP => 1);
+    mkdir "$root/CamelDir" or die "mkdir: $!";
+    my $cwd_before = Cwd::getcwd();
+    is(HostPlatform::canonical_dir("$root/cameldir", os => 'linux'), "$root/cameldir",
+        'C: canonical_dir is a no-op off darwin');
+    is(HostPlatform::canonical_dir("$root/nope", os => 'darwin'), "$root/nope",
+        'C: a path that is not a directory comes back unchanged');
+  SKIP: {
+        skip 'C: APFS case canonicalisation only measurable on darwin', 2 unless $^O eq 'darwin';
+        my $stored = do { chdir "$root/CamelDir" or die; my $c = Cwd::getcwd(); chdir $cwd_before; $c };
+        is(HostPlatform::canonical_dir("$root/cameldir"), $stored,
+            'C: darwin: a case-mismatched spelling resolves to the stored case');
+        is(Cwd::getcwd(), $cwd_before, 'C: ...and the caller\'s working directory is restored');
+    }
 }
 
 # ---------------------------------------------------------------------------

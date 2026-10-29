@@ -95,9 +95,16 @@ sub _have_container_cli {
 }
 
 my $anchor = '$PROJECT_PATH = winify_path($PROJECT_PATH);';
+my $WINDOWS_HOST = $^O =~ /^(MSWin32|cygwin|msys)$/;
 
 SKIP: {
-    skip 'neither docker nor podman is on PATH (launcher.pl refuses to start without one)', 3
+    # Drive letters exist only on a Windows host: on macOS/Linux abs_path
+    # returns /Users/... or /home/..., there is no drive to upper-case, and
+    # Part 2's assertion has nothing to measure. The darwin counterpart (case
+    # canonicalisation on APFS) is Part 2b below.
+    skip 'Part 2/3 pin a drive-letter fix and drive letters exist only on a Windows host', 7
+        unless $WINDOWS_HOST;
+    skip 'neither docker nor podman is on PATH (launcher.pl refuses to start without one)', 7
         unless _have_container_cli();
 
     open my $fh, '<', $launcher or BAIL_OUT("cannot read $launcher: $!");
@@ -179,6 +186,47 @@ SKIP: {
             }
         }
     }
+}
+
+# =====================================================================
+# Part 2b (darwin) -- the same sliced prefix, against a case-MISMATCHED
+# spelling of a real directory. APFS is case-insensitive, so the mismatched
+# spelling resolves; Cwd::abs_path keeps the typed case on macOS, and Claude
+# Code names its host session directory from getcwd(), which reports the
+# STORED case. launcher.pl must hand on the stored case, or the container name
+# (hashed from this path) and the host-session lookup both depend on how the
+# operator happened to type the path.
+# =====================================================================
+SKIP: {
+    skip 'APFS case canonicalisation is darwin-only', 3 unless $^O eq 'darwin';
+    skip 'neither docker nor podman is on PATH (launcher.pl refuses to start without one)', 3
+        unless _have_container_cli();
+
+    open my $fh, '<', $launcher or BAIL_OUT("cannot read $launcher: $!");
+    my $src = do { local $/; <$fh> };
+    close $fh;
+    my $pos = index($src, $anchor);
+    skip 'cannot locate the winify_path call site -- launcher.pl source changed shape', 3 if $pos < 0;
+    my $prefix = substr($src, 0, $pos + length($anchor))
+               . "\nprint \"PROJECT_PATH=\$PROJECT_PATH\\n\";\n1;\n";
+    my ($slice_fh, $slice_path) = tempfile(SUFFIX => '.pl', UNLINK => 1);
+    print {$slice_fh} $prefix;
+    close $slice_fh;
+
+    my $root = tempdir(CLEANUP => 1);
+    mkdir "$root/MixedCase" or die "mkdir: $!";
+    mkdir "$root/MixedCase/SubDir" or die "mkdir: $!";
+    my $stored = do { require Cwd; my $o = Cwd::getcwd(); chdir "$root/MixedCase/SubDir" or die; my $c = Cwd::getcwd(); chdir $o; $c };
+    my $typed  = "$root/mixedcase/subdir";
+    ok(-d $typed, 'fixture: the lower-cased spelling resolves on this case-insensitive volume');
+
+    my $cmd = sprintf('"%s" -I"%s" "%s" "%s" 2>&1', $^X, $scripts_dir, $slice_path, $typed);
+    my $output = `$cmd`;
+    my ($captured) = $output =~ /PROJECT_PATH=(.*)$/m;
+    ok(defined $captured, 'sliced launcher.pl prefix printed a resolved PROJECT_PATH for the mismatched spelling')
+        or diag("command: $cmd\noutput:\n$output");
+    is($captured, $stored,
+       'launcher.pl resolves a case-mismatched project path to the case the filesystem stores');
 }
 
 # =====================================================================

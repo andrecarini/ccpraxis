@@ -486,6 +486,12 @@ if (length $RESUME_SESSION
 my $PROJECT_PATH = @POSITIONAL ? $POSITIONAL[0] : Cwd::getcwd();
 $PROJECT_PATH = abs_path($PROJECT_PATH)
     or die "ERROR: cannot resolve project path '$POSITIONAL[0]'\n";
+# APFS is case-insensitive and abs_path keeps the TYPED case on macOS, so
+# `claude-sandbox ~/projects/foo` and `claude-sandbox ~/Projects/foo` would
+# name two containers (the name hashes this path) and look for host sessions
+# under a directory Claude Code never wrote (it names them from getcwd(), which
+# reports the stored case). canonical_dir is a no-op off darwin.
+$PROJECT_PATH = HostPlatform::canonical_dir($PROJECT_PATH);
 $PROJECT_PATH =~ s|\\|/|g;
 $PROJECT_PATH =~ s|/+$||;
 # f15e: Cwd::abs_path() on this host hands back a lowercase-drive POSIX path
