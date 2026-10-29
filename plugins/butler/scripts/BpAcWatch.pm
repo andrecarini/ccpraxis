@@ -273,13 +273,16 @@ sub probe_source {
         $line = lc($line);
         return ($line eq 'ac' || $line eq 'dc' || $line eq 'unknown') ? $line : 'unknown';
     }
-    return _probe_darwin() if $^O eq 'darwin';
     my $ok = eval {
         require "$DIR/BpPowerJournal.pm" unless defined &BpPowerJournal::probe_argv;
         1;
     };
     return 'unknown' unless $ok;
+    # The PowerShell probe first, whenever it is available (it never is on a
+    # Mac: probe_argv answers undef without powershell.exe); macOS's pmset
+    # read otherwise.
     my $argv = eval { BpPowerJournal::probe_argv() };
+    return _probe_darwin() if ref $argv ne 'ARRAY' && $^O eq 'darwin';
     return 'unknown' unless ref $argv eq 'ARRAY';
     my $r = eval { BpPowerJournal::run_bounded($argv, $BpPowerJournal::PROBE_TIMEOUT_SECONDS) };
     return 'unknown' unless ref $r eq 'HASH' && defined $r->{status} && $r->{status} eq 'ok';
