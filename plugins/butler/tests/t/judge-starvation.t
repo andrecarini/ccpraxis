@@ -900,11 +900,16 @@ sub pid_gone_within {
     my ($pid, $secs) = @_;
     # A killed-but-unreaped child is a zombie: plain kill(0,...) still reports
     # it as present, so use the same zombie-aware liveness check production
-    # uses (BpOrch::pid_alive) rather than a raw signal probe.
+    # uses (BpOrch::pid_alive) rather than a raw signal probe. That check
+    # reads /proc, which macOS does not have (it falls back to kill(0) there,
+    # so a zombie looks alive) -- and the dummy is OUR child, so reaping it is
+    # the direct, OS-independent proof that it died.
     for (1 .. int($secs*20)) {
+        return 1 if waitpid($pid, POSIX::WNOHANG()) == $pid;
         return 1 unless BpOrch::pid_alive($pid);
         select(undef, undef, undef, 0.05);
     }
+    return 1 if waitpid($pid, POSIX::WNOHANG()) == $pid;
     return !BpOrch::pid_alive($pid);
 }
 # Best-effort cleanup: never leave a sleeping dummy behind, whether or not the
@@ -1003,7 +1008,14 @@ sub reap_dummy {
 # ENOSPC -- no need for an actually-full disk or a root-defeating chmod.
 # ---------------------------------------------------------------------------
 {
-    ok(-e '/dev/full', 'ITEM 14b: precondition -- /dev/full exists on this host (ENOSPC simulator)');
+    # /dev/full exists on Linux and in the Cygwin/MSYS layer; macOS has none.
+    # Without it there is no ENOSPC to simulate, so on macOS the negative half
+    # below is skipped rather than run against a dangling symlink (whose open
+    # fails first, which is a different path than the one under test).
+    my $have_full = -e '/dev/full';
+    if ($^O ne 'darwin') {
+        ok($have_full, 'ITEM 14b: precondition -- /dev/full exists on this host (ENOSPC simulator)');
+    }
 
     # Positive first: an ordinary call actually marks inflight (proves the
     # sub still works at all before we go looking for its failure path).
@@ -1017,6 +1029,8 @@ sub reap_dummy {
     # path is deterministic ("$f.tmp.$$") since this call runs in-process (no
     # fork), so $$ is known ahead of time -- pre-seed a symlink there
     # pointing at /dev/full before calling the sub.
+    SKIP: {
+    skip 'ITEM 14b: no /dev/full on this host to simulate ENOSPC with', 3 unless $have_full;
     make_path("$dir/runs/harvest");
     my $f   = BpOrch::judge_inflight_path("$dir/runs", 'harvest', 'bad');
     my $tmp = "$f.tmp.$$";
@@ -1025,6 +1039,7 @@ sub reap_dummy {
     is($rc, 0, 'ITEM 14b: mark_judge_inflight returns 0 when the write fails at print/close (ENOSPC), not just open/rename');
     ok(!-e $f, 'ITEM 14b: no zero-length marker was renamed into place -- the live path does not exist at all');
     ok(!-e $tmp && !-l $tmp, 'ITEM 14b: the tmp symlink was cleaned up (unlinked), not left behind');
+    }
 }
 
 # ---------------------------------------------------------------------------
