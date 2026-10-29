@@ -467,6 +467,13 @@ sub write_git_stub {
     my ($scratch) = @_;
     write_text("$scratch/git-stub.pl", $GIT_STUB_PL);
     write_text("$scratch/git-stub.cmd", $GIT_STUB_CMD);
+    # Off Windows a .cmd file is not executable at all (the shell reads
+    # "@echo off" as a command and every git verb fails), so the wrapper is
+    # the perl script itself, run through its shebang.
+    unless ($^O eq q{MSWin32} || $^O eq q{cygwin} || $^O eq q{msys}) {
+        chmod 0755, "$scratch/git-stub.pl";
+        return "$scratch/git-stub.pl";
+    }
     return "$scratch/git-stub.cmd";
 }
 
@@ -1640,9 +1647,15 @@ sub remote_head_sha {
 # pushed:1. Repeated with a non-ASCII home and a non-ASCII file name to
 # prove the whole path survives (message, notes, checkpoint JSON).
 # ===========================================================================
+# APFS (macOS) refuses a file name that is not valid UTF-8 (EILSEQ, "Illegal
+# byte sequence"), so the lone Latin-1 \xE9 byte cannot even be created
+# there; on darwin the same e-acute is spelled as its UTF-8 bytes, which is
+# also how a real non-ASCII macOS home reaches perl. Every other host keeps
+# the original single-byte fixture.
+my $AC24_EACUTE = $^O eq q{darwin} ? "\xc3\xa9" : "\x{e9}";
 for my $variant (
     { label => 'plain',    machine_name => 'host',       file => 'export-marker.txt',   content => "new content\n" },
-    { label => 'non-ASCII', machine_name => "host-Andr\x{e9}", file => "caf\x{e9}-notes.txt", content => "Andr\x{e9} was here\n" },
+    { label => q{non-ASCII}, machine_name => "host-Andr$AC24_EACUTE", file => "caf${AC24_EACUTE}-notes.txt", content => "Andr$AC24_EACUTE was here\n" },
 ) {
     my $r = setup_root(with_origin => 1, machine_name => $variant->{machine_name});
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });

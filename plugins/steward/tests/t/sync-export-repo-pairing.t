@@ -108,6 +108,13 @@ sub write_git_stub {
     my ($scratch) = @_;
     write_text("$scratch/git-stub.pl", $GIT_STUB_PL);
     write_text("$scratch/git-stub.cmd", $GIT_STUB_CMD);
+    # Off Windows a .cmd file is not executable at all (the shell reads
+    # "@echo off" as a command and every git verb fails), so the wrapper is
+    # the perl script itself, run through its shebang.
+    unless ($^O eq q{MSWin32} || $^O eq q{cygwin} || $^O eq q{msys}) {
+        chmod 0755, "$scratch/git-stub.pl";
+        return "$scratch/git-stub.pl";
+    }
     return "$scratch/git-stub.cmd";
 }
 
