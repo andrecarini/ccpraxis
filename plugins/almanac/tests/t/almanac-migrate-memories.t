@@ -185,6 +185,12 @@ sub fresh_home {
     $base =~ s{\\}{/}g;
     $leaf = "Andr\x{e9}-home-" . (++$HOME_SEQ) unless defined $leaf;
     my $home = "$base/$leaf";
+    # APFS (macOS) refuses a file name that is not valid UTF-8 (EILSEQ). The
+    # "\x{e9}" above is stored as the single byte 0xE9, which is what perl hands
+    # the filesystem, so on darwin the path is utf8::upgrade'd: the same
+    # characters, now stored and handed over as UTF-8 bytes, which is what a
+    # real macOS path is. Elsewhere the byte form is kept as it was.
+    utf8::upgrade($home) if $^O eq 'darwin';
     mkdir($home) or die "fixture: cannot mkdir $home: $!";
     make_path("$home/.claude") or die "fixture: cannot mkdir $home/.claude: $!";
     _register_temp_root($home);
@@ -200,6 +206,7 @@ sub fresh_root {
     $base =~ s{\\}{/}g;
     $leaf = "root-" . (++$ROOT_SEQ) unless defined $leaf;
     my $root = "$base/$leaf";
+    utf8::upgrade($root) if $^O eq 'darwin';   # see fresh_home
     mkdir($root) or die "fixture: cannot mkdir $root: $!";
     _register_temp_root($root);
     return $root;
@@ -933,7 +940,11 @@ sub snapshot_tree {
     # solely to observe the warning + exit code.
     my $r = run_migrate('plan', home => $HOME);
     is($r->{rc}, 0, 'AC-10: a missing registered root does not fail the run') or diag("stderr: $r->{err}");
-    like($r->{err}, qr/^migrate: root_missing: \Q$missing_root\E\s*$/m,
+    # The script names the root in its canonical (abs_path) spelling. On macOS
+    # File::Temp's /var/... is a symlink into /private/var/..., so accept
+    # either spelling of the same missing directory.
+    my $missing_canon = Cwd::abs_path($missing_root) // $missing_root;
+    like($r->{err}, qr/^migrate: root_missing: (?:\Q$missing_root\E|\Q$missing_canon\E)\s*$/m,
         'AC-10: STDERR carries exactly the "migrate: root_missing: <R>" warning line');
 }
 
