@@ -2232,13 +2232,20 @@ sub _fast_ascii_escape_decode {
     return undef unless defined $raw && length $raw;
     my $esc = $raw;
     my $bad = 0;
+    # One _utf8_seq_escape call per DISTINCT sequence, not per occurrence:
+    # real text repeats a handful of non-ASCII characters, and the sub call
+    # was a third of the non-ASCII decode cost (1 MiB of U+00E9: 0.18s of
+    # 0.83s on macOS perl 5.34, which put worker-bash-hygiene.t AC-58's
+    # 4x-of-ASCII ratio at 4.06). The output is identical: a bad sequence
+    # still sets $bad on its first occurrence, which is all the caller reads.
+    my %memo;
     $esc =~ s{
         ( [\xC2-\xDF][\x80-\xBF]
         | [\xE0-\xEF][\x80-\xBF]{2}
         | [\xF0-\xF4][\x80-\xBF]{3}
         )
     }{
-        _utf8_seq_escape($1, \$bad)
+        $memo{$1} //= _utf8_seq_escape($1, \$bad)
     }gex;
     return undef if $bad;
     # A stray/malformed byte that never matched the pattern above (a lone
