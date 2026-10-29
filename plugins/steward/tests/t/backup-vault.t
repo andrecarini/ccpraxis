@@ -566,6 +566,12 @@ sub scenario_env {
     my %env = (
         HOME                   => $r->{home},
         USERPROFILE            => $r->{home},
+        # The machine HOME's own hermetic .gitconfig (make_machine), not
+        # whatever GIT_CONFIG_GLOBAL the caller inherited: scripts/run-tests.pl
+        # points that at a copy of the operator's real ~/.gitconfig, which
+        # need not carry an identity (this Mac's does not), and then the
+        # real-git vault commits in AC6/AC17 fail with "git commit failed".
+        GIT_CONFIG_GLOBAL      => "$r->{home}/.gitconfig",
         BACKUP_RUN_STATE       => $r->{state_path},
         BACKUP_PHASE_DIR       => $r->{phase_dir},
         VAULT_TEST_LOG         => $r->{log_path},

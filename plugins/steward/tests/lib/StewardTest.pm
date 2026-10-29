@@ -151,13 +151,24 @@ sub temproot {
         $base =~ s|\\|/|g;
         $base =~ s|^([a-zA-Z]):/|"/" . lc($1) . "/"|e;
     } else {
-        # Fallthrough tail, unchanged from before this package: only
-        # reached when scratch_root() is undef (non-Windows, no override).
+        # Fallthrough tail: only reached when scratch_root() is undef
+        # (non-Windows, no override). A candidate that IS, or sits inside,
+        # the current $HOME is skipped: scenarios here check that the HOME
+        # they started under never leaks into produced paths (backup-closeout
+        # AC27), and a scratch tree inside that HOME makes every scratch path
+        # a "leak". scripts/run-tests.pl points TEMP/TMP at the per-file
+        # sandbox HOME off Windows (on Windows TEMP is a separate tree), so
+        # under the runner this lands on /tmp exactly as a standalone run does.
+        my $home_real = (defined $ENV{HOME} && length $ENV{HOME}) ? (abs_path($ENV{HOME}) // $ENV{HOME}) : undef;
         for my $cand ($ENV{TEMP}, $ENV{TMP}, '/tmp') {
             next unless defined $cand && length $cand;
             my $p = $cand;
             $p =~ s|\\|/|g;
             $p =~ s|^([a-zA-Z]):/|"/" . lc($1) . "/"|e;
+            if (defined $home_real && -d $p) {
+                my $p_real = abs_path($p) // $p;
+                next if $p_real eq $home_real || index("$p_real/", "$home_real/") == 0;
+            }
             if (-d $p && -w $p) { $base = $p; last; }
         }
         die "StewardTest: no writable temp base found\n" unless $base;
