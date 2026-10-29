@@ -1013,8 +1013,19 @@ SKIP: {
     # =================================================================================
     # AC-31 [M9] fail-CLOSED with jq missing from PATH. M9's text is verbatim the old shared bash guard library --
     # emitted by bp_hook_require_jq, never reimplemented.
+    #
+    # AC-31 and AC-32 are RETIRED (macOS port, 2026-10-29), and skipped on every host. Both pin
+    # the bash implementation's plumbing, which the hook-core remake replaced: ledger-guard.sh
+    # now execs run-hook.sh and WriteGuards.pm, which never call jq (guards-remake-bash.t lists
+    # "jq-availability plumbing" as LIB, not re-expressed), and run-hook.sh exits 0 when perl
+    # cannot be started -- deliberately, every hook path fails open there, pinned by
+    # hook-core-spawn-budget.t S5f ("PATH with only the bash shim (no perl) -> exit 0"). The two
+    # cases could only run where jq is installed, so the Windows host never saw them fail; on
+    # macOS they did, against the newer oracle's own contract.
     # =================================================================================
-    {
+    SKIP: {
+        skip 'AC-31 pins the retired bash plumbing: the remake never calls jq '
+           . '(guards-remake-bash.t, jq-availability plumbing | LIB)', 2;
         my ($bp, $proj) = mk_bp();
         my %env = env_for($bp, $proj);
         $env{PATH} = path_without('jq');
@@ -1024,9 +1035,11 @@ SKIP: {
     }
 
     # =================================================================================
-    # AC-32 [M10] fail-CLOSED with perl missing from PATH.
+    # AC-32 [M10] fail-CLOSED with perl missing from PATH. RETIRED with AC-31, see above.
     # =================================================================================
-    {
+    SKIP: {
+        skip 'AC-32 pins the retired bash plumbing: run-hook.sh fails open without perl by design '
+           . '(hook-core-spawn-budget.t S5f)', 3;
         my ($bp, $proj) = mk_bp();
         my %env = env_for($bp, $proj);
         $env{PATH} = path_without('perl');

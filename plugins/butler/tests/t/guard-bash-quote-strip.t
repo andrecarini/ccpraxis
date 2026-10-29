@@ -231,9 +231,17 @@ SKIP: {
         # On a host with real jq this runs exactly as before. Skipping is
         # honest; asserting 2 here would be asserting something the harness,
         # not the hook, determines.
-        skip 'jq is shimmed with perl, so removing perl from PATH also removes the '
-           . 'JSON parser; this case needs a real jq', 1
-            unless $HAVE_REAL_JQ;
+        #
+        # RETIRED on every host since the hook-core remake (macOS port,
+        # 2026-10-29). guard-bash.sh now execs run-hook.sh, which exits 0
+        # when perl cannot be started -- deliberately: every hook fails open
+        # there (hook-core-spawn-budget.t S5f), and guards-remake-bash.t
+        # lists this file's jq/perl-availability plumbing as LIB, not
+        # re-expressed. There is no bash-side raw matcher left to degrade to.
+        # The real-jq gate kept this off the Windows host; macOS has jq, ran
+        # it, and got the remake's documented 0.
+        skip 'AC17 pins the retired bash guard (raw-match deny without perl); the remake '
+           . 'fails open without perl by design (hook-core-spawn-budget.t S5f)', 1;
         my $noperl = path_without('perl');
         my ($rc, $out) = run_guard(q{perl x.pl --text "don't run git checkout"}, PATH => $noperl);
         is($rc, 2, 'AC17: with perl unavailable, the quoted-mention case DEGRADES to raw-match DENY '
