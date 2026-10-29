@@ -66,8 +66,49 @@ set -u
 # no external command. -N is the buffered form, required on a non-tty. Any
 # read status (timeout, short read, EOF) is tolerated; an empty payload just
 # fails open below.
-IFS= read -r -N 8388608 -t 10 P
+#
+# "read -N" arrived in bash 4.1. Stock macOS /bin/bash is 3.2, where -N is an
+# invalid option (rc 2, nothing read), so this guard silently allowed every
+# write there. An older bash reads with -d '' instead: still a builtin, still
+# bounded by -t, but it reads byte by byte (measured ~0.35s per MiB on macOS),
+# so bash >= 4.1 keeps -N. Same gate as butler's run-hook.sh. P starts empty
+# so `set -u` can never trip on it, whatever read does.
+P=''
+_ALM_BASH4=0
+[ "${BASH_VERSINFO[0]:-0}" -ge 4 ] && _ALM_BASH4=1
+_alm_read_n=0
+[ "${BASH_VERSINFO[0]:-0}" -gt 4 ] && _alm_read_n=1
+[ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 1 ] && _alm_read_n=1
+if [ "$_alm_read_n" -eq 1 ]; then
+  IFS= read -r -N 8388608 -t 10 P
+else
+  IFS= read -r -d '' -t 10 P
+fi
 [ -n "${P:-}" ] || exit 0
+
+# _alm_has_marker TEXT -> 0 when TEXT holds either root's literal, a store
+# segment's 8.3 short-name prefix, or a store leaf name (see Stage 1 for
+# why each is there). Case-insensitive via the nocasematch set below.
+_alm_has_marker() {
+  case "$1" in
+    *ccpraxis-local-data*|*claude-code-vault*|*'ccprax~'*|*'claude~'*|*bug-reports*|*almanac*|*code-vault*) return 0 ;;
+  esac
+  return 1
+}
+
+# _alm_unquoted TEXT -> sets ALM_UNQUOTED to TEXT with every ', " and \
+# removed. bash >= 4 does it with the ${x//pattern/} builtin (no spawn, which
+# the Windows latency budget needs). bash 3.2's pattern substitution is
+# super-linear: measured 1.6s on a 3 KB payload and 66s on a 10 KB one, past
+# every hook timeout, so 3.2 pipes through tr instead -- one cheap spawn on
+# a host (macOS) where process creation costs a few milliseconds.
+_alm_unquoted() {
+  if [ "$_ALM_BASH4" -eq 1 ]; then
+    ALM_UNQUOTED=${1//[\'\"\\]/}
+  else
+    ALM_UNQUOTED=$(printf '%s' "$1" | LC_ALL=C tr -d "\\\\'\"")
+  fi
+}
 
 # Stage 1: the prefilter. A case-insensitive bash builtin match for either
 # root's literal substring, OR the 8.3 short-name PREFIX either store
@@ -100,10 +141,12 @@ shopt -s nocasematch
 # stripped copy tested as well. Matching only `$P` left the strip at :122
 # dead code for Stage 1's own purposes, since Stage 1 already exited above
 # it on a miss. Builtins only; can only add perl spawns, never remove a deny.
-case "$P${P//[\'\"\\]/}" in
-  *ccpraxis-local-data*|*claude-code-vault*|*'ccprax~'*|*'claude~'*|*bug-reports*|*almanac*|*code-vault*) ;;
-  *) exit 0 ;;
-esac
+# The stripped copy is only built when the raw text misses: it can only add a
+# hit, so a raw hit already settles Stage 1.
+if ! _alm_has_marker "$P"; then
+  _alm_unquoted "$P"
+  _alm_has_marker "$ALM_UNQUOTED" || exit 0
+fi
 
 # Stage 1b (Bash only, builtins only, spawns nothing). Narrows the trigger
 # to the two fields that can actually name a write target -- tool_input.
@@ -126,12 +169,12 @@ if [[ $P =~ $RE_TOOL_IS_BASH ]]; then
     # S5/B1: a quote injected mid-literal (`.ccpraxis-local-"data"`) or a
     # backslash before a path separator defeats a literal substring match
     # even though the two would be the SAME path once the shell strips
-    # them. Also test a quote/backslash-stripped copy, builtins only.
-    STRIPPED1B=${COMBINED1B//[\'\"\\]/}
-    case "$COMBINED1B$STRIPPED1B" in
-      *ccpraxis-local-data*|*claude-code-vault*|*'ccprax~'*|*'claude~'*|*bug-reports*|*almanac*|*code-vault*) ;;
-      *) exit 0 ;;
-    esac
+    # them. Also test a quote/backslash-stripped copy (builtins only on
+    # bash >= 4; see _alm_unquoted for 3.2).
+    if ! _alm_has_marker "$COMBINED1B"; then
+      _alm_unquoted "$COMBINED1B"
+      _alm_has_marker "$ALM_UNQUOTED" || exit 0
+    fi
   fi
 fi
 
@@ -1210,10 +1253,17 @@ fi
 
 # kind == store — the verb map, keyed by lc(type). ${TYPE,,} is a bash
 # builtin (no extra process on the deny path, unlike a printf|tr pipeline).
+# It is bash 4 syntax, though: macOS /bin/bash 3.2 aborts on it ("bad
+# substitution", exit 1, a non-blocking hook error), so a store deny there
+# let the write through. 3.2 pays the tr instead.
 # LEGACY_INBOX_TYPE is the unmigrated store dir's own name (blueprint
 # where-things-go, package 01-inbox-rename): a write into an unmigrated
 # legacy dir is still denied and points at the live script.
-TYPE_LC=${TYPE,,}
+if [ "$_ALM_BASH4" -eq 1 ]; then
+  TYPE_LC=${TYPE,,}
+else
+  TYPE_LC=$(printf '%s' "$TYPE" | LC_ALL=C tr 'A-Z' 'a-z')
+fi
 LEGACY_INBOX_TYPE=decision
 case "$TYPE_LC" in
   todo)        SCRIPT="almanac-todo.pl";     VERBS="create | edit | complete | reopen | delete" ;;

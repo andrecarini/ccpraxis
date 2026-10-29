@@ -9,8 +9,9 @@
 # almanac-thread.pl now.
 #
 # Bash builtins only -- no external command-line JSON tool, no capturing
-# stdin through a subshell cat, no delimiter-based read. Reads stdin once, in
-# bulk, with a bounded builtin read, and extracts the FIRST unescaped
+# stdin through a subshell cat, and no delimiter-based read on any bash that
+# has "read -N" (4.1+; the 3.2 fallback below is the one exception). Reads
+# stdin once, in bulk, with a bounded builtin read, and extracts the FIRST unescaped
 # "tool_name" via a bash regex rather than parsing JSON. Fails OPEN on any
 # unexpected condition: empty stdin, a read timeout, no match, or a name
 # that is not one of the four denied tools all exit 0 with no output.
@@ -22,8 +23,18 @@
 # the word is emitted, at runtime, in the message a denied call sees.
 set -u
 
+# "read -N" is bash >= 4.1. On macOS /bin/bash 3.2 it is an invalid option
+# that reads nothing, so every Tasks call was silently allowed there; an
+# older bash reads with -d '' instead (builtin, bounded by -t, byte by byte).
 PAYLOAD=''
-IFS= read -r -N 8388608 -t 10 PAYLOAD || true
+_read_n=0
+[ "${BASH_VERSINFO[0]:-0}" -gt 4 ] && _read_n=1
+[ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 1 ] && _read_n=1
+if [ "$_read_n" -eq 1 ]; then
+    IFS= read -r -N 8388608 -t 10 PAYLOAD || true
+else
+    IFS= read -r -d '' -t 10 PAYLOAD || true
+fi
 [ -n "$PAYLOAD" ] || exit 0
 
 if [[ $PAYLOAD =~ \"tool_name\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9_]+)\" ]]; then

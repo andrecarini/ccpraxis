@@ -246,6 +246,14 @@ for my $case (
         unlike($src, qr/perl/i, 'G-5: no "perl" anywhere in guard-tasks-tool.sh');
         ok(index($src, '$(cat') == -1, 'G-5: no $(cat');
         ok(index($src, 'read -d') == -1, 'G-5: no read -d');
+        # bash 3.2 (stock macOS) has no "read -N", so the guard falls back to
+        # a NUL-delimited read there. That fallback is the only delimiter read
+        # allowed: never a real delimiter (it would cut the payload short),
+        # and only in the else-branch after the -N read bash >= 4.1 takes.
+        my @delims = ($src =~ /^[^#\n]*\bread\b[^\n]*?\s-d\s+(\S+)/mg);
+        is_deeply([grep { $_ ne q{''} } @delims], [], q{G-5: every delimiter read uses -d '' (to EOF), never a real delimiter});
+        like($src, qr/read -r -N 8388608[^\n]*\n\s*else\s*\n[^\n]*read -r -d ''/,
+             q{G-5: the -d '' read is only the else-branch fallback of the -N read});
         ok(index(lc($src), 'jq') == -1, 'G-5: no jq');
     }
 }

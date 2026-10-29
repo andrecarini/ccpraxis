@@ -17,7 +17,19 @@ H="${ALMANAC_HOME:-${HOME:-$USERPROFILE}}"
 [ -n "$H" ] || exit 0
 case "$H" in /*|[A-Za-z]:/*) ;; *) exit 0 ;; esac
 
-IFS= read -r -N 8388608 -t 10 P
+# "read -N" is bash >= 4.1. On macOS /bin/bash 3.2 it is an invalid option:
+# nothing is read, P stays unset, and `set -u` turned the very next line into
+# an exit-1 error on EVERY PostToolUse call. An older bash reads with -d ''
+# (builtin, bounded by -t, byte by byte); P starts empty either way.
+P=''
+_read_n=0
+[ "${BASH_VERSINFO[0]:-0}" -gt 4 ] && _read_n=1
+[ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 1 ] && _read_n=1
+if [ "$_read_n" -eq 1 ]; then
+    IFS= read -r -N 8388608 -t 10 P
+else
+    IFS= read -r -d '' -t 10 P
+fi
 [ -n "$P" ] || exit 0
 
 [[ $P =~ \"hook_event_name\"[[:space:]]*:[[:space:]]*\"PostToolUse\" ]] || exit 0
