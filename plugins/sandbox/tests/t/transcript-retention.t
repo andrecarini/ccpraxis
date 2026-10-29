@@ -446,7 +446,13 @@ my $HOST_BASELINE = {
     },
     extraKnownMarketplaces => {
         'ccpraxis-local' => {
-            source => { path => 'C:/Users/André/.claude/ccpraxis/plugins', source => 'directory' },
+            # DELIBERATE DECLARATION, macOS port 2026-10-29: the payload no
+            # longer carries the Windows host's absolute path. ${CCPRAXIS_LIVE}
+            # is expanded per machine by promote.pl and folded back by the
+            # backup export (plugins/steward/scripts/MachineLocalSettings.pm),
+            # so the Windows live value stays C:/Users/André/... byte for byte
+            # while a Mac gets its own path. Pinned by machine-local-settings.t.
+            source => { path => '${CCPRAXIS_LIVE}/plugins', source => 'directory' },
         },
         'notion-plugin-marketplace' => {
             source => { repo => 'makenotion/claude-code-notion-plugin', source => 'github' },

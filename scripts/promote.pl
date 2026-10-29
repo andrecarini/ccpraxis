@@ -20,6 +20,12 @@ use File::Path qw(make_path);
 use File::Temp qw(tempfile);
 use JSON::PP qw(decode_json);
 use B ();
+# MachineLocalSettings: the settings.json values that differ per machine (the
+# ${CCPRAXIS_LIVE} marketplace path, platform-only keys). Shared with the
+# backup side -- ccpraxis-helpers.pl settings-export-merge and json-diff.pl --
+# so a promote and a backup agree on what is machine-local.
+use lib "$Bin/../plugins/steward/scripts";
+use MachineLocalSettings ();
 
 # ---------------------------------------------------------------------------
 # Usage / argument parsing
@@ -833,15 +839,40 @@ sub main {
             $bump->(2);
             $settings_status = 'error payload settings.json is not a JSON object';
         } else {
+            # Machine-local values (MachineLocalSettings.pm). Every payload
+            # object this merge looks at -- the current payload, its history
+            # and the Decision 27 baseline -- is first turned into the
+            # payload AS IT APPLIES TO THIS MACHINE: ${CCPRAXIS_LIVE} expanded
+            # to the live install being promoted into, and platform-only keys
+            # foreign to this host dropped. The live side is compared in the
+            # same form (its marketplace path re-spelled canonically, its
+            # foreign keys set aside), and those foreign keys are put back
+            # untouched at the end: promote never adds, changes or removes a
+            # key that does not apply on this host. On Windows nothing is
+            # foreign and the expanded path is the C:/ form the payload used
+            # to carry literally, so a Windows promote is unchanged.
+            my $for_this_host = sub {
+                my ($obj) = @_;
+                return $obj unless ref($obj) eq 'HASH';
+                MachineLocalSettings::expand_live_root($obj, $live_dir);
+                MachineLocalSettings::strip_foreign_platform_keys($obj);
+                return $obj;
+            };
+            $for_this_host->($payload_obj);
+            my $live_cmp = deep_clone($live_obj);
+            MachineLocalSettings::collapse_live_root($live_cmp, $live_dir);
+            MachineLocalSettings::expand_live_root($live_cmp, $live_dir);
+            my $live_foreign = MachineLocalSettings::strip_foreign_platform_keys($live_cmp);
+
             my @hist_versions = ($payload_obj);
             for my $b (payload_versions_bytes($payload_dir, $payload_ref, $relpath_settings)) {
                 my ($v, $e) = decode_json_bytes($b);
-                push @hist_versions, $v unless $e;
+                push @hist_versions, $for_this_host->($v) unless $e;
             }
             if ($mode eq 'dry-run') {
                 for my $b (payload_versions_bytes($live_dir, 'HEAD', $relpath_settings)) {
                     my ($v, $e) = decode_json_bytes($b);
-                    push @hist_versions, $v unless $e;
+                    push @hist_versions, $for_this_host->($v) unless $e;
                 }
             }
 
@@ -855,12 +886,12 @@ sub main {
                 my $bbytes = show_blob($live_dir, $baseline_sha, $relpath_settings);
                 if (defined $bbytes) {
                     my ($bobj, $berr) = decode_json_bytes($bbytes);
-                    $baseline_obj = $bobj unless $berr;
+                    $baseline_obj = $for_this_host->($bobj) unless $berr;
                 }
             }
 
             my $result = deep_clone($live_obj);
-            my @units = compute_units($live_obj, $payload_obj);
+            my @units = compute_units($live_cmp, $payload_obj);
             my $count = 0;
             for my $u (@units) {
                 my $rel = $u->{relation};
@@ -964,6 +995,11 @@ sub main {
                     }
                 }
             }
+
+            # Platform-only keys foreign to this host stay exactly as live had
+            # them, even if a whole-value unit above (an `env` replaced as one
+            # value after a dotted-key collision) would have dropped them.
+            MachineLocalSettings::restore_foreign_platform_keys($result, $live_foreign);
 
             if ($count == 0) {
                 $settings_status = 'unchanged';

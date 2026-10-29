@@ -684,6 +684,23 @@ sub cmd_settings_export_merge {
     # failure mode this subcommand exists to avoid.
     die_json(2, "Cannot parse backup preferences: $prefs_err") if $prefs_err;
 
+    # Machine-local values (MachineLocalSettings.pm). The payload is shared by
+    # every machine, so this machine's own live-install path goes back in as
+    # ${CCPRAXIS_LIVE}, never as the literal path, and the platform-only keys
+    # that do not apply on this host are taken out of the merge on both sides
+    # and put back exactly as the repo had them -- a Mac backup never adds,
+    # changes or deletes the Windows-only PowerShell switch. Required lazily:
+    # only this subcommand needs it.
+    my $repo_foreign;
+    {
+        (my $self = __FILE__) =~ s{\\}{/}g;
+        local @INC = (dirname($self), @INC);
+        require MachineLocalSettings;
+        MachineLocalSettings::collapse_live_root($live_obj, ccpraxis_dir());
+        MachineLocalSettings::strip_foreign_platform_keys($live_obj);
+        $repo_foreign = MachineLocalSettings::strip_foreign_platform_keys($repo_obj);
+    }
+
     # Pre-flight: backup the repo file before writing (in case caller hasn't).
     # Keep only the 2 most recent pre-merge backups; prune older ones so the
     # repo dir doesn't accumulate timestamped files forever.
@@ -714,6 +731,7 @@ sub cmd_settings_export_merge {
         skip_used => {},
     };
     my $merged = merge_export_level($live_obj, $repo_obj, $ctx, '', 0);
+    MachineLocalSettings::restore_foreign_platform_keys($merged, $repo_foreign);
 
     my $err = write_json_file_atomic($repo, $merged);
     die_json(2, "Cannot write merged settings: $err") if $err;

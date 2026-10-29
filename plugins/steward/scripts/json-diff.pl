@@ -2,10 +2,19 @@
 # Semantic JSON diff — compares two JSON files ignoring key order/whitespace.
 # Outputs a structured JSON report of all differences.
 #
-# Usage: perl json-diff.pl [--exclude key,...] [--deep-exclude key,...] left.json right.json
+# Usage: perl json-diff.pl [--exclude key,...] [--deep-exclude key,...] [--host-live DIR] left.json right.json
 #
 # --exclude        Remove these top-level keys before comparing
 # --deep-exclude   Recursively remove these keys from all nested objects before comparing
+# --host-live DIR  LEFT is this host's live settings.json, RIGHT the global-config
+#                  payload, DIR this host's live install. Compare them as they
+#                  apply to THIS machine (MachineLocalSettings.pm): the payload's
+#                  ${CCPRAXIS_LIVE} marketplace path is expanded to DIR (and a live
+#                  value spelling DIR differently is normalised to the same form),
+#                  and platform-only keys that do not apply on this host are
+#                  dropped from both sides. Without it, a machine whose settings
+#                  are in sync would see its own live path, and the other
+#                  platform's keys, reported as differences on every backup.
 #
 # Exit codes: 0 = identical, 1 = different, 2 = error
 use strict;
@@ -14,6 +23,8 @@ use JSON::PP;
 use Getopt::Long;
 use Encode qw(decode);
 use B ();
+use FindBin ();
+use lib $FindBin::Bin;
 
 # The output structure mixes char strings (from decode_json) with raw UTF-8 byte
 # strings (the @ARGV file paths in left/right). Normalize byte strings up to chars
@@ -52,14 +63,15 @@ sub _json_number {
     return (($f & (B::SVf_IOK | B::SVf_NOK)) && !($f & B::SVf_POK)) ? 1 : 0;
 }
 
-my (@exclude, @deep_exclude);
+my (@exclude, @deep_exclude, $host_live);
 GetOptions(
     'exclude=s'      => sub { push @exclude,      split /,/, $_[1] },
     'deep-exclude=s' => sub { push @deep_exclude, split /,/, $_[1] },
+    'host-live=s'    => \$host_live,
 ) or exit 2;
 
 unless (@ARGV == 2) {
-    print STDERR "Usage: $0 [--exclude key,...] [--deep-exclude key,...] left.json right.json\n";
+    print STDERR "Usage: $0 [--exclude key,...] [--deep-exclude key,...] [--host-live DIR] left.json right.json\n";
     exit 2;
 }
 
@@ -79,6 +91,16 @@ sub read_json {
 my ($left_path, $right_path) = @ARGV;
 my $left  = read_json($left_path);
 my $right = read_json($right_path);
+
+# --host-live: compare the live settings and the payload as they apply to this
+# machine (see the header and MachineLocalSettings.pm).
+if (defined $host_live && length $host_live) {
+    require MachineLocalSettings;
+    MachineLocalSettings::collapse_live_root($left, $host_live);
+    MachineLocalSettings::expand_live_root($left, $host_live);
+    MachineLocalSettings::expand_live_root($right, $host_live);
+    MachineLocalSettings::strip_foreign_platform_keys($_) for $left, $right;
+}
 
 # Remove top-level excluded keys
 for my $k (@exclude) {

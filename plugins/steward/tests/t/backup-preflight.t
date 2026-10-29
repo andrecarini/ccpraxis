@@ -264,9 +264,11 @@ sub write_stub_scripts {
 # the REAL scripts (byte copies), per the spec's explicit instruction. These
 # are read as "wrapped scripts the spec names explicitly", never as
 # Preflight.pm implementation detail.
+# MachineLocalSettings.pm rides along: the real json-diff.pl requires it from
+# its own directory when Preflight passes --host-live.
 sub install_real_pref_scripts {
     my ($ccpx) = @_;
-    for my $name (qw(json-diff.pl filter-diff.pl save-preference.pl)) {
+    for my $name (qw(json-diff.pl filter-diff.pl save-preference.pl MachineLocalSettings.pm)) {
         my $src = "$Bin/../../scripts/$name";
         die "AC14 fixture: real script missing: $src" unless -f $src;
         my $body = read_text($src);

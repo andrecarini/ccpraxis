@@ -165,7 +165,7 @@ my $settings_export = "$export_dir/global-config/settings.json";
 if (-f $settings_live && -f $settings_export) {
     push @results, {
         file   => 'settings.json',
-        status => json_diff_changed($settings_live, $settings_export) ? 'settings_changed' : 'identical',
+        status => json_diff_changed('--host-live', $export_dir, $settings_live, $settings_export) ? 'settings_changed' : 'identical',
         note   => 'full semantic comparison',
     };
 } elsif (-f $settings_live) {

@@ -702,7 +702,11 @@ sub _do_u7 {
     my $live_settings = "$home_n/.claude/settings.json";
     my $repo_settings = "$root/global-config/settings.json";
 
-    my $jd = _run_capture($^X, "$root/plugins/steward/scripts/json-diff.pl", $live_settings, $repo_settings);
+    # --host-live: compare as the payload applies to THIS machine -- its
+    # ${CCPRAXIS_LIVE} marketplace path expanded to this live install, other
+    # platforms' platform-only keys ignored (MachineLocalSettings.pm). Without
+    # it every in-sync machine is asked about its own path on every backup.
+    my $jd = _run_capture($^X, "$root/plugins/steward/scripts/json-diff.pl", '--host-live', $root, $live_settings, $repo_settings);
     unless ($jd->{spawned}) {
         return { failed => 'json-diff.pl failed to spawn' };
     }
