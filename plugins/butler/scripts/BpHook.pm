@@ -17,7 +17,9 @@
 # read are holder pids, written by a holder's own $$ and read back through
 # /proc/<pid>/cmdline in the SAME (MSYS) namespace. Never /proc/*/stat,
 # /proc/*/status or /proc/*/winpid; never ps -W, tasklist, taskkill or
-# Get-Process; never a WINPID compared with an MSYS pid.
+# Get-Process; never a WINPID compared with an MSYS pid. darwin has no /proc
+# and no second namespace: there, and only there, a holder pid's start time
+# comes from `ps -o lstart= -p <pid>` (start_fp).
 package BpHook;
 use strict;
 use warnings;
@@ -547,6 +549,13 @@ sub holder_live {
 # running_work (spec 38 sec 2.2): the record's pid is alive and, where
 # /proc exists, its cmdline still hashes to the record's fp, so a recycled
 # pid never reads as the holder. Same MSYS pid namespace as the writer.
+#
+# macOS has no /proc, so there the check used to be kill(0) alone, and a
+# recycled pid read as the live holder. butler-hold writes a "ps:<start>"
+# fp on darwin instead (start_fp below), and a record carrying one is
+# compared against the pid's current start time. Any other fp on darwin
+# (empty because ps failed at become, or a fixture's placeholder) keeps the
+# old kill(0) answer, as does a ps that cannot run at all.
 sub _holder_proc_alive {
     my ($h) = @_;
     return 0 unless ref $h eq 'HASH';
@@ -560,7 +569,62 @@ sub _holder_proc_alive {
         return 0 unless defined $cmdline && length $cmdline;
         return sha1_hex($cmdline) eq $fp ? 1 : 0;
     }
-    return kill(0, $pid) ? 1 : 0;
+    return 0 unless kill(0, $pid);
+    if ($^O eq 'darwin') {
+        my $fp = $h->{fp};
+        if (_is_plain_string($fp) && $fp =~ /\Aps:/) {
+            my $have = start_fp($pid);
+            return 1 unless defined $have;
+            return $have eq $fp ? 1 : 0;
+        }
+    }
+    return 1;
+}
+
+# start_fp($pid) -> "ps:<start time>" | undef. darwin's stand-in for the
+# /proc cmdline hash: `LC_ALL=C ps -o lstart= -p <pid>`, whitespace
+# collapsed, so a recycled pid (a different process, started later) never
+# matches the record its predecessor wrote. Same MSYS-free namespace as
+# everything else here: on darwin $$ and ps share one pid space.
+#
+# This is the one process this module starts, and only on the darwin
+# branch of a holder check (the Stop gate, butler-hold, the power journal),
+# never on the per-tool-call path. /bin/ps by absolute path (it is part of
+# the base system), stderr to /dev/null so a hook prints nothing, and a
+# 2-second per-pid cache so one Stop evaluation that asks holder_live and
+# running_work about the same holder pays for one ps, not three. undef when
+# ps cannot run or prints nothing (the pid is gone); undef is not cached.
+my %START_FP_CACHE;
+sub start_fp {
+    my ($pid) = @_;
+    return undef unless defined $pid && "$pid" =~ /^[1-9][0-9]{0,9}$/;
+    my $now = time();
+    my $hit = $START_FP_CACHE{$pid};
+    return $hit->[1] if $hit && $now - $hit->[0] < 2 && $now >= $hit->[0];
+    my $ps = -x '/bin/ps' ? '/bin/ps' : 'ps';
+    my $out;
+    {
+        local $?;
+        local $ENV{LC_ALL} = 'C';
+        my $kid = open(my $ph, '-|');
+        return undef unless defined $kid;
+        if (!$kid) {
+            open(STDERR, '>', '/dev/null');
+            { no warnings 'exec'; exec { $ps } 'ps', '-o', 'lstart=', '-p', "$pid"; }
+            POSIX::_exit(127);
+        }
+        local $/;
+        $out = <$ph>;
+        close $ph;
+    }
+    return undef unless defined $out;
+    $out =~ s/\s+/ /g;
+    $out =~ s/\A //;
+    $out =~ s/ \z//;
+    return undef unless length $out;
+    my $fp = "ps:$out";
+    $START_FP_CACHE{$pid} = [$now, $fp];
+    return $fp;
 }
 
 # ------------------------------------------------------------ running work -

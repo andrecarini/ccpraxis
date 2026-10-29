@@ -171,9 +171,20 @@ sub write_record_atomic {
 
 # --------------------------------------------------------------- pid/fp -----
 
+# darwin has no /proc: the fp there is this process's start time
+# (BpHook::start_fp, "ps:<lstart>"), and the liveness check is BpHook's own,
+# so a recycled pid is told apart from the holder on that host too. Without
+# it the fp was always empty there and a pid reused by any other process
+# read as a live holder -- an extend merged into nobody and the session
+# stopped unheld.
 sub compute_fp {
     my $c = read_bytes_file("/proc/$$/cmdline");
-    return (defined $c && length $c) ? sha1_hex($c) : '';
+    return sha1_hex($c) if defined $c && length $c;
+    if ($^O eq 'darwin') {
+        my $fp = BpHook::start_fp($$);
+        return $fp if defined $fp;
+    }
+    return '';
 }
 
 sub proc_alive {
@@ -184,6 +195,7 @@ sub proc_alive {
         return 0 unless defined $cmdline && length $cmdline;
         return sha1_hex($cmdline) eq $fp ? 1 : 0;
     }
+    return BpHook::_holder_proc_alive({ pid => $pid, fp => $fp }) if $^O eq 'darwin';
     return kill(0, $pid) ? 1 : 0;
 }
 
