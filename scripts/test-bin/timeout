@@ -1,4 +1,4 @@
-#!/usr/bin/env perl
+#!/usr/bin/perl
 # timeout -- a pure-perl stand-in for GNU coreutils' `timeout`, for test runs
 # on hosts that ship without it (macOS: no coreutils; BSD has no `timeout`).
 #
@@ -20,6 +20,16 @@
 # Signal delivery follows GNU: unless --foreground, timeout makes itself a
 # process-group leader and signals the whole group, so a shell COMMAND's
 # children are timed out too.
+#
+# The shebang names /usr/bin/perl (the system perl every macOS ships), not
+# `/usr/bin/env perl`, on purpose: the hook spawn-budget tests put a logging
+# `perl` shim at the front of PATH and then run `timeout N bash hook.sh`. A
+# PATH lookup here would land on that shim and count this stand-in as one of
+# the hook's own perl launches -- GNU timeout is a native binary and never
+# shows up there. The exec below runs under `no warnings 'exec'` because the
+# compile-time "Statement unlikely to be reached" warning otherwise lands on
+# the stderr of every command run through this file, and those same tests
+# assert that a hook's stderr is empty.
 use strict;
 use warnings;
 use POSIX qw(:sys_wait_h setpgid);
