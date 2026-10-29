@@ -34,6 +34,26 @@ use warnings;
 # guard cannot reach (its $0 is the .pl). CCPRAXIS_NO_WAKELOCK is the supported
 # opt-out and IS inherited across exec. Enforced by t/test-wakelock-hygiene.t.
 BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
+
+# A deterministic stand-in for a concurrent writer: while $main::MKDIR_RACE
+# names a path, the next mkdir of exactly that path creates it "from another
+# process" and then fails with EEXIST, the way the losing side of a real race
+# does. Every other mkdir passes straight through. Installed before the script
+# under test is compiled (it is required at run time below).
+our $MKDIR_RACE;
+BEGIN {
+    require Errno;
+    *CORE::GLOBAL::mkdir = sub {
+        my $d = @_ ? $_[0] : $_;
+        if (defined $main::MKDIR_RACE && $d eq $main::MKDIR_RACE) {
+            undef $main::MKDIR_RACE;
+            CORE::mkdir($d);
+            $! = Errno::EEXIST();
+            return 0;
+        }
+        return @_ > 1 ? CORE::mkdir($_[0], $_[1]) : CORE::mkdir($d);
+    };
+}
 use FindBin qw($Bin);
 use Test::More;
 use File::Temp qw(tempdir);
@@ -455,6 +475,21 @@ sub history_file {
     like($out3, qr/budget_seconds=1800\b/, 'F2: 0 is NOT treated as "unlimited" — it falls back '
                                           . 'to the default like any other invalid value');
     like(($err3 // ''), qr/budget-seconds.*0/s, 'F2: warns naming the rejected value (0)');
+}
+
+# ===========================================================================
+# G. Losing the mkdir race on a fresh log dir is not a failure to record.
+#    Two dispatches into a project with no .dispatch-log yet both find it
+#    absent; one creates it, and the other's mkdir fails with EEXIST.
+# ===========================================================================
+SKIP: {
+    skip 'bp-dispatch-log.pl did not load', 2 unless $LOADED;
+    my $root = tempdir(CLEANUP => 1);
+    mkdir "$root/.ccpraxis-local-data" or die $!;
+    local $main::MKDIR_RACE = "$root/.ccpraxis-local-data/.dispatch-log";
+    my $ok = BpDispatchLog::write_record($root, { id => 'race-1', kind => 'worker' });
+    ok($ok, 'G1: write_record succeeds when another writer created the log dir first');
+    ok(-f BpDispatchLog::record_path($root, 'race-1'), 'G1: and the record is on disk');
 }
 
 done_testing();

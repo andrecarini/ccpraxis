@@ -267,7 +267,10 @@ sub _mkdir_p {
     for my $part (grep { length } split m{/}, $d) {
         $cur = ($cur eq '' || $cur eq '/') ? "$cur$part" : "$cur/$part";
         next if $cur =~ /^[A-Za-z]:$/;      # bare drive letter is not a dir
-        unless (-d $cur) { mkdir $cur or return 0 }
+        # A failed mkdir is still success when the directory exists now: two
+        # dispatches recording into a fresh log both see it absent, one wins
+        # the mkdir, and the loser's EEXIST is not a failure to record.
+        unless (-d $cur) { mkdir $cur or -d $cur or return 0 }
     }
     return -d $d;
 }
