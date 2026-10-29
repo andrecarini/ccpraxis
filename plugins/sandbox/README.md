@@ -65,23 +65,76 @@ Or via the slash command: `/sandbox:test`.
 
 ## Runtime support
 
-The launcher auto-detects which container runtime is installed and uses
-whichever is present, in this preference order:
+The launcher auto-detects which container CLI to drive
+(`HostPlatform::detect_container_cli`, shared by `launcher.pl`,
+`bootstrap.pl` and `tests/lib/TestSandbox.pm`; `runtime-detection.t` and
+`host-platform-decisions.t` pin it). It probes `<cli> --version` in this
+order:
 
-1. **Docker** (`docker.exe` on Windows, `docker` elsewhere) — Docker
-   Desktop on Windows/macOS, Docker Engine on Linux.
-2. **Podman** (`podman.exe` / `podman`) — Podman Desktop / Podman Machine
-   on Windows/macOS, native podman on Linux.
+| host | order | notes |
+|---|---|---|
+| Windows (Git-for-Windows perl) | `docker.exe`, `podman.exe` | Docker Desktop or Podman Machine, both on WSL2 |
+| macOS | `podman`, `docker` | a rootless `podman machine` is the supported runtime |
+| Linux | `docker`, `podman` | Docker Engine or native podman |
 
-Detection runs each time the launcher starts (`<cli> --version`). The
-same helper lives in `launcher.pl`, `bootstrap.pl`, and
-`tests/lib/TestSandbox.pm` (test `04-runtime-detection.t` pins this).
+`CCPRAXIS_CONTAINER_CLI=<name or path>` overrides the order. When set it
+is the only candidate: if it does not answer `--version` the launcher
+stops and names it, instead of falling back to something else.
 
 **On Windows, both runtimes require WSL2** (see the warning at the top of
 this file). The bootstrap blocks `podman + hyperv` automatically; Docker
 Desktop on Hyper-V isn't auto-detected (it requires manual user effort
 to even configure) but the same fatal 9p bugs apply if you set it up
 that way. Don't.
+
+### macOS: rootless podman machine
+
+One-time setup, from any terminal:
+
+```bash
+brew install podman
+podman machine init --cpus 6 --memory 8192   # rootless is the default
+podman machine start
+```
+
+Then, from the project directory (anything under `/Users` works):
+
+```bash
+claude-sandbox            # first run: bootstrap, image build, skills picker, dashboard
+```
+
+Press `[c]` in the dashboard for a claude session: it opens a new
+Terminal.app window (via a single-use `.command` file and `open -a
+Terminal`, so no Automation permission is asked for). By hand, run
+`claude-sandbox --session` in a second terminal.
+
+What differs from Windows, and why:
+
+- **The image is built natively for the machine's architecture.** The
+  Containerfile picks the Node tarball from `dpkg --print-architecture`,
+  so an Apple Silicon Mac builds a linux/arm64 image with no emulation.
+- **Only the machine's shared folders can be mounted.** A macOS podman
+  machine sees `/Users`, `/private` and `/var/folders` by default (see
+  `podman machine init --help`). The launcher reads the machine's share
+  list and refuses a project outside it before asking anything, with the
+  remedy. podman passes paths literally, so `/tmp/x` is not covered by
+  the `/private` share even though `/tmp` links there; the launcher
+  resolves the project path first, which avoids that.
+- **Bind mounts need no `:Z`.** The machine runs SELinux, but the
+  virtiofs shares are usable as they are; files the container's root
+  writes appear on the Mac owned by you, and O_APPEND, rename and
+  utimensat behave (`bind-honors-append-and-utimensat.t`).
+- **Keep-awake** is `caffeinate -i -s -w <launcher pid>` (idle sleep
+  always, system sleep on AC power); it exits by itself with the launcher.
+- **The Resources panel** reads the Mac's RAM, swap, CPU and disk from
+  `sysctl`, `vm_stat`, `ps` and `df`.
+- **Published ports** (`$SANDBOX_OPEN_PORTS`, 9000-9019 for the first
+  sandbox) are reachable at `localhost:<port>` on the Mac through
+  podman's gvproxy, and services on the Mac are reachable from inside the
+  container as `host.containers.internal`.
+- **Sign in inside the sandbox.** The sandbox never copies the host's
+  Claude token (and on macOS Claude Code keeps it in the login Keychain
+  anyway): run `/login` once in the first session.
 
 The historical Hyper-V investigation produced an xfs-volume + sync-sidecar
 workaround that shipped in earlier versions of this sandbox — retired in
