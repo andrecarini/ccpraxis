@@ -536,6 +536,24 @@ my @c3_results;
         my ($ofh, $opath) = tempfile('t63-rss-outXXXXXX', TMPDIR => 1); close $ofh;
         local %ENV = %ENV;
         $ENV{$_} = $env->{$_} for keys %$env;
+        # macOS has no /proc to sample. Its /usr/bin/time -l reports the
+        # child's peak resident set size (in bytes) straight from the kernel,
+        # which is the exact figure this sampler approximates.
+        if (!-d '/proc' && $^O eq 'darwin' && -x '/usr/bin/time') {
+            my ($tfh, $tpath) = tempfile('rss-timeXXXXXX', TMPDIR => 1); close $tfh;
+            my $tpid = fork();
+            return undef unless defined $tpid;
+            if ($tpid == 0) {
+                open(STDOUT, '>', $opath) or exit 1;
+                open(STDERR, '>', $tpath) or exit 1;
+                exec('/usr/bin/time', '-l', $^X, $script, @$args) or exit 1;
+            }
+            waitpid($tpid, 0);
+            my $rep = '';
+            if (open(my $r, '<', $tpath)) { local $/; $rep = <$r> // ''; close $r }
+            unlink $opath, $tpath;
+            return ($rep =~ /(\d+)\s+maximum resident set size/) ? int($1 / 1024) : 0;
+        }
         my $pid = fork();
         if (!defined $pid) { return undef }
         if ($pid == 0) {

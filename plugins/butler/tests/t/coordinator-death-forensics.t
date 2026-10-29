@@ -664,7 +664,16 @@ sub set_checkboxes { my ($dir, $pkg, $n) = @_; my $f = "$dir/packages/$pkg.md"; 
       . 'block for the full 20s instead)')
         or diag("drain_watcher took ${elapsed}s -- looks like the coordinator ran to completion instead of being killed");
 
-    ok(-d "$dir/j1.pid" && !-s "$dir/j1.pid", 'BLOCK J: PIDFILE was never successfully written (still just the bare directory)');
+    # "Still just the bare directory" means an EMPTY directory. `-s` on a
+    # directory is not that test: it reports the directory's own allocation,
+    # which is 0 on NTFS but 64 bytes for an empty APFS directory and 4096 on
+    # ext4, so it only ever held on Windows.
+    my $j1_entries = -1;
+    if (opendir(my $dh, "$dir/j1.pid")) {
+        $j1_entries = scalar(grep { $_ ne '.' && $_ ne '..' } readdir $dh);
+        closedir $dh;
+    }
+    ok(-d "$dir/j1.pid" && $j1_entries == 0, 'BLOCK J: PIDFILE was never successfully written (still just the bare directory)');
     ok(!-e $statusfile, 'BLOCK J: STATUSFILE was never written either -- the failure short-circuits before that point');
 }
 
