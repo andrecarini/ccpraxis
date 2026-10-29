@@ -369,8 +369,17 @@ my ($REDUCIBLE_APPEND_TOKEN, $IRREDUCIBLE_APPEND_TOKEN);
 {
     my $bpdir = fresh_dir();
     my $path  = stage_ledger(ledger_bytes(entries => \@REDUCIBLE_ENTRIES), bpdir => $bpdir, pkg => 'case7-pkg');
-    ok($path =~ m{^[A-Za-z]:[/\\]},
-        "CASE7 FIXTURE-SANITY: the ledger path is drive-absolute ($path) -- the exact shape spec 1c reproduces against");
+    # The drive-absolute shape exists only on a Windows host. Elsewhere a temp
+    # path is "/..."-absolute, which is the same question (does the history dir
+    # land at the absolute location, with nothing created relative to the cwd?)
+    # in that OS's only absolute form.
+    if ($^O =~ /^(MSWin32|msys|cygwin)$/) {
+        ok($path =~ m{^[A-Za-z]:[/\\]},
+            "CASE7 FIXTURE-SANITY: the ledger path is drive-absolute ($path) -- the exact shape spec 1c reproduces against");
+    } else {
+        ok($path =~ m{^/},
+            "CASE7 FIXTURE-SANITY: the ledger path is absolute ($path) -- the non-Windows form of spec 1c's shape");
+    }
     my $hist_path = "$bpdir/reports/ledger-history/case7-pkg.md";
     ok(!-d "$bpdir/reports/ledger-history",
         'CASE7 FIXTURE-SANITY: reports/ledger-history/ does not exist yet -- ensure_dir_exists must create it from scratch');
