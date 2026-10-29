@@ -597,6 +597,24 @@ for my $role (qw(manual driver reporter)) {
     is($sres2->{rc}, 0, 'AC-15: armed P(compact) through the shim -> rc 0');
     is(GuardHarness::count_lines($sres2->{shim_log}, 'perl'), 1,
         'AC-15: armed P(compact) still launches exactly 1 perl (unchanged: the route is one perl invocation either way)');
+
+    # macOS port finding (cross-platform): re-attach loaded Almanac/Thread.pm by
+    # file path, then the digest's Gather.pm `use`d it by module name, so perl
+    # compiled it twice and BpHook's warn handler filed ~57 "Subroutine ...
+    # redefined" lines into hook-errors.log on every SessionStart. Both runs
+    # above went through re-attach and the digest; none of that may appear.
+    my @logs;
+    my @walk = ($state_root);
+    while (defined(my $d = shift @walk)) {
+        opendir(my $dh, $d) or next;
+        for my $e (grep { $_ ne '.' && $_ ne '..' } readdir $dh) {
+            my $f = "$d/$e";
+            if (-d $f) { push @walk, $f } elsif ($e =~ /\Ahook-errors\.log/) { push @logs, $f }
+        }
+        closedir $dh;
+    }
+    my $redef = join '', grep { /redefined/ } map { split /^/m, (GuardHarness::read_bytes($_) // '') } @logs;
+    is($redef, '', 'AC-15: SessionStart leaves no "Subroutine ... redefined" lines in hook-errors.log (Thread.pm loaded once)');
 }
 
 # ===========================================================================

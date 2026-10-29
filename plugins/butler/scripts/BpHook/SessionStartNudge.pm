@@ -41,8 +41,16 @@ require "$SELF_DIR/../BpHook.pm"
 
 # Almanac modules, loaded relative to $SELF_DIR (sec 2.6). A load failure is
 # caught -- the hook still emits the never-halt-12 nudges.
-my $ALMANAC_THREAD_PM = "$SELF_DIR/../../../almanac/scripts/Almanac/Thread.pm";
-my $ALMANAC_GATHER_PM = "$SELF_DIR/../../../almanac/scripts/Almanac/Gather.pm";
+#
+# Thread.pm is required by MODULE NAME through a local @INC entry (the way
+# ArmOnEntry already does it), never by file path. Gather.pm, loaded next,
+# says `use Almanac::Thread`, which looks for the %INC key
+# "Almanac/Thread.pm"; a path require files the module under the path
+# instead, so Gather compiled Thread.pm a second time and every SessionStart
+# wrote ~57 "Subroutine ... redefined" warnings into hook-errors.log, on
+# every host.
+my $ALMANAC_SCRIPTS   = "$SELF_DIR/../../../almanac/scripts";
+my $ALMANAC_GATHER_PM = "$ALMANAC_SCRIPTS/Almanac/Gather.pm";
 
 # ---------------------------------------------------------------------------
 # sec 2.2 -- pinned text, byte-exact.
@@ -140,7 +148,7 @@ sub run {
     @nudge = () if $@;
 
     eval {
-        require $ALMANAC_THREAD_PM;
+        { local @INC = ($ALMANAC_SCRIPTS, @INC); require Almanac::Thread; }
         Almanac::Thread::reattach(
             session    => $sid,
             transcript => $p->{transcript_path},
