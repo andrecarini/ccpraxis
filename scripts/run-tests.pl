@@ -1338,6 +1338,32 @@ sub _git_status_paths {
     return sort @paths;
 }
 
+# Repo-root stray attribution. The post-sweep audit names a new path but not
+# what made it, and some strays cannot be reproduced on demand: a PowerShell
+# ModuleAnalysisCache appeared at the repo root during two full sweeps
+# (2026-09-26, 2026-10-21) and in no single-file rerun since. So after every
+# test file exits, the repo root is listed again (one readdir, no git), and
+# each new top-level entry is recorded with the files running at that moment:
+# the one that just finished and every one still in flight. Strays that land
+# deeper are still caught by the git-status audit, unattributed.
+my (%ROOT_SEEN, @ROOT_STRAYS, $ROOT_WATCH);
+sub _root_entries {
+    opendir(my $d, $ROOT_ABS) or return ();
+    my @e = grep { $_ ne q{.} && $_ ne q{..} } readdir $d;
+    closedir $d;
+    return @e;
+}
+sub _root_watch_start { %ROOT_SEEN = map { ($_ => 1) } _root_entries(); @ROOT_STRAYS = (); $ROOT_WATCH = 1 }
+sub _note_root_strays {
+    my (@running) = @_;
+    return unless $ROOT_WATCH;
+    for my $e (_root_entries()) {
+        next if $ROOT_SEEN{$e}++;
+        my %u = map { ($_ => 1) } grep { defined } @running;
+        push @ROOT_STRAYS, { path => $e, running => [ sort keys %u ] };
+    }
+}
+
 # _wakelock_pids() -> @{ {pid, cmd} } -- every live process (WINPID
 # namespace, per Get-CimInstance) whose command line names one of the fake/
 # real wake-lock stand-ins the contract lists: keep-awake.ps1,
@@ -1585,6 +1611,7 @@ sub run_sweep {
     my $audit_pre_ca;
     unless ($ENCLOSING_SWEEP_OWNS_AUDIT) {
         @audit_pre_paths = _git_status_paths($ROOT_ABS);
+        _root_watch_start();
         @audit_pre_procs = grep { !(defined $REAL_KEEPAWAKE_PID && $_->{pid} eq $REAL_KEEPAWAKE_PID) } _wakelock_pids();
         # FIX-BATCH M4 (review, step 7): the real butler-state dir and continuity
         # active dir are never under $ROOT_ABS, so git status can never see a
@@ -1779,6 +1806,7 @@ sub run_sweep {
         require File::Temp;
         my $dir = File::Temp::tempdir(CLEANUP => 1);
         my (%pid_of, @queue);
+        my %file_of;   # pid => test file, for _note_root_strays
         @queue = _order_longest_first(\@host_parallel, _read_durations());
         my $i = 0;
         my %slot;
@@ -1800,6 +1828,7 @@ sub run_sweep {
                 close $o;
                 exit 0;
             }
+            $file_of{$pid} = $f;
             $slot{$pid} = $id;
             return 1;
         };
@@ -1844,6 +1873,7 @@ sub run_sweep {
                 $slot{$pid} = $id;
                 $is_batch{$id} = 1;          # tells the reap loop to split, not treat as one record
                 $batch_files{$id} = [@container];
+                $file_of{$pid} = join(q{, }, @container);
             }
         }
 
@@ -1852,6 +1882,8 @@ sub run_sweep {
             my $pid = waitpid(-1, 0);
             last if $pid <= 0;
             my $id = delete $slot{$pid};
+            my $done_file = delete $file_of{$pid};
+            _note_root_strays($done_file, values %file_of);
             my $handled = 0;
             if (defined $id && open my $in, '<', "$dir/$id") {
                 my $raw = do { local $/; <$in> };
@@ -1890,7 +1922,7 @@ sub run_sweep {
     }
 
     # --- serial phase ----------------------------------------------------------
-    push @results, run_one($_) for @host_serial;
+    for my $f (@host_serial) { push @results, run_one($f); _note_root_strays($f) }
 
     # --- refused phase -----------------------------------------------------------
     push @results, _refusal_result($_) for @refused;
@@ -2156,6 +2188,10 @@ sub run_sweep {
             if (@new_unattributed) {
                 print "  new repo path(s) appeared during this sweep (git status):\n";
                 print "    $_\n" for @new_unattributed;
+                for my $s (@ROOT_STRAYS) {
+                    print "  $s->{path} first appeared at the repo root while running: "
+                        . (@{ $s->{running} } ? join(', ', @{ $s->{running} }) : '(nothing in flight)') . "\n";
+                }
             }
             if (@new_procs) {
                 print "  wake-lock-style process(es) survived this sweep:\n";
