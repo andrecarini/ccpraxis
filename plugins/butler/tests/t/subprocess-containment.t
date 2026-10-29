@@ -58,9 +58,28 @@ my $REAL_PATH = $CLEAN_ENV{PATH} // '/usr/bin:/bin';
 # placed itself inside the one directory the audit is contractually required to
 # ignore. HostCaps::tempdir_args() anchors in the ccpraxis scratch root, whose absolute
 # form (C:/Users/.../Temp/...) does not match ^/tmp/.
-my $TEST_BASE = tempdir(
-    (-d '/root' && -w '/root') ? (DIR => '/root') : HostCaps::tempdir_args(),
-    CLEANUP => 1);
+#
+# macOS has no scratch root, so tempdir_args() is empty and tempdir() follows
+# $TMPDIR -- which the test runner points at its per-file sandbox under /tmp.
+# There the per-user temp dir (getconf DARWIN_USER_TEMP_DIR, /var/folders/...)
+# is the native place outside /tmp.
+sub _base_outside_tmp {
+    return (DIR => '/root') if -d '/root' && -w '/root';
+    my @a = HostCaps::tempdir_args();
+    return @a if @a;
+    if ($^O eq 'darwin') {
+        my $d = `getconf DARWIN_USER_TEMP_DIR 2>/dev/null`;
+        $d = '' unless defined $d;
+        $d =~ s/\s+\z//;
+        $d =~ s{/+\z}{};
+        return (DIR => $d) if length $d && -d $d && -w $d;
+    }
+    return ();
+}
+my $TEST_BASE = tempdir(_base_outside_tmp(), CLEANUP => 1);
+BAIL_OUT("TEST_BASE $TEST_BASE is under /tmp, inside the audit's own exemption -- every assertion "
+       . 'below would fail for the fixture\'s location, not the audit')
+    if $TEST_BASE =~ m{^/tmp/};
 my $rn = 0;
 
 # =====================================================================================
