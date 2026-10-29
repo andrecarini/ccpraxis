@@ -143,6 +143,17 @@ my @HARD_EXCLUDE_REGEX = (
 my $SCRIPT_DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 my $SENSITIVE_CHECK = "$SCRIPT_DIR/sensitive-check.pl";   # sibling in plugins/steward/scripts/
 
+# Every git child here runs with its output captured, from a skill or the
+# backup driver, so nobody can answer a username/password prompt. Off Windows
+# git opens /dev/tty for one anyway and the sync hangs on an expired token
+# instead of failing; GIT_TERMINAL_PROMPT=0 makes it fail with a message.
+# Credential helpers (osxkeychain, libsecret) are unaffected. An explicit value
+# from the caller wins. Windows is left alone: Git Credential Manager reads
+# this variable too and would stop offering its sign-in window, which is how a
+# Windows host re-authenticates today.
+$ENV{GIT_TERMINAL_PROMPT} //= '0'
+    unless $^O eq 'MSWin32' || $^O eq 'cygwin' || $^O eq 'msys';
+
 # Perl-native secret patterns — mirror sensitive-check.pl. Defined here (before the
 # dispatcher) so that the `my` initializer actually runs before any subcommand calls
 # scan_files_for_secrets. (File-scope `my` runs its initializer in source order.)
@@ -300,7 +311,8 @@ sub cmd_init {
             "# Atomic staging tmps and merge tmps written by vault-sync.pl.\n" .
             "*.vault-sync.tmp\n" .
             "projects/*/.merge-*.tmp\n" .
-            "projects/*/.empty-*.tmp\n");
+            "projects/*/.empty-*.tmp\n" .
+            finder_junk_ignore_block());
         write_file_text("$VAULT_DIR/.gitattributes",
             "# Treat all files as binary to defeat CRLF normalization.\n" .
             "# Vault stores byte-exact copies of tracked project files; any normalization\n" .
@@ -1001,6 +1013,7 @@ sub cmd_vault_files {
             wanted => sub {
                 return if -l $_;
                 return unless -f $_;
+                return if is_finder_junk($_);
                 my $rel = abs_to_rel($files_dir, $_);
                 push @files, { path => $rel, size => (-s $_) + 0 } if defined $rel;
             },
@@ -1044,6 +1057,7 @@ sub cmd_sync_project {
     # .gitignore predates the journal split, so its ops log would read as
     # uncommitted project content and every sync would report drift.
     ensure_journal_ignored();
+    ensure_finder_junk_ignored();
 
     # Reconcile any leftover journal before starting fresh.
     my $reconcile = journal_reconcile($slug, $cwd, $vproj);
@@ -2777,6 +2791,14 @@ sub walk_dir_into_inventory {
             # dangerous part: each failed sync makes the next one worse.
             return if $_ =~ /\Q$TMP_SUFFIX\E\z/;
 
+            # Finder metadata is never project content: .DS_Store appears in
+            # any directory a Finder window has shown, and ._<name>
+            # AppleDouble files carry resource forks on non-HFS volumes.
+            # Synced, they churn the vault from every Mac and land in every
+            # Windows checkout. Skipped on every side (local, vault, cache),
+            # like the staging tmps above.
+            return if is_finder_junk($_);
+
             my $rel = $to_rel->($_);
             unless (defined $rel && validate_relative_path($rel)) {
                 push @$skipped_bad, ($rel // $_);
@@ -3341,6 +3363,38 @@ sub copy_file {
     }
     close $in;
     close $out;
+    copy_file_mode($src, $dst);
+}
+
+# A fresh open('>') is 0666 & ~umask, so every copy above used to come out
+# 0644 and a tracked hook script lost its exec bit on the way into the vault
+# (git then recorded it 100644) and again on the way back out -- a synced
+# .claude/hooks/*.sh stopped running on the next Mac. The copy now takes the
+# source's permission bits, and never REMOVES an exec bit the file it is about
+# to replace already has: a vault copy written on Windows (core.fileMode=false,
+# so recorded 100644) must not strip +x from a working local script. $dst is
+# the staging tmp; the file it will be renamed over is $dst minus the suffix.
+# Windows has no mode bits worth carrying and is left alone.
+# True for macOS Finder metadata files (.DS_Store, ._<name> AppleDouble), by
+# basename. Never project content; see walk_dir_into_inventory.
+sub is_finder_junk {
+    my ($path) = @_;
+    (my $base = $path) =~ s{^.*[/\\]}{};
+    return ($base eq q{.DS_Store} || $base =~ /^\._./) ? 1 : 0;
+}
+
+sub copy_file_mode {
+    my ($src, $dst) = @_;
+    return if $^O eq 'MSWin32' || $^O eq 'cygwin' || $^O eq 'msys';
+    my @st = stat($src);
+    return unless @st;
+    my $mode = $st[2] & 07777;
+    (my $final = $dst) =~ s/\Q$TMP_SUFFIX\E\z//;
+    if ($final ne $dst && -f $final && !-l $final) {
+        my @fst = stat($final);
+        $mode |= ($fst[2] & 0111) if @fst;
+    }
+    chmod($mode, $dst);
 }
 
 sub is_text_file {
@@ -3365,6 +3419,7 @@ sub build_hash_map_from_cache {
             return if -l $_;
             return unless -f $_;
             return if $_ =~ /\Q$TMP_SUFFIX\E$/;
+            return if is_finder_junk($_);
             my $rel = abs_to_rel($root, $_);
             $map{$rel} = hash_file($_) if defined $rel;
         },
@@ -4095,6 +4150,46 @@ sub ensure_journal_ignored {
     }
     unless (vault_git_ok('commit', '-m', 'vault: ignore the append-only sync journal ops log', '--', '.gitignore')) {
         emit_error("vault: failed to commit the sync journal .gitignore rule");
+    }
+}
+
+# The vault .gitignore block for macOS Finder metadata. Written by cmd_init's
+# scaffold and appended to an existing vault by ensure_finder_junk_ignored.
+sub finder_junk_ignore_block {
+    return
+    "\n# macOS Finder metadata (.DS_Store in any folder Finder has shown, ._*\n" .
+    "# AppleDouble resource-fork files). Never project content.\n" .
+    ".DS_Store\n" .
+    "._*\n";
+}
+
+# ensure_finder_junk_ignored() -- add the Finder-metadata rules to an EXISTING
+# vault. Every vault created before them was made on Windows, so it lacks the
+# rules, and one Finder visit to the vault checkout on a Mac leaves an
+# untracked .DS_Store that vault_dirty_files reads as drift (inside
+# projects/<slug>/) or that an unscoped add would commit. Same shape as
+# ensure_journal_ignored: idempotent (keyed on the .DS_Store line), CRLF-safe
+# match, pathspec-limited commit, both git results checked.
+sub ensure_finder_junk_ignored {
+    my $path = "$VAULT_DIR/.gitignore";
+    return unless -f $path;
+    open my $fh, '<:raw', $path or return;
+    local $/;
+    my $text = <$fh>;
+    close $fh;
+    return if $text =~ /^\.DS_Store\r?$/m;
+
+    $text .= "\n" unless $text =~ /\n\z/ || !length $text;
+    $text .= finder_junk_ignore_block();
+    open my $out, '>:raw', $path or return;
+    print {$out} $text;
+    close $out;
+
+    unless (vault_git_ok('add', '.gitignore')) {
+        emit_error("vault: failed to stage .gitignore for the Finder metadata ignore rules");
+    }
+    unless (vault_git_ok('commit', '-m', 'vault: ignore macOS Finder metadata (.DS_Store, ._*)', '--', '.gitignore')) {
+        emit_error("vault: failed to commit the Finder metadata .gitignore rules");
     }
 }
 

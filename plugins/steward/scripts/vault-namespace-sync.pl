@@ -21,6 +21,9 @@ use Getopt::Long qw(GetOptionsFromArray);
 use VaultNamespace ();
 
 $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/;
+# Same reasoning as vault-sync.pl: a captured git push must fail, not wait on
+# a /dev/tty password prompt nobody can answer. Windows keeps GCM's sign-in.
+$ENV{GIT_TERMINAL_PROMPT} //= '0' unless $^O =~ /^(MSWin32|cygwin|msys)$/;
 binmode(STDOUT, ':raw');
 
 my @argv = @ARGV;
