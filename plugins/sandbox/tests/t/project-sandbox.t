@@ -57,6 +57,12 @@ like(errs({ run => { privileged => JSON::PP::true } }), qr/unknown key 'privileg
 like(errs({ run => { cap_add => ['SYS_ADMIN'] } }), qr/unknown key 'cap_add'/, 'capabilities cannot be added');
 like(errs({ run => { devices => ['/dev/kvm'] } }), qr{'/dev/kvm' is not allowed}, 'a device outside the allowlist is refused');
 like(errs({ run => { devices => '/dev/fuse' } }), qr/run.devices: must be a list/, 'devices must be a list');
+is(errs({ run => { devices => ['/dev/fuse', '/dev/net/tun'] } }), '',
+   '/dev/net/tun is allowed (nested containers need it for a network of their own)');
+for my $d ('/dev/net', '/dev/net/tun/', '/dev/net/tun:/dev/net/tun', '/dev/net/tun:/dev/net/tun:rwm',
+           '/dev/net/../kvm', '/dev/mem') {
+    like(errs({ run => { devices => [$d] } }), qr{'\Q$d\E' is not allowed}, "device '$d' is refused");
+}
 like(errs({ run => { security_opt => ['seccomp=unconfined'] } }), qr/'seccomp=unconfined' is not allowed/,
      'a security option outside the allowlist is refused');
 like(errs({ run => { security_opt => ['apparmor=unconfined'] } }), qr/not allowed/, 'apparmor=unconfined is refused');

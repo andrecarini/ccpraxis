@@ -216,8 +216,9 @@ Read and validated by `scripts/ProjectSandbox.pm`; the rules are held by `tests/
   `localhost/<container>-image:<hash>`, the hash covering the base image id, the build args and
   every file of the context, so an unchanged layer is reused and a changed one rebuilt. A failed
   layer build stops the launch; the old container is untouched.
-- **Run settings, allowlisted only.** `devices` may contain `/dev/fuse`; `security_opt` may contain
-  `label=disable` (what podman inside the sandbox needs). `volumes` are named volumes, scoped to
+- **Run settings, allowlisted only.** `devices` may contain `/dev/fuse` and `/dev/net/tun`; `security_opt`
+  may contain `label=disable` (what podman inside the sandbox needs: `/dev/net/tun` gives nested
+  containers a network of their own through pasta or slirp4netns, instead of `--network=host`). `volumes` are named volumes, scoped to
   the container (`<container>-<name>`), so their data survives a rebuild; targets may not cover
   `/project`, `/root/.claude` or system directories. **There is no way to ask for anything else**
   (no `--privileged`, capabilities, host binds or host network): the manifest is a file the agents

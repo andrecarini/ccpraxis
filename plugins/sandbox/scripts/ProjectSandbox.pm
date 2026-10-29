@@ -3,7 +3,7 @@ package ProjectSandbox;
 #
 # Lets a project (1) build its own image layer on top of the shared claude-sandbox image, and
 # (2) ask for a short, fixed allowlist of extra container settings -- the ones running podman
-# inside the sandbox needs (`/dev/fuse`, `label=disable`) and named volumes for state that must
+# inside the sandbox needs (`/dev/fuse`, `/dev/net/tun`, `label=disable`) and named volumes for state that must
 # survive a container rebuild (inner container storage, caches, a dev service's data).
 #
 # WHY AN ALLOWLIST AND NOT PASS-THROUGH FLAGS. The manifest is a file in the project, and the
@@ -35,7 +35,10 @@ our @EXPORT_OK = qw(load validate create_args resource_args memory_limit spec_si
 
 our $MANIFEST_NAME = 'claude-sandbox.json';
 
-our %ALLOWED_DEVICES      = map { $_ => 1 } ('/dev/fuse');
+# /dev/net/tun: nested rootless podman networks (pasta, slirp4netns) open it to make a tap device in
+# a network namespace they created themselves. Creating one needs CAP_NET_ADMIN over that
+# namespace, which the sandbox holds only for namespaces it owns, never for its own or the host's.
+our %ALLOWED_DEVICES      = map { $_ => 1 } ('/dev/fuse', '/dev/net/tun');
 our %ALLOWED_SECURITY_OPT = map { $_ => 1 } ('label=disable');
 
 # Volume targets the manifest may not cover: the project bind, the Claude home, and system trees.
