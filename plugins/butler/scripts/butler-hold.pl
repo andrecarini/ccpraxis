@@ -206,6 +206,17 @@ sub resolve_self_task_id {
     # basename of its own stdout redirect target -- resolved the same way
     # the spec resolves any other item's output file (2.7).
     my $link = readlink("/proc/$$/fd/1");
+    if ((!defined $link || !length $link) && $^O eq 'darwin') {
+        # No /proc on macOS. fcntl(F_GETPATH) asks the kernel for the path
+        # behind an open fd -- the answer readlink gives above -- with no
+        # process started. 50 is F_GETPATH in <sys/fcntl.h>; Fcntl.pm does
+        # not export it. The buffer is MAXPATHLEN (1024) with room to spare;
+        # the kernel NUL-terminates what it writes.
+        my $buf = "\0" x 4096;
+        if (fcntl(STDOUT, 50, $buf)) {
+            ($link = $buf) =~ s/\0.*\z//s;
+        }
+    }
     return undef unless defined $link && length $link;
     $link =~ s{\\}{/}g;
     return undef unless $link =~ m{([^/]+)\.output$};
