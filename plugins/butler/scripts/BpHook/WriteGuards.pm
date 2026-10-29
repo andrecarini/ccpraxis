@@ -350,7 +350,41 @@ sub _temp_candidates {
         next if $c =~ m{\A[a-z]:/?\z};
         push @valid, $v;
     }
+    # darwin: /tmp, /var and /etc are symlinks into /private, and a payload
+    # path can arrive in either spelling ($TMPDIR is /var/folders/.../T;
+    # realpath and abs_path answer /private/var/folders/.../T). Each
+    # candidate counts under both, since the checks here are lexical.
+    if ($^O eq 'darwin') {
+        my @alias;
+        for my $v (@valid) {
+            if ($v =~ m{\A/(?:tmp|var|etc)(?:/|\z)}) { push @alias, "/private$v" }
+            elsif ($v =~ m{\A/private(/(?:tmp|var|etc)(?:/.*)?)\z}s) { push @alias, $1 }
+        }
+        push @valid, @alias;
+    }
     return @valid;
+}
+
+# _posix_temp_roots() -- the bases Claude Code's own temp root sits under on
+# a non-Windows host, whatever $TMPDIR says: /tmp/claude-<uid>/... on Linux,
+# /private/tmp/claude-<uid>/... on macOS (where /tmp is the same directory
+# through a symlink). Empty on Windows-family perls, whose scratchpad lives
+# under %TEMP% and is found through _temp_candidates.
+sub _posix_temp_roots {
+    return () if $^O =~ /\A(?:MSWin32|msys|cygwin)\z/;
+    return ('/tmp', '/private/tmp');
+}
+
+# _claude_seg_ok($seg) -- the first segment under a temp base: "claude"
+# everywhere, and "claude-<uid>" off Windows (Claude Code's POSIX temp root
+# carries the uid: /private/tmp/claude-501/...).
+sub _claude_seg_ok {
+    my ($x) = @_;
+    return 0 unless defined $x;
+    $x = _foldc($x) if _is_ci();
+    return 1 if $x eq 'claude';
+    return 0 if $^O =~ /\A(?:MSWin32|msys|cygwin)\z/;
+    return ($x =~ /\Aclaude-[0-9]{1,10}\z/) ? 1 : 0;
 }
 
 # ---------------------------------------------------------------------------
@@ -401,7 +435,7 @@ sub _own_scratchpad {
     return 0 if _in($ABS_c, $R->{root});
     return 0 if defined($R->{data}) && length($R->{data}) && _in($ABS_c, $R->{data});
 
-    for my $B (_temp_candidates()) {
+    for my $B (_temp_candidates(), _posix_temp_roots()) {
         my $Bc = _ccanon($B);
         next unless defined $Bc && length $Bc;
         my @b = split m{/}, $Bc;
@@ -414,8 +448,9 @@ sub _own_scratchpad {
         next unless $ok;
         my @tail = @a[scalar(@b) .. scalar(@b) + 3];
         my @want = ('claude', $slug, $sid, 'scratchpad');
-        my $tail_ok = 1;
-        for my $i (0 .. 3) {
+        my $tail_ok = _claude_seg_ok($tail[0]);
+        for my $i (1 .. 3) {
+            last unless $tail_ok;
             my ($x, $y) = ($tail[$i], $want[$i]);
             unless ($ci ? (_foldc($x) eq _foldc($y)) : ($x eq $y)) { $tail_ok = 0; last }
         }
@@ -429,6 +464,9 @@ sub _is_temp {
     return 0 if defined($root) && length($root) && _in($abs_c, $root);
     return 0 if defined($data) && length($data) && _in($abs_c, $data);
     return 1 if $abs_c =~ m{\A/tmp/};
+    # The same directory under its real name on macOS (/tmp -> /private/tmp),
+    # which is how Claude Code hands out its temp root and scratchpad there.
+    return 1 if $^O eq 'darwin' && (_is_ci() ? _foldc($abs_c) : $abs_c) =~ m{\A/private/tmp/};
     for my $cand (_temp_candidates()) {
         return 1 if _in($abs_c, $cand);
     }
