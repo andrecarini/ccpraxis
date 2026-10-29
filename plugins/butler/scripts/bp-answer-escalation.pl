@@ -43,7 +43,9 @@
 #
 # CLI: bp-answer-escalation.pl <blueprint> --decision <id|file|path>
 #                            [--action relaunch|reset|accept|drop|resume]
-#                            [--note "text"]
+#                            [--note "text" | --note - | --note-file PATH]
+#                                  (`-` reads the note from stdin; both forms
+#                                  drop trailing newlines, like $(...) did)
 #                            [--widen-write-set PATH]   # b17: additive-only write_set
 #                                                       # widening, through bp-ledger.pl
 #                            [--set-write-set VALUE]    # b17: ALWAYS refused (narrowing/
@@ -92,6 +94,24 @@ use warnings;
 # Delegates to BpOrch::%KIND_REGISTRY (a shared, tested, data-driven registry
 # both scripts load) instead, closing that blind spot for good rather than
 # widening the window again.
+# _read_note_from($fh, $label) -> the note text. `--note -` / `--note-file`
+# exist so a skill can hand over free text WITHOUT a command substitution:
+# `NOTE=$(cat <<'EOF' ... EOF)` is mis-parsed by bash 3.2 (macOS /bin/bash),
+# which scans the heredoc body for parentheses and quotes inside $(...), and an
+# operator's note full of backticks and parens is exactly what lands there.
+# A plain `--note - <<'EOF'` heredoc feeds stdin and has no such parse.
+# Trailing newlines are dropped, as $(...) dropped them.
+sub _read_note_from {
+    my ($fh, $label) = @_;
+    my $t = do { local $/; <$fh> };
+    $t = '' unless defined $t;
+    $t =~ s/\n+\z//;
+    unless (length $t) {
+        print STDERR "bp-answer-escalation: --note from $label is empty\n"; exit 2;
+    }
+    return $t;
+}
+
 sub known_kinds {
     return BpOrch::known_kinds_list();
 }
@@ -781,7 +801,12 @@ unless (caller) {
         elsif ($arg eq '--decision')        { $decision        = $need->('--decision'); }
         elsif ($arg eq '--package')         { $package         = $need->('--package'); }
         elsif ($arg eq '--action')          { $action          = $need->('--action'); }
-        elsif ($arg eq '--note')            { $note            = $need_free->('--note'); }
+        elsif ($arg eq '--note')            { $note            = $need_free->('--note');
+                                              $note            = BpAnswer::_read_note_from(\*STDIN, 'stdin') if $note eq '-'; }
+        elsif ($arg eq '--note-file')       { my $nf = $need->('--note-file');
+                                              open(my $nfh, '<', $nf) or do {
+                                                  print STDERR "bp-answer-escalation: --note-file $nf: $!\n"; exit 2; };
+                                              $note = BpAnswer::_read_note_from($nfh, $nf); close $nfh; }
         elsif ($arg eq '--widen-write-set') { $widen_write_set = $need->('--widen-write-set'); }
         elsif ($arg eq '--set-write-set')   { $set_write_set   = $need->('--set-write-set'); }
         elsif ($arg eq '--list')            { $list_mode       = 1; }
@@ -810,7 +835,7 @@ unless (caller) {
         print STDERR "usage: bp-answer-escalation.pl <blueprint>\n"
                    . "         --decision <id|file> [--action relaunch|reset|accept|drop|resume|not-mine]  # answer a queued escalation\n"
                    . "         --package <pkg>      [--action reset|accept|drop]                    # act directly on a package (#29)\n"
-                   . "         [--note ...] [--widen-write-set PATH] [--bp-dir DIR]\n"
+                   . "         [--note TEXT | --note - | --note-file PATH] [--widen-write-set PATH] [--bp-dir DIR]\n"
                    . "       bp-answer-escalation.pl sweep --bp-dir DIR                              # e06: archive settled escalations + close their inbox items (no-op while an orchestrator is live)\n"
                    . "  --widen-write-set PATH   ADD path to the package's write_set (additive only, via bp-ledger.pl)\n"
                    . "  --set-write-set VALUE    always refused: replacing/narrowing write_set is not supported\n"

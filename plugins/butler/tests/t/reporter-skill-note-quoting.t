@@ -22,22 +22,27 @@ ok(-f $SKILL, "harness sanity: $SKILL exists") or BAIL_OUT("cannot find SKILL.md
 open my $fh, '<:raw', $SKILL or die "read $SKILL: $!";
 local $/; my $text = <$fh>; close $fh;
 
-# ── AC-10: every --note example binds from a single-quoted heredoc ──────────────
-# Look for the exact shape: NOTE=$(cat <<'EOF' ... ) ... --note "$NOTE"
-my @heredoc_binds = ($text =~ /NOTE=\$\(cat\s*<<'EOF'.*?\bEOF\b.*?\)/gs);
-ok(scalar(@heredoc_binds) >= 1,
-    'AC-10: at least one `NOTE=$(cat <<\'EOF\' ... )` single-quoted heredoc binding is present')
+# ── AC-10: every --note example reads a single-quoted heredoc on stdin ───────
+# The shape: `--note - <<'EOF'` ... `EOF`. It used to be
+# `NOTE=$(cat <<'EOF' ... EOF)` + `--note "$NOTE"`, which closed the
+# substitution hole but opened another: bash 3.2 (macOS /bin/bash) parses a
+# heredoc inside $(...) for parentheses and quotes, so an operator's note with
+# a stray ")" or apostrophe broke the command. stdin needs no substitution.
+my @heredoc_feeds = ($text =~ /--note\s+-\s+<<'EOF'\n.*?\nEOF\n/gs);
+ok(scalar(@heredoc_feeds) >= 1,
+    'AC-10: at least one `--note - <<\'EOF\'` single-quoted heredoc feed is present')
     or diag('found none; scanned ' . length($text) . ' bytes of SKILL.md');
+unlike($text, qr/\$\(cat\s*<</, 'AC-10: no heredoc inside a command substitution anywhere (bash 3.2 mis-parses it)');
 
-# Every `--note` use in the doc must reference $NOTE (the heredoc-bound variable),
-# never an inline literal string.
+# Every `--note` use in the doc must read stdin (`-`) or a file, never an
+# inline literal string.
 my @note_uses = ($text =~ /--note\s+("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\S+)/g);
 ok(scalar(@note_uses) >= 1, 'AC-10: SKILL.md contains at least one --note usage to check')
     or diag('found no --note usage at all in the file');
 
-my @bad_inline = grep { $_ ne '"$NOTE"' } @note_uses;
+my @bad_inline = grep { $_ ne '-' } @note_uses;
 is_deeply(\@bad_inline, [],
-    'AC-10: every --note usage passes "$NOTE" (the heredoc-bound var); no inline literal example remains')
+    'AC-10: every --note usage reads the heredoc on stdin (`--note -`); no inline literal example remains')
     or diag('offending --note argument(s): ' . join(', ', @bad_inline));
 
 # No example anywhere uses an UNquoted heredoc delimiter (`<<EOF` without quotes),

@@ -232,6 +232,41 @@ sub run_cli {
 }
 
 # ===========================================================================
+# --note - (stdin) and --note-file: free text with no command substitution.
+# The reporter skill feeds the note as `--note - <<'EOF'`; the old
+# `NOTE=$(cat <<'EOF' ...)` form is mis-parsed by bash 3.2 (macOS /bin/bash)
+# as soon as the note holds an apostrophe or an unbalanced parenthesis. The
+# script is driven here through `bash` with exactly that kind of note.
+# ===========================================================================
+{
+    my $tricky = q{don't skip (the `parser`) step; keep $(HOME) literal};
+    my ($bpdir, $id, $pkg) = mk_bp(kind => 'stuck-package');
+    my $sh = "$bpdir/answer.sh";
+    write_file($sh, join("\n",
+        'perl "$SCRIPT" bp --bp-dir "$BPDIR" --decision "$ID" --action relaunch --note - <<' . "'EOF'",
+        $tricky, 'EOF', ''));
+    local $ENV{SCRIPT} = $script;
+    local $ENV{BPDIR}  = $bpdir;
+    local $ENV{ID}     = $id;
+    my $out = `bash "$sh" 2>&1`;
+    is($? >> 8, 0, '--note -: a heredoc on stdin is accepted') or diag($out);
+    my $ledger = slurp("$bpdir/packages/$pkg.md");
+    ok(index($ledger, $tricky) >= 0, '--note -: the note lands byte-for-byte (quotes, parens, backticks, $(...) intact)')
+        or diag($ledger);
+    unlike($ledger, qr/\Q$tricky\E\n\n?\Q$tricky\E/, '--note -: and only once');
+}
+{
+    my ($bpdir, $id, $pkg) = mk_bp(kind => 'stuck-package');
+    my $nf = "$bpdir/note.txt";
+    write_file($nf, "From a file: (a) and (b).\n\n");
+    my ($rc, $out) = run_cli($bpdir, '--decision', $id, '--action', 'relaunch', '--note-file', $nf);
+    is($rc, 0, '--note-file: accepted') or diag($out);
+    like(slurp("$bpdir/packages/$pkg.md"), qr/From a file: \(a\) and \(b\)\./, '--note-file: the note lands');
+    my ($rc2, $out2) = run_cli($bpdir, '--decision', $id, '--action', 'relaunch', '--note-file', "$bpdir/missing.txt");
+    is($rc2, 2, '--note-file: a missing file is a usage error (exit 2)') or diag($out2);
+}
+
+# ===========================================================================
 # The recorded pids belong to the SANDBOX's pid namespace (coordinators and
 # judges are launched in the container). Answered from the HOST through the
 # project mount, the same number names some unrelated host process, and

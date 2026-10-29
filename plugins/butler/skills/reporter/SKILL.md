@@ -118,19 +118,20 @@ rather than treated as `stuck-package` by default.
 
 You decide *what* the answer is with the user (the intent — discuss it, draft any corrective note). The **mechanical unblock is deterministic** — never hand-edit ledgers or delete queue files yourself; run:
 
-Bind `--note` from a **single-quoted heredoc**, never an inline double-quoted literal: an
-inline guidance string containing backticks or `$(...)` gets command-substituted by the shell
-**before the script ever sees the argument**, so a mandate can reach the ledger with a silent
-hole in it. A single-quoted heredoc delimiter (`<<` followed by `'EOF'`) closes that hole; an
-unquoted delimiter reopens it, so always quote it.
+Feed the note on **stdin from a single-quoted heredoc** (a lone `-` as the `--note` value),
+never an inline double-quoted literal: an inline guidance string containing backticks or `$(...)`
+gets command-substituted by the shell **before the script ever sees the argument**, so a mandate
+can reach the ledger with a silent hole in it. A single-quoted heredoc delimiter (`<<` followed by
+`'EOF'`) closes that hole; an unquoted delimiter reopens it, so always quote it. Do not wrap the
+heredoc in a command substitution either: bash 3.2 (macOS `/bin/bash`) mis-parses a heredoc
+inside `$(...)` when the note holds parentheses or quotes. `--note-file <path>` is the
+alternative when the note is already in a file.
 
 ```
-NOTE=$(cat <<'EOF'
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-answer-escalation.pl" $0 --bp-dir "<bpdir>" \
+     --decision <pkg--shortid> --action <relaunch|reset|accept|drop|resume> --note - <<'EOF'
 ...guidance, backticks and all, safe...
 EOF
-)
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-answer-escalation.pl" $0 --bp-dir "<bpdir>" \
-     --decision <pkg--shortid> --action <relaunch|reset|accept|drop|resume> --note "$NOTE"
 ```
 
 - **Package parks** (`stuck-package` / `harvest-failure` / `harvest-spawn-failure`): `relaunch` (default) appends your `--note` to the ledger as a corrective section, sets the package back to `pending`, and resets its attempt budget — the orchestrator relaunches it next tick (it re-reads ledgers every tick; **no restart needed**). `accept` marks it `done` as-is (the output is actually fine); `drop` abandons it.
@@ -145,12 +146,10 @@ The script is fail-closed (a wrong action for the kind exits non-zero and change
 **Reset a package with no queued escalation (#29).** When a package is wedged at the attempt cap or churning in its resolve-judge and the user wants a *clean retry* — a fresh coordinator with a reset budget rather than the resolve path or waiting on a verdict — do **not** hand-edit the registry, kill processes, or delete markers yourself. Run the deterministic reset: it supersedes any in-flight coordinator/judge for the package (kills it + clears its markers), resets the attempt **and** resolve budgets, sets the package `pending`, and clears any of its queued escalations — so the still-running orchestrator relaunches it fresh on its next tick (no orchestrator restart needed).
 
 ```
-NOTE=$(cat <<'EOF'
+perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-answer-escalation.pl" $0 --bp-dir "<bpdir>" \
+     --package <pkg> --action reset --note - <<'EOF'
 ...guidance, backticks and all, safe...
 EOF
-)
-perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-answer-escalation.pl" $0 --bp-dir "<bpdir>" \
-     --package <pkg> --action reset --note "$NOTE"
 ```
 
 **Widen a package's `write_set` (a decision only you are sanctioned to make).** A coordinator or judge sometimes needs to touch a file the package's ledger doesn't already declare — e.g. a shared config it turns out has to change too. The guard hook blocks any write outside the declared `write_set`, and hand-editing the ledger's frontmatter yourself is exactly the move the protocol forbids (the guard would then block *that* write too, or worse, silently drift the ledger and the guard's model of it apart). The sanctioned unblock:
