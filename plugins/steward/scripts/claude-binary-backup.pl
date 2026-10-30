@@ -1,6 +1,6 @@
 #!/usr/bin/perl
-# claude-binary-backup.pl — snapshot, list, restore, prune, verify, detect
-# operations on the Claude Code binary.
+# claude-binary-backup.pl — snapshot, list, restore, prune, verify, detect and
+# install-command operations on the Claude Code binary.
 #
 # Purpose: give /update a deterministic safety net. Before any installer
 # runs, snapshot the current binary; if the installer leaves a broken or
@@ -117,8 +117,9 @@ sub lock_path {
     return File::Spec->catfile(backup_root(), '.lock');
 }
 
-# Default binary path. /update detects npm/brew installs separately; for now
-# this script targets the native install path. Override via --binary.
+# Default binary path: the native install. install-command (below) tells a
+# native install from an npm or Homebrew one; snapshot/restore target this
+# path unless --binary says otherwise.
 sub default_binary_path {
     my $home = home_dir();
     if (is_windows()) {
@@ -427,6 +428,136 @@ sub cmd_detect {
     }
     emit_json(\%r);
     exit($exists ? 0 : 1);
+}
+
+# ─── install-command ──────────────────────────────────────────────────────
+#
+# /steward:update installs the version the user chose, and the command that
+# does it depends on how Claude Code was installed and on the OS. The skill
+# used to list every OS's installer command and ask the agent to pick the
+# matching line; the pick is made here instead, from the claude actually on
+# PATH, and the skill runs the one command this prints.
+
+# The OS the installer command is chosen for. CLAUDE_BINARY_OS is a test seam
+# (windows | macos | linux), like CLAUDE_BINARY_BACKUP_ROOT -- never document
+# it in user-facing surfaces.
+sub install_os {
+    my $o = $ENV{CLAUDE_BINARY_OS};
+    return $o if defined $o && $o =~ /\A(?:windows|macos|linux)\z/;
+    return 'windows' if is_windows();
+    return $^O eq 'darwin' ? 'macos' : 'linux';
+}
+
+# One spelling of a path for comparison: forward slashes, an MSYS /c/... as
+# c:/..., no trailing slash, and lower case on the case-insensitive
+# filesystems (Windows, APFS).
+sub _cmp_path {
+    my ($p, $os) = @_;
+    return '' unless defined $p && length $p;
+    $p =~ s{\\}{/}g;
+    $p =~ s{\A/([A-Za-z])(?=/|\z)}{$1:};
+    $p =~ s{/+\z}{} unless $p eq '/';
+    return ($os eq 'windows' || $os eq 'macos') ? lc $p : $p;
+}
+
+# find_claude_on_path($os) -> the first claude on PATH, or undef.
+sub find_claude_on_path {
+    my ($os) = @_;
+    require Config;
+    my $sep = $Config::Config{path_sep} || ':';
+    my @names = $os eq 'windows' ? ('claude.exe', 'claude.cmd', 'claude') : ('claude');
+    for my $dir (split /\Q$sep\E/, (defined $ENV{PATH} ? $ENV{PATH} : '')) {
+        next unless length $dir;
+        for my $n (@names) {
+            my $p = File::Spec->catfile($dir, $n);
+            return $p if -f $p && ($os eq 'windows' || -x $p);
+        }
+    }
+    return undef;
+}
+
+# classify_install(path => $found, resolved => $realpath, home => $home,
+#                  os => $os) -> 'npm' | 'brew' | 'native' | 'unknown'
+# npm first: an npm prefix of ~/.local puts its shim at ~/.local/bin/claude,
+# which would otherwise read as native.
+sub classify_install {
+    my (%a) = @_;
+    my $os   = $a{os};
+    my $path = _cmp_path($a{path}, $os);
+    my $real = _cmp_path($a{resolved}, $os);
+    my $home = _cmp_path($a{home}, $os);
+    my @both = grep { length } ($path, $real);
+    return 'unknown' unless @both;
+
+    return 'npm' if grep { m{/node_modules/} } @both;
+    if (defined $a{path} && $a{path} =~ /\.(?:cmd|ps1)\z/i) {
+        my $dir = $a{path};
+        $dir =~ s{[\\/][^\\/]+\z}{};
+        return 'npm' if -d File::Spec->catdir($dir, 'node_modules', '@anthropic-ai', 'claude-code');
+    }
+    return 'brew' if grep { m{/(?:caskroom|cellar)/}i } @both;
+    return 'brew' if $path =~ m{\A(?:/opt/homebrew|/home/linuxbrew/\.linuxbrew)/};
+    if (length $home) {
+        return 'native' if $path eq "$home/.local/bin/claude" || $path eq "$home/.local/bin/claude.exe";
+        # The resolved path is canonical (on macOS, /var/... comes back as
+        # /private/var/...), so compare it with the canonical home as well.
+        my $home_real = (defined $a{home} && -d $a{home}) ? _cmp_path(abs_path($a{home}), $os) : '';
+        for my $h (grep { length } ($home, $home_real)) {
+            return 'native' if index($real, "$h/.local/share/claude/") == 0;
+        }
+    }
+    return 'unknown';
+}
+
+# install_command($method, $version, $os) -> ($command | undef, $note)
+sub install_command {
+    my ($method, $v, $os) = @_;
+    if ($method eq 'native') {
+        return ($os eq 'windows'
+            ? qq{powershell -Command "& ([scriptblock]::Create((irm https://claude.ai/install.ps1))) $v"}
+            : "curl -fsSL https://claude.ai/install.sh | bash -s $v",
+            "native install: the official installer, pinned to $v");
+    }
+    if ($method eq 'npm') {
+        return ("npm install -g \@anthropic-ai/claude-code\@$v", "npm global install, pinned to $v");
+    }
+    if ($method eq 'brew') {
+        return (undef, "Homebrew install: Homebrew installs only the version its own formula currently ships, so $v cannot be pinned. Tell the user, and run nothing unless they choose Homebrew's version or another install method.");
+    }
+    return (undef, 'could not tell how Claude Code was installed from the claude found on PATH (see binary_path). Ask the user how it was installed before running anything.');
+}
+
+sub cmd_install_command {
+    my (@args) = @_;
+    my ($version, $binary);
+    GetOptionsFromArray(\@args, 'version=s' => \$version, 'binary=s' => \$binary)
+        or die_json(3, 'Usage: install-command --version <x.y.z> [--binary <path>]');
+    die_json(3, 'install-command needs --version <x.y.z>') unless defined $version;
+    # The version lands in a shell command line, so only a version shape gets
+    # through: digits and dots, an optional pre-release tag of [0-9A-Za-z.-].
+    die_json(3, "not a version: '$version'")
+        unless $version =~ /\A\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\z/;
+
+    my $os    = install_os();
+    my $found = defined $binary ? $binary : find_claude_on_path($os);
+    my $real  = (defined $found && -e $found) ? (abs_path($found) // $found) : undef;
+    my $method = defined $found
+        ? classify_install(path => $found, resolved => $real, home => home_dir(), os => $os)
+        : 'unknown';
+    my ($command, $note) = install_command($method, $version, $os);
+    $note = 'no claude found on PATH. Ask the user how Claude Code was installed before running anything.'
+        unless defined $found;
+    emit_json({
+        status        => (defined $command ? 'ok' : 'no-command'),
+        os            => $os,
+        method        => $method,
+        binary_path   => $found,
+        resolved_path => $real,
+        version       => $version,
+        command       => $command,
+        note          => $note,
+    });
+    exit(defined $command ? 0 : 1);
 }
 
 sub cmd_snapshot {
@@ -986,6 +1117,11 @@ Subcommands:
   detect     [--binary <path>]
              Report whether the binary exists, its version, size, and SHA.
 
+  install-command --version <x.y.z> [--binary <path>]
+             Work out how the claude on PATH (or --binary) was installed and print the
+             one command that installs version x.y.z on this machine. Exit 1 when there
+             is no such command (a Homebrew install, or an unknown method); see "note".
+
   snapshot   [--binary <path>] [--reason <text>] [--mark <label>]
              Capture the current binary into a new versioned snapshot.
 
@@ -1016,6 +1152,7 @@ my $sub = shift @ARGV;
 $sub //= 'help';
 
 if    ($sub eq 'detect')   { cmd_detect(@ARGV); }
+elsif ($sub eq "install-command") { cmd_install_command(@ARGV); }
 elsif ($sub eq 'snapshot') { cmd_snapshot(@ARGV); }
 elsif ($sub eq 'list')     { cmd_list(@ARGV); }
 elsif ($sub eq 'verify')   { cmd_verify(@ARGV); }

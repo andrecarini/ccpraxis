@@ -92,12 +92,13 @@ ccpraxis binary prune --keep 4
 
 Never `claude update` — it fetches the absolute latest, which may not be what was chosen if something shipped during the conversation.
 
-Detect the install method first: a binary at `~/.local/bin/claude` is a native install; one under `node_modules` is npm; one under a Homebrew prefix is brew.
+Get the install command for this machine:
 
-- **Windows native:** `powershell -Command "& ([scriptblock]::Create((irm https://claude.ai/install.ps1))) <SELECTED>"`
-- **macOS/Linux native:** `curl -fsSL https://claude.ai/install.sh | bash -s <SELECTED>`
-- **npm:** `npm install -g @anthropic-ai/claude-code@<SELECTED>`
-- **brew:** no version pinning; tell the user and confirm before proceeding.
+```bash
+ccpraxis binary install-command --version <SELECTED>
+```
+
+It finds the `claude` on PATH, works out how it was installed (`method`: native, npm, brew or unknown) and prints the one command that installs `<SELECTED>` here as `command`. **Exit 0:** run `command` exactly as printed. **Exit 1:** there is no command to run (a Homebrew install cannot pin a version, or the method is unknown); tell the user what `note` says and run nothing until they decide. **Exit 3:** the version argument was rejected; re-check `<SELECTED>`.
 
 ## Step 8: Verify, and revert if it broke
 
