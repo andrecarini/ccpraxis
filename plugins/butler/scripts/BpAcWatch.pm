@@ -278,11 +278,9 @@ sub probe_source {
         1;
     };
     return 'unknown' unless $ok;
-    # The PowerShell probe first, whenever it is available (it never is on a
-    # Mac: probe_argv answers undef without powershell.exe); macOS's pmset
-    # read otherwise.
+    # macOS has no PowerShell: its power source is one pmset read.
+    return _probe_darwin() if $^O eq 'darwin';
     my $argv = eval { BpPowerJournal::probe_argv() };
-    return _probe_darwin() if ref $argv ne 'ARRAY' && $^O eq 'darwin';
     return 'unknown' unless ref $argv eq 'ARRAY';
     my $r = eval { BpPowerJournal::run_bounded($argv, $BpPowerJournal::PROBE_TIMEOUT_SECONDS) };
     return 'unknown' unless ref $r eq 'HASH' && defined $r->{status} && $r->{status} eq 'ok';
