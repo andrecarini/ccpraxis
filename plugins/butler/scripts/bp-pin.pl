@@ -3,27 +3,34 @@
 #
 # ONE implementation, TWO modes, opposite failure policies (spec b46 sec2):
 #
-#   resolve  — runs at IMAGE BUILD time, to pick the version a human then bakes
-#              into the Containerfile as a literal. On any registry problem
-#              (unreachable, malformed, no eligible version) it FAILS CLOSED:
-#              non-zero exit, a named cause, and NEVER a printed version.
-#              Falling back to "latest" here would invert the repo's >=7-day
-#              supply-chain rule and bake an unvetted version into an image.
+#   resolve  — picks the version a human then bakes into a pin as a literal
+#              (today: the backpack recipe plugins/backpack/recipes/node-pnpm.json).
+#              On any registry problem (unreachable, malformed, no eligible
+#              version) it FAILS CLOSED: non-zero exit, a named cause, and
+#              NEVER a printed version. Falling back to "latest" here would
+#              invert the repo's >=7-day supply-chain rule and bake an
+#              unvetted version into a pin.
 #
-#   audit    — runs in PREFLIGHT, to report drift between what's pinned in the
-#              Containerfile and what would now be eligible. On the SAME
-#              registry problems it DEGRADES TO WARN: exit 0, a drift-unknown
-#              line. A network blip must never wedge an unattended fleet
-#              (the same invariant bp-deps-check.pl already carries).
+#   audit    — runs in PREFLIGHT, to report drift between what a manifest pins
+#              and what would now be eligible. On the SAME registry problems
+#              it DEGRADES TO WARN: exit 0, a drift-unknown line. A network
+#              blip must never wedge an unattended fleet (the same invariant
+#              bp-deps-check.pl already carries).
 #
 # EOL/LTS data is NEVER duplicated here. It is `require`d straight from
 # bp-deps-check.pl's `our %EOL` (dates, not an is_eol flag, so an injected
 # clock still drives the verdict). A second table is the b12/b13 drift lesson
 # this blueprint has now hit four times — do not reintroduce it.
 #
-# The pin manifest IS the Containerfile (plugins/sandbox/container/Containerfile).
-# `audit` parses the pinned versions out of it BY PATTERN, never by line number
-# (SYN-23) — a separate pin list would drift from the real pins.
+# THE PIN MANIFEST. Until 2026-10-30 it was the Containerfile, which baked Node
+# and pnpm into every sandbox image. They left the image that day (operator
+# decision) and are declared per project in the backpack, so a manifest is now
+# either a backpack file (JSON: only each item's `install` command is scanned,
+# never its rationale or verify) or any other text (scanned whole, which keeps
+# Containerfile-shaped fixtures working). The default is the sanctioned recipe;
+# bp-preflight.pl passes the project's own backpack instead. Pins are found BY
+# PATTERN, never by line number (SYN-23), and a manifest that pins nothing is
+# "nothing to audit", not an error: most projects declare no Node at all.
 #
 # TRANSPORT CONTRACT — identical in shape to bp-deps-check.pl's own injected
 # `http` (bp-deps-check.pl `_registry_publish`) and to BpHttp::request's return
@@ -79,7 +86,7 @@ require "$DIR/bp-deps-check.pl";
 
 our $DEFAULT_MIN_AGE_DAYS = $BpDepsCheck::FRESH_DAYS;   # 7, reused rather than re-declared
 
-our $DEFAULT_MANIFEST = "$DIR/../../sandbox/container/Containerfile";
+our $DEFAULT_MANIFEST = "$DIR/../../backpack/recipes/node-pnpm.json";
 
 # ---- version comparison (dotted numeric, "1.2.3" style) -------------------
 
@@ -116,6 +123,11 @@ sub _uri_escape_segment {
     return $s;
 }
 
+# For `node` this is the npm package of that name, which republishes each
+# Node.js release about two days after nodejs.org does (checked 2026-10-30:
+# 24.22.1 is dated 2026-10-20 in nodejs.org/dist/index.json, 2026-10-22 on npm).
+# Ages computed from it therefore run young, which errs on the safe side of the
+# 7-day floor; at worst a release becomes eligible here two days late.
 sub _url_for_package {
     my ($pkg) = @_;
     return 'https://registry.npmjs.org/' . _uri_escape_segment($pkg);
@@ -248,9 +260,15 @@ sub resolve {
     my $now = eval { _resolve_now($opts) };
     return (undef, 'usage-error', $@) if $@;
 
-    my $http = _resolve_http($opts);
-    my ($releases, $cause, $detail) = _fetch_releases($http, $package);
-    return (undef, $cause, $detail) unless $releases;
+    # `releases` (internal, used by audit): an already-fetched list, so one
+    # audit row that resolves twice (held major + unrestricted) fetches once.
+    my ($releases, $cause, $detail);
+    if (ref $opts->{releases} eq 'ARRAY') {
+        $releases = $opts->{releases};
+    } else {
+        ($releases, $cause, $detail) = _fetch_releases(_resolve_http($opts), $package);
+        return (undef, $cause, $detail) unless $releases;
+    }
 
     # A prerelease/non-stable version ("12.0.0-alpha.21", "1.2.3-rc.0") is
     # NEVER "eligible", regardless of age: it is not what "latest LTS/stable"
@@ -263,6 +281,19 @@ sub resolve {
     return (undef, 'no-eligible-version', "'$package' has releases, but none is a stable (non-prerelease) version")
         unless @stable;
     $releases = \@stable;
+
+    # `major` (latest-eligible only): stay within one major line. Used for a
+    # pin held on a major on purpose; see hold_major in @PIN_SPEC.
+    if (defined $opts->{major} && $policy eq 'latest-eligible') {
+        my $want = $opts->{major};
+        my @in_major = grep {
+            my $m = BpDepsCheck::major_of($package, $_->{version});
+            defined $m && $m eq $want;
+        } @$releases;
+        return (undef, 'no-eligible-version', "'$package' has no stable release in major $want")
+            unless @in_major;
+        $releases = \@in_major;
+    }
 
     if ($policy eq 'latest-eligible') {
         my @eligible = grep {
@@ -320,31 +351,76 @@ sub resolve {
             "no non-EOL LTS line of '$package' has a release >= $min_age day(s) old as of " . BpDepsCheck::iso_of($now));
 }
 
-# ---- Containerfile pin extraction (SYN-23: by pattern, never by line number) ---
+# ---- pin extraction (SYN-23: by pattern, never by line number) -------------
 
 our @PIN_SPEC = (
     { package => 'node',              policy => 'latest-lts-eligible',
       pattern => qr/node-v([0-9][0-9.]*)-linux-x64\.tar\.xz/ },
-    { package => 'pnpm',               policy => 'latest-eligible',
+    # pnpm is HELD on the major it is pinned to: drift is judged within that
+    # major, and a newer major is named in the row without warning. Reason, read
+    # from the 12.15.0 tarball on 2026-10-30: pnpm 12's npm package installs its
+    # native binary from preinstall/postinstall scripts, which the sandbox's
+    # npm_config_ignore_scripts=true disables, and without them it falls back to
+    # running through Node and fetching a binary at run time. Moving to 12 is a
+    # reviewed decision (plugins/backpack/recipes/node-pnpm.json), not drift; a
+    # warning on every preflight until somebody makes it would only teach people
+    # to ignore the row.
+    { package => 'pnpm',               policy => 'latest-eligible', hold_major => 1,
       pattern => qr/pnpm\@([0-9][0-9.]*)/ },
 );
 
-# _parse_pins($path) -> (\@pins, undef) | (undef, $error)
-sub _parse_pins {
+# parse_pins($path) -> (\@pins, undef) | (undef, $error)
+#   \@pins may be EMPTY: a readable manifest that pins neither package is
+#   "nothing to audit" (the normal state of a project that declares no Node),
+#   never an error. An error means the manifest itself could not be read.
+#   A backpack file (a JSON object with an `items` array) contributes only its
+#   items' `install` commands -- the one place a pin takes effect -- so prose in
+#   a rationale ("re-pin with ...") can never be mistaken for a pin. Anything
+#   else is scanned as plain text, which is what Containerfile-shaped fixtures
+#   rely on. The first match per package wins, as it always has.
+sub parse_pins {
     my ($path) = @_;
-    open my $fh, '<', $path or return (undef, "cannot open manifest '$path': $!");
+    open my $fh, '<:raw', $path or return (undef, "cannot open manifest '$path': $!");
     local $/;
     my $content = <$fh>;
     close $fh;
     return (undef, "manifest '$path' is empty") unless defined $content && length $content;
 
+    my $text = $content;
+    if ($content =~ /\A\s*\{/) {
+        my $doc = eval { JSON::PP->new->utf8->relaxed->decode($content) };
+        if (ref $doc eq 'HASH' && ref $doc->{items} eq 'ARRAY') {
+            $text = join "\n", map { (ref $_ eq 'HASH' && defined $_->{install} && !ref $_->{install})
+                                         ? $_->{install} : () } @{ $doc->{items} };
+        }
+    }
+
     my @pins;
     for my $spec (@PIN_SPEC) {
-        next unless $content =~ $spec->{pattern};
-        push @pins, { package => $spec->{package}, policy => $spec->{policy}, pinned => $1 };
+        next unless $text =~ $spec->{pattern};
+        push @pins, { package => $spec->{package}, policy => $spec->{policy}, pinned => $1,
+                      ($spec->{hold_major} ? (hold_major => 1) : ()) };
     }
-    return (undef, "no recognizable version pins found in '$path'") unless @pins;
     return (\@pins, undef);
+}
+
+# cached_rows_for(\@rows, \@pins) -> \@rows if those cached audit rows were
+# computed for exactly these pins (same packages, same pinned versions), else
+# undef. bp-preflight.pl keys its TTL cache on this: the manifest is now the
+# project's own backpack, so one shared cache file would otherwise show one
+# project's verdict in another, or keep reporting a pin for a day after it was
+# bumped.
+sub cached_rows_for {
+    my ($rows, $pins) = @_;
+    return undef unless ref $rows eq 'ARRAY' && ref $pins eq 'ARRAY' && @$rows && @$rows == @$pins;
+    my %want = map { ($_->{package} => $_->{pinned}) } @$pins;
+    my %seen;
+    for my $r (@$rows) {
+        return undef unless ref $r eq 'HASH' && defined $r->{package} && defined $r->{pinned};
+        return undef unless exists $want{$r->{package}} && $want{$r->{package}} eq $r->{pinned};
+        return undef if $seen{$r->{package}}++;
+    }
+    return $rows;
 }
 
 # ---- audit ------------------------------------------------------------------
@@ -368,13 +444,18 @@ sub audit {
                   error => "bad --now: $err" }, 0);
     }
 
-    my ($pins, $perr) = _parse_pins($manifest);
+    my ($pins, $perr) = parse_pins($manifest);
     unless ($pins) {
         # Cannot even locate the pins -- degrade to WARN, exactly like every
         # other "I could not determine" path in this family. A missing/moved
         # manifest is not a safety condition.
         return ({ generated_at => BpDepsCheck::iso_of($now), manifest => $manifest, rows => [],
                   error => $perr }, 0);
+    }
+    unless (@$pins) {
+        # Nothing pinned is nothing to audit: no lookup, no row, exit 0.
+        return ({ generated_at => BpDepsCheck::iso_of($now), manifest => $manifest, rows => [],
+                  note => "no exact node or pnpm pin in '$manifest'; nothing to audit" }, 0);
     }
 
     my $http = _resolve_http($opts);
@@ -387,10 +468,20 @@ sub audit {
                           detail => "$p->{package}: pinned $p->{pinned}, eligible-version drift-unknown (--offline)" };
             next;
         }
-        my ($eligible, $cause, $detail) = resolve({
-            policy => $p->{policy}, package => $p->{package}, min_age_days => $min_age,
-            http => $http, now => $now,
-        });
+        my ($releases, $fcause, $fdetail) = _fetch_releases($http, $p->{package});
+        my $held = $p->{hold_major} ? BpDepsCheck::major_of($p->{package}, $p->{pinned}) : undef;
+        my ($eligible, $cause, $detail) = $releases
+            ? resolve({ policy => $p->{policy}, package => $p->{package}, min_age_days => $min_age,
+                        releases => $releases, now => $now, major => $held })
+            : (undef, $fcause, $fdetail);
+        # A held pin names a newer eligible major in its row, without warning.
+        my $beyond = '';
+        if (defined $held && defined $eligible) {
+            my ($any) = resolve({ policy => $p->{policy}, package => $p->{package}, min_age_days => $min_age,
+                                  releases => $releases, now => $now });
+            $beyond = "; $p->{package} $any is newer but outside the held major $held (a reviewed move, not drift)"
+                if defined $any && cmp_version($any, $eligible) > 0;
+        }
         if (!defined $eligible) {
             push @rows, { package => $p->{package}, pinned => $p->{pinned}, eligible => undef,
                           status => 'unknown',
@@ -401,11 +492,11 @@ sub audit {
             $drift = 1;
             push @rows, { package => $p->{package}, pinned => $p->{pinned}, eligible => $eligible,
                           status => 'drift',
-                          detail => "$p->{package}: pinned $p->{pinned}, newest eligible $eligible -- DRIFT (warn, not blocking)" };
+                          detail => "$p->{package}: pinned $p->{pinned}, newest eligible $eligible -- DRIFT (warn, not blocking)$beyond" };
         } else {
             push @rows, { package => $p->{package}, pinned => $p->{pinned}, eligible => $eligible,
                           status => 'current',
-                          detail => "$p->{package}: pinned $p->{pinned} is current (newest eligible $eligible)" };
+                          detail => "$p->{package}: pinned $p->{pinned} is current (newest eligible $eligible)$beyond" };
         }
     }
 
@@ -486,6 +577,10 @@ unless (caller) {
     }
     if (defined $report->{error}) {
         print "bp-pin.pl audit: $report->{error} (drift-unknown; not blocking)\n";
+        exit 0;
+    }
+    if (defined $report->{note}) {
+        print "bp-pin.pl audit: $report->{note}\n";
         exit 0;
     }
     for my $r (@{ $report->{rows} }) {

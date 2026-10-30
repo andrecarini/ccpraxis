@@ -537,6 +537,7 @@ CF
         BP_PIN_MANIFEST => $manifest_path,
         BP_PIN_FETCHER  => $fetcher_path,
         BP_PIN_NOW      => NOW_ISO,
+        BP_CREDS_KEYCHAIN => '0',   # never the macOS Keychain from a test
     });
     my $combined = $out . $err;
 
@@ -571,33 +572,56 @@ CF
 # Asserted WITHOUT NETWORK (C3 still holds) by pre-seeding the TTL cache and running
 # preflight with NO --deep and NO fetcher override: if the default path consults the
 # audit at all, it must surface these rows.
+#
+# RETARGETED 2026-10-30: the default manifest is now THE PROJECT'S OWN BACKPACK
+# (<data dir>/claude-home/backpack.json), so the fixture project declares pnpm there, found
+# through CCPRAXIS_DATA_DIR exactly as preflight finds it in production. The cache is keyed
+# on the pins, so its row carries the pinned version it was computed for.
 # =====================================================================================
-{
-    my $tmp = tempdir(CLEANUP => 1);
-    my $cache = "$tmp/pin-cache.json";
-    write_file($cache, '{"rows":[{"package":"pnpm","status":"drifted",'
-        . '"detail":"pnpm: pinned 11.17.0, newest eligible 11.20.0"}]}');
-
-    # C6b asserts rc==0. bp-preflight.pl's creds.path/creds.shape checks read
-    # home()."/.claude/.credentials.json" (home() = USERPROFILE // HOME) --
-    # under the real operator's home this file exists and is valid, but under
-    # a sandboxed run (scripts/run-tests.pl points HOME/USERPROFILE at a fresh
-    # temp dir) it is absent, both checks FAIL, and preflight's rc becomes 2
-    # for a reason that has nothing to do with this test's pin-audit subject.
-    # Fixture, per Decision 87: build a throwaway home with a valid creds file
-    # instead of depending on the operator's real one.
-    my $fixture_home = "$tmp/fixture-home";
-    mkdir $fixture_home or die "mkdir fixture home: $!";
-    mkdir "$fixture_home/.claude" or die "mkdir fixture .claude: $!";
-    write_file("$fixture_home/.claude/.credentials.json",
+sub fixture_home {
+    my ($tmp) = @_;
+    # bp-preflight.pl's creds checks read home()."/.claude/.credentials.json" (home() =
+    # USERPROFILE // HOME). Under a sandboxed run (scripts/run-tests.pl points HOME at a
+    # fresh temp dir) it is absent, both checks FAIL, and preflight's rc becomes 2 for a
+    # reason unrelated to the pin audit. Fixture, per Decision 87: a throwaway home with a
+    # valid creds file, which also keeps BpCreds away from the macOS Keychain.
+    my $home = "$tmp/fixture-home";
+    mkdir $home or die "mkdir fixture home: $!";
+    mkdir "$home/.claude" or die "mkdir fixture .claude: $!";
+    write_file("$home/.claude/.credentials.json",
         '{"claudeAiOauth":{"accessToken":"fixture-access-token",'
         . '"refreshToken":"fixture-refresh-token","expiresAt":9999999999999,'
         . '"scopes":["user:inference"]}}');
+    return $home;
+}
+
+# fixture_data_dir($tmp, @items) -> a CCPRAXIS_DATA_DIR whose claude-home/backpack.json holds @items.
+sub fixture_data_dir {
+    my ($tmp, @items) = @_;
+    my $data = "$tmp/data";
+    mkdir $data or die "mkdir $data: $!";
+    mkdir "$data/claude-home" or die "mkdir claude-home: $!";
+    write_json("$data/claude-home/backpack.json", { version => 2, items => \@items });
+    return $data;
+}
+
+my $PNPM_ITEM = { category => 'npm-global', name => 'pnpm', install => 'npm install -g pnpm@11.17.0',
+                  verify => 'command -v pnpm', rationale => 'fixture' };
+{
+    my $tmp = tempdir(CLEANUP => 1);
+    my $cache = "$tmp/pin-cache.json";
+    write_file($cache, '{"rows":[{"package":"pnpm","pinned":"11.17.0","status":"drifted",'
+        . '"detail":"pnpm: pinned 11.17.0, newest eligible 11.20.0"}]}');
+    my $fixture_home = fixture_home($tmp);
+    my $data = fixture_data_dir($tmp, $PNPM_ITEM);
 
     my ($rc, $out, $err) = run_cli($PREFLIGHT_SCRIPT, [], {
-        BP_PIN_CACHE => $cache,
-        HOME         => $fixture_home,
-        USERPROFILE  => $fixture_home,
+        BP_PIN_CACHE      => $cache,
+        HOME              => $fixture_home,
+        USERPROFILE       => $fixture_home,
+        CCPRAXIS_DATA_DIR => $data,
+        BP_PIN_MANIFEST   => undef,
+        BP_CREDS_KEYCHAIN => '0',
     });
     my $combined = $out . $err;
 
@@ -613,6 +637,153 @@ CF
         or diag($combined);
     is($rc, 0, 'C6b: drift still does not change preflight\'s exit code')
         or diag($combined);
+}
+
+# =====================================================================================
+# C9 -- a backpack manifest: pins come from items' `install` commands only; a manifest that
+# pins nothing is "nothing to audit", never an error, and costs no lookup.
+# =====================================================================================
+{
+    my $tmp = tempdir(CLEANUP => 1);
+    my $bp = write_json("$tmp/backpack.json", { version => 2, items => [
+        { category => 'apt', name => 'jq', install => 'apt-get install -y jq', verify => 'true',
+          rationale => 'mentions pnpm@9.0.0 and node-v20.0.0-linux-x64.tar.xz in prose only' },
+        { category => 'other', name => 'node+pnpm', verify => 'true',
+          install => 'curl -o /tmp/t https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.xz && npm install -g pnpm@11.28.8' },
+    ] });
+    my ($pins, $err) = BpPin::parse_pins($bp);
+    my %by = map { ($_->{package} => $_->{pinned}) } @{ $pins || [] };
+    is($by{node}, '24.22.1', 'C9: the Node pin is read from an item install command');
+    is($by{pnpm}, '11.28.8', 'C9: the pnpm pin is read from an item install command, not from rationale prose');
+
+    my $empty = write_json("$tmp/empty.json", { version => 2, items => [
+        { category => 'apt', name => 'jq', install => 'apt-get install -y jq', verify => 'true',
+          rationale => 'pnpm@9.0.0 named in prose only' } ] });
+    my ($none, $nerr) = BpPin::parse_pins($empty);
+    ok(ref $none eq 'ARRAY' && !@$none && !defined $nerr,
+        'C9: a backpack that pins neither package yields an empty list, not an error');
+
+    my $calls = 0;
+    my ($report, $rc) = BpPin::audit({ manifest => $empty, now => NOW_EPOCH,
+                                       http => sub { $calls++; return { status => 500, content => '' } } });
+    is($rc, 0, 'C9: auditing a manifest with no pins exits 0');
+    is(scalar @{ $report->{rows} || [] }, 0, 'C9: ... and reports no rows');
+    like($report->{note} // '', qr/nothing to audit/, 'C9: ... but says why');
+    is($calls, 0, 'C9: ... and makes no registry lookup at all');
+
+    my ($cli_rc, $cli_out) = run_cli($PIN_SCRIPT, [ cli_args('audit', manifest => $empty, now => NOW_ISO) ], {});
+    is($cli_rc, 0, 'C9: the CLI exits 0 on a manifest with no pins');
+    like($cli_out, qr/nothing to audit/, 'C9: the CLI says there is nothing to audit');
+
+    my ($missing, $merr) = BpPin::parse_pins("$tmp/no-such-file.json");
+    ok(!defined $missing && defined $merr, 'C9: an unreadable manifest is still an error (degrades to WARN upstream)');
+}
+
+# =====================================================================================
+# C10 -- the cache is keyed on the pins: a cached verdict applies only to the pins it was
+# computed for. One shared $TMPDIR cache would otherwise show project A's verdict in project
+# B, or keep reporting a pin for a day after it was bumped.
+# =====================================================================================
+{
+    my @pins = ({ package => 'node', pinned => '24.22.1' }, { package => 'pnpm', pinned => '11.28.8' });
+    my @rows = ({ package => 'node', pinned => '24.22.1', status => 'current' },
+                { package => 'pnpm', pinned => '11.28.8', status => 'current' });
+    ok(BpPin::cached_rows_for(\@rows, \@pins), 'C10: rows computed for exactly these pins are reused');
+    ok(!BpPin::cached_rows_for([ { %{ $rows[0] } }, { %{ $rows[1] }, pinned => '11.17.0' } ], \@pins),
+        'C10: a row for a different pinned version is not reused');
+    ok(!BpPin::cached_rows_for([ $rows[0] ], \@pins), 'C10: rows missing a pinned package are not reused');
+    ok(!BpPin::cached_rows_for(\@rows, [ $pins[0] ]), 'C10: rows for an extra package are not reused');
+    ok(!BpPin::cached_rows_for([ { package => 'pnpm', status => 'current' } ], [ $pins[1] ]),
+        'C10: a row with no pinned version (the pre-2026-10-30 cache shape) is not reused');
+    ok(!BpPin::cached_rows_for([], []), 'C10: an empty cache is never a hit');
+
+    # End to end, still without network: the project's backpack pins 11.28.8 while the cache
+    # holds a verdict for 11.17.0, so preflight must not print the cached row. BP_PIN_NOW turns
+    # the live lookup off the network path (it bypasses the cache), so what is printed is
+    # whatever the audit itself says -- here, offline-free: an unreachable fixture.
+    my $tmp = tempdir(CLEANUP => 1);
+    my $cache = "$tmp/pin-cache.json";
+    write_file($cache, '{"rows":[{"package":"pnpm","pinned":"11.17.0","status":"drifted",'
+        . '"detail":"pnpm: pinned 11.17.0, newest eligible 11.20.0 CACHED-FOR-OTHER-PINS"}]}');
+    my $home = fixture_home($tmp);
+    my $data = fixture_data_dir($tmp, { %$PNPM_ITEM, install => 'npm install -g pnpm@11.28.8' });
+    my ($rc, $out, $err) = run_cli($PREFLIGHT_SCRIPT, [], {
+        BP_PIN_CACHE      => $cache,
+        BP_PIN_FETCHER    => "$tmp/does-not-exist.json",
+        HOME              => $home,
+        USERPROFILE       => $home,
+        CCPRAXIS_DATA_DIR => $data,
+        BP_PIN_MANIFEST   => undef,
+        BP_CREDS_KEYCHAIN => '0',
+    });
+    my $combined = $out . $err;
+    like($combined, qr/pin\.pnpm[^\n]*11\.28\.8/, 'C10: preflight reports the pin the backpack declares now')
+        or diag($combined);
+    unlike($combined, qr/CACHED-FOR-OTHER-PINS/, 'C10: ... never a cached verdict for other pins')
+        or diag($combined);
+}
+
+# =====================================================================================
+# C11 -- preflight on a project that pins no Node: one skip row, no pin.node/pin.pnpm row.
+# =====================================================================================
+{
+    my $tmp = tempdir(CLEANUP => 1);
+    my $home = fixture_home($tmp);
+    my $data = fixture_data_dir($tmp,
+        { category => 'apt', name => 'jq', install => 'apt-get install -y jq', verify => 'true' });
+    my %env = (HOME => $home, USERPROFILE => $home, CCPRAXIS_DATA_DIR => $data,
+               BP_PIN_MANIFEST => undef, BP_PIN_FETCHER => undef, BP_PIN_NOW => undef,
+               BP_PIN_CACHE => "$tmp/cache.json", BP_CREDS_KEYCHAIN => '0');
+
+    my ($rc, $out, $err) = run_cli($PREFLIGHT_SCRIPT, [], \%env);
+    my $combined = $out . $err;
+    like($combined, qr/\[ skip \] pin\.audit\s+no exact node or pnpm pin in \S*backpack\.json/,
+        'C11: a backpack with no Node pins gets one skip row saying there is nothing to audit')
+        or diag($combined);
+    unlike($combined, qr/\bpin\.(?:node|pnpm)\b/, 'C11: and no pin.node / pin.pnpm row')
+        or diag($combined);
+    is($rc, 0, 'C11: preflight still passes') or diag($combined);
+    ok(!-e "$tmp/cache.json", 'C11: nothing was looked up, so nothing was cached');
+
+    unlink "$data/claude-home/backpack.json";
+    my ($rc2, $out2, $err2) = run_cli($PREFLIGHT_SCRIPT, [], \%env);
+    like($out2 . $err2, qr/\[ skip \] pin\.audit\s+nothing pinned to audit: no project backpack at /,
+        'C11: no backpack at all is a skip too, naming where it looked')
+        or diag($out2 . $err2);
+}
+
+# =====================================================================================
+# C12 -- pnpm is held on its pinned major; Node is not.
+# pnpm 12's npm package installs its native binary from install scripts, which the sandbox
+# disables, so a new pnpm major is a reviewed move: within-major drift warns, a newer major is
+# only named. Node's policy already moves to a newer LTS line once one is eligible.
+# =====================================================================================
+{
+    my $tmp = tempdir(CLEANUP => 1);
+    my $fetcher = "$tmp/registry.json";
+    write_file($fetcher, multi_pkg_fixture_json(
+        node => { '24.22.1' => '2026-10-20T00:00:00Z', '26.13.0' => '2026-10-28T00:00:00Z' },
+        pnpm => { '11.28.8' => '2026-10-22T00:00:00Z', '11.29.0' => '2026-10-24T00:00:00Z',
+                  '12.15.0' => '2026-10-21T00:00:00Z' },
+    ));
+    my $later = '2026-11-10T00:00:00Z';   # every release above is >= 7 days old by now
+
+    my $held = write_file("$tmp/Containerfile.held",
+        "RUN x node-v24.22.1-linux-x64.tar.xz && npm install -g pnpm\@11.28.8\n");
+    my ($rc, $out) = run_cli($PIN_SCRIPT, [ cli_args('audit', manifest => $held, fetcher => $fetcher, now => $later) ], {});
+    like($out, qr/^pnpm: pinned 11\.28\.8, newest eligible 11\.29\.0 -- DRIFT/m,
+        'C12: pnpm drift is judged within its pinned major (11.29.0, not 12.15.0)') or diag($out);
+    like($out, qr/^pnpm:[^\n]*12\.15\.0 is newer but outside the held major 11/m,
+        'C12: the newer pnpm major is named in the row') or diag($out);
+    like($out, qr/^node: pinned 24\.22\.1, newest eligible 26\.13\.0 -- DRIFT/m,
+        'C12: Node is NOT held: a newer eligible LTS line is drift') or diag($out);
+
+    my $current = write_file("$tmp/Containerfile.current",
+        "RUN x node-v26.13.0-linux-x64.tar.xz && npm install -g pnpm\@11.29.0\n");
+    my ($rc2, $out2) = run_cli($PIN_SCRIPT, [ cli_args('audit', manifest => $current, fetcher => $fetcher, now => $later) ], {});
+    is($rc2, 0, 'C12: newest in the held major plus the newest LTS line is no drift at all') or diag($out2);
+    like($out2, qr/^pnpm: pinned 11\.29\.0 is current[^\n]*12\.15\.0 is newer but outside the held major 11/m,
+        'C12: a current held pin still names the newer major, without warning') or diag($out2);
 }
 
 done_testing();

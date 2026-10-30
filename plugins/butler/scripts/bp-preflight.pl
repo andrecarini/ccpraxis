@@ -385,9 +385,17 @@ sub dag_integrity_gate {
 # preflight and wedge an unattended fleet over a routine upstream release --
 # so this row is pushed to @rows only, NEVER to @fail, regardless of drift.
 #
+# WHAT IS AUDITED. Until 2026-10-30 the Containerfile pinned Node and pnpm into
+# every sandbox image, so this audited the image. They left the image that day
+# and are declared per project in the backpack (usually through the recipe
+# plugins/backpack/recipes/node-pnpm.json), so this audits THE PROJECT'S OWN
+# BACKPACK: pin_manifest() below. A project that pins no Node -- most of them --
+# gets one `skip` row and no network round trip at all.
+#
 # Env overrides exist so this is testable exactly like repo.usable's
 # BP_PROJECT_ROOT / BP_ALLOW_NO_GIT ladder, without a new CLI flag:
-#   BP_PIN_MANIFEST  - path to a Containerfile-shaped fixture (default: the real one)
+#   BP_PIN_MANIFEST  - path to the manifest to audit (a backpack file, or any
+#                      Containerfile-shaped text) instead of the project's backpack
 #   BP_PIN_FETCHER   - path to a JSON fixture keyed by package name, each value an
 #                      npm-packument doc ({"time": {...}}) -- see bp-pin.pl's own contract
 #   BP_PIN_NOW       - ISO-8601 or epoch clock override
@@ -401,10 +409,44 @@ sub _pin_cache_path {
     return "$tmp/.bp-pin-audit-cache.json";
 }
 
+# pin_manifest() -> ($path, $source) | (undef, $why). Ladder: BP_PIN_MANIFEST
+# -> the project's backpack, <data dir>/claude-home/backpack.json (the host
+# path, and the same file inside the sandbox through the /project bind) ->
+# inside the sandbox only, ~/.claude/backpack.json (where claude-home is
+# mounted). The last rung is never consulted on a host, where ~/.claude is not
+# any one project's.
+sub pin_manifest {
+    if (defined $ENV{BP_PIN_MANIFEST} && length $ENV{BP_PIN_MANIFEST}) {
+        return ($ENV{BP_PIN_MANIFEST}, 'BP_PIN_MANIFEST');
+    }
+    my ($data, $dsrc) = dag_data_dir();
+    my $project_bp = "$data/claude-home/backpack.json";
+    return ($project_bp, "project backpack via $dsrc") if -f $project_bp;
+    if (($ENV{IS_SANDBOX} // '') eq '1') {
+        my $home_bp = home() . '/.claude/backpack.json';
+        return ($home_bp, 'sandbox ~/.claude') if -f $home_bp;
+    }
+    return (undef, "no project backpack at $project_bp");
+}
+
 sub pin_audit_rows {
     my ($deep) = @_;
     my @rows;
     my $have_fetcher_override = defined $ENV{BP_PIN_FETCHER} && length $ENV{BP_PIN_FETCHER};
+
+    my ($manifest, $msrc) = pin_manifest();
+    return (['skip', 'pin.audit', "nothing pinned to audit: $msrc"]) unless defined $manifest;
+
+    # Read the pins locally first: free, and it decides whether any lookup is
+    # needed at all and which cached verdict (if any) still applies.
+    my ($pins, $perr) = eval { require "$Bin/bp-pin.pl"; BpPin::parse_pins($manifest) };
+    if (!$pins) {
+        my $err = $perr // $@ // 'unknown error';
+        $err =~ s/\s+$//;
+        return (['warn', 'pin.audit', "version-pin audit: $err (drift-unknown; not blocking)"]);
+    }
+    return (['skip', 'pin.audit', "no exact node or pnpm pin in $manifest ($msrc); nothing to audit"])
+        unless @$pins;
 
     # A live lookup is 3 HTTP round trips (~14s), which starves any caller that
     # spawns preflight repeatedly (t/27 runs one subprocess per assertion). The
@@ -418,39 +460,46 @@ sub pin_audit_rows {
     #
     # So the live check runs BY DEFAULT and is made cheap by a TTL cache: the
     # first run per TTL pays the round trips, every run after it is a file read.
-    # The cache is keyed to nothing and deliberately outside the project tree --
-    # it is a pure optimisation, safe to delete, and shared across the repeated
-    # spawns that made this expensive in the first place.
+    # The cache lives outside the project tree -- a pure optimisation, safe to
+    # delete, shared across the repeated spawns that made this expensive in the
+    # first place -- and a cached verdict is used only for the exact pins it was
+    # computed for (BpPin::cached_rows_for). Since the manifest became each
+    # project's own backpack, an unkeyed cache would show one project's verdict
+    # in another that shares $TMPDIR, and keep reporting a pin for a day after
+    # it was bumped. That keying is also why a BP_PIN_MANIFEST override no
+    # longer bypasses the cache.
     my $ttl = defined $ENV{BP_PIN_CACHE_TTL} && $ENV{BP_PIN_CACHE_TTL} =~ /^\d+$/
         ? $ENV{BP_PIN_CACHE_TTL} : 86_400;
     my $cache = _pin_cache_path();
-    my $use_cache = !$have_fetcher_override && !$ENV{BP_PIN_MANIFEST} && !$ENV{BP_PIN_NOW};
+    my $use_cache = !$have_fetcher_override && !$ENV{BP_PIN_NOW};
 
     if ($use_cache && $ttl > 0 && -f $cache && (time - (stat($cache))[9]) < $ttl) {
         my $cached = eval { read_json($cache) };
-        if (ref $cached eq 'HASH' && ref $cached->{rows} eq 'ARRAY') {
-            for my $row (@{ $cached->{rows} }) {
-                next unless ref $row eq 'HASH' && defined $row->{package};
+        my $hit = ref $cached eq 'HASH' ? BpPin::cached_rows_for($cached->{rows}, $pins) : undef;
+        if ($hit) {
+            for my $row (@$hit) {
                 my $status = (defined $row->{status} && $row->{status} eq 'current') ? 'ok' : 'warn';
                 push @rows, [$status, "pin.$row->{package}", ($row->{detail} // '') . ' [cached]'];
             }
-            return @rows if @rows;
+            return @rows;
         }
-        # Unreadable or empty cache is not an error -- fall through and re-check.
+        # Unreadable, empty, or computed for other pins: not an error -- re-check.
     }
 
     my ($report, $rc) = eval {
-        require "$Bin/bp-pin.pl";
-        my %opts;
-        $opts{manifest} = $ENV{BP_PIN_MANIFEST} if defined $ENV{BP_PIN_MANIFEST} && length $ENV{BP_PIN_MANIFEST};
+        my %opts = (manifest => $manifest);
         $opts{now}      = $ENV{BP_PIN_NOW}      if defined $ENV{BP_PIN_NOW}      && length $ENV{BP_PIN_NOW};
         $opts{fetcher_path} = $ENV{BP_PIN_FETCHER} if $have_fetcher_override;
         BpPin::audit(\%opts);
     };
+    # Taken now: the cache write below runs its own eval, which resets $@, and a
+    # cache that could not be written then masqueraded as "audit unavailable".
+    my $audit_err = $@;
 
     # Persist a good live report so the next spawn is free. Best-effort: a
     # cache that cannot be written must never affect the verdict.
-    if ($use_cache && ref $report eq 'HASH' && !defined $report->{error} && ref $report->{rows} eq 'ARRAY') {
+    if ($use_cache && ref $report eq 'HASH' && !defined $report->{error} && ref $report->{rows} eq 'ARRAY'
+        && @{ $report->{rows} }) {
         eval {
             open my $cfh, '>:raw', "$cache.tmp.$$" or die;
             print $cfh JSON::PP->new->canonical->encode({ rows => $report->{rows} });
@@ -459,8 +508,8 @@ sub pin_audit_rows {
             1;
         } or do { unlink "$cache.tmp.$$" };
     }
-    if ($@ || ref $report ne 'HASH') {
-        my $err = $@ || 'bp-pin.pl audit returned no report';
+    if ($audit_err || ref $report ne 'HASH') {
+        my $err = $audit_err || 'bp-pin.pl audit returned no report';
         $err =~ s/\s+$//;
         push @rows, ['warn', 'pin.audit', "version-pin audit unavailable: $err"];
         return @rows;
