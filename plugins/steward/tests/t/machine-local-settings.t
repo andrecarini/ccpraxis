@@ -131,6 +131,52 @@ for my $os (qw(darwin linux)) {
     MachineLocalSettings::restore_foreign_platform_keys($merged, {});
     ok(!exists $merged->{env}{$PS}, "$os: restore with nothing saved removes the key");
 }
+# ---------------------------------------------------------------------------
+# 3b. Platform-only hook registrations (the Windows-only guards).
+# ---------------------------------------------------------------------------
+{
+    my $nul  = { matcher => 'Bash', hooks => [ { type => 'command', command => 'f="$HOME/.claude/ccpraxis/scripts/hooks/block-nul-redirect.pl"; [ -f "$f" ] || exit 0; exec perl "$f"' } ] };
+    my $ps1  = { matcher => 'Edit|Write', hooks => [ { type => 'command', command => 'exec perl "C:\\Users\\x\\.claude\\ccpraxis\\scripts\\hooks\\block-nonascii-ps1.pl"' } ] };
+    my $mine = { matcher => 'Bash', hooks => [ { type => 'command', command => 'exec perl /x/my-own-guard.pl' } ] };
+    my $mixed = { matcher => 'Bash', hooks => [ $nul->{hooks}[0], $mine->{hooks}[0] ] };
+    my $reap = { hooks => [ { type => 'command', command => 'exec perl "$HOME/.claude/ccpraxis/scripts/hooks/reap-orphans-hook.pl"' } ] };
+    my $mk = sub { return { hooks => { PreToolUse => [ map { +{ %$_ } } @_ ], SessionStart => [ { %$reap } ] } } };
+    my $canon = sub { JSON::PP->new->canonical->encode($_[0]) };
+
+    {
+        local $^O = 'msys';
+        my $s = $mk->($nul, $mine, $ps1);
+        my $before = $canon->($s);
+        is_deeply(MachineLocalSettings::strip_foreign_platform_keys($s), {}, 'windows: the Windows-only guards are not foreign');
+        is($canon->($s), $before, 'windows: strip leaves every hook in place');
+    }
+    for my $os (qw(darwin linux)) {
+        local $^O = $os;
+        my $s = $mk->($nul, $mine, $ps1);
+        my $orig = $canon->($s);
+        my $saved = MachineLocalSettings::strip_foreign_platform_keys($s);
+        is(scalar(@{ $s->{hooks}{PreToolUse} }), 1, "$os: both Windows-only guard groups are stripped");
+        is($s->{hooks}{PreToolUse}[0]{hooks}[0]{command}, 'exec perl /x/my-own-guard.pl', "$os: an unrelated hook group stays");
+        is(scalar(@{ $s->{hooks}{SessionStart} }), 1, "$os: other events are untouched");
+        MachineLocalSettings::restore_foreign_platform_keys($s, $saved);
+        is($canon->($s), $orig, "$os: strip then restore is the identity (positions kept)");
+
+        my $only = $mk->($nul, $ps1);
+        my $saved2 = MachineLocalSettings::strip_foreign_platform_keys($only);
+        ok(!exists $only->{hooks}{PreToolUse}, "$os: an event left with no groups is removed");
+        my $merged = { hooks => { SessionStart => [ { %$reap } ] } };
+        MachineLocalSettings::restore_foreign_platform_keys($merged, $saved2);
+        is(scalar(@{ $merged->{hooks}{PreToolUse} }), 2, "$os: restore recreates the event with the saved groups");
+
+        my $live = $mk->($nul, $mine);
+        MachineLocalSettings::restore_foreign_platform_keys($live, {});
+        is(scalar(@{ $live->{hooks}{PreToolUse} }), 1, "$os: restore with nothing saved drops a foreign group the merge left");
+
+        my $m = { hooks => { PreToolUse => [ { %$mixed } ] } };
+        is_deeply(MachineLocalSettings::strip_foreign_platform_keys($m), {}, "$os: a group mixing a guard with another hook is left alone");
+    }
+}
+
 {
     local $^O = 'darwin';
     my $tok_only = { extraKnownMarketplaces => { x => { source => { source => 'github', path => "$TOKEN/plugins" } } } };
@@ -189,7 +235,10 @@ sub git {
     return $out;
 }
 
-my $PAYLOAD_V2 = mp_settings("$TOKEN/plugins", env => { $PS => '1', KEEP => '1' }, theme => 'dark');
+my $NUL_GROUP  = { matcher => 'Bash', hooks => [ { type => 'command', command => 'f="$HOME/.claude/ccpraxis/scripts/hooks/block-nul-redirect.pl"; [ -f "$f" ] || exit 0; exec perl "$f"' } ] };
+my $REAP_GROUP = { matcher => '', hooks => [ { type => 'command', command => 'f="$HOME/.claude/ccpraxis/scripts/hooks/reap-orphans-hook.pl"; [ -f "$f" ] || exit 0; exec perl "$f"' } ] };
+my $PAYLOAD_V2 = mp_settings("$TOKEN/plugins", env => { $PS => '1', KEEP => '1' }, theme => 'dark',
+    hooks => { PreToolUse => [ $NUL_GROUP ], SessionStart => [ $REAP_GROUP ] });
 
 # A clone whose main carries an OLD payload (the Windows literal) and then the
 # current one (the token), cloned --no-hardlinks into <home>/.claude/ccpraxis.
@@ -242,6 +291,12 @@ SKIP: {
         ok(!exists $live->{env}{$PS}, 'promote (non-windows host): the PowerShell switch is NOT added');
     }
     is($live->{env}{KEEP}, '1', 'promote: the rest of env arrives normally');
+    if ($IS_WIN) {
+        is(scalar(@{ $live->{hooks}{PreToolUse} // [] }), 1, 'promote (windows host): the Windows-only NUL guard is registered');
+    } else {
+        ok(!exists $live->{hooks}{PreToolUse}, 'promote (non-windows host): the Windows-only NUL guard is NOT registered');
+    }
+    is(scalar(@{ $live->{hooks}{SessionStart} // [] }), 1, 'promote: a hook for every host arrives normally');
 
     # 4b. second promote is a no-op
     my $before = read_file("$f->{home}/.claude/settings.json");
@@ -323,7 +378,10 @@ SKIP: {
     make_path($live_root);
     my ($root_spelling) = MachineLocalSettings::live_root_spellings($live_root);
     my %env = (KEEP => '1', ($IS_WIN ? ($PS => '1') : ()));
-    write_json_file("$dir/live.json", mp_settings("$root_spelling/plugins", env => \%env, theme => 'dark'));
+    # In sync = what promote installs on this host: the Windows-only guard
+    # only on Windows, the every-host hook everywhere.
+    my %hooks = (SessionStart => [ $REAP_GROUP ], ($IS_WIN ? (PreToolUse => [ $NUL_GROUP ]) : ()));
+    write_json_file("$dir/live.json", mp_settings("$root_spelling/plugins", env => \%env, theme => 'dark', hooks => \%hooks));
     write_json_file("$dir/payload.json", $PAYLOAD_V2);
 
     my ($rc, $out) = run_cmd({}, $^X, $JSONDIFF, "$dir/live.json", "$dir/payload.json");
@@ -333,7 +391,7 @@ SKIP: {
 
     # a genuinely different path is still reported, with the payload side
     # expanded (so a "use the repo value" answer writes a real path).
-    write_json_file("$dir/live2.json", mp_settings('/somewhere/else/plugins', env => \%env, theme => 'dark'));
+    write_json_file("$dir/live2.json", mp_settings('/somewhere/else/plugins', env => \%env, theme => 'dark', hooks => \%hooks));
     ($rc, $out) = run_cmd({}, $^X, $JSONDIFF, '--host-live', $live_root, "$dir/live2.json", "$dir/payload.json");
     is($rc, 1, 'json-diff --host-live: a different live path is still a difference');
     my $j = eval { decode_json($out) } // {};

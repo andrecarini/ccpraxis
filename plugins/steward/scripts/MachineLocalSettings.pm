@@ -48,6 +48,21 @@
 #    PowerShell tool with no pwsh behind it, and a Mac backup (where the key
 #    is absent, or pinned "0") must not take it away from the Windows host.
 #
+# 3. PLATFORM-ONLY HOOKS (%PLATFORM_ONLY_HOOKS below). A hook registration
+#    whose script only guards against one platform's failure is a cost and
+#    nothing else on the others: block-nul-redirect.pl (a `> NUL` from Git
+#    Bash creates an undeletable file on Windows) and block-nonascii-ps1.pl
+#    (PowerShell 5.1 misreads a BOM-less non-ASCII .ps1) each started a perl
+#    process on every Bash or Edit/Write call on a Mac to guard against
+#    nothing there. Such a registration gets the platform-only-key treatment:
+#    stripped from both sides before a comparison, and put back afterwards
+#    from the side that owns it on this host (live for promote, the payload
+#    for export). A hook group is platform-only when every hook in it runs a
+#    listed script; a group mixing a listed script with anything else is
+#    left alone. What strip removes is remembered by event and position, so
+#    a restore puts each group back where it was and an export never
+#    reorders the payload.
+#
 # Keys are named in the one-level dotted form the rest of the settings sync
 # uses (json-diff.pl, filter-diff.pl, .backup-preferences.json): "top" or
 # "top.sub".
@@ -64,7 +79,7 @@ use File::Spec;
 use Exporter 'import';
 
 our @EXPORT_OK = qw(
-    LIVE_ROOT_TOKEN %PLATFORM_ONLY_KEYS
+    LIVE_ROOT_TOKEN %PLATFORM_ONLY_KEYS %PLATFORM_ONLY_HOOKS
     is_windows_host host_platform live_root_spellings
     expand_live_root collapse_live_root
     foreign_platform_keys strip_foreign_platform_keys restore_foreign_platform_keys
@@ -77,6 +92,17 @@ use constant LIVE_ROOT_TOKEN => '${CCPRAXIS_LIVE}';
 our %PLATFORM_ONLY_KEYS = (
     'env.CLAUDE_CODE_USE_POWERSHELL_TOOL' => 'windows',
 );
+
+# script path (as it appears in a hook command, forward slashes) => the one
+# platform it applies to.
+our %PLATFORM_ONLY_HOOKS = (
+    'scripts/hooks/block-nul-redirect.pl'  => 'windows',
+    'scripts/hooks/block-nonascii-ps1.pl'  => 'windows',
+);
+
+# Prefix of the %saved entries that carry stripped hook groups, so they can
+# never collide with a dotted key name.
+use constant HOOK_SAVE_PREFIX => "\0hooks:";
 
 # Git-for-Windows perl reports cygwin/msys, Strawberry/ActivePerl MSWin32.
 sub is_windows_host { return ($^O eq 'MSWin32' || $^O eq 'cygwin' || $^O eq 'msys') ? 1 : 0 }
@@ -222,8 +248,29 @@ sub _delete_key {
     return;
 }
 
-# Remove this host's foreign platform-only keys from $obj, in place. Returns
-# { name => value } for what was present, so a caller can put it back.
+# True when every hook in $group runs a script that applies only to a
+# platform other than this host's.
+sub _is_foreign_hook_group {
+    my ($group) = @_;
+    return 0 unless ref($group) eq 'HASH' && ref($group->{hooks}) eq 'ARRAY' && @{ $group->{hooks} };
+    my $plat = host_platform();
+    for my $h (@{ $group->{hooks} }) {
+        my $cmd = (ref($h) eq 'HASH' && defined $h->{command} && !ref $h->{command}) ? $h->{command} : '';
+        (my $norm = $cmd) =~ s{\\}{/}g;
+        my $foreign = 0;
+        for my $script (keys %PLATFORM_ONLY_HOOKS) {
+            next if $PLATFORM_ONLY_HOOKS{$script} eq $plat;
+            if (index($norm, $script) >= 0) { $foreign = 1; last; }
+        }
+        return 0 unless $foreign;
+    }
+    return 1;
+}
+
+# Remove this host's foreign platform-only keys and hook groups from $obj,
+# in place. Returns { name => value } for what was present, so a caller can
+# put it back: dotted key names for keys, HOOK_SAVE_PREFIX.<event> =>
+# [ [index, group], ... ] (original positions, ascending) for hook groups.
 sub strip_foreign_platform_keys {
     my ($obj) = @_;
     my %saved;
@@ -234,13 +281,31 @@ sub strip_foreign_platform_keys {
         $saved{$k} = $val;
         _delete_key($obj, $k);
     }
+    if (ref($obj->{hooks}) eq 'HASH') {
+        for my $event (sort keys %{ $obj->{hooks} }) {
+            my $groups = $obj->{hooks}{$event};
+            next unless ref($groups) eq 'ARRAY';
+            my (@kept, @gone);
+            for my $i (0 .. $#$groups) {
+                if (_is_foreign_hook_group($groups->[$i])) { push @gone, [ $i, $groups->[$i] ]; }
+                else                                       { push @kept, $groups->[$i]; }
+            }
+            next unless @gone;
+            $saved{ HOOK_SAVE_PREFIX . $event } = \@gone;
+            if (@kept) { $obj->{hooks}{$event} = \@kept; }
+            else       { delete $obj->{hooks}{$event}; }
+        }
+        delete $obj->{hooks} unless %{ $obj->{hooks} };
+    }
     return \%saved;
 }
 
-# Make $obj carry exactly $saved's foreign platform-only keys: set what
-# $saved has, delete what it lacks. Used after a merge so the side that owns
-# those keys on this host (live for promote, the payload for export) wins
-# whatever the merge did.
+# Make $obj carry exactly $saved's foreign platform-only keys and hook
+# groups: set what $saved has, delete what it lacks. Used after a merge so
+# the side that owns them on this host (live for promote, the payload for
+# export) wins whatever the merge did. Hook groups go back at the positions
+# they were stripped from (clamped to the array's end), so a strip followed
+# by a restore is the identity.
 sub restore_foreign_platform_keys {
     my ($obj, $saved) = @_;
     return unless ref($obj) eq 'HASH';
@@ -248,6 +313,28 @@ sub restore_foreign_platform_keys {
     for my $k (foreign_platform_keys()) {
         if (exists $saved->{$k}) { _set_key($obj, $k, $saved->{$k}); }
         else                     { _delete_key($obj, $k); }
+    }
+    # Drop whatever foreign groups the merge left (a strip of a hash holding
+    # only the hooks has no keys to remove), then re-insert the saved ones.
+    if (ref($obj->{hooks}) eq 'HASH') {
+        my %only = (hooks => $obj->{hooks});
+        strip_foreign_platform_keys(\%only);
+        if (exists $only{hooks}) { $obj->{hooks} = $only{hooks}; }
+        else                     { delete $obj->{hooks}; }
+    }
+    my $pfx = HOOK_SAVE_PREFIX;
+    for my $sk (sort grep { index($_, $pfx) == 0 } keys %$saved) {
+        my $event = substr($sk, length $pfx);
+        my $entries = $saved->{$sk};
+        next unless ref($entries) eq 'ARRAY' && @$entries;
+        $obj->{hooks} = {} unless ref($obj->{hooks}) eq 'HASH';
+        $obj->{hooks}{$event} = [] unless ref($obj->{hooks}{$event}) eq 'ARRAY';
+        my $arr = $obj->{hooks}{$event};
+        for my $e (sort { $a->[0] <=> $b->[0] } @$entries) {
+            my ($i, $group) = @$e;
+            $i = scalar(@$arr) if $i > scalar(@$arr);
+            splice @$arr, $i, 0, $group;
+        }
     }
     return;
 }
