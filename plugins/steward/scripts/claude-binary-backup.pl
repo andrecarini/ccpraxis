@@ -1118,9 +1118,7 @@ Subcommands:
              Report whether the binary exists, its version, size, and SHA.
 
   install-command --version <x.y.z> [--binary <path>]
-             Work out how the claude on PATH (or --binary) was installed and print the
-             one command that installs version x.y.z on this machine. Exit 1 when there
-             is no such command (a Homebrew install, or an unknown method); see "note".
+             Work out how the claude on PATH (or --binary) was installed and print the one command that installs version x.y.z on this machine. Exit 1 when there is no such command (a Homebrew install, or an unknown method); see "note".
 
   snapshot   [--binary <path>] [--reason <text>] [--mark <label>]
              Capture the current binary into a new versioned snapshot.
