@@ -22,7 +22,7 @@ Per-surface `ccpraxis-install.pl` hooks let each plugin/skill own its install-ti
 
 The orchestrator is two-phase: a bare run prints the plan and exits without touching anything; re-running with `--confirm` applies it. Each hook is idempotent — re-runs are safe no-ops. On Windows only User-scope `PATH`/`PATHEXT` are touched (no admin required).
 
-`install.pl` wires; it never updates. Plugin code and the global config reach the live install and `~/.claude` only by promotion (`scripts/promote.pl`, run from the dev clone), so run `install.pl` from the live install, after promoting, and only when the wiring changed. [Working on ccpraxis](../plugins/sandbox/docs/working-on-ccpraxis.md) has the model and the fresh-machine procedure.
+`install.pl` wires; it never updates. Plugin code and the global config reach the live install and `~/.claude` only by promotion (`scripts/promote.pl`, run from the dev clone), so run `install.pl` from the live install, after promoting, and only when the wiring changed. [Working on ccpraxis](working-on-ccpraxis.md) has the model and the fresh-machine procedure.
 
 ## Shell-script policy
 
@@ -138,7 +138,7 @@ To change what's offered by default, edit `@DEFAULT_TRACKABLE` and `%HARD_EXCLUD
 - File-modified-during-sync rollback (re-hash before final rename)
 - Path safety (no `..`, no absolute paths, no backslashes; symlinks skipped via `File::Find` preprocess)
 
-**Restore on a fresh machine:** set the machine up as in [Setting up a machine](../plugins/sandbox/docs/working-on-ccpraxis.md#setting-up-a-machine), whose vault step runs `vault-sync.pl init`, then run `/steward:setup-project` inside each project, the ccpraxis dev clone included. The skill calls `list-orphans` first; if a slug already exists in the vault from another machine, it offers to link this directory to it — first sync then pulls all vault content locally.
+**Restore on a fresh machine:** set the machine up as in [Setting up a machine](working-on-ccpraxis.md#setting-up-a-machine), whose vault step runs `vault-sync.pl init`, then run `/steward:setup-project` inside each project, the ccpraxis dev clone included. The skill calls `list-orphans` first; if a slug already exists in the vault from another machine, it offers to link this directory to it — first sync then pulls all vault content locally.
 
 ## Sandbox
 

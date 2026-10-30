@@ -1,23 +1,26 @@
 # ccpraxis — project instructions
 
 You are working **on ccpraxis itself**: the plugins, skills, launchers and scripts that Claude Code
-runs. Read `plugins/sandbox/docs/working-on-ccpraxis.md` before changing anything about how the
-sandbox launches.
+runs. Read `docs/working-on-ccpraxis.md` before changing anything about how ccpraxis is installed,
+promoted or backed up, and `plugins/sandbox/docs/sandbox-checkouts.md` before changing how the
+sandbox treats checkouts.
 
 ## Where you are, and where you must not be
 
 | path | what it is |
 |---|---|
-| this repo | your **dev clone** (normally under `~/Projects`). Develop here. Sandbox here. |
-| `~/.claude/ccpraxis` | the **live install** — the plugin tree Claude Code is executing. Never develop here. |
+| this repo | your **dev clone** (normally under `~/Projects`). Develop here. Sandbox here. The only checkout that talks to GitHub. |
+| `~/.claude/ccpraxis` | the **live install** — the plugin tree Claude Code is executing. Produced by promotion only; never develop, commit, pull or push there. |
 
 `claude-sandbox` refuses to launch against `~/.claude/ccpraxis`, by design. Editing the live install
 means editing tooling while it is in use.
 
-GitHub's `main` is fed from the live install: `/steward:backup` merges `origin/main` into it and
-pushes from there. Do not push this clone's `main`; the next backup would merge it into the live
-install without promotion's global-config sync. The model and the fresh-machine procedure:
-`plugins/sandbox/docs/working-on-ccpraxis.md`.
+This clone is the only checkout that talks to GitHub: pull and push here. The live install takes
+code from this clone alone: `scripts/promote.pl` creates it on the first run and fast-forwards it
+afterwards (its `origin` is this clone), and refuses a live install that has commits of its own.
+`/steward:backup` exports settings Claude Code wrote into `~/.claude` into this clone's
+`global-config/` and pushes this clone. The model, the fresh-machine procedure and the one-time
+move of a machine set up the old way: `docs/working-on-ccpraxis.md`.
 
 ### ⚠ THE MACHINERY YOU ARE USING IS NOT THE MACHINERY YOU ARE EDITING
 
@@ -60,18 +63,23 @@ Stale skill text in an old session is this, not a file bug. A **new** `skills/<n
 mounted at all until a full manager launch.
 
 **Promotion is one command: `perl scripts/promote.pl`**, run from this clone (`--dry-run`
-previews and writes nothing). It (1) merges this clone's `main` into the live install
-(`git -C ~/.claude/ccpraxis pull --no-rebase --ff --no-edit <clone> main`; the live install has
-commits of its own, so this is usually a merge commit), refusing on a dirty live tree; then
-(2) syncs the `global-config/` payload into `~/.claude`: `CLAUDE.md` is replaced after a backup
-to `~/.claude/.promotion-backups/<ts>/`, and refused, with the offending lines shown, if it holds
-a line no committed version of the payload ever had; `settings.json` is merged key by key (the
-payload wins only over values it once had, and `.backup-preferences.json` is honoured);
+previews and writes nothing). It (1) fast-forwards the live install to this clone's `main`
+(`git merge --ff-only`; it clones this clone there when the live install is missing, re-points a
+GitHub `origin` at this clone, and refuses a dirty live tree or one with commits this clone lacks);
+then (2) syncs the `global-config/` payload into `~/.claude`: `CLAUDE.md` is built from
+`global-config/CLAUDE.md` plus this host's `CLAUDE.windows.md` or `CLAUDE.macos.md`
+(`plugins/steward/scripts/GlobalClaudeMd.pm`), replaced after a backup to
+`~/.claude/.promotion-backups/<ts>/`, and refused, with the offending lines shown, if it holds a
+line no committed version of any part ever had; `settings.json` is merged key by key (the payload
+wins only over values it once had, and `.backup-preferences.json` is honoured);
 `known_marketplaces.json` is only reported. A bare `git pull` is not a promotion: it leaves
 the installed global config at whatever was last copied, which is how `~/.claude/CLAUDE.md` sat
 at the Aug 26 payload for a month. `install.pl` only re-wires PATH and plugin registration; it
-never copies plugin code, so a clean install run does not mean promotion happened. Full
-mechanics: `plugins/sandbox/docs/working-on-ccpraxis.md`.
+never copies plugin code, so a clean install run does not mean promotion happened. Claude Code
+loads the `ccpraxis-local` plugins in place from `~/.claude/ccpraxis/plugins` (measured on 2.1.301:
+`claude plugin list --json` reports `readFromFolder` there, and hook commands expand
+`${CLAUDE_PLUGIN_ROOT}` to it); the copies under `~/.claude/plugins/cache/ccpraxis-local/` are
+unused leftovers. Full mechanics: `docs/working-on-ccpraxis.md`.
 
 ## Language and runtime
 
@@ -193,14 +201,8 @@ These have each cost real debugging time. Details in the user-global `CLAUDE.md`
 
 - **Paths contain non-ASCII** (`André`). Nothing may assume ASCII paths. Round-trip registry values
   as UTF-8 bytes; never re-encode something already decoded.
-- **`podman machine set --disk-size` fails on WSL machines** (exit 125). Grow via WSL instead:
-  `wsl --shutdown`, then `wsl --manage podman-machine-default --resize <bytes>` (grow only; it runs
-  `e2fsck`/`resize2fs` itself). Verify with `df -h /` inside the machine — `podman machine list`
-  keeps reporting the creation-time size and is not the truth.
-- **The WSL VM's memory cap is a real failure mode.** `~/.wslconfig`'s `memory=` is what `vmmem`
-  will consume; when the host runs low on commit, Windows terminates the VM and every container in
-  it dies at once, with no reap record. A missing `.launcher/last-reap.txt` is the signature of a
-  hard kill rather than a graceful reap.
+- **Operating the podman machine** (disk and memory limits on the WSL machine, the macOS
+  machine's settings) is in `plugins/sandbox/docs/podman-machine.md`.
 
 ## macOS landmines
 
@@ -250,7 +252,7 @@ ignored too — but **not** `.claude/settings.json`; see the next section.
 
 On relocation, **`git status --ignored` is the authoritative copy-list** — `.gitignore` lists
 patterns, not what exists. Full gotchas, including the `claude-home/.launcher/` container-identity
-trap: `plugins/sandbox/docs/working-on-ccpraxis.md`.
+trap: `plugins/sandbox/docs/sandbox-checkouts.md`.
 
 ## Guidance notes — read on demand
 
@@ -339,7 +341,9 @@ blueprint over ad-hoc edits.
 
 ## Do not confuse these two
 
-- `global-config/CLAUDE.md` — a **payload** of this repo, installed to the user's
-  `~/.claude/CLAUDE.md` by `scripts/promote.pl`. Editing it changes what every project sees on
-  this machine once promoted.
+- `global-config/CLAUDE.md` (plus `CLAUDE.windows.md` and `CLAUDE.macos.md`) — the **payload** of
+  this repo that `scripts/promote.pl` builds into the user's `~/.claude/CLAUDE.md`: the shared file
+  for every host, plus the part for the host being promoted on. Editing it changes what every
+  project sees once promoted, so a rule that holds on one OS goes in that OS's part, never in the
+  shared file.
 - **This file** — instructions for working on ccpraxis itself.

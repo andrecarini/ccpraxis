@@ -890,7 +890,7 @@ sub is_deeply_ordered {
 # ===========================================================================
 {
     my $claude_md = read_bytes("$ROOT/CLAUDE.md") // '';
-    my $working_doc = read_bytes("$ROOT/plugins/sandbox/docs/working-on-ccpraxis.md") // '';
+    my $working_doc = read_bytes("$ROOT/docs/working-on-ccpraxis.md") // '';
 
     like($claude_md, qr/scripts\/promote\.pl/, 'AC-17: CLAUDE.md names scripts/promote.pl');
     unlike($claude_md, qr/\*\*Promotion is a merge:\*\*/, 'AC-17: CLAUDE.md drops the "Promotion is a merge:" framing');

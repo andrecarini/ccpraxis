@@ -26,9 +26,12 @@ ccpraxis/
 │   ├── disabling-claude-code-features.md                        # Which Claude Code setting removes a tool/server/subagent/skill from context vs only gating calls
 │   ├── install-protocol.md                                      # The fresh-install procedure Claude follows when asked to install ccpraxis
 │   ├── reference.md                                             # How each surface works: install contract, slash commands, statusline, backup flow, vault sync, sandbox, backpack
-│   └── repo-layout.md                                           # This page: every tracked file, annotated and generated from disk
+│   ├── repo-layout.md                                           # This page: every tracked file, annotated and generated from disk
+│   └── working-on-ccpraxis.md                                   # How to develop ccpraxis itself: dev clone, live install, promotion, setting up or migrating a machine
 ├── global-config/                                               # What gets installed to ~/.claude/ — global CLAUDE.md and settings
+│   ├── CLAUDE.macos.md                                          # Platform-specific part of the global instructions, appended to the shared CLAUDE.md by promote.pl on that platform only
 │   ├── CLAUDE.md                                                # Global instructions shared by every host (supply chain rules, response style); promote.pl appends the host's platform part
+│   ├── CLAUDE.windows.md                                        # Platform-specific part of the global instructions, appended to the shared CLAUDE.md by promote.pl on that platform only
 │   ├── known_marketplaces.json                                  # Marketplace selections (synced across machines)
 │   └── settings.json                                            # Base settings (env, statusline, plugins, effort level)
 ├── host-tools/                                                  # Host-side executables wired onto PATH by install.pl
@@ -594,6 +597,7 @@ ccpraxis/
 │   │   │       ├── progress-heuristic.t                         # platform: any t/63 — immutable oracle for b11-turns-backstop.
 │   │   │       ├── promote-array-merge.t                        # platform: host Oracle for blueprint tooling-fixes, package 09…
 │   │   │       ├── promote-drops-retired-keys.t                 # platform: host Oracle for blueprint hook-continuity-remake, package…
+│   │   │       ├── promote-live-follows-clone.t                 # platform: host promote.pl under the dev-clone-only workflow: the live install…
 │   │   │       ├── promote-syncs-global-config.t                # platform: host Oracle for blueprint hook-continuity-remake, package…
 │   │   │       ├── prompt-watch.t                               # platform: any ORACLE for never-halt package 06-prompt-watch…
 │   │   │       ├── pseudo-package-acknowledge.t                 # platform: any e04-honest-terminal-reporting, AC2 (-> DC2)…
@@ -703,7 +707,6 @@ ccpraxis/
 │   │   │   ├── terminal-minimize-investigation.md               # Investigation into terminal minimize behaviour
 │   │   │   ├── token-schema-inventory.md                        # Inventory of the token-credential schemas the sandbox reads
 │   │   │   ├── tui-adapter-contract.md                          # Contract between the TUI and the state it renders
-│   │   │   ├── working-on-ccpraxis.md                           # How to develop ccpraxis itself: clone vs live install, promotion
 │   │   │   └── wt-profile.md
 │   │   ├── scripts/                                             # Implementation scripts
 │   │   │   ├── BackpackApproval.pm                              # Per-item, machine-local approval memory for backpack items — the launcher's…
@@ -923,6 +926,7 @@ ccpraxis/
 │       │   └── ccpraxis.sh                                      # thin dispatcher shim for steward's host-side scripts.
 │       ├── ccpraxis-install.pl                                  # steward plugin install hook.
 │       ├── scripts/                                             # Implementation scripts
+│       │   ├── GlobalClaudeMd.pm                                # GlobalClaudeMd -- ~/.claude/CLAUDE.md is built per host, not copied.
 │       │   ├── MachineLocalSettings.pm                          # MachineLocalSettings -- the settings.json values that cannot be shared.
 │       │   ├── VaultNamespace.pm                                # Scoped commit + push for ONE top-level namespace inside the vault.
 │       │   ├── ccpraxis-helpers.pl                              # Deterministic subcommands for /backup (sync-skills, etc.) — replaces several LLM-driven prose steps with scripted ones; emits JSON the skill consumes
@@ -971,6 +975,7 @@ ccpraxis/
 │               ├── claude-internals-check.t                     # platform: any Never-halt package 08 — a read-only signature scan of the…
 │               ├── container-follows-global-answer.t            # platform: host Oracle for blueprint tooling-fixes, package…
 │               ├── fresh-register-commits.t                     # platform: any 12 — a fresh registration's FIRST commit must actually store the…
+│               ├── global-claude-md-render.t                    # platform: any GlobalClaudeMd: ~/.claude/CLAUDE.md is the shared payload file…
 │               ├── global-config-perl-hook-guard.t              # platform: any Every perl command that global-config/settings.json registers…
 │               ├── hard-exclude.t                               # platform: any 05 — hard-excludes are honoured both at WALK time (a tracked…
 │               ├── host-memory-roundtrip.t                      # platform: any 02 — fresh register + host-memory PUSH.

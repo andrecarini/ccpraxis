@@ -284,7 +284,7 @@ sub _ccpraxis_markers {
         'plugins/sandbox/.claude-plugin/plugin.json',   # M3
         'plugins/sandbox/scripts/MountSpec.pm',         # M4
         'plugins/sandbox/bin/claude-sandbox.sh',        # M5
-        'plugins/sandbox/docs/working-on-ccpraxis.md',  # M6
+        'docs/working-on-ccpraxis.md',                  # M6 (moved from plugins/sandbox/docs/ on 2026-10-30)
         # MAJOR-1: repo-root markers sharing no ancestor with M1-M6 above —
         # every prior marker lives under plugins/ (five under
         # plugins/sandbox/), so a single `mv plugins plugins.x` dropped the

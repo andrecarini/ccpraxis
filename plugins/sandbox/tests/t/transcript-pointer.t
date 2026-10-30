@@ -11,7 +11,7 @@
 # AC14: launcher.pl source contains the last-transcript.txt write shown in
 #       spec section 2.5, anchored immediately after the $TRANSCRIPT =
 #       _open_transcript(...) line.
-# AC15: plugins/sandbox/docs/working-on-ccpraxis.md mentions
+# AC15: plugins/sandbox/docs/sandbox-checkouts.md mentions
 #       last-transcript.txt.
 use strict;
 use warnings;
@@ -70,19 +70,19 @@ close $fh;
 }
 
 # ===========================================================================
-# AC15 -- plugins/sandbox/docs/working-on-ccpraxis.md mentions
-# last-transcript.txt.
+# AC15 -- the sandbox doc on checkouts (plugins/sandbox/docs/sandbox-checkouts.md,
+# split out of the old working-on-ccpraxis.md) mentions last-transcript.txt.
 # ===========================================================================
 {
-    my $doc = "$REPO_ROOT/plugins/sandbox/docs/working-on-ccpraxis.md";
-    ok(-f $doc, 'working-on-ccpraxis.md exists') or BAIL_OUT('fixture broken');
+    my $doc = "$REPO_ROOT/plugins/sandbox/docs/sandbox-checkouts.md";
+    ok(-f $doc, 'sandbox-checkouts.md exists') or BAIL_OUT('fixture broken');
     open my $dfh, '<:raw', $doc or BAIL_OUT("cannot open $doc: $!");
     local $/;
     my $dsrc = <$dfh>;
     close $dfh;
 
     like($dsrc, qr/last-transcript\.txt/,
-        'AC15: working-on-ccpraxis.md mentions last-transcript.txt') or diag('not found');
+        'AC15: sandbox-checkouts.md mentions last-transcript.txt') or diag('not found');
 }
 
 # ===========================================================================
