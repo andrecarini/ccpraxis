@@ -79,7 +79,8 @@ ccpraxis/
 │   │   │   ├── almanac-thread.pl                                # Threads per project: create, list, show, archive; ordered tasks with a status or a package link; a typed log
 │   │   │   ├── almanac-todo.pl                                  # Todo CRUD in project and global scope: create, list, show, edit, complete, reopen, delete, count
 │   │   │   ├── almanac.pl                                       # Dispatcher: routes almanac type verb to the todo, note, task, inbox and bug scripts, and doctor to the diagnostic
-│   │   │   └── gen-statusline-counters.pl                       # Prints the almanac counting block embedded in scripts/statusline.pl, which may import nothing
+│   │   │   ├── gen-statusline-counters.pl                       # Prints the almanac counting block embedded in scripts/statusline.pl, which may import nothing
+│   │   │   └── read-payload.sh                                  # Hook payload reader the almanac bash hooks source (bash 3.2 and 5 alike); byte-identical to butler's copy
 │   │   ├── skills/                                              # Slash-command skills this plugin provides
 │   │   │   ├── bug-report/
 │   │   │   │   └── SKILL.md                                     # File a ccpraxis tooling bug report from whatever project you are working in.
@@ -366,7 +367,8 @@ ccpraxis/
 │   │   │   ├── bp-write-guard.pl                                # BpWrite::guarded_write, the a01-write-integrity-reread-under-lock primitive…
 │   │   │   ├── butler-continuity.pl                             # the one command for Decision 1's arm and disarm triggers (package 04 of…
 │   │   │   ├── butler-fork-ok.pl                                # the fork-override recorder (package 19 of blueprint hook-continuity-remake…
-│   │   │   └── butler-hold.pl                                   # the one continuity holder (package 05 of blueprint hook-continuity-remake).
+│   │   │   ├── butler-hold.pl                                   # the one continuity holder (package 05 of blueprint hook-continuity-remake).
+│   │   │   └── read-payload.sh                                  # the one hook-payload reader for the bash hooks of the almanac and butler…
 │   │   ├── skills/                                              # Slash-command skills this plugin provides
 │   │   │   ├── continuity/
 │   │   │   │   └── SKILL.md                                     # Toggle or check whether THIS session is armed to keep going.
@@ -605,6 +607,7 @@ ccpraxis/
 │   │   │       ├── prompt-watch.t                               # platform: any ORACLE for never-halt package 06-prompt-watch…
 │   │   │       ├── pseudo-package-acknowledge.t                 # platform: any e04-honest-terminal-reporting, AC2 (-> DC2)…
 │   │   │       ├── rate-limit-attempt-isolation.t               # platform: any t/80 — immutable oracle for b29.
+│   │   │       ├── read-payload-lib.t                           # platform: any The one hook-payload reader, <plugin>/scripts/read-payload.sh.
 │   │   │       ├── reconcile-data-root-thread.t                 # platform: any Bug report 20260922-214319-9389: bp-status.sh and the…
 │   │   │       ├── registry-runtime-only.t                      # platform: any s02: runs/registry.json becomes strictly runtime-only.
 │   │   │       ├── remediation-attempt-cap.t                    # platform: any t/119 — oracle for r01.
@@ -687,7 +690,8 @@ ccpraxis/
 │   │   │       ├── write-guard-primitive.t                      # platform: any t/98 — immutable oracle for BpWrite::guarded_write, the…
 │   │   │       ├── write-guard-sites.t                          # platform: any t/99 — the four converted sites of a01-write-integrity…
 │   │   │       ├── write-set-implied-checks.t                   # platform: any b50 oracle.
-│   │   │       └── write-set-refusal-diagnoses-itself.t         # platform: any Report 20260916-175013-34af, remaining half.
+│   │   │       ├── write-set-refusal-diagnoses-itself.t         # platform: any Report 20260916-175013-34af, remaining half.
+│   │   │       └── zsh-command-spellings.t                      # platform: any The guards parse a Bash-tool command as bash, but on macOS the…
 │   │   └── turn-caps.json                                       # CANONICAL turn caps.
 │   ├── sandbox/                                                 # Sandbox plugin — bundles the claude-sandbox host launcher, the container blueprint, the bootstrap routine, and the /sandbox:setup redirect skill
 │   │   ├── .claude-plugin/                                      # Plugin manifest directory

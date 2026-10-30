@@ -215,8 +215,8 @@ code in this repo.
   (the almanac guards failed open on it), `${var,,}`, `declare -A`, `mapfile`, `$EPOCHSECONDS`,
   `printf '%(...)T'`. `"${arr[@]}"` of an empty array is unbound under `set -u`, and
   `${P//pattern/}` is super-linear on a large string (10 KB took 44 s). Where a bash 4 feature is
-  the Windows fast path, keep it behind a version check with a 3.2 fallback, as
-  `plugins/butler/hooks/run-hook.sh` does.
+  the Windows fast path, keep it behind a version check with a 3.2 fallback, as the hooks' shared
+  payload reader (`plugins/butler/scripts/read-payload.sh`, mirrored in almanac) does.
 - **BSD userland.** `stat -f %m`, not `stat -c %Y`; `sed -i ''`; `date -v`; no `ps -o etimes`;
   no `/proc`. A script that shells out to these needs both forms or a perl replacement.
 - **No `timeout`, `setsid` or `flock(1)`.** Tests use `scripts/test-bin/timeout` (see Tests above).
