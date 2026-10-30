@@ -1,6 +1,5 @@
 #!/usr/bin/env perl
 # platform: host
-#
 # The backup's two checkouts (plugins/steward/scripts/DevClone.pm): the live
 # install is only read, the dev clone is where an export goes. Covers
 #   A  DevClone::locate -- the dev clone is the live install's origin, valid

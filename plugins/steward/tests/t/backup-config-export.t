@@ -1,6 +1,5 @@
 #!/usr/bin/env perl
 # platform: host
-#
 # /steward:backup's config export, end to end through the real driver
 # (scripts/backup.pl -> Preflight.pm + Export.pm) with the REAL wrapped
 # scripts (json-diff.pl --host-live, filter-diff.pl, save-preference.pl,

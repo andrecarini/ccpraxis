@@ -1,6 +1,5 @@
 #!/usr/bin/env perl
 # platform: host
-#
 # /steward:upstream-sync (plugins/steward/scripts/upstream-sync.pl): the
 # GitHub side of ccpraxis, for the dev clone only. Fetch origin, integrate
 # origin/main into main (fast-forward or a merge commit; a conflict or a
