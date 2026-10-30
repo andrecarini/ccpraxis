@@ -24,7 +24,8 @@
 # marketplace-diff). That script's subs are not importable (it is a
 # dispatch-table script, not a module), so the unit model and preference
 # table are re-implemented here, citing the source lines at each mirror
-# point. Extracting a shared module is a logged follow-up, not this package.
+# point. The unit model itself has since moved into
+# plugins/steward/scripts/SettingsUnits.pm, which this script imports.
 use strict;
 use warnings;
 use FindBin qw($Bin);
@@ -44,6 +45,11 @@ use MachineLocalSettings ();
 # plus this host's own part (CLAUDE.windows.md, CLAUDE.macos.md), never a
 # copy of one file. Shared with the backup side's drift check.
 use GlobalClaudeMd ();
+# SettingsUnits: the one-level dotted unit model every settings sync shares
+# (this script's settings.json merge, the sandbox merge, the backup's sandbox
+# pair). It used to be spelled inline here.
+use SettingsUnits qw(canon_str same_value deep_clone dotted_collision compute_units
+                     value_at_path set_at_path delete_at_path);
 
 # ---------------------------------------------------------------------------
 # Usage / argument parsing
@@ -273,27 +279,14 @@ sub encode_json_bytes {
     return JSON::PP->new->utf8->canonical->pretty->encode($data);
 }
 
-sub canon_str {
-    my ($data) = @_;
-    return JSON::PP->new->canonical->allow_nonref->encode($data);
-}
-
-sub same_value { return canon_str($_[0]) eq canon_str($_[1]); }
-
-sub deep_clone {
-    my ($data) = @_;
-    return JSON::PP->new->allow_nonref->decode(JSON::PP->new->allow_nonref->encode($data));
-}
-
 # ---------------------------------------------------------------------------
-# Unit model, shared by settings.json (spec S3.4/S3.5). Mirrors
-# plugins/steward/scripts/ccpraxis-helpers.pl's settings-export-merge:
-#   VALID_ACTION table:      ccpraxis-helpers.pl:506-510
-#   same_value / VALUE_CMP:  ccpraxis-helpers.pl:515-516
-#   dotted_collision:        ccpraxis-helpers.pl:535-541
-#   one-level dotted expand: ccpraxis-helpers.pl:562-589 (merge_export_level)
-# left = live, right = payload (current repo config), matching that script's
-# live-vs-repo vocabulary.
+# Unit model, shared by settings.json (spec S3.4/S3.5). canon_str, same_value,
+# deep_clone, dotted_collision, compute_units and the *_at_path helpers come
+# from plugins/steward/scripts/SettingsUnits.pm (imported above), the one copy
+# the sandbox merge and the backup's sandbox pair use too. The VALID_ACTION
+# table mirrors ccpraxis-helpers.pl's settings-export-merge. left = live,
+# right = payload (current repo config), matching that script's live-vs-repo
+# vocabulary.
 # ---------------------------------------------------------------------------
 
 our %VALID_ACTION = (
@@ -301,86 +294,6 @@ our %VALID_ACTION = (
     only_right => 'right-only',
     diverged   => 'skip-always',
 );
-
-sub dotted_collision {
-    my ($key, $left_val, $right_val, $all_keys) = @_;
-    for my $sk (keys %$left_val, keys %$right_val) {
-        return 1 if exists $all_keys->{"$key.$sk"};
-    }
-    return 0;
-}
-
-# Returns a list of unit hashrefs:
-#   { name, path => [k] | [k, sk], relation, live_val, payload_val }
-sub compute_units {
-    my ($live, $payload) = @_;
-    my %all_keys;
-    $all_keys{$_} = 1 for (keys %$live, keys %$payload);
-
-    my @units;
-    for my $k (sort keys %all_keys) {
-        my $in_l = exists $live->{$k};
-        my $in_r = exists $payload->{$k};
-        my $lv   = $live->{$k};
-        my $rv   = $payload->{$k};
-
-        my $rel = !$in_r ? 'only_left'
-                : !$in_l ? 'only_right'
-                : same_value($lv, $rv) ? 'identical'
-                :                        'diverged';
-
-        if ($rel eq 'diverged' && ref($lv) eq 'HASH' && ref($rv) eq 'HASH'
-            && !dotted_collision($k, $lv, $rv, \%all_keys)) {
-            my %sub_keys;
-            $sub_keys{$_} = 1 for (keys %$lv, keys %$rv);
-            for my $sk (sort keys %sub_keys) {
-                my $sin_l = exists $lv->{$sk};
-                my $sin_r = exists $rv->{$sk};
-                my $slv   = $lv->{$sk};
-                my $srv   = $rv->{$sk};
-                my $srel = !$sin_r ? 'only_left'
-                         : !$sin_l ? 'only_right'
-                         : same_value($slv, $srv) ? 'identical'
-                         :                          'diverged';
-                push @units, {
-                    name => "$k.$sk", path => [$k, $sk], relation => $srel,
-                    live_val => $slv, payload_val => $srv,
-                };
-            }
-            next;
-        }
-
-        push @units, {
-            name => $k, path => [$k], relation => $rel,
-            live_val => $lv, payload_val => $rv,
-        };
-    }
-    return @units;
-}
-
-sub value_at_path {
-    my ($data, $path) = @_;
-    if (@$path == 1) {
-        return exists $data->{$path->[0]} ? (1, $data->{$path->[0]}) : (0, undef);
-    }
-    my $top = $data->{$path->[0]};
-    return (0, undef) unless ref($top) eq 'HASH' && exists $top->{$path->[1]};
-    return (1, $top->{$path->[1]});
-}
-
-sub set_at_path {
-    my ($data, $path, $val) = @_;
-    if (@$path == 1) { $data->{$path->[0]} = $val; }
-    else              { $data->{$path->[0]}{$path->[1]} = $val; }
-    return;
-}
-
-sub delete_at_path {
-    my ($data, $path) = @_;
-    if (@$path == 1) { delete $data->{$path->[0]}; }
-    else              { delete $data->{$path->[0]}{$path->[1]}; }
-    return;
-}
 
 # Historical values for a unit: canonical JSON of the value at that unit's
 # path, across every payload-history version that parses as JSON and

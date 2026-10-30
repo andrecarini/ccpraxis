@@ -384,6 +384,8 @@ sub setup_root {
     install_real_pref_scripts($clone) if $opts{real_pref_scripts};
     write_text("$clone/scripts/promote.pl", read_text("$Bin/../../../../scripts/promote.pl"));
     write_text("$clone/plugins/steward/scripts/GlobalClaudeMd.pm", read_text("$Bin/../../scripts/GlobalClaudeMd.pm"));
+    # promote.pl imports the shared settings unit model too.
+    write_text("$clone/plugins/steward/scripts/SettingsUnits.pm", read_text("$Bin/../../scripts/SettingsUnits.pm"));
 
     _git($home, $clone, 'add', '-A');
     _git($home, $clone, 'commit', '-q', '-m', 'initial fixture commit');

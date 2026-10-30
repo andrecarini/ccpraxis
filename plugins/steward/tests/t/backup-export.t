@@ -1985,7 +1985,7 @@ sub is_deeply_wrote {
         repo_settings => qq({"theme":"dark"}\n), live_settings => qq({"theme":"dark","fromLive":"exported"}\n));
     my $real = "$Bin/../../scripts";
     for my $name (qw(ccpraxis-helpers.pl sync-export.pl json-diff.pl filter-diff.pl save-preference.pl
-                     DevClone.pm MachineLocalSettings.pm GlobalClaudeMd.pm)) {
+                     DevClone.pm MachineLocalSettings.pm GlobalClaudeMd.pm SettingsUnits.pm)) {
         write_text("$r->{clone}/plugins/steward/scripts/$name", read_text("$real/$name"));
     }
     write_text("$r->{clone}/scripts/promote.pl", read_text("$Bin/../../../../scripts/promote.pl"));

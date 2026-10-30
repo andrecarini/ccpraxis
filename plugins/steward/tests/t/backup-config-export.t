@@ -81,7 +81,7 @@ sub fixture {
     write_text("$clone/global-config/known_marketplaces.json", "{}\n");
     write_text("$clone/skills/.keep", '');
     for my $name (qw(ccpraxis-helpers.pl sync-export.pl json-diff.pl filter-diff.pl save-preference.pl
-                     sensitive-check.pl DevClone.pm MachineLocalSettings.pm GlobalClaudeMd.pm)) {
+                     sensitive-check.pl DevClone.pm MachineLocalSettings.pm GlobalClaudeMd.pm SettingsUnits.pm)) {
         write_text("$clone/plugins/steward/scripts/$name", read_text("$SCRIPTS/$name"));
     }
     write_text("$clone/scripts/lint-readme-paths.pl", stub("exit 0;\n"));
