@@ -446,7 +446,7 @@ my %EXPLANATION_SENTINEL = (
     'user-configured'     => 'your own protected-paths list at',
 );
 my %ADVICE_SENTINEL = (
-    'ccpraxis-install' => 'Work on a separate clone instead',
+    'ccpraxis-install' => 'Work in your dev clone instead',
     'claude-home'      => 'Open the specific project directory you meant to work in',
     'user-configured'  => 'remove it from',
 );
@@ -499,18 +499,29 @@ SKIP: {
 }
 
 # ---- AC-29 ----
+# DELIBERATELY AMENDED 2026-10-30 (the dev-clone workflow): the spec's
+# "git clone --no-hardlinks {root} <your-clone-dir>" advice is retired. The
+# dev clone is now cloned from GitHub and is the live install's origin; the
+# live install is produced by scripts/promote.pl alone. Cloning the live
+# install would hand the owner a checkout whose origin is the very tree
+# promotion writes to. The advice must point at the dev clone (and say how to
+# find it), name promote.pl, and never suggest cloning or pulling into the
+# live install.
 SKIP: {
-    skip "$SKIP_REASON (AC-29)", 2 unless defined $DECIDE;
+    skip "$SKIP_REASON (AC-29)", 5 unless defined $DECIDE;
     my ($ok, $got, $err) = _try_decide('/home/u/.claude/ccpraxis', \%O);
     if (!$ok || !defined $got->{message}) {
-        ok(0, "AC-29: ccpraxis-install message contains 'git clone --no-hardlinks /home/u/.claude/ccpraxis <your-clone-dir>'");
-        ok(0, "AC-29: ccpraxis-install message explains why --no-hardlinks is required");
+        ok(0, "AC-29: ccpraxis-install message tells how to find the dev clone (call failed)") for 1 .. 5;
         diag("decision call failed: $err") if $err;
     } else {
-        like($got->{message}, qr/git clone --no-hardlinks \Q\/home\/u\/.claude\/ccpraxis\E\s+<your-clone-dir>/,
-             "AC-29: ccpraxis-install message contains 'git clone --no-hardlinks /home/u/.claude/ccpraxis <your-clone-dir>'");
-        like($got->{message}, _sentinel_re('The --no-hardlinks flag is required'),
-             "AC-29: ccpraxis-install message explains why --no-hardlinks is required");
+        my $m = $got->{message};
+        like($m, qr/git -C \Q\/home\/u\/.claude\/ccpraxis\E remote get-url origin/,
+             "AC-29: ccpraxis-install message shows how to find the dev clone (the live install's origin)");
+        like($m, qr{\Qscripts/promote.pl\E}, 'AC-29: ccpraxis-install message names scripts/promote.pl');
+        like($m, qr{\Qdocs/working-on-ccpraxis.md\E}, 'AC-29: ccpraxis-install message points at docs/working-on-ccpraxis.md');
+        unlike($m, qr{git clone\b[^\n]*\Q/home/u/.claude/ccpraxis\E}, 'AC-29: ccpraxis-install message never says to clone the live install');
+        unlike($m, qr{--no-hardlinks|git -C \Q/home/u/.claude/ccpraxis\E pull},
+             'AC-29: ccpraxis-install message offers neither the retired local clone nor a pull into the live install');
     }
 }
 

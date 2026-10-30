@@ -118,16 +118,25 @@ is($o1->{warn},   1, 'AC-R3: warn == 1');
 like(defined $o1->{message} ? $o1->{message} : '', qr/\Q$FAKE_PATH\E/,
      'AC-R4: message contains the offending path verbatim');
 
-# AC-R5
-like(defined $o1->{message} ? $o1->{message} : '', qr/\Q--no-hardlinks\E/,
-     'AC-R5: message contains the literal string --no-hardlinks');
+# AC-R5 -- DELIBERATELY AMENDED 2026-10-30 (the dev-clone workflow). This used
+# to require "--no-hardlinks": the advice was to clone the live install
+# locally. The dev clone is now cloned from GitHub and is the live install's
+# origin, and the live install is produced by scripts/promote.pl alone, so
+# the advice points at the dev clone and must never say to clone the live
+# install (AC-R6).
+like(defined $o1->{message} ? $o1->{message} : '', qr/\bdev clone\b.*\bGitHub\b/s,
+     'AC-R5: message sends the owner to the dev clone, cloned from GitHub');
+unlike(defined $o1->{message} ? $o1->{message} : '', qr/\Q--no-hardlinks\E/,
+     'AC-R5: message no longer offers the retired --no-hardlinks local clone');
 
 # AC-R6 — distinct path/live_root so the two cannot be confused
 my $DISTINCT_PATH = 'C:/somewhere/project-in-place';
 my $DISTINCT_LIVE = 'C:/somewhere-else/ccpraxis-live';
 my $o6 = refusal_or_undef({ path => $DISTINCT_PATH, live_root => $DISTINCT_LIVE });
-like(defined $o6->{message} ? $o6->{message} : '', qr/git clone --no-hardlinks \Q$DISTINCT_LIVE\E\s+\S+/,
-     'AC-R6: message contains "git clone --no-hardlinks <live_root> <dest>" with the correct live_root');
+like(defined $o6->{message} ? $o6->{message} : '', qr/git -C \Q$DISTINCT_LIVE\E remote get-url origin/,
+     'AC-R6: message shows how to find the dev clone (the origin of the live root), with the correct live_root');
+unlike(defined $o6->{message} ? $o6->{message} : '', qr/git clone\b[^\n]*\Q$DISTINCT_LIVE\E/,
+     'AC-R6: message never says to clone the live install');
 
 # AC-R7
 like(defined $o1->{message} ? $o1->{message} : '', qr/install\.pl/, 'AC-R7a: message mentions install.pl');
@@ -139,7 +148,7 @@ unlike(defined $o1->{message} ? $o1->{message} : '', qr/worktree/i, 'AC-R8b: mes
 unlike(defined $o1->{message} ? $o1->{message} : '', qr/\boffer\b/i, 'AC-R8c: message does not mention "offer"');
 
 # AC-R12 -- the advice for bringing changes back names the one promotion
-# command (plugins/sandbox/docs/working-on-ccpraxis.md). It used to offer
+# command (docs/working-on-ccpraxis.md). It used to offer
 # `git -C <live> pull <clone> main` and call that the whole promotion, which
 # skips promote.pl's global-config sync into ~/.claude.
 like(defined $o6->{message} ? $o6->{message} : '', qr{\Qscripts/promote.pl\E},
@@ -164,8 +173,8 @@ unlike(defined $o6->{message} ? $o6->{message} : '', qr/alone promotes/i,
     ok((defined $o_noargs && ref $o_noargs eq 'HASH'
         && defined $o_noargs->{message} && length $o_noargs->{message}),
        'AC-R9b: workcopy_refusal_outcome() with no args returns a complete, non-empty message');
-    like(($o_noargs && $o_noargs->{message}) // '', qr/\Q--no-hardlinks\E/,
-         'AC-R9c: no-args message still contains --no-hardlinks');
+    like(($o_noargs && $o_noargs->{message}) // '', qr{\Qscripts/promote.pl\E},
+         'AC-R9c: no-args message still names scripts/promote.pl');
     ok((defined $o_noargs && defined $o_noargs->{exit_code} && $o_noargs->{exit_code} != 0),
        'AC-R9d: no-args exit_code is non-zero');
 
@@ -182,8 +191,8 @@ unlike(defined $o6->{message} ? $o6->{message} : '', qr/alone promotes/i,
     ok((defined $o_empty && ref $o_empty eq 'HASH'
         && defined $o_empty->{message} && length $o_empty->{message}),
        'AC-R9f: workcopy_refusal_outcome({}) returns a complete, non-empty message');
-    like(($o_empty && $o_empty->{message}) // '', qr/\Q--no-hardlinks\E/,
-         'AC-R9g: {}-args message still contains --no-hardlinks');
+    like(($o_empty && $o_empty->{message}) // '', qr{\Qscripts/promote.pl\E},
+         'AC-R9g: {}-args message still names scripts/promote.pl');
     ok((defined $o_empty && defined $o_empty->{exit_code} && $o_empty->{exit_code} != 0),
        'AC-R9h: {}-args exit_code is non-zero');
 }
@@ -201,7 +210,7 @@ unlike(defined $o6->{message} ? $o6->{message} : '', qr/alone promotes/i,
 # AC-R11 — Decision #6: C:/Development/ccpraxis is illustrative only, never
 # the clone destination; and the message is not Windows-only.
 unlike(defined $o1->{message} ? $o1->{message} : '',
-       qr{git clone --no-hardlinks \S+\s+C:/Development/ccpraxis},
+       qr{git clone\b[^\n]*C:/Development/ccpraxis},
        'AC-R11a: C:/Development/ccpraxis is never the clone command destination');
 like(defined $o1->{message} ? $o1->{message} : '', qr{~/},
      'AC-R11b: message also gives a POSIX-flavoured example (not Windows-only)');
@@ -576,8 +585,8 @@ my @GATE_SYMBOLS = qw(
             # silently letting `$rc != 0` (124 is non-zero!) masquerade as a
             # correct refusal exit code.
             fail('AC-E1i: launcher exits non-zero on the offer route (TIMED OUT after 30s, not a refusal exit)');
-            fail('AC-E1ii: STDERR contains --no-hardlinks (TIMED OUT after 30s)');
-            fail('AC-E1iii: STDERR contains the clone command (TIMED OUT after 30s)');
+            fail('AC-E1ii: STDERR sends the owner to the dev clone (TIMED OUT after 30s)');
+            fail('AC-E1iii: STDERR contains the promote command (TIMED OUT after 30s)');
             fail('AC-E1iv: STDERR mentions the repo\'s basename (TIMED OUT after 30s)');
             fail('AC-E1v: STDOUT contains no part of the refusal (TIMED OUT after 30s)');
             diag("launcher.pl did not exit within the 30s wall-clock bound and was killed by `timeout`.\n"
@@ -585,11 +594,11 @@ my @GATE_SYMBOLS = qw(
                  . "stdout so far:\n$out\nstderr so far:\n$err");
         } else {
             ok($rc != 0, 'AC-E1i: launcher exits non-zero on the offer route') or diag("exit code: $rc");
-            like($err, qr/\Q--no-hardlinks\E/, 'AC-E1ii: STDERR contains --no-hardlinks') or diag("stderr:\n$err");
-            like($err, qr/git clone --no-hardlinks/, 'AC-E1iii: STDERR contains the clone command') or diag("stderr:\n$err");
+            like($err, qr/Work in your dev clone instead/, 'AC-E1ii: STDERR sends the owner to the dev clone') or diag("stderr:\n$err");
+            like($err, qr{\Qscripts/promote.pl\E}, 'AC-E1iii: STDERR contains the promote command') or diag("stderr:\n$err");
             my ($basename) = $repo_root =~ m{([^/]+)/?$};
             like($err, qr/\Q$basename\E/, 'AC-E1iv: STDERR mentions the repo\'s basename') or diag("stderr:\n$err");
-            unlike($out, qr/\Q--no-hardlinks\E/, 'AC-E1v: STDOUT contains no part of the refusal') or diag("stdout:\n$out");
+            unlike($out, qr/dev clone/, 'AC-E1v: STDOUT contains no part of the refusal') or diag("stdout:\n$out");
         }
     }
 }

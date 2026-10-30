@@ -653,13 +653,20 @@ sub _pp_advice {
     my ($reason, $root) = @_;
 
     if ($reason eq 'ccpraxis-install') {
-        return q{Work on a separate clone instead. Pick any ordinary directory outside this install (for example C:/Development/ccpraxis on Windows, or ~/src/ccpraxis on macOS or Linux), then run:
+        return q{Work in your dev clone instead: the checkout you cloned from GitHub (normally ~/Projects/ccpraxis). Promotion makes it this installation's origin, so this prints where it is:
 
-  git clone --no-hardlinks } . $root . q{ <your-clone-dir>
-  cd <your-clone-dir>
+  git -C } . $root . q{ remote get-url origin
+
+Then run claude-sandbox there:
+
+  cd <your-dev-clone>
   claude-sandbox
 
-The --no-hardlinks flag is required: a local clone hardlinks the object store by default, which would silently re-couple the clone to this installation. See plugins/sandbox/docs/working-on-ccpraxis.md.};
+No dev clone on this machine yet? Clone your repository from GitHub into any ordinary directory outside this installation:
+
+  git clone https://github.com/<you>/ccpraxis.git ~/Projects/ccpraxis
+
+Bring changes back by committing on the dev clone's main and running perl <your-dev-clone>/scripts/promote.pl on the host. Promotion is the only way this installation changes: never git pull into it. See docs/working-on-ccpraxis.md.};
     }
 
     if ($reason eq 'marketplace-install' || $reason eq 'marketplace-source') {
