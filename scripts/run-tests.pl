@@ -506,13 +506,14 @@ sub _lint_root {
 # (spec section 2.4): Cwd::abs_path, falling back to the path itself when
 # abs_path can't resolve it (e.g. a path under a HEAD snapshot that no
 # longer exists by the time this is called), backslashes folded to forward
-# slashes, lowercased on a Windows-family perl (case-insensitive filesystem).
+# slashes, lowercased on a Windows-family perl or macOS (case-insensitive
+# filesystems; abs_path keeps the case it was given on both).
 sub _path_identity {
     my ($p) = @_;
     my $id = Cwd::abs_path($p);
     $id = $p unless defined $id;
     $id =~ s{\\}{/}g;
-    $id = lc($id) if $^O =~ /^(MSWin32|cygwin|msys)$/;
+    $id = lc($id) if $^O =~ /^(MSWin32|cygwin|msys|darwin)$/;
     return $id;
 }
 

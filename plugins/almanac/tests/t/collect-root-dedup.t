@@ -72,9 +72,9 @@ is(scalar(@mine), 1,
     or diag(explain_rows($rows));
 }
 
-# ---- macOS: two CASE spellings of one root ----------------------------------
+# ---- macOS and Windows: two CASE spellings of one root --------------
 SKIP: {
-    skip 'case spellings of one root are a macOS (APFS) shape', 4 unless $MAC;
+    skip 'case spellings of one root are a macOS (APFS) or Windows (NTFS) shape', 4 unless $MAC || $WIN;
     my $base = tempdir(CLEANUP => 1);
     my $UPPER = "$base/CaseRoot";
     mkdir $UPPER or die "fixture: mkdir $UPPER: $!";

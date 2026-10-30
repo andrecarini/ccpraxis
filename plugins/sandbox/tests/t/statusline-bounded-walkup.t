@@ -205,6 +205,20 @@ for my $p (@PAIRS) {
     }
 }
 
+# The darwin flag drives the case fold and the /tmp second temp root in every
+# stop rule above; a drifted definition would change which paths the statusline
+# walk treats as equal on a Mac without any sub body differing.
+{
+    my ($rhs_alm) = $PAYLOAD =~ /my\s+\$ALMANAC_SW_IS_DARWIN\s*=\s*(.*?);/s;
+    my ($rhs_bdr) = $bdr_txt =~ /my\s+\$IS_DARWIN\s*=\s*(.*?);/s;
+    ok(defined $rhs_alm, 'AC-3: statusline.pl\'s payload defines $ALMANAC_SW_IS_DARWIN');
+    ok(defined $rhs_bdr, 'AC-3 sanity: BpDataRoot.pm defines $IS_DARWIN');
+    if (defined $rhs_alm && defined $rhs_bdr) {
+        is(normalize_alm_mirror_body($rhs_alm), normalize_alm_mirror_body($rhs_bdr),
+            'AC-3: $ALMANAC_SW_IS_DARWIN right-hand side matches $IS_DARWIN (mod naming)');
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Load the payload standalone, exactly as spec section 4 instructs: extract
 # the block, then evaluate it in its own package. Built by concatenation

@@ -217,24 +217,29 @@ sub _almanac_type_dirs {
 # so it contributes nothing either way -- this only stops it being walked
 # under BOTH of its spellings.
 #
-# macOS: abs_path there does NOT resolve case. Default APFS is case-
-# insensitive, so `/Users/x/Proj` and `/users/x/proj` are one directory but
+# macOS and Windows: abs_path there does NOT reliably resolve case. Default
+# APFS and NTFS are case-insensitive, so `/Users/x/Proj` and `/users/x/proj` are one directory but
 # two abs_path results, and every report under it was walked twice. On
-# darwin the value is therefore lower-cased (ASCII, as everywhere else a
-# Windows/macOS path is folded). Every caller uses it only as a dedupe key
+# darwin and Windows the value is therefore lower-cased (ASCII, as everywhere
+# else a Windows/macOS path is folded). The `/x/` -> `X:/` drive rewrite in the
+# fallback is Windows-only: elsewhere `/x/..` is a directory named x. Every caller uses it only as a dedupe key
 # or for an ancestor-prefix comparison between two canonical_root values,
 # never as a path to open, so folding both sides is safe.
 sub canonical_root {
     my ($p) = @_;
     return '' unless defined $p && length $p;
     my $abs = Cwd::abs_path($p);
-    return ($^O eq 'darwin' ? lc($abs) : $abs) if defined $abs;
+    my $win  = $^O =~ /^(?:MSWin32|cygwin|msys)$/ ? 1 : 0;
+    my $fold = ($win || $^O eq 'darwin') ? 1 : 0;
+    return ($fold ? lc($abs) : $abs) if defined $abs;
     my $norm = $p;
     $norm =~ s{\\}{/}g;
-    $norm =~ s{^/([a-zA-Z])(?=/|\z)}{uc($1) . ':'}e;
-    $norm =~ s{^([a-zA-Z]):}{uc($1) . ':'}e;
+    if ($win) {
+        $norm =~ s{^/([a-zA-Z])(?=/|\z)}{uc($1) . ':'}e;
+        $norm =~ s{^([a-zA-Z]):}{uc($1) . ':'}e;
+    }
     $norm =~ s{/+\z}{};
-    return $^O eq 'darwin' ? lc($norm) : $norm;
+    return $fold ? lc($norm) : $norm;
 }
 
 sub _mkpath {

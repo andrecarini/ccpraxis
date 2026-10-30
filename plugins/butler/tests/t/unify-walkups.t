@@ -1520,6 +1520,20 @@ subtest 'Decision 24 item 7: Store.pm mirrored stop-rule subs are source-identic
     }
 };
 
+subtest 'Store.pm platform flags are defined exactly as in BpDataRoot.pm (windows and darwin)' => sub {
+    my $store_txt = slurp("$ALM_SCRIPTS/Almanac/Store.pm");
+    my $bdr_txt   = slurp($DATAROOT_PM);
+    for my $f (['SW_IS_WIN', 'IS_WIN'], ['SW_IS_DARWIN', 'IS_DARWIN']) {
+        my ($sw, $bdr) = @$f;
+        my ($rs) = $store_txt =~ /my\s+\$\Q$sw\E\s*=\s*(.*?);/s;
+        my ($rb) = $bdr_txt   =~ /my\s+\$\Q$bdr\E\s*=\s*(.*?);/s;
+        ok(defined $rs, "Store.pm defines \$$sw") or next;
+        ok(defined $rb, "BpDataRoot.pm defines \$$bdr") or next;
+        is(normalize_mirror_body($rs), normalize_mirror_body($rb),
+            "\$$sw right-hand side matches \$$bdr -- a drifted flag changes which paths compare equal");
+    }
+};
+
 # ---------------------------------------------------------------------------
 # Item 8 (nits): a start containing ".." is canonicalised before the walk;
 # an empty or relative HOME/USERPROFILE is ignored as a stop dir, and home

@@ -126,23 +126,27 @@ sub _die {
 #
 # Cwd::abs_path($p) when the path resolves (the common case: the directory
 # already exists); otherwise a textual fallback -- backslashes to forward
-# slashes, /x/ <-> X:/ drive-form normalisation, uppercased drive letter, no
-# trailing slash. This restates almanac-bug.pl::canonical_root (find it by
-# that name, not by line number -- see the package ledger's scout note).
-# Duplicated rather than imported because almanac-bug.pl is a script:
-# require-ing it would run its main body (out of scope, S6).
+# slashes, /x/ -> X:/ drive-form normalisation and uppercased drive letter
+# (Windows-family only; elsewhere /x/ is a directory named x), no trailing
+# slash. It is the sibling of almanac-bug.pl::canonical_root, NOT a copy: that
+# one lower-cases on darwin and Windows because its value is only ever a dedupe
+# key, while this one keeps the on-disk/typed case because its result is a path
+# that is opened, printed and compared against callers' own spelling.
+# Separate because almanac-bug.pl is a script (its main body is guarded, but
+# Store is the lower layer and must not require it).
 sub _canonical_path {
     my ($p) = @_;
     return $p unless defined $p;
     my $abs = Cwd::abs_path($p);
+    my $win = $^O =~ /^(?:MSWin32|msys|cygwin)$/ ? 1 : 0;
     if (!defined $abs) {
         $abs = $p;
         $abs =~ s{\\}{/}g;
-        $abs =~ s{^/([a-zA-Z])(?=/|\z)}{uc($1) . ':'}e;
+        $abs =~ s{^/([a-zA-Z])(?=/|\z)}{uc($1) . ':'}e if $win;
     }
     $abs =~ s{\\}{/}g;
     $abs =~ s{/\z}{} if length($abs) > 1;
-    $abs =~ s{^([a-zA-Z]):}{uc($1) . ':'}e;
+    $abs =~ s{^([a-zA-Z]):}{uc($1) . ':'}e if $win;
     return $abs;
 }
 
