@@ -50,6 +50,7 @@ use ProtectedPaths qw(path_relation protected_roots target_self_codes normalize_
 use RefusalMarker ();  # .claude-sandbox-refuse markers: refuse before anything is written
 use SandboxIdentity ();  # launcher identity + this checkout's own install root
 use HostPlatform ();     # container CLI choice, machine shares, darwin path case
+use PodmanMachine ();    # the macOS machine: its share folders and the script that keeps them
 use ContainerClaudeMd ();  # the container CLAUDE.md, built for this host and runtime
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
@@ -279,6 +280,11 @@ use constant SELECT_SESSION_FORK_FAILED_EXIT => 3;
 # screen frame is a byte the screen restore is about to discard.
 my $PICK_ERROR;
 my $HOST_PLUGINS_DIR  = "$CLAUDE_HOST_CONFIG/plugins";
+# macOS: the podman machine shares no part of ~/.claude, so host files a
+# container reads are copied into its read-only container-files share and bound
+# from there (MountSpec::stage_global_counts_copy). undef on every other host,
+# where they are bound in place.
+my $CONTAINER_FILES_DIR = PodmanMachine::container_files_dir();
 # B2: the canonical entry paths the dashboard spawns for a new claude session,
 # and whether the raw-ANSI TUI is even possible (else the plain heartbeat loop).
 my $LAUNCHER_PL       = "$SANDBOX_PLUGIN/scripts/launcher.pl";
@@ -5224,7 +5230,8 @@ if (! _container_exists($CONTAINER_NAME)) {
             launcher_dir => $LAUNCHER_DIR,
             statusline   => "${INSTALL_ROOT}/scripts/statusline.pl",
             (defined &MountSpec::ensure_global_counts_file
-                ? (global_counts => "${CLAUDE_HOST_CONFIG}/almanac-global-counts.json") : ()),
+                ? (global_counts => "${CLAUDE_HOST_CONFIG}/almanac-global-counts.json",
+                   global_counts_copy_dir => $CONTAINER_FILES_DIR) : ()),
         );
         push @args, @SKILL_MOUNTS;
         push @args, @PLUGIN_MOUNTS;
@@ -5735,6 +5742,19 @@ sub _launch_commit_reap_marker {
     return 1;
 }
 _surface_last_reap();
+
+# macOS: refresh the container's copy of the global-counts snapshot before the
+# container (re)starts. Its single-file bind re-resolves on start, so a
+# restarted container sees counts as fresh as the host's -- the freshness the
+# direct bind of ~/.claude/almanac-global-counts.json gave. Best effort: a
+# failure leaves the previous copy (or none) and the launch goes on.
+if (defined $CONTAINER_FILES_DIR && defined &MountSpec::stage_global_counts_copy) {
+    my $src = "${CLAUDE_HOST_CONFIG}/almanac-global-counts.json";
+    if (-f $src) {
+        my ($ok, $reason) = MountSpec::stage_global_counts_copy($src, $CONTAINER_FILES_DIR);
+        log_ev('global_counts_copy', { ok => ($ok ? 1 : 0), reason => $reason });
+    }
+}
 
 # $start_rc stays undef through a pre-flight abort below (machine
 # unreachable / image missing / degraded exec -- none of which ever call the
@@ -6804,6 +6824,14 @@ sub _machine_start_bounded {
     my $secs = ($ENV{SANDBOX_RECOVER_MACHINE_TIMEOUT}
                 && $ENV{SANDBOX_RECOVER_MACHINE_TIMEOUT} =~ /^\d+$/)
                ? $ENV{SANDBOX_RECOVER_MACHINE_TIMEOUT} : 180;
+    # macOS: vfkit refuses to start a VM whose shared folder is missing, and
+    # ccpraxis's own share folders live under ~/.cache, which cleanup tools
+    # empty. Recreate them (empty) first; the launcher refills container-files.
+    if ($^O eq 'darwin') {
+        my $home = PodmanMachine::account_home();
+        eval { PodmanMachine::ensure_share_dirs(PodmanMachine::layout(home => $home)) }
+            if defined $home && length $home;
+    }
     my $out = _run_timed(qq{$PODMAN machine start 2>&1}, $secs);
     return { ok => 0, timeout => 1,
              detail => "podman machine start did not finish within ${secs}s" }

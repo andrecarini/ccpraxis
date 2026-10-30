@@ -18,7 +18,7 @@ use JSON::PP ();
 
 our @EXPORT_OK = qw(winify_path v_to_mount convert_v_to_mount
     claude_home_create_args parse_create_args parse_inspect_lines
-    audit_claude_home ensure_global_counts_file);
+    audit_claude_home ensure_global_counts_file stage_global_counts_copy);
 
 our $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/;
 
@@ -91,6 +91,8 @@ sub convert_v_to_mount {
 #       claude_data  => $CLAUDE_DATA,
 #       launcher_dir => $LAUNCHER_DIR,
 #       statusline   => "$CLAUDE_HOST_CONFIG/ccpraxis/scripts/statusline.pl",
+#       global_counts          => "$CLAUDE_HOST_CONFIG/almanac-global-counts.json",
+#       global_counts_copy_dir => $CONTAINER_FILES_DIR,   # undef off macOS
 #   )
 #
 # — which is the same claude-home block that used to be written inline
@@ -119,6 +121,12 @@ sub claude_home_create_args {
         && !(defined $opt{global_counts} && length $opt{global_counts})) {
         die "MountSpec::claude_home_create_args: missing or empty required option 'global_counts'\n";
     }
+    # global_counts_copy_dir is OPTIONAL too: undef (every host but macOS)
+    # binds global_counts where it is. An empty string is refused like above.
+    if (exists $opt{global_counts_copy_dir} && defined $opt{global_counts_copy_dir}
+        && !length $opt{global_counts_copy_dir}) {
+        die "MountSpec::claude_home_create_args: empty option 'global_counts_copy_dir'\n";
+    }
     my ($claude_data, $launcher_dir, $statusline) =
         @opt{qw(claude_data launcher_dir statusline)};
 
@@ -138,6 +146,11 @@ sub claude_home_create_args {
     if (defined $opt{global_counts} && length $opt{global_counts}) {
         my $gc = $opt{global_counts};
         my ($ok, $reason) = ensure_global_counts_file($gc);
+        if ($ok && defined $opt{global_counts_copy_dir}) {
+            my $copy;
+            ($ok, $reason, $copy) = stage_global_counts_copy($gc, $opt{global_counts_copy_dir});
+            $gc = $copy if $ok;
+        }
         if ($ok) {
             push @args, '-v', "$gc:/root/.claude/almanac-global-counts.json:ro";
         } else {
@@ -183,6 +196,57 @@ sub ensure_global_counts_file {
     }
     return (1, 'exists') if -f $p;
     return (0, 'create_failed');
+}
+
+# stage_global_counts_copy($src, $dir) -> (1, 'copied', $copy) | (0, $reason, undef)
+#
+# macOS only (the caller passes a $dir only there): the container must read the
+# snapshot without the podman machine sharing ~/.claude, which holds the
+# transcripts, the vault and the machine's own share list. So the launcher
+# copies the one file into the machine's read-only container-files share
+# (PodmanMachine::container_files_dir) and binds the copy. The snapshot's
+# writer, its lock files and its path are untouched: the host statusline and
+# Almanac::GlobalCounts keep reading and writing ~/.claude/almanac-global-
+# counts.json, and the container needs no lock (it never writes).
+#
+# Written by temp file + rename, so a concurrent launch or a container start
+# never sees half a file; the copy is refreshed at every create and before
+# every container start, which keeps the container as fresh as the direct bind
+# was (a single-file bind pins an inode; a restart re-resolves the path). A
+# source larger than the snapshot's 4096-byte budget (the reader refuses it
+# anyway) is not copied. Never follows a claude-code-vault path.
+sub stage_global_counts_copy {
+    my ($src, $dir) = @_;
+    return (0, 'no_copy_dir', undef) unless defined $dir && length $dir;
+    for my $p ($src, $dir) {
+        return (0, 'vault_path', undef)
+            if grep { lc($_) eq 'claude-code-vault' } split(m{[\\/]}, (defined $p ? $p : ''));
+    }
+    return (0, 'source_not_a_file', undef) unless defined $src && -f $src;
+    open(my $in, '<:raw', $src) or return (0, 'read_failed', undef);
+    my $bytes = '';
+    my $n = read($in, $bytes, 65537);
+    close $in;
+    return (0, 'read_failed', undef) unless defined $n;
+    return (0, 'too_large', undef) if $n > 65536;
+    unless (-d $dir) {
+        require File::Path;
+        eval { File::Path::make_path($dir); 1 };
+        return (0, 'copy_dir_unavailable', undef) unless -d $dir;
+    }
+    my $copy = "$dir/almanac-global-counts.json";
+    return (0, 'not_a_file', undef) if -e $copy && !-f $copy;
+    my $tmp = "$copy.tmp.$$";
+    my $fh;
+    sysopen($fh, $tmp, O_WRONLY | O_CREAT | O_EXCL) or return (0, 'copy_failed', undef);
+    binmode($fh);
+    my $printed = print {$fh} $bytes;
+    my $closed  = close($fh);
+    unless ($printed && $closed && rename($tmp, $copy)) {
+        unlink $tmp;
+        return (0, 'copy_failed', undef);
+    }
+    return (1, 'copied', $copy);
 }
 
 sub _global_counts_now_iso {

@@ -796,6 +796,10 @@ for my $run_result ([1, ''], [-1, '']) {
         # (SandboxIdentity::install_root), no longer a ~/.claude/ccpraxis literal;
         # the fixture places that root where the literal used to point.
         my $INSTALL_ROOT       = "$tmp_hc/ccpraxis";
+        # undef = every host but macOS: the snapshot is bound where it is.
+        # (The macOS copy into the machine's container-files share is
+        # sandbox-global-counts-mount.t's to check.)
+        my $CONTAINER_FILES_DIR = undef;
         mkdir("$tmp_hc/ccpraxis");
         mkdir("$tmp_hc/ccpraxis/scripts");
         open(my $fh, '>', "$tmp_hc/ccpraxis/scripts/statusline.pl"); print $fh "1;\n"; close $fh;

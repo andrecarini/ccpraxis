@@ -292,6 +292,78 @@ my $gc_path_ac16 = "$ac16_base/almanac-global-counts.json";
 }
 
 # ---------------------------------------------------------------------------
+# COPY (podman-machine narrowing, 2026-10-30). On macOS the podman machine
+# shares no part of ~/.claude, so the launcher passes global_counts_copy_dir
+# (PodmanMachine::container_files_dir, a read-only machine share) and the
+# container binds a COPY from there. The snapshot's own path, writer and lock
+# files stay in ~/.claude, untouched. undef = every other host: bound in place.
+# ---------------------------------------------------------------------------
+{
+    my $home  = tempdir(CLEANUP => 1);
+    my $src   = "$home/claude/almanac-global-counts.json";
+    my $share = "$home/cache/ccpraxis/container-files";
+    mkdir_p("$home/claude");
+    my $bytes = qq({"generated_at":"2030-01-01T00:00:00Z","note":{"total":3},"schema":1,"todo":{"done":1,"open":2,"total":3}}\n);
+    write_raw($src, $bytes);
+    write_raw("$src.lock", '');
+    my @src_stat = stat($src);
+
+    my @args = eval { MountSpec::claude_home_create_args(
+        claude_data => $claude_data, launcher_dir => $launcher_dir, statusline => $statusline,
+        global_counts => $src, global_counts_copy_dir => $share) };
+    is_deeply([ @args[-2, -1] ], ['-v', "$share/almanac-global-counts.json:/root/.claude/almanac-global-counts.json:ro"],
+        'COPY: with global_counts_copy_dir, the read-only bind is of the copy in that folder')
+        or diag("error: " . ($@ // '(none)'));
+    ok(-d $share, 'COPY: the copy folder is created when missing');
+    is(slurp_raw("$share/almanac-global-counts.json"), $bytes, 'COPY: the copy holds the snapshot\'s bytes');
+    is(slurp_raw($src), $bytes, 'COPY: the snapshot itself is unchanged');
+    is((stat($src))[1], $src_stat[1], 'COPY: ...and is the same file (same inode: nothing renamed over it)');
+    opendir(my $dh, $share) or die;
+    my @in_share = sort grep { !/^\.\.?\z/ } readdir $dh;
+    closedir $dh;
+    is_deeply(\@in_share, ['almanac-global-counts.json'],
+        'COPY: the share folder holds only the copy (no lock file, no leftover temp file)');
+
+    # A second create, or the launcher's refresh before a container start,
+    # replaces the copy whole (rename), so a reader never sees half a file.
+    my $ino1 = (stat("$share/almanac-global-counts.json"))[1];
+    (my $bytes2 = $bytes) =~ s/"total":3\}/"total":4}/;
+    write_raw($src, $bytes2);
+    my ($ok, $reason, $copy) = MountSpec::stage_global_counts_copy($src, $share);
+    ok($ok, 'COPY: stage_global_counts_copy refreshes an existing copy') or diag($reason);
+    is($copy, "$share/almanac-global-counts.json", 'COPY: ...returning the copy\'s path');
+    is(slurp_raw($copy), $bytes2, 'COPY: ...with the new bytes');
+    isnt((stat($copy))[1], $ino1, 'COPY: ...as a new file renamed into place, not a rewrite in place');
+
+    my @direct = eval { MountSpec::claude_home_create_args(
+        claude_data => $claude_data, launcher_dir => $launcher_dir, statusline => $statusline,
+        global_counts => $src, global_counts_copy_dir => undef) };
+    is_deeply([ @direct[-2, -1] ], ['-v', "$src:/root/.claude/almanac-global-counts.json:ro"],
+        'COPY: global_counts_copy_dir => undef (Windows, Linux) binds the snapshot in place, as before');
+    eval { MountSpec::claude_home_create_args(
+        claude_data => $claude_data, launcher_dir => $launcher_dir, statusline => $statusline,
+        global_counts => $src, global_counts_copy_dir => '') };
+    like($@ // '', qr/global_counts_copy_dir/, 'COPY: an empty copy dir dies naming the option');
+
+    my ($vok, $vreason) = MountSpec::stage_global_counts_copy($src, "$home/claude-code-vault/x");
+    ok(!$vok && $vreason eq 'vault_path', 'COPY: a copy folder under a claude-code-vault segment is refused');
+    ok(!-e "$home/claude-code-vault", 'COPY: ...and nothing is created there');
+    write_raw($src, 'x' x 70000);
+    my ($bok, $breason) = MountSpec::stage_global_counts_copy($src, $share);
+    ok(!$bok && $breason eq 'too_large', 'COPY: a source far over the snapshot budget is not copied');
+    is(slurp_raw($copy), $bytes2, 'COPY: ...and the previous copy is left as it was');
+
+    # A failed copy falls back to NO bind (the container shows no counters),
+    # never to binding ~/.claude, which the machine does not share.
+    my ($r, $died, $stderr) = capture_stderr(sub { MountSpec::claude_home_create_args(
+        claude_data => $claude_data, launcher_dir => $launcher_dir, statusline => $statusline,
+        global_counts => $src, global_counts_copy_dir => $share) });
+    is(scalar(@$r), scalar(@expected_base), 'COPY: when the copy fails, the global-counts pair is omitted')
+        or diag(explain($r));
+    like($stderr, qr/global counts snapshot not mounted \(too_large\)/, 'COPY: ...and the reason is logged');
+}
+
+# ---------------------------------------------------------------------------
 # AC19 (DC-d, DC-g): launcher.pl's single call site, by source text. The
 # launcher is never executed.
 # ---------------------------------------------------------------------------
@@ -302,8 +374,14 @@ my $gc_path_ac16 = "$ac16_base/almanac-global-counts.json";
     like($launcher_src, qr/global_counts\s*=>\s*"\$\{CLAUDE_HOST_CONFIG\}\/almanac-global-counts\.json"/,
         'AC19: launcher.pl passes global_counts => "${CLAUDE_HOST_CONFIG}/almanac-global-counts.json"');
 
+    like($launcher_src, qr/my \$CONTAINER_FILES_DIR = PodmanMachine::container_files_dir\(\);/,
+        'COPY: launcher.pl takes the copy folder from PodmanMachine::container_files_dir (undef off macOS)');
+    like($launcher_src, qr/MountSpec::stage_global_counts_copy\(\$src, \$CONTAINER_FILES_DIR\)/,
+        'COPY: launcher.pl refreshes the copy (before the container start), with the same helper');
     if ($launcher_src =~ /(MountSpec::claude_home_create_args\s*\([^;]*?\)\s*;)/s) {
         my $call = $1;
+        like($call, qr/global_counts_copy_dir\s*=>\s*\$CONTAINER_FILES_DIR/,
+            'COPY: the create call passes global_counts_copy_dir => $CONTAINER_FILES_DIR');
         unlike($call, qr/claude-code-vault/, 'AC19: the literal claude-code-vault does not occur in that call');
     } else {
         fail('AC19: located the claude_home_create_args call site to check for claude-code-vault');
