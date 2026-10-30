@@ -7,6 +7,7 @@
 #
 #   1. The Node toolchain step fetched node-*-linux-x64 unconditionally, so an
 #      arm64 build died at `npm install -g pnpm` with "Exec format error".
+#      (That step left the image on 2026-10-30; the check is now general.)
 #   2. The jail-skeleton step chained `mknod ... && cp ... || true && ...`.
 #      Shell precedence let that `|| true` swallow a mknod failure (which is
 #      what a rootless build always produces) together with every command
@@ -61,39 +62,32 @@ sub unscoped_or_true {
     return $n;
 }
 
-# node_step($runs) -> the RUN body that installs the Node tarball, or undef.
-sub node_step {
-    my @runs = @_;
-    my ($r) = grep { /nodejs\.org\/dist\// } @runs;
-    return $r;
-}
-
 my @RUNS = run_instructions($SRC);
 ok(scalar(@RUNS) >= 5, 'harness: found the Containerfile RUN instructions (' . scalar(@RUNS) . ')');
 
 # ---------------------------------------------------------------------------
-# 1. Node tarball follows the image architecture.
+# 1. No step downloads an artifact for one architecture only.
+#
+# The Node step this section was written for left the image on 2026-10-30
+# (Node now comes from the backpack recipe, whose arch handling is asserted in
+# node-pnpm-toolchain.t D1b-D1d). The class of defect stays possible for the
+# next prebuilt download anyone adds, so the check is now general: a RUN that
+# names a linux-x64 / amd64 / x86_64 artifact must pick it from dpkg.
 # ---------------------------------------------------------------------------
 {
-    my $node = node_step(@RUNS);
-    ok(defined $node, 'the Node install step exists');
-    $node //= '';
-    like($node, qr/dpkg --print-architecture/,
-        'the Node step picks its tarball from dpkg --print-architecture (the image arch, not the host shell)');
-    my ($x64)   = $node =~ /node-v(\d+\.\d+\.\d+)-linux-x64\.tar\.xz/;
-    my ($arm64) = $node =~ /node-v(\d+\.\d+\.\d+)-linux-arm64\.tar\.xz/;
-    ok(defined $x64,   'an amd64 (linux-x64) Node tarball literal is present');
-    ok(defined $arm64, 'an arm64 (linux-arm64) Node tarball literal is present');
-    is($arm64, $x64, 'both architectures pin the SAME Node version (a bump must move both)');
-    unlike($node, qr{https://nodejs\.org/dist/v[\d.]+/node-v[\d.]+-linux-x64\.tar\.xz},
-        'the download URL is not hard-wired to linux-x64');
-    like($node, qr/\*\)[^\n]*?exit 1\s*;;/,
-        'an unrecognised architecture fails the build instead of guessing');
+    my $arch_specific = qr/linux-x64|linux-amd64|x86_64-linux|amd64\.(?:deb|tar|zip)/;
+    my @pinned = grep { $_ =~ $arch_specific && !/dpkg --print-architecture/ } @RUNS;
+    is(scalar(@pinned), 0, 'no RUN step fetches a single-architecture artifact without consulting dpkg')
+        or diag("offending RUN:\n  " . join("\n  ", @pinned));
 
-    # Counter-fixture: the pre-fix step must trip the detectors above.
+    # Counter-fixture: the pre-fix Node step must trip the detector above.
     my $old = 'curl -sSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz -o /tmp/node.tar.xz '
             . '&& tar -xf /tmp/node.tar.xz -C /tmp && mv /tmp/node-v24.18.0-linux-x64 /opt/node24';
-    unlike($old, qr/dpkg --print-architecture/, 'counter-fixture: the old x64-only step is caught by the arch check');
+    ok($old =~ $arch_specific && $old !~ /dpkg --print-architecture/,
+       'counter-fixture: the old x64-only Node step is caught by the detector');
+    my $fixed = 'case "$(dpkg --print-architecture)" in amd64) T=x-linux-x64.tar.xz ;; esac';
+    ok(!($fixed =~ $arch_specific && $fixed !~ /dpkg --print-architecture/),
+       'paired negative: an arch-aware step is not flagged');
 }
 
 # ---------------------------------------------------------------------------

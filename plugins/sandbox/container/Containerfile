@@ -146,64 +146,39 @@ ENV COLORTERM=truecolor
 # autonomy" model breaks. See anthropics/claude-code#9184.
 ENV IS_SANDBOX=1
 
-# Supply chain hardening — env vars take effect whenever runtimes are installed
+# Supply chain hardening. Environment variables, not installs: they cost
+# nothing while no Node is present and take effect the moment a project's
+# backpack installs one. The pnpm half is further down.
 ENV npm_config_ignore_scripts=true
 ENV NODE_OPTIONS="--dns-result-order=ipv4first"
 
-# Node + pnpm toolchain (b38-node-pnpm-toolchain).
+# NO NODE IN THE IMAGE (operator decision, 2026-10-30). From 2026-08-03 this
+# step installed an exactly pinned Node 24 tarball and pnpm
+# (b38-node-pnpm-toolchain). Nothing in ccpraxis needs Node inside the
+# container -- Claude Code comes from its native installer above -- so Node was
+# the one project runtime every sandbox got whether it used it or not, at a
+# version no project chose, and it shadowed a project's own Node: klink links
+# its nvm-installed Node 22 into /root/.local/bin, behind /opt/node24/bin on
+# PATH, so its backpack verify (`node -v | grep ^v22`) could not pass outside
+# an nvm-initialised shell. A project now declares Node in its backpack like any
+# other runtime:
+#   /backpack:add --recipe node-pnpm      (plugins/backpack/recipes/node-pnpm.json)
+# What b38 measured and hardened stays, because it protects whichever Node a
+# project installs later: the npm and pnpm environment variables in this file.
 #
-# Versions are EXACT pins, measured 2026-08-03 against the repo's >=7-day
-# supply-chain rule -- do NOT "helpfully" bump to latest/lts without
-# re-running that measurement:
-#   Node v24.18.1 was 6 days old on 2026-08-03 (too new); v24.18.0 (2026-06-23,
-#   41 days old) is the newest ELIGIBLE Active-LTS release. Node 20 is EOL;
-#   Node 24 "Krypton" is Active LTS.
-#   pnpm 11.19.0 (3d) and 11.18.0/dist-tag latest (5d) were both too new;
-#   11.17.0 (2026-07-23, 11 days old) is the newest ELIGIBLE release.
-# Installed by tarball (not apt/nodesource) so the version is pinned exactly.
-# --connect-timeout/--max-time/--retry* added fix-batch step 7 (finding F4);
-# see the identical note above the Claude Code installer RUN step. --max-time
-# is larger here (the node tarball is a much bigger download).
-#
-# THE TARBALL FOLLOWS THE IMAGE'S ARCHITECTURE. This used to fetch linux-x64
-# unconditionally, which is right on a Windows/WSL2 or Intel host and wrong on
-# an Apple Silicon Mac, whose podman machine builds a linux/arm64 image: the
-# x64 node binary then fails to exec ("Exec format error") at the very next
-# step, `npm install -g pnpm`. dpkg reports the architecture of the image being
-# built, so each host gets its native tarball and no emulation is involved.
-# Both filenames stay full literals, with ONE version: the butler pin auditor and
-# version-pin-currency.t read the pin out of the x64 literal, and
-# containerfile-portability.t fails if the two ever name different versions.
-# An unknown architecture fails the build loudly rather than guessing.
-RUN case "$(dpkg --print-architecture)" in \
-        amd64) NODE_TARBALL=node-v24.18.0-linux-x64.tar.xz ;; \
-        arm64) NODE_TARBALL=node-v24.18.0-linux-arm64.tar.xz ;; \
-        *) echo "Containerfile: no pinned Node tarball for architecture '$(dpkg --print-architecture)'" >&2; exit 1 ;; \
-    esac \
-    && curl -sSL --connect-timeout 10 --max-time 180 --retry 2 --retry-delay 3 --retry-all-errors "https://nodejs.org/dist/v24.18.0/${NODE_TARBALL}" -o /tmp/node.tar.xz \
-    && tar -xf /tmp/node.tar.xz -C /tmp \
-    && mv "/tmp/${NODE_TARBALL%.tar.xz}" /opt/node24 \
-    && ln -sf /opt/node24/bin/node /usr/local/bin/node \
-    && ln -sf /opt/node24/bin/npm /usr/local/bin/npm \
-    && rm -f /tmp/node.tar.xz \
-    && npm install -g pnpm@11.17.0
-
-# /opt/node24/bin MUST be on PATH. npm derives its global prefix from the REAL
-# path of the node binary -- dirname(dirname(realpath(process.execPath))) --
-# which resolves through the /usr/local/bin/node symlink to /opt/node24, NOT to
-# /usr/local. So `npm install -g <tool>` drops its bin into /opt/node24/bin,
-# which nothing else puts on PATH: the two `ln -sf` lines above cover exactly
-# node and npm and nothing else.
-#
-# Measured: the build died at the very next step with `/bin/sh: 1: pnpm: not
-# found` immediately after npm reported "added 1 package". The install had
-# succeeded; only the lookup failed.
-#
-# Fixing the CLASS (PATH) rather than the INSTANCE (one more symlink for pnpm)
-# is deliberate: every `npm install -g` an agent or a backpack item runs inside
-# the container hits the same wall, and would "succeed" and then be unreachable
-# -- a silent failure far harder to diagnose than this loud one.
-ENV PATH="/opt/node24/bin:${PATH}"
+# /opt/tools/node/bin IS ON PATH for that recipe. npm derives its global prefix
+# from the REAL path of the node binary, so `npm install -g <tool>` (pnpm
+# included) puts the tool's bin into <prefix>/bin, which nothing else puts on
+# PATH; b38's build died on exactly that with "pnpm: not found". The recipe
+# installs Node under the fixed prefix /opt/tools/node, inside the backpack's
+# install root, and this entry makes node, npm, npx, corepack and every global
+# tool reachable by name from every process the container starts, hooks and the
+# Bash tool included. The backpack's /etc/profile.d fragment only reaches shells
+# that read /etc/profile. With no Node installed the directory does not exist,
+# and a PATH entry that does not resolve costs nothing. It sits where
+# /opt/node24/bin did, ahead of /root/.local/bin and the system directories, so
+# Debian's own nodejs package (18, end of life) can never shadow it.
+ENV PATH="/opt/tools/node/bin:${PATH}"
 
 # ccpraxis plugin shims, so the verbs a hook tells the agent to run are
 # reachable BY NAME inside a sandbox and not only on the host.
@@ -235,6 +210,12 @@ ENV PNPM_CONFIG_MINIMUM_RELEASE_AGE=10080
 # whole age control if left unset. Must be pinned explicitly.
 ENV PNPM_CONFIG_MINIMUM_RELEASE_AGE_IGNORE_MISSING_TIME=false
 ENV PNPM_CONFIG_MINIMUM_RELEASE_AGE_STRICT=true
+# NOT COVERED: minimumReleaseAgeExclude. No variable here sets it, so a
+# project's pnpm-workspace.yaml can still exempt named packages from the age
+# floor (b38 measured env > pnpm-workspace.yaml for the keys above, but never
+# measured how pnpm reads a list-valued key from the environment, so pinning it
+# empty here would be a guess). Closing it needs that measurement in a sandbox
+# with pnpm installed.
 
 # Git defaults
 RUN git config --global core.autocrlf input \

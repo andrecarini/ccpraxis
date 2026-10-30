@@ -110,9 +110,11 @@ Terminal`, so no Automation permission is asked for). By hand, run
 
 What differs from Windows, and why:
 
-- **The image is built natively for the machine's architecture.** The
-  Containerfile picks the Node tarball from `dpkg --print-architecture`,
-  so an Apple Silicon Mac builds a linux/arm64 image with no emulation.
+- **The image is built natively for the machine's architecture**, so an
+  Apple Silicon Mac builds a linux/arm64 image with no emulation. No step
+  downloads an artifact for one architecture only
+  (`containerfile-portability.t`); the backpack's Node recipe picks its
+  tarball from `dpkg --print-architecture` the same way.
 - **Only the machine's shared folders can be mounted.** A macOS podman
   machine sees `/Users`, `/private` and `/var/folders` by default (see
   `podman machine init --help`). The launcher reads the machine's share
@@ -170,6 +172,26 @@ below.
 container's `/root/.claude/` — claude's session jsonl, tasks/, lockfiles,
 settings.json, and CLAUDE.md are all writable host files. No volume,
 no sync sidecar, no `podman cp` round-trips.
+
+### What the image contains, and what it leaves to the backpack
+
+The image (`container/Containerfile`) is Debian bookworm-slim with the tools
+every sandbox uses (git, curl, build-essential, jq, perl, openssh-client and a
+few more), Claude Code from its native installer, and GitHub's SSH host keys.
+Beyond the Perl that ccpraxis itself runs on, it carries **no language runtime**:
+anything a project builds with is declared in that project's backpack and
+installed on top, so a rebuild returns each sandbox to its own toolchain and
+nothing else.
+
+**Node.js and pnpm are not in the image** since 2026-10-30 (they were from
+2026-08-03, pinned in the Containerfile). A project that needs them adds the
+sanctioned recipe, `/backpack:add --recipe node-pnpm`
+(`plugins/backpack/recipes/node-pnpm.json`): an exact Node LTS tarball checked
+against its sha256, plus pnpm, under `/opt/tools/node`. The image keeps what
+protects that Node once it exists: `npm_config_ignore_scripts=true`, the
+`PNPM_CONFIG_*` settings (no install scripts; a 7-day minimum package age), and
+`/opt/tools/node/bin` on `PATH`, so `npm install -g` tools are reachable by
+name from every process. With no Node installed those cost nothing.
 
 ### Mount layering
 

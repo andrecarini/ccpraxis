@@ -31,12 +31,14 @@ You are running inside an isolated dev container, as root. The project folder is
 You have full autonomy. No permission prompts. Go fast.
 
 **You CAN and SHOULD install and run dev tooling directly:**
-- ✅ `apt-get install -y …` for system packages and runtimes (Node.js, Python, etc.) — runs as root, no `sudo` needed (and `sudo` isn't installed; the container IS root)
-- ✅ `npm install`, `npm ci`, `npx`
+- ✅ `apt-get install -y …` for system packages and runtimes (Python, etc.) — runs as root, no `sudo` needed (and `sudo` isn't installed; the container IS root)
+- ✅ `npm install`, `npm ci`, `npx`, `pnpm` — once the project's backpack provides Node (below)
 - ✅ `dart`, `flutter`, `pub get`
 - ✅ `pip install`, `python`, `cargo`, `go build`
 - ✅ `firebase`, `gcloud`, `terraform`
 - ✅ ANY build tool, linter, formatter, or compiler
+
+**Node.js and pnpm are NOT preinstalled.** The image carries no language runtime beyond the Perl that ccpraxis itself runs on. If the project builds with Node (a `package.json`, an `.nvmrc`, a JS build), declare it with `/backpack:add --recipe node-pnpm` and then `/backpack:install`: an exact Node LTS plus pnpm under `/opt/tools/node`, whose `bin` is already on `PATH`, so `npm install -g` tools are found too. Do not `apt-get install nodejs`: Debian's is Node 18, end of life.
 
 There is no host machine to protect — this container IS the sandbox, and a compromise stays contained in it even with full in-container root.
 Worst case, the container gets recreated. Project files are bind-mounted and git-recoverable.
@@ -46,6 +48,7 @@ Worst case, the container gets recreated. Project files are bind-mounted and git
 Even inside a container, supply chain attacks can exfiltrate project source code and credentials. Minimize the attack surface:
 
 - **`npm_config_ignore_scripts=true` is set as an environment variable.** This blocks npm postinstall hooks globally. Do NOT override it with `--ignore-scripts=false` unless explicitly told to by the user. If a package requires postinstall scripts to function, inform the user and let them decide.
+- **pnpm is hardened the same way, also by environment variables:** `PNPM_CONFIG_IGNORE_SCRIPTS=true` and a 7-day minimum package age (`PNPM_CONFIG_MINIMUM_RELEASE_AGE=10080`, in minutes, with the missing-publish-time escape closed). Environment variables win over a project's `pnpm-workspace.yaml` and `.npmrc`, so do not try to lower them there, and do not add `minimumReleaseAgeExclude` entries to get a fresh package in: flag it to the user instead.
 - **When installing any package manager**, set its equivalent security protections (e.g. pip `--no-build-isolation` where appropriate).
 - **Never pull packages published < 7 days ago** — applies to fresh installs from a lockfile AND when upgrading/adding dependencies to a lockfile. If you notice a dependency was published very recently, flag it.
 - **Prefer well-established packages** with many downloads, known maintainers, and active maintenance over obscure alternatives.

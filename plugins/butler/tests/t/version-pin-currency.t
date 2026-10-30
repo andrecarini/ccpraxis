@@ -77,6 +77,7 @@ my $PIN_SCRIPT        = "$BUTLER/scripts/bp-pin.pl";
 my $DEPS_SCRIPT       = "$BUTLER/scripts/bp-deps-check.pl";
 my $PREFLIGHT_SCRIPT  = "$BUTLER/scripts/bp-preflight.pl";
 my $REAL_CONTAINERFILE = "$PROJ/plugins/sandbox/container/Containerfile";
+my $REAL_RECIPE        = "$PROJ/plugins/backpack/recipes/node-pnpm.json";
 
 diag("subject under test: $PIN_SCRIPT " . (-e $PIN_SCRIPT ? "(present)" : "(ABSENT -- most assertions below are expected to fail)"));
 
@@ -348,26 +349,42 @@ ok($DEPS_LOADED, 'HARNESS: bp-deps-check.pl (source of %EOL) requires cleanly')
 }
 
 # =====================================================================================
-# C7 -- the Containerfile's pins are STATIC (no build-time resolution). Positive FIRST: the pin
+# C7 -- the pins are STATIC (no build-time or install-time resolution). Positive FIRST: the pin
 # literals are actually FOUND (a no-op / vacuous implementation could not find real numbers here).
+#
+# RETARGETED 2026-10-30: Node and pnpm left the sandbox image (operator decision) and are pinned
+# by the backpack recipe plugins/backpack/recipes/node-pnpm.json, which is now bp-pin.pl's
+# default manifest. The image must pin neither any more, and the recipe must resolve nothing
+# when it runs.
 # =====================================================================================
 {
-    my $cf = read_file($REAL_CONTAINERFILE);
-    ok(defined($cf) && length($cf) > 0, 'C7 setup: the real Containerfile is readable');
+    my $recipe = read_file($REAL_RECIPE);
+    ok(defined($recipe) && length($recipe) > 0, 'C7 setup: the node-pnpm recipe is readable');
 
-    my ($node_ver)     = ($cf // '') =~ /node-v(\d+\.\d+\.\d+)-linux-x64\.tar\.xz/;
-    my ($pnpm_ver)     = ($cf // '') =~ /pnpm\@(\d+\.\d+\.\d+)/;
+    my ($node_ver) = ($recipe // '') =~ /node-v(\d+\.\d+\.\d+)-linux-x64\.tar\.xz/;
+    my ($pnpm_ver) = ($recipe // '') =~ /pnpm\@(\d+\.\d+\.\d+)/;
 
-    ok(defined $node_ver,     'C7 positive gate: a literal Node version pin was FOUND in the Containerfile')
+    ok(defined $node_ver, 'C7 positive gate: a literal Node version pin was FOUND in the recipe')
         or diag('no node-vX.Y.Z-linux-x64.tar.xz literal found');
-    ok(defined $pnpm_ver,     'C7 positive gate: a literal pnpm version pin was FOUND in the Containerfile')
+    ok(defined $pnpm_ver, 'C7 positive gate: a literal pnpm version pin was FOUND in the recipe')
         or diag('no pnpm@X.Y.Z literal found');
 
-    # Negative: the Containerfile performs no version RESOLUTION at build time -- no invocation of
-    # bp-pin.pl, no fetch of a registry's version LISTING endpoint, no `resolve` verb.
-    unlike($cf // '', qr/bp-pin\.pl/, 'C7: the Containerfile never invokes bp-pin.pl at build time');
-    unlike($cf // '', qr/registry\.npmjs\.org|nodejs\.org\/dist\/index\.json/,
-        'C7: the Containerfile never queries a registry version-listing endpoint at build time');
+    # Negative: the recipe performs no version RESOLUTION when it runs -- no invocation of
+    # bp-pin.pl, no fetch of a registry's version LISTING endpoint. Only the commands count:
+    # the rationale legitimately tells a maintainer to re-pin with bp-pin.pl resolve.
+    my $item = eval { JSON::PP->new->utf8->decode($recipe // '')->{items}[0] } || {};
+    my $cmds = join "\n", map { $_ // '' } @{$item}{qw(install verify)};
+    ok(length $cmds > 0, 'C7 setup: the recipe item has install/verify commands to scan');
+    unlike($cmds, qr/bp-pin\.pl\s+resolve|\$\(\s*perl[^)]*bp-pin/,
+        'C7: the recipe never invokes bp-pin.pl when it runs');
+    unlike($cmds, qr/registry\.npmjs\.org|nodejs\.org\/dist\/index\.json/,
+        'C7: the recipe never queries a registry version-listing endpoint');
+
+    # The image pins nothing: bp-pin.pl finds no pin there, so it cannot report one.
+    my $cf = read_file($REAL_CONTAINERFILE) // '';
+    unlike($cf, qr/^(?!\s*#).*node-v\d+\.\d+\.\d+-linux-x64\.tar\.xz/m,
+        'C7: the Containerfile no longer pins a Node tarball');
+    unlike($cf, qr/^(?!\s*#).*pnpm\@\d/m, 'C7: the Containerfile no longer pins pnpm');
 }
 
 # =====================================================================================
