@@ -14,7 +14,9 @@
 #   1. an explicit path from the caller (a test seam or a CLI option)
 #   2. $BP_CREDS_PATH, when set and non-empty
 #   3. $HOME/.claude/.credentials.json, when it exists
-#   4. the macOS Keychain, when keychain_enabled() says so
+#   4. the macOS Keychain, when keychain_enabled() says so, read through
+#      security_bin() (/usr/bin/security unless BP_CREDS_SECURITY_BIN names
+#      another binary)
 #
 # Steps 1 and 2 are AUTHORITATIVE: a named file that is missing is reported as
 # missing, never quietly replaced by the next step. Every test that drives
@@ -53,6 +55,21 @@ sub keychain_service { return $KEYCHAIN_SERVICE }
 # waiting for a human, and an unattended driver must not wait on that forever.
 our $KEYCHAIN_TIMEOUT_SECONDS = 10;
 
+# The binary that reads the Keychain, by ABSOLUTE path. It used to be the
+# bare name `security`, found through PATH, so whatever sat first on PATH
+# answered for the operator's login Keychain: a stub a test meant for one
+# child, or anything else that happened to be called `security`. macOS ships
+# it at /usr/bin/security (SIP-protected), and that is the only binary
+# production runs. BP_CREDS_SECURITY_BIN, when set and non-empty, names
+# another one; that is the test seam, and a test that exercises the Keychain
+# path points it at a stub instead of putting one on PATH.
+our $DEFAULT_SECURITY_BIN = '/usr/bin/security';
+
+sub security_bin {
+    my $o = $ENV{BP_CREDS_SECURITY_BIN};
+    return (defined $o && length $o) ? $o : $DEFAULT_SECURITY_BIN;
+}
+
 sub _home { return $ENV{HOME} // $ENV{USERPROFILE} // '' }
 
 sub default_path {
@@ -72,9 +89,9 @@ sub _canon {
 # keychain_enabled() -> 0|1
 #
 #   BP_CREDS_KEYCHAIN=0   never (an explicit opt-out)
-#   BP_CREDS_KEYCHAIN=1   always, on any OS. The test seam: together with a
-#                         fake `security` first on PATH it exercises this path
-#                         anywhere without touching a real Keychain.
+#   BP_CREDS_KEYCHAIN=1   always, on any OS. The test seam: together with
+#                         BP_CREDS_SECURITY_BIN naming a stub it exercises
+#                         this path anywhere without touching a real Keychain.
 #   otherwise             only on macOS, and only when $HOME is the account's
 #                         own home directory (the passwd entry).
 #
@@ -174,7 +191,7 @@ sub load {
 # one hex string instead, so a hex-only answer that decodes to a JSON object is
 # accepted as that object.
 sub read_keychain {
-    my @cmd = ('security', 'find-generic-password', '-s', $KEYCHAIN_SERVICE, '-w');
+    my @cmd = (security_bin(), 'find-generic-password', '-s', $KEYCHAIN_SERVICE, '-w');
 
     my $saved;
     my $null = File::Spec->devnull;

@@ -1077,6 +1077,13 @@ sub run_one {
     $ENV{CCPRAXIS_NO_WAKELOCK}              = 1;
     # spend-token-report Decision 8: no per-file sandbox ever performs a live pricing fetch.
     $ENV{CCPRAXIS_SPEND_NO_FETCH}           = 1;
+    # No test reads the operator's macOS login Keychain (BpCreds.pm). The
+    # sandboxed HOME above already switches the automatic rule off; this is
+    # the explicit opt-out, which also covers a test that restores the real
+    # HOME. Set after the BP_ scrub, so an ambient value cannot survive it. A
+    # test of the Keychain path opts back in locally, with a stub
+    # BP_CREDS_SECURITY_BIN.
+    $ENV{BP_CREDS_KEYCHAIN}                 = 0;
 
     # FIX-BATCH M2 (review, step 7): GIT_CONFIG_GLOBAL used to point straight
     # at the operator's REAL ~/.gitconfig -- git has no read-only mode for

@@ -2,6 +2,12 @@ package GuardHarness;
 use strict;
 use warnings;
 
+# Never the operator's login Keychain from a test (BpCreds.pm). A direct
+# `perl x.t` keeps the real HOME, which is exactly when BpCreds would read it.
+# A test that exercises the Keychain path opts in locally with
+# BP_CREDS_KEYCHAIN=1 and a stub named by BP_CREDS_SECURITY_BIN.
+BEGIN { $ENV{BP_CREDS_KEYCHAIN} = '0' }
+
 # =============================================================================
 # GuardHarness.pm -- the shared rig for every guards-remake-*.t file
 # (blueprint hook-continuity-remake, package 14-guards-remake, batch 1).
@@ -239,7 +245,7 @@ sub read_bytes {
 
 # ---------------------------------------------------------------------------
 # isolate_env() -- deletes every BP_*/CCPRAXIS_*/CLAUDE_* var from the LIVE
-# %ENV, sets CCPRAXIS_NO_WAKELOCK=1, and pins HOME/USERPROFILE to a fresh
+# %ENV, sets CCPRAXIS_NO_WAKELOCK=1 and BP_CREDS_KEYCHAIN=0, and pins HOME/USERPROFILE to a fresh
 # decoy tempdir so nothing under this process can resolve to the operator's
 # real ~/.claude or ~/.ccpraxis-local-data by falling through a fallback
 # root. Mutates %ENV in place -- every caller MUST wrap its own call site in
@@ -249,6 +255,9 @@ sub read_bytes {
 sub isolate_env {
     delete $ENV{$_} for grep { !/^CCPRAXIS_NO_WAKELOCK$/ && /^(?:BP_|CCPRAXIS_|CLAUDE_)/ } keys %ENV;
     $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
+    # The BP_ wipe above takes the load-time Keychain opt-out with it; put it
+    # back, so a hook run from here can never read the login Keychain.
+    $ENV{BP_CREDS_KEYCHAIN}    = '0';
     my $decoy_root = tempdir(CLEANUP => 1);
     (my $decoy = "$decoy_root/decoy-home") =~ s{\\}{/}g;
     mkdir $decoy;

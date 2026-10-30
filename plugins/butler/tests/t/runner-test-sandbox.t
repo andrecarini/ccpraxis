@@ -305,7 +305,7 @@ use strict;
 use warnings;
 my $report = $ENV{FIXTURE_REPORT_DIR};
 die "FIXTURE_REPORT_DIR not set\n" unless defined $report && length $report;
-my @VARS = qw(BP_LEDGER BP_DIR BP_PROJECT_ROOT CCPRAXIS_DATA_DIR CLAUDE_PROJECT_DIR CLAUDE_CONFIG_DIR ALMANAC_HOME);
+my @VARS = qw(BP_LEDGER BP_DIR BP_PROJECT_ROOT CCPRAXIS_DATA_DIR CLAUDE_PROJECT_DIR CLAUDE_CONFIG_DIR ALMANAC_HOME BP_CREDS_KEYCHAIN);
 open(my $fh, '>', "$report/ambient-env-seen.txt") or die "$!";
 for my $v (@VARS) {
     my $val = defined $ENV{$v} ? $ENV{$v} : '<UNSET>';
@@ -787,6 +787,8 @@ sub read_report {
 
     my %env = (HOME => $outer_home, FIXTURE_REPORT_DIR => $report_dir);
     $env{$_} = "REAL-SENTINEL-$_" for @AMBIENT_VARS;
+    # An ambient opt-IN to the login Keychain must not reach a test either.
+    $env{BP_CREDS_KEYCHAIN} = '1';
 
     my $res = run_fake_sweep(repo => $repo, args => [], env => \%env, timeout => $BOUND);
 
@@ -802,6 +804,12 @@ sub read_report {
             "M3: $v is unset or sandboxed for the test (not the runner's own ambient value)")
             or diag("test saw $v=" . (defined $got ? $got : '<not reported>'));
     }
+    # BpCreds: every file the runner starts has the Keychain explicitly off,
+    # whatever the runner itself inherited (a direct `perl x.t` keeps the real
+    # HOME, which is when BpCreds would read the operator's secret).
+    is($seen->{BP_CREDS_KEYCHAIN}, '0',
+        'M3: BP_CREDS_KEYCHAIN is pinned to 0 for the test, even when the runner had it set to 1')
+        or diag('test saw BP_CREDS_KEYCHAIN=' . ($seen->{BP_CREDS_KEYCHAIN} // '<not reported>'));
 }
 
 # ---------------------------------------------------------------------------

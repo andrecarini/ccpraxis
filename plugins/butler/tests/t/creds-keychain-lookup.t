@@ -9,11 +9,16 @@
 # and the spend panel showed "unknown", and preflight refused drive-solo.
 #
 # NO REAL KEYCHAIN IS EVER TOUCHED HERE. Every case that reaches the Keychain
-# branch forces it with BP_CREDS_KEYCHAIN=1 and puts a FAKE `security` first
-# on PATH; the real one can raise a Keychain dialog and would read the
-# operator's actual secret. Cases that must NOT reach it either name a file or
-# set BP_CREDS_KEYCHAIN=0, and the fake records every call so "never called"
-# is asserted, not assumed.
+# branch forces it with BP_CREDS_KEYCHAIN=1 and names a FAKE `security` with
+# BP_CREDS_SECURITY_BIN; the real one can raise a Keychain dialog and would
+# read the operator's actual secret. Cases that must NOT reach it either name a
+# file or set BP_CREDS_KEYCHAIN=0, and the fake records every call so "never
+# called" is asserted, not assumed.
+#
+# The fake used to go first on PATH, because BpCreds ran a bare `security`.
+# That made PATH the thing deciding which binary answered for the Keychain;
+# production now runs /usr/bin/security by absolute path, and section 11
+# proves a `security` on PATH is never consulted.
 use strict;
 use warnings;
 use FindBin qw($Bin);
@@ -87,7 +92,7 @@ sub fresh_home { my $h = "$ROOT/home" . (++$fn); make_path($h); return $h }
 {
     my ($bin, $log) = fake_security(stdout => creds_json() . "\n");
     my $home = fresh_home();
-    my $r = with_env({ PATH => "$bin$SEP$ENV{PATH}", HOME => $home, USERPROFILE => $home,
+    my $r = with_env({ BP_CREDS_SECURITY_BIN => "$bin/security", HOME => $home, USERPROFILE => $home,
                        BP_CREDS_PATH => undef, BP_CREDS_KEYCHAIN => 1 },
                      sub { BpCreds::load() });
     ok($r->{ok}, 'keychain: credentials are read when no file exists');
@@ -102,7 +107,7 @@ sub fresh_home { my $h = "$ROOT/home" . (++$fn); make_path($h); return $h }
 {
     my ($bin, $log) = fake_security(stdout => creds_json());
     my $home = fresh_home();
-    my $r = with_env({ PATH => "$bin$SEP$ENV{PATH}", HOME => $home, USERPROFILE => $home,
+    my $r = with_env({ BP_CREDS_SECURITY_BIN => "$bin/security", HOME => $home, USERPROFILE => $home,
                        BP_CREDS_PATH => "$home/nope.json", BP_CREDS_KEYCHAIN => 1 },
                      sub { BpCreds::load() });
     ok(!$r->{ok}, 'BP_CREDS_PATH: a missing named file is a failure');
@@ -118,7 +123,7 @@ sub fresh_home { my $h = "$ROOT/home" . (++$fn); make_path($h); return $h }
     open my $f, '>:raw', "$home/.claude/.credentials.json" or die $!;
     print {$f} creds_json(token => 'from-file');
     close $f;
-    my $r = with_env({ PATH => "$bin$SEP$ENV{PATH}", HOME => $home, USERPROFILE => $home,
+    my $r = with_env({ BP_CREDS_SECURITY_BIN => "$bin/security", HOME => $home, USERPROFILE => $home,
                        BP_CREDS_PATH => undef, BP_CREDS_KEYCHAIN => 1 },
                      sub { BpCreds::load() });
     is($r->{kind}, 'file', 'default file: an existing ~/.claude/.credentials.json is used');
@@ -130,7 +135,7 @@ sub fresh_home { my $h = "$ROOT/home" . (++$fn); make_path($h); return $h }
 {
     my ($bin, $log) = fake_security(stdout => creds_json());
     my $home = fresh_home();
-    my $r = with_env({ PATH => "$bin$SEP$ENV{PATH}", HOME => $home, USERPROFILE => $home,
+    my $r = with_env({ BP_CREDS_SECURITY_BIN => "$bin/security", HOME => $home, USERPROFILE => $home,
                        BP_CREDS_PATH => undef, BP_CREDS_KEYCHAIN => 0 },
                      sub { BpCreds::load() });
     is($r->{kind}, 'none', 'opt-out: BP_CREDS_KEYCHAIN=0 leaves no source');
@@ -155,7 +160,7 @@ sub fresh_home { my $h = "$ROOT/home" . (++$fn); make_path($h); return $h }
 {
     my ($bin) = fake_security(stdout => "$SENTINEL garbage", exit => 44);
     my $home = fresh_home();
-    my $r = with_env({ PATH => "$bin$SEP$ENV{PATH}", HOME => $home, USERPROFILE => $home,
+    my $r = with_env({ BP_CREDS_SECURITY_BIN => "$bin/security", HOME => $home, USERPROFILE => $home,
                        BP_CREDS_PATH => undef, BP_CREDS_KEYCHAIN => 1 },
                      sub { BpCreds::load() });
     ok(!$r->{ok}, 'security failure: not ok');
@@ -165,7 +170,7 @@ sub fresh_home { my $h = "$ROOT/home" . (++$fn); make_path($h); return $h }
 {
     my ($bin) = fake_security(stdout => "not json $SENTINEL\n");
     my $home = fresh_home();
-    my $r = with_env({ PATH => "$bin$SEP$ENV{PATH}", HOME => $home, USERPROFILE => $home,
+    my $r = with_env({ BP_CREDS_SECURITY_BIN => "$bin/security", HOME => $home, USERPROFILE => $home,
                        BP_CREDS_PATH => undef, BP_CREDS_KEYCHAIN => 1 },
                      sub { BpCreds::load() });
     is($r->{detail}, 'invalid-json:keychain', 'unparseable item: detail says so without quoting it');
@@ -176,7 +181,7 @@ sub fresh_home { my $h = "$ROOT/home" . (++$fn); make_path($h); return $h }
 {
     my ($bin) = fake_security(stdout => unpack('H*', creds_json(token => 'hex-token')) . "\n");
     my $home = fresh_home();
-    my $r = with_env({ PATH => "$bin$SEP$ENV{PATH}", HOME => $home, USERPROFILE => $home,
+    my $r = with_env({ BP_CREDS_SECURITY_BIN => "$bin/security", HOME => $home, USERPROFILE => $home,
                        BP_CREDS_PATH => undef, BP_CREDS_KEYCHAIN => 1 },
                      sub { BpCreds::load() });
     is($r->{data}{claudeAiOauth}{accessToken}, 'hex-token',
@@ -189,7 +194,7 @@ sub fresh_home { my $h = "$ROOT/home" . (++$fn); make_path($h); return $h }
     my $home = fresh_home();
     local $BpCreds::KEYCHAIN_TIMEOUT_SECONDS = 1;
     my $t0 = Time::HiRes::time();
-    my $r = with_env({ PATH => "$bin$SEP$ENV{PATH}", HOME => $home, USERPROFILE => $home,
+    my $r = with_env({ BP_CREDS_SECURITY_BIN => "$bin/security", HOME => $home, USERPROFILE => $home,
                        BP_CREDS_PATH => undef, BP_CREDS_KEYCHAIN => 1 },
                      sub { BpCreds::load() });
     my $dt = Time::HiRes::time() - $t0;
@@ -203,7 +208,7 @@ sub fresh_home { my $h = "$ROOT/home" . (++$fn); make_path($h); return $h }
     my $home = fresh_home();
     my @auth;
     my $cap = "$ROOT/gate-out.txt";
-    my $rc = with_env({ PATH => "$bin$SEP$ENV{PATH}", HOME => $home, USERPROFILE => $home,
+    my $rc = with_env({ BP_CREDS_SECURITY_BIN => "$bin/security", HOME => $home, USERPROFILE => $home,
                         BP_CREDS_PATH => undef, BP_CREDS_KEYCHAIN => 1 }, sub {
         open(my $saved, '>&', \*STDOUT) or die "dup: $!";
         open(STDOUT, '>', $cap) or die "redirect: $!";
@@ -233,13 +238,62 @@ sub fresh_home { my $h = "$ROOT/home" . (++$fn); make_path($h); return $h }
 {
     my ($bin) = fake_security(stdout => creds_json(expires_ms => 1000));
     my $home = fresh_home();
-    my $out = with_env({ PATH => "$bin$SEP$ENV{PATH}", HOME => $home, USERPROFILE => $home,
+    my $out = with_env({ BP_CREDS_SECURITY_BIN => "$bin/security", HOME => $home, USERPROFILE => $home,
                          BP_CREDS_PATH => undef, BP_CREDS_KEYCHAIN => 1 },
                        sub { scalar `"$^X" "$SCRIPTS/bp-usage-gate.pl" 2>&1` });
     my $rc = $? >> 8;
     is($rc, 40, 'gate CLI: an expired Keychain token is RELOGIN (40), not CREDS (30)')
         or diag($out);
     unlike($out, qr/SENTINEL/, 'gate CLI: the secret is never printed');
+}
+
+# ---- 11. the binary is named by absolute path; PATH is never consulted --------
+{
+    my $saved = delete local $ENV{BP_CREDS_SECURITY_BIN};
+    is(BpCreds::security_bin(), '/usr/bin/security',
+        'security_bin: production runs /usr/bin/security, the copy macOS ships');
+    local $ENV{BP_CREDS_SECURITY_BIN} = '';
+    is(BpCreds::security_bin(), '/usr/bin/security', 'security_bin: an empty override is no override');
+}
+{
+    # A `security` first on PATH must not answer, with or without the override.
+    my ($on_path, $path_log) = fake_security(stdout => creds_json(token => 'from-PATH'));
+    my ($named,   $named_log) = fake_security(stdout => creds_json(token => 'from-override'));
+    my $home = fresh_home();
+    my $r = with_env({ PATH => "$on_path$SEP$ENV{PATH}", BP_CREDS_SECURITY_BIN => "$named/security",
+                       HOME => $home, USERPROFILE => $home, BP_CREDS_PATH => undef, BP_CREDS_KEYCHAIN => 1 },
+                     sub { BpCreds::load() });
+    is($r->{data}{claudeAiOauth}{accessToken}, 'from-override',
+        'override: BP_CREDS_SECURITY_BIN is the binary that is run');
+    ok(-e $named_log, 'override: ...and it was called');
+    ok(!-e $path_log, 'override: the `security` first on PATH was never run');
+
+    my $missing = "$ROOT/no-such-dir/security";
+    my $r2 = with_env({ PATH => "$on_path$SEP$ENV{PATH}", BP_CREDS_SECURITY_BIN => $missing,
+                        HOME => $home, USERPROFILE => $home, BP_CREDS_PATH => undef, BP_CREDS_KEYCHAIN => 1 },
+                      sub { BpCreds::load() });
+    ok(!$r2->{ok}, 'missing binary: not ok');
+    like($r2->{detail}, qr/\Akeychain:(?:security-not-runnable|security-exit-\d+)\z/,
+        'missing binary: reported as a Keychain failure') or diag($r2->{detail});
+    ok(!-e $path_log, 'missing binary: PATH is NOT searched for a stand-in');
+}
+
+# ---- 12. tests cannot reach the real Keychain by default ---------------------
+# A standalone `perl x.t` keeps the operator's HOME, which is exactly the case
+# keychain_enabled() reads the real Keychain in. The runner pins
+# BP_CREDS_KEYCHAIN=0 for every file it runs (runner-test-sandbox.t M3), and
+# every shared harness lib pins it at load so a direct run of a file that uses
+# one is covered too. TestPlatform.pm is not a harness: it is the pure marker
+# parser the runner itself loads, and it must not touch %ENV.
+{
+    my @libs = grep { !m{/TestPlatform\.pm\z} } sort glob("$Bin/../../../*/tests/lib/*.pm");
+    ok(scalar @libs >= 4, 'found the shared test harness libs (' . scalar(@libs) . ')');
+    for my $lib (@libs) {
+        my $src = slurp($lib) // '';
+        (my $name = $lib) =~ s{.*/plugins/}{plugins/};
+        like($src, qr/^BEGIN\s*\{\s*\$ENV\{BP_CREDS_KEYCHAIN\}\s*=\s*'0'\s*\}/m,
+            "$name pins BP_CREDS_KEYCHAIN=0 at load");
+    }
 }
 
 done_testing();

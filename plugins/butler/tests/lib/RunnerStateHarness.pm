@@ -19,6 +19,12 @@ package RunnerStateHarness;
 use strict;
 use warnings;
 
+# Never the operator's login Keychain from a test (BpCreds.pm). A direct
+# `perl x.t` keeps the real HOME, which is exactly when BpCreds would read it.
+# A test that exercises the Keychain path opts in locally with
+# BP_CREDS_KEYCHAIN=1 and a stub named by BP_CREDS_SECURITY_BIN.
+BEGIN { $ENV{BP_CREDS_KEYCHAIN} = '0' }
+
 use Exporter 'import';
 our @EXPORT_OK = qw(
     repo_root runner_script

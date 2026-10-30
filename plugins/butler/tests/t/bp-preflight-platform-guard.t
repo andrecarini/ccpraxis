@@ -6,7 +6,7 @@
 #
 # macOS is a supported HOST (drive-solo runs there): darwin maps to 'macos',
 # and its credentials come from the login Keychain via BpCreds. The Keychain
-# case below uses a FAKE `security` first on PATH; nothing here may reach the
+# case below names a FAKE `security` (BP_CREDS_SECURITY_BIN); nothing here may reach the
 # real one (it can raise a Keychain dialog and reads the operator's secret),
 # hence BP_CREDS_KEYCHAIN=0 for every other spawn.
 BEGIN { $ENV{BP_CREDS_KEYCHAIN} = '0' }
@@ -86,7 +86,9 @@ SKIP: {
     print {$f} "#!/bin/sh\ncat <<'EOF'\n$json\nEOF\n";
     close $f;
     chmod 0755, "$bin/security";
-    local $ENV{PATH} = "$bin" . ($^O eq 'MSWin32' ? ';' : ':') . $ENV{PATH};
+    # Named by BP_CREDS_SECURITY_BIN: BpCreds runs /usr/bin/security by
+    # absolute path otherwise, never whatever `security` is first on PATH.
+    local $ENV{BP_CREDS_SECURITY_BIN} = "$bin/security";
     local $ENV{HOME} = $home;
     local $ENV{USERPROFILE} = $home;
     local $ENV{BP_CREDS_KEYCHAIN} = '1';
