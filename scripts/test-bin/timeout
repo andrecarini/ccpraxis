@@ -17,9 +17,13 @@
 # COMMAND was found but could not be run, 127 if it was not found, 128+9 if
 # it had to be KILLed, otherwise COMMAND's own status.
 #
-# Signal delivery follows GNU: unless --foreground, timeout makes itself a
-# process-group leader and signals the whole group, so a shell COMMAND's
-# children are timed out too.
+# Signal delivery follows GNU: the command itself is always signalled, and
+# unless --foreground the command leads its own process group and the whole
+# group is signalled, so a shell COMMAND's children are timed out too
+# (a child that called setsid is out of the group; the direct signal still
+# reaches the command). A TERM/INT/HUP/QUIT/USR1/USR2 sent to timeout itself is
+# forwarded to the command, and when the command dies of a signal timeout
+# re-raises that signal on itself, so its own parent sees what GNU would show.
 #
 # The shebang names /usr/bin/perl (the system perl every macOS ships), not
 # `/usr/bin/env perl`, on purpose: the hook spawn-budget tests put a logging
@@ -34,6 +38,7 @@ use strict;
 use warnings;
 use POSIX qw(:sys_wait_h setpgid);
 use Time::HiRes qw(time sleep);
+use Config ();
 
 my $sig = 'TERM';
 my ($kill_after, $foreground, $preserve, $verbose) = (0, 0, 0, 0);
@@ -71,43 +76,67 @@ while (@ARGV && $ARGV[0] =~ /\A-/) {
 my $limit = duration(shift @ARGV);
 fail('missing operand') unless @ARGV;
 
-# Become a process-group leader so the signal reaches the command's children.
-setpgid(0, 0) unless $foreground;
+my @FWD = qw(TERM INT HUP QUIT USR1 USR2);
 
-my $pid = fork;
+# An inherited SIGCHLD=IGNORE would auto-reap the command and make waitpid
+# fail (-1, ECHILD), so reset it before forking.
+$SIG{CHLD} = 'DEFAULT';
+
+my $pid;                # the command; set right after fork
+my ($timed_out, $killed, $kill_deadline, $got_sig) = (0, 0, undef, undef);
+
+# Deliver a signal to the command and, unless --foreground, to its whole
+# process group (the command leads its own group, see below). The command is
+# always signalled directly as well, so one that called setsid and left the
+# group is still reached.
+sub send_sig {
+    my ($s) = @_;
+    return unless $pid;
+    kill($s, $pid);
+    kill($s, -$pid) unless $foreground;
+    kill('CONT', $pid) unless $s =~ /\A(?:KILL|9|CONT)\z/;
+}
+
+# A signal sent to timeout itself is forwarded to the command (GNU does the
+# same); timeout then keeps waiting and reports how the command ended.
+for my $n (@FWD) {
+    $SIG{$n} = sub { $got_sig = $n; send_sig($n) };
+}
+
+$pid = fork;
 fail("fork failed: $!") unless defined $pid;
 if ($pid == 0) {
-    $SIG{$_} = 'DEFAULT' for qw(TERM INT HUP ALRM);
+    $SIG{$_} = 'DEFAULT' for @FWD, 'ALRM', 'CHLD';
+    # The command leads its own group so a timeout signal reaches its children
+    # without ever signalling timeout itself.
+    setpgid(0, 0) unless $foreground;
     { no warnings 'exec'; exec { $ARGV[0] } @ARGV; }   # the lines below run only if exec failed
     my $code = ($!{ENOENT} || $!{ENOTDIR}) ? 127 : 126;
     print STDERR "timeout: failed to run command '$ARGV[0]': $!\n";
     POSIX::_exit($code);
 }
-
-# Our own signal must not kill us when we send it to our group.
-$SIG{$sig} = 'IGNORE' unless $foreground || $sig =~ /\A(?:KILL|STOP|9|19)\z/;
+setpgid($pid, $pid) unless $foreground;   # close the race with the child's own call
 
 my $status;
-my $timed_out = 0;
-my $killed = 0;
 my $deadline = $limit > 0 ? time + $limit : undef;
-my $kill_deadline;
 while (1) {
     my $r = waitpid($pid, WNOHANG);
     if ($r == $pid) { $status = $?; last }
-    if ($r < 0)     { $status = 0;  last }
+    if ($r < 0) {
+        print STDERR "timeout: waitpid failed: $!\n";
+        exit 125;
+    }
     my $now = time;
     if (defined $deadline && !$timed_out && $now >= $deadline) {
         $timed_out = 1;
         print STDERR "timeout: sending signal $sig to command '$ARGV[0]'\n" if $verbose;
-        kill($sig, $foreground ? $pid : -$$);
-        kill('CONT', $foreground ? $pid : -$$) unless $sig =~ /\A(?:KILL|9)\z/;
+        send_sig($sig);
         $kill_deadline = $now + $kill_after if $kill_after > 0;
     }
     if (defined $kill_deadline && !$killed && $now >= $kill_deadline) {
         $killed = 1;
         print STDERR "timeout: sending signal KILL to command '$ARGV[0]'\n" if $verbose;
-        kill('KILL', $foreground ? $pid : -$$);
+        send_sig('KILL');
     }
     sleep 0.02;
 }
@@ -116,4 +145,14 @@ if ($timed_out && !$preserve) {
     exit 137 if $killed || ($status & 127) == 9;
     exit 124;
 }
-exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);
+if (my $n = $status & 127) {
+    # Re-raise the command's terminating signal on ourselves, as GNU does, so
+    # a parent sees WIFSIGNALED rather than a 128+n exit code.
+    my $name = (split ' ', $Config::Config{sig_name})[$n];
+    $SIG{$name} = 'DEFAULT' if defined $name && exists $SIG{$name};
+    $SIG{$_} = 'DEFAULT' for @FWD;
+    kill($n, $$);
+    sleep 1;                # not reached unless the signal is ignored/blocked
+    exit 128 + $n;
+}
+exit($status >> 8);
