@@ -163,6 +163,8 @@ ccpraxis/
 │   │   │   └── plugin.json                                      # Plugin manifest -- name, description, version
 │   │   ├── hooks/                                               # Hook scripts registered in settings.json
 │   │   │   └── auto-declare.pl                                  # PostToolUse hook on Bash — detects install commands and proposes /backpack:add
+│   │   ├── recipes/                                             # sanctioned one-item backpack recipes, added by name with backpack.pl add --recipe
+│   │   │   └── node-pnpm.json                                   # Node.js LTS + pnpm, exactly pinned and sha256-checked, under /opt/tools/node
 │   │   ├── scripts/                                             # Implementation scripts
 │   │   │   └── backpack.pl                                      # Core helper: validate / list / install / add / remove / audit
 │   │   ├── skills/                                              # Slash-command skills this plugin provides
@@ -179,6 +181,7 @@ ccpraxis/
 │   │   └── tests/                                               # Test suite -- run via scripts/run-tests.pl
 │   │       ├── run-tests.pl                                     # Test runner for plugins/backpack/tests/t/.
 │   │       └── t/                                               # Test files, one concern each
+│   │           ├── add-from-recipe.t                            # platform: any `backpack.pl add --recipe NAME` and the recipes it reads.
 │   │           ├── backpack-cli-encoding.t                      # platform: any backpack.pl encoding + verify-surfacing regressions.
 │   │           ├── bin-dirs-security.t                          # platform: any Oracle for b02-backpack-owns-path — fix-batch step7 regressions.
 │   │           ├── bin-dirs-validation.t                        # platform: any Oracle for b02-backpack-owns-path — DC1 (schema) + DC2 (cmd_add…

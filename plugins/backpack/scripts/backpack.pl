@@ -15,6 +15,9 @@
 #   list <path>                                              Pretty-print the contents.
 #   add <path> --category C --name N --install I --verify V [--rationale R]
 #                                                           Add or update entry (idempotent on category+name).
+#   add <path> --recipe NAME [any flag above]               Same, with every field not given on the command line taken
+#                                                           from the sanctioned recipe ../recipes/NAME.json (a one-item
+#                                                           backpack file, e.g. node-pnpm: Node LTS + pnpm).
 #   remove <path> --category C --name N                     Drop an entry (idempotent).
 #   install <path> [--declared <declared-path>]              Run verify; if it fails, run install. Reports status per item.
 #                                                           With --declared, also reconciles against the full declared
@@ -77,6 +80,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 use POSIX qw(strftime);
 use File::Basename qw(dirname);
 use File::Path qw(make_path);
+use Cwd ();
 use Encode ();
 
 binmode STDOUT, ':encoding(UTF-8)';
@@ -660,14 +664,54 @@ sub cmd_list {
     }
 }
 
+# recipes_dir() -> the directory of sanctioned recipes: `recipes/`, a sibling of
+# this script's own directory in the plugin tree. __FILE__ is normalised and
+# made absolute first, so a relative invocation resolves the same way.
+sub recipes_dir {
+    (my $f = __FILE__) =~ s{\\}{/}g;
+    my $abs = Cwd::abs_path($f) // $f;
+    return dirname(dirname($abs)) . '/recipes';
+}
+
+# load_recipe($name) -> the recipe's single item (a hashref). A recipe is an
+# ordinary backpack file holding exactly one item, so it passes the same
+# validation as any backpack and `validate` can check it directly. The name is
+# a bare word, never a path: --recipe exists to replay a reviewed, tracked
+# file, not to read an arbitrary one.
+sub load_recipe {
+    my ($recipe) = @_;
+    die_user("--recipe takes a recipe name (letters, digits, '.', '_', '+', '-'), not a path: $recipe")
+        unless $recipe =~ /\A[A-Za-z0-9][A-Za-z0-9._+-]*\z/;
+    my $dir  = recipes_dir();
+    my $file = "$dir/$recipe.json";
+    unless (-f $file) {
+        my @have;
+        if (opendir my $dh, $dir) {
+            @have = sort map { /\A(.+)\.json\z/ ? $1 : () } readdir $dh;
+            closedir $dh;
+        }
+        die_user("no recipe '$recipe' in $dir"
+            . (@have ? " (available: " . join(', ', @have) . ")" : " (no recipes found there)"));
+    }
+    my $bp = read_json($file);
+    die_user("recipe $file is not valid JSON") unless defined $bp;
+    my @errors = grep { $_->[0] eq 'error' } validate_backpack($bp);
+    die_user("recipe $file is not a valid backpack file: " . join('; ', map { $_->[1] } @errors))
+        if @errors;
+    die_user("recipe $file must hold exactly one item (it holds " . scalar(@{ $bp->{items} }) . ")")
+        unless @{ $bp->{items} } == 1;
+    return $bp->{items}[0];
+}
+
 sub cmd_add {
-    my $path = shift @ARGV or die_user("usage: add <path> --category C --name N --install I --verify V [--rationale R]");
+    my $path = shift @ARGV or die_user("usage: add <path> --category C --name N --install I --verify V [--rationale R]"
+        . "\n       add <path> --recipe NAME [flags that override the recipe's fields]");
     # The per-item version field was removed from the schema. Reject it loudly
     # (rather than silently ignore) so callers update to pinning inside --install.
     die_user("the per-item --version field was removed from the backpack schema; "
         . "pin the version inside the --install command (e.g. 'apt-get install -y jq=1.6') instead")
         if grep { /^--version(?:=|$)/ } @ARGV;
-    my ($category, $name, $install, $verify, $rationale, $bin_dirs_raw);
+    my ($category, $name, $install, $verify, $rationale, $bin_dirs_raw, $recipe);
     GetOptionsFromArray(\@ARGV,
         'category=s'  => \$category,
         'name=s'      => \$name,
@@ -675,7 +719,21 @@ sub cmd_add {
         'verify=s'    => \$verify,
         'rationale=s' => \$rationale,
         'bin_dirs=s@' => \$bin_dirs_raw,
+        'recipe=s'    => \$recipe,
     ) or die_user("invalid options for add");
+
+    # --recipe fills every field the command line did not give. The result then
+    # goes through exactly the checks a hand-typed entry does, below.
+    if (defined $recipe) {
+        my $r = load_recipe($recipe);
+        $category  //= $r->{category};
+        $name      //= $r->{name};
+        $install   //= $r->{install};
+        $verify    //= $r->{verify};
+        $rationale //= $r->{rationale};
+        $bin_dirs_raw = [ @{ $r->{bin_dirs} } ]
+            if !defined $bin_dirs_raw && ref $r->{bin_dirs} eq 'ARRAY';
+    }
 
     for my $f (qw(category name install verify)) {
         my %vals = (category => $category, name => $name, install => $install, verify => $verify);
@@ -759,6 +817,7 @@ sub cmd_add {
     }
 
     write_json_atomic($path, $bp);
+    emit("RECIPE",   $recipe) if defined $recipe;
     emit("CATEGORY", $category);
     emit("NAME",     $name);
     emit("RATIONALE_SET", defined $entry->{rationale} && $entry->{rationale} ne '' ? "yes" : "no");
@@ -1356,6 +1415,8 @@ Subcommands:
   list <path>                                              Pretty-print the contents.
   add <path> --category C --name N --install I --verify V [--rationale R]
                                                            Add or update entry.
+  add <path> --recipe NAME                                 Add a sanctioned recipe (e.g. node-pnpm);
+                                                           any flag above overrides its field.
   remove <path> --category C --name N                     Drop an entry.
   install <path> [--declared <declared-path>]              Run verify; install if missing.
   audit <path>                                             Per-item: verify status + rationale check.

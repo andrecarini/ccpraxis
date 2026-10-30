@@ -1,6 +1,6 @@
 ---
 name: add
-description: Record an item in the sandbox backpack so it's restored on every container rebuild. Use when (a) the auto-declare hook's additionalContext surfaces a pre-filled invocation after a successful install — decide whether to run it (with a real rationale) or skip the install as a one-off; (b) the user says "add to the backpack", "declare X", "pack X", "persist this install"; (c) you installed something via an unusual shape the hook can't parse (curl-pipe-bash, custom script) and want to record it manually. Also use to fill in a missing rationale on an existing entry — re-running add with the same category+name updates in place. Skip on the host.
+description: Record an item in the sandbox backpack so it's restored on every container rebuild. Use when (a) the auto-declare hook's additionalContext surfaces a pre-filled invocation after a successful install — decide whether to run it (with a real rationale) or skip the install as a one-off; (b) the user says "add to the backpack", "declare X", "pack X", "persist this install"; (c) you installed something via an unusual shape the hook can't parse (curl-pipe-bash, custom script) and want to record it manually; (d) the project needs Node.js or pnpm, which the sandbox image does not ship — add the sanctioned `node-pnpm` recipe. Also use to fill in a missing rationale on an existing entry — re-running add with the same category+name updates in place. Skip on the host.
 user-invocable: true
 argument-hint: "[--category C --name N --install I --verify V --rationale R]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -51,7 +51,40 @@ If outside a sandbox, stop and explain — don't try to fall back to host paths 
 2. **User typed `/backpack:add` bare** — interactive mode: gather everything via `AskUserQuestion`.
 3. **Partial flags** — gather only the missing ones interactively.
 
-Required for any item: `category`, `name`, `install`, `verify`. Optional: `rationale`, `--bin_dirs` (repeatable).
+Required for any item: `category`, `name`, `install`, `verify` (or `--recipe NAME`, which supplies them; see Recipes below). Optional: `rationale`, `--bin_dirs` (repeatable).
+
+## Recipes — reviewed items you add by name
+
+Some runtimes need more than one install line to do right, so ccpraxis ships them as **recipes**:
+one-item backpack files under `${CLAUDE_SKILL_DIR}/../../recipes/`, reviewed and pinned in the
+ccpraxis repo. `--recipe NAME` fills every field you do not pass yourself; a flag you do pass wins
+(most often `--rationale`, to say why this project needs it).
+
+| recipe | what it installs |
+|---|---|
+| `node-pnpm` | Node.js LTS and pnpm, exactly pinned, under `/opt/tools/node` (on the image PATH, so `npm install -g` tools are found too). The Node tarball is checked against a pinned sha256 for both amd64 and arm64. |
+
+**Node.js and pnpm are not in the sandbox image.** They used to be; since 2026-10-30 each project
+that builds with Node declares them, like any other runtime. When a project needs Node (a
+`package.json`, `.nvmrc`, a JS build), add the recipe rather than improvising an install:
+
+```bash
+perl "${CLAUDE_SKILL_DIR}/../../scripts/backpack.pl" add "$HOME/.claude/backpack.json" \
+  --recipe node-pnpm --rationale "<WHY: what this project builds with Node>"
+```
+
+then run `/backpack:install` to install it now rather than at the next rebuild. Add it **before** any
+item that runs `npm` or `pnpm` (for example the `pnpm-install-<slug>` line `bp-fast-store.sh` prints):
+items install in file order, and `add` appends. An `npm-global` item declared back when the image
+shipped Node now sits ahead of the recipe: `/backpack:remove` it and add it again so it lands after.
+The npm and pnpm supply-chain settings (no install scripts, a 7-day minimum package age for pnpm)
+are set by the image and apply to this Node the moment it exists.
+
+A project that needs a different major (say Node 22, pinned by its `engines`) still uses the recipe as
+the template: copy its install and verify, change the version literals and both sha256 values (from
+`https://nodejs.org/dist/v<version>/SHASUMS256.txt`), and add it under a name that starts with
+`node` (`node22`, `node22+pnpm`), which is how the butler dependency check recognises a declared Node.
+Never `latest`, `lts` or a bare major.
 
 ## PATH — entries no longer need a hand-rolled preamble
 
