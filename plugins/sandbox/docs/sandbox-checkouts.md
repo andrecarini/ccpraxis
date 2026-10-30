@@ -31,7 +31,11 @@ one, `claude-sandbox` will start refusing it, by design.
   statusline, backpack scripts, custom `skills/` dir, the image-build lock and the `ccpraxis-local`
   plugin tree bind-mounted into the container all come from it. Through the `claude-sandbox` shims
   that is the live install. Run `perl plugins/sandbox/scripts/launcher.pl` straight from a clone and
-  you get the clone's tooling.
+  you get the clone's tooling. On macOS the binds read a copy of that checkout's `plugins/`,
+  `skills/` and `scripts/statusline.pl` instead (`LiveMirror.pm`, refreshed before each container
+  create and start, and by promotion for the live install), because the podman machine must not
+  share code the Mac runs; each checkout has its own copy, so a clone's launcher never changes what
+  the live install's sandboxes see ([`podman-machine.md`](podman-machine.md)).
 - **Identity** (`$ID`, `$CONTAINER_PREFIX`) names the image (`claude-sandbox:latest`), the
   containers (`claude-<project>-<hash>`), the in-container hostname and the id presented to
   refusal markers.

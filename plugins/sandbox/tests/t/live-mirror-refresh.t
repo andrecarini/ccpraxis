@@ -19,6 +19,10 @@
 #      that is itself a symlink is refused.
 #   E. one refresh at a time (lock), the working directory is restored, and the
 #      mirror can never be the source or inside it.
+#   F. the launcher, by source text (it is never run): binds from the mirror on
+#      darwin and from the install root elsewhere, refreshes it before create
+#      and start, and the preflight checks the mirror; every bind it would emit
+#      is served by the shares PodmanMachine plans.
 use strict;
 use warnings;
 use FindBin qw($Bin);
@@ -35,6 +39,8 @@ plan skip_all => 'the live-install mirror is macOS machinery; its POSIX file sem
 
 use LiveMirror ();
 use MountSpec ();
+use HostPlatform ();
+use PodmanMachine ();
 
 sub spew { my ($p, $c) = @_; open my $fh, '>:raw', $p or die "write $p: $!"; print {$fh} $c; close $fh }
 sub slurp { my ($p) = @_; open my $fh, '<:raw', $p or return undef; local $/; my $c = <$fh>; close $fh; $c }
@@ -121,6 +127,8 @@ sub refresh_ok {
     for my $os (qw(linux cygwin msys MSWin32)) {
         ok(!defined LiveMirror::mirror_dir(os => $os, home => '/Users/u'), "A: no mirror on $os (the install root is bound in place)");
     }
+    is(PodmanMachine::layout(home => '/Users/u')->{live_mirror}, '/Users/u/.cache/ccpraxis/live-mirror',
+        'A: PodmanMachine\'s layout names the same folder');
 }
 
 # ---------------------------------------------------------------------------
@@ -317,6 +325,78 @@ sub refresh_ok {
     ok(!$bad->{ok} && $bad->{error} =~ /cannot be the source or inside it/, 'E: a mirror inside the source is refused');
     ok(!-e "$src/plugins/inner", 'E: ...before anything is created');
     is(Cwd::getcwd(), $cwd, 'E: ...and the working directory is unchanged after a failure');
+}
+
+# ---------------------------------------------------------------------------
+# F. the launcher, by source text (never run)
+# ---------------------------------------------------------------------------
+my $src = slurp("$Bin/../../scripts/launcher.pl");
+ok(defined $src && length $src, 'F: launcher.pl read as text');
+{
+    like($src, qr/my \$LIVE_MIRROR = LiveMirror::mirror_dir\(home => PodmanMachine::account_home\(\),\s*install_root => \$INSTALL_ROOT\);/,
+        'F: the mirror is keyed by this launcher\'s own install root, under the account home the machine shares from');
+
+    my ($closure) = $src =~ /(\$build_create_args = sub \{.*?\n    \};\n)/s;
+    ok(defined $closure, 'F: the podman create closure is found');
+    $closure //= '';
+    my ($stmt) = $closure =~ /(\@args = MountSpec::map_bind_sources\(.*?\)\s*if defined \$LIVE_MIRROR;)/s;
+    ok(defined $stmt, 'F: the create closure maps its bind sources through the mirror when there is one');
+    my ($i_img, $i_map, $i_conv) = map { index($closure, $_) } ('push @args, $IMAGE_LATEST;', '@args = MountSpec::map_bind_sources(', 'return convert_v_to_mount(@args);');
+    ok($i_img >= 0 && $i_map > $i_img && $i_conv > $i_map, 'F: ...after every bind is in the list and before the --mount conversion');
+
+    SKIP: {
+        skip 'F: no mapping statement to evaluate', 3 unless defined $stmt;
+        my $INSTALL_ROOT = '/Users/u/.claude/ccpraxis';
+        my @launch = ('/usr/bin/podman', 'create', '-it', '--name', 'claude-app-12345678',
+            '-v', '/Users/u/Projects/app:/project',
+            '-e', 'CLAUDE_CONFIG_DIR=/root/.claude',
+            '-v', '/Users/u/Projects/app/.ccpraxis-local-data/claude-home:/root/.claude',
+            '-v', '/Users/u/Projects/app/.ccpraxis-local-data/claude-home/.launcher:/root/.claude/.launcher:ro',
+            '-v', "$INSTALL_ROOT/scripts/statusline.pl:/root/.claude/statusline.pl:ro",
+            '-v', '/Users/u/.cache/ccpraxis/container-files/almanac-global-counts.json:/root/.claude/almanac-global-counts.json:ro',
+            '-v', "$INSTALL_ROOT/skills/s1:/root/.claude/skills/s1:ro",
+            '-v', "$INSTALL_ROOT/plugins:/root/.claude/plugins/marketplaces/ccpraxis-local:ro",
+            '-v', '/Users/u/Projects/app/.ccpraxis-local-data/claude-home/.launcher/empty-skill:/root/.claude/plugins/marketplaces/ccpraxis-local/sandbox/skills/x:ro',
+            '-v', "$INSTALL_ROOT/plugins/backpack/scripts/backpack.pl:/root/.claude/backpack.pl:ro",
+            '-v', "$INSTALL_ROOT/plugins/backpack/hooks/auto-declare.pl:/root/.claude/auto-declare.pl:ro",
+            'claude-sandbox:latest');
+
+        my $LIVE_MIRROR;   # every host but macOS
+        my @args = @launch;
+        eval "$stmt; 1" or die "eval: $@";   ## no critic
+        is_deeply(\@args, \@launch, 'F: off macOS the create arguments are byte-identical: binds come from the install root');
+
+        $LIVE_MIRROR = '/Users/u/.cache/ccpraxis/live-mirror';
+        @args = @launch;
+        eval "$stmt; 1" or die "eval: $@";   ## no critic
+        (my $want = join("\n", @launch)) =~ s{\Q$INSTALL_ROOT\E/}{$LIVE_MIRROR/}g;
+        is(join("\n", @args), $want,
+            'F: on macOS every install-root bind (statusline, skill, plugin tree, backpack) comes from the mirror; container paths, ro flags and all other binds unchanged');
+
+        # Those binds are exactly what the planned machine serves.
+        my $L = PodmanMachine::layout(home => '/Users/u');
+        my $want_m = PodmanMachine::desired_machine(layout => $L, current => { exists => 0 },
+            state => { projects => ['/Users/u/Projects/app'], test_scratch => 1 });
+        my @binds = HostPlatform::bind_mounts(MountSpec::convert_v_to_mount(@args));
+        is_deeply([HostPlatform::sources_outside_shares(\@binds, $want_m->{shares})], [],
+            'F: every bind the macOS launcher emits lies inside a share PodmanMachine plans');
+        my @old = HostPlatform::bind_mounts(MountSpec::convert_v_to_mount(@launch));
+        ok(scalar(HostPlatform::sources_outside_shares(\@old, $want_m->{shares})),
+            'F: ...while binds straight from the live install would not be served (it is no longer shared)');
+    }
+
+    like($src, qr/_refuse_unshared_mounts\('preflight', \{ source => \$PROJECT_PATH, readonly => 0 \},\s*\{ source => \(\$LIVE_MIRROR \/\/ \$INSTALL_ROOT\), readonly => 1 \}\)/,
+        'F: the preflight checks the mirror the binds come from (the install root off macOS)');
+    my $i_rc = index($src, "_refresh_live_mirror('create')");
+    my $i_cr = index($src, '@podman_args = $build_create_args->();');
+    ok($i_rc > 0 && $i_cr > $i_rc, 'F: the mirror is refreshed before podman create');
+    my $i_rs = index($src, "_refresh_live_mirror('start');");
+    my $i_gate = index($src, 'my $gate_result = s03_run_launch_gate(');
+    ok($i_rs > 0 && $i_gate > $i_rs, 'F: ...and before the container is started');
+    like($src, qr/sub _refresh_live_mirror \{\s*my \(\$stage\) = \@_;\s*return 1 unless defined \$LIVE_MIRROR;/,
+        'F: the refresh is a no-op wherever there is no mirror');
+    like($src, qr/PodmanMachine::ensure_share_dirs\(PodmanMachine::layout\(home => \$home\),\s*grep \{ defined \} \$LIVE_MIRROR\)/,
+        'F: the mirror folder is recreated before the launcher starts the machine (vfkit refuses a missing share)');
 }
 
 done_testing();

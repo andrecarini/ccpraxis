@@ -229,7 +229,11 @@ The live install is moved first, then the payload is synced from it:
 `~/.claude/ccpraxis` *is* the installed plugin tree: the `ccpraxis-local` marketplace is a
 `directory` source at `~/.claude/ccpraxis/plugins`, Claude Code loads those plugins in place, and
 `~/.claude/ccpraxis/plugins/*/bin` is what sits on your `PATH`, so there is no separate installed
-copy to refresh. Then the three `global-config/` files, with backups under
+copy to refresh for Claude Code. Sandboxes on macOS read a copy of the live install's plugins, skills
+and statusline that the podman machine shares in its place (`plugins/sandbox/docs/podman-machine.md`);
+promote.pl refreshes that copy right after the fast-forward when it exists (`mirror: refreshed ...`),
+and a copy it cannot refresh is a `mirror: warning` line that does not fail the promotion. Then the
+three `global-config/` files, with backups under
 `~/.claude/.promotion-backups/<ts>/`:
 
 | payload | live | rule |

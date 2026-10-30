@@ -51,6 +51,7 @@ use RefusalMarker ();  # .claude-sandbox-refuse markers: refuse before anything 
 use SandboxIdentity ();  # launcher identity + this checkout's own install root
 use HostPlatform ();     # container CLI choice, machine shares, darwin path case
 use PodmanMachine ();    # the macOS machine: its share folders and the script that keeps them
+use LiveMirror ();       # macOS: the copy of the install root the podman machine shares instead of it
 use ContainerClaudeMd ();  # the container CLAUDE.md, built for this host and runtime
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
@@ -285,6 +286,15 @@ my $HOST_PLUGINS_DIR  = "$CLAUDE_HOST_CONFIG/plugins";
 # from there (MountSpec::stage_global_counts_copy). undef on every other host,
 # where they are bound in place.
 my $CONTAINER_FILES_DIR = PodmanMachine::container_files_dir();
+# macOS: the podman machine does not share the install root either -- the VM can
+# write an "ro" share, and the Mac runs that code. It shares a copy of what
+# containers mount from it (plugins/, skills/, scripts/statusline.pl), which
+# _refresh_live_mirror brings up to date before each create and start, and
+# every bind out of the install root is served from that copy (LiveMirror.pm).
+# Keyed by install root, so a fork's or a clone's launcher has its own. undef on
+# every other host, where the install root is bound in place.
+my $LIVE_MIRROR = LiveMirror::mirror_dir(home => PodmanMachine::account_home(),
+                                         install_root => $INSTALL_ROOT);
 # B2: the canonical entry paths the dashboard spawns for a new claude session,
 # and whether the raw-ANSI TUI is even possible (else the plain heartbeat loop).
 my $LAUNCHER_PL       = "$SANDBOX_PLUGIN/scripts/launcher.pl";
@@ -2529,6 +2539,26 @@ sub _refuse_unshared_mounts {
     exit 1;
 }
 
+# _refresh_live_mirror($stage) -> 1 | 0. macOS: bring the live-install mirror
+# ($LIVE_MIRROR, LiveMirror.pm) up to date with this launcher's install root
+# before a container is created ('create') or started ('start'). Everywhere
+# else there is no mirror and this returns 1. A failed refresh is a warning, not
+# a refusal: the mirror keeps the whole files of its last refresh, so the
+# container sees the code as of then. Returns 0 only when the mirror holds no
+# plugins/ tree afterwards, which no bind can be served from.
+sub _refresh_live_mirror {
+    my ($stage) = @_;
+    return 1 unless defined $LIVE_MIRROR;
+    my $r = LiveMirror::refresh(source => $INSTALL_ROOT, mirror => $LIVE_MIRROR, create => 1);
+    log_ev('live_mirror_refresh', { stage => $stage, ok => ($r->{ok} ? 1 : 0),
+                                    updated => $r->{updated}, removed => $r->{removed},
+                                    (defined $r->{error} ? (error => $r->{error}) : ()) });
+    _emit_err(_c_warn('WARNING:'), " the sandbox's copy of the live install was not refreshed: $r->{error}\n",
+              "  $LIVE_MIRROR keeps the files of its last refresh.\n")
+        unless $r->{ok};
+    return -d "$LIVE_MIRROR/plugins" ? 1 : 0;
+}
+
 sub build_image {
     # Before the build, not after it fails: a cold machine makes `podman build`
     # exit 125 with a socket error that reads like a broken install.
@@ -2700,8 +2730,10 @@ my $IMAGE_EXISTS;
 # (which holds claude-home) and this checkout (statusline, plugin tree) are
 # the sources every launch mounts -- the project read-write (/project and
 # claude-home), the checkout read-only; the full list is checked again at create.
+# On macOS the checkout's binds come from its mirror, so the mirror is what the
+# machine must share.
 _refuse_unshared_mounts('preflight', { source => $PROJECT_PATH, readonly => 0 },
-                                     { source => $INSTALL_ROOT, readonly => 1 });
+                                     { source => ($LIVE_MIRROR // $INSTALL_ROOT), readonly => 1 });
 
 # =====================================================================
 # Container name (generate + persist)
@@ -5241,6 +5273,17 @@ if (! _container_exists($CONTAINER_NAME)) {
         push @args, @BACKPACK_MOUNTS;
         push @args, $IMAGE_LATEST;
 
+        # macOS: every bind out of the install root (statusline, skills, the
+        # ccpraxis-local plugin tree, the backpack script and hook) is served
+        # from the live-install mirror the podman machine shares in its place.
+        # The container paths and the read-only flags do not change. A bind from
+        # anywhere else in the install root has no copy, stays as it is, and is
+        # refused below as outside the machine's shares. undef elsewhere: the
+        # list is untouched.
+        @args = MountSpec::map_bind_sources(
+                    sub { LiveMirror::mirror_path($_[0], $INSTALL_ROOT, $LIVE_MIRROR) }, @args)
+            if defined $LIVE_MIRROR;
+
         # Rewrite every `-v HOST:CONTAINER[:opts]` pair into
         # `--mount type=bind,…` to defeat MSYS2's `:`-as-path-list mangling on
         # Git-for-Windows perl. The generated `-p N-M:N-M` args are NOT `-v`
@@ -5249,6 +5292,18 @@ if (! _container_exists($CONTAINER_NAME)) {
         return convert_v_to_mount(@args);
     };
 
+    # macOS: the binds read the live-install mirror, so it must be current --
+    # and hold a plugin tree at all -- before podman create resolves them.
+    unless (_refresh_live_mirror('create')) {
+        log_ev('launch_failed', { reason => 'the live-install mirror holds no plugin tree' });
+        _launch_fail('create', 'the live-install mirror holds no plugin tree', undef);
+        _fail_visibly("ERROR: the sandbox's copy of the live install ($LIVE_MIRROR) holds no plugins/ tree,",
+                      "  so podman create has nothing to bind. The warning above says why it could not be refreshed.");
+        LaunchLog::close_log($LAUNCH_LOG);
+        SandboxLock::release($LOCK_DIR);
+        reset_terminal();
+        exit 1;
+    }
     @podman_args = $build_create_args->();
     _refuse_unshared_mounts('create', HostPlatform::bind_mounts(@podman_args));
 
@@ -5757,6 +5812,10 @@ if (defined $CONTAINER_FILES_DIR && defined &MountSpec::stage_global_counts_copy
         log_ev('global_counts_copy', { ok => ($ok ? 1 : 0), reason => $reason });
     }
 }
+# ...and the live-install mirror the same way (macOS; a no-op elsewhere): a
+# (re)started container's binds then serve the install root as it is now, even
+# when nothing was promoted since the container was created. Best effort.
+_refresh_live_mirror('start');
 
 # $start_rc stays undef through a pre-flight abort below (machine
 # unreachable / image missing / degraded exec -- none of which ever call the
@@ -6828,10 +6887,12 @@ sub _machine_start_bounded {
                ? $ENV{SANDBOX_RECOVER_MACHINE_TIMEOUT} : 180;
     # macOS: vfkit refuses to start a VM whose shared folder is missing, and
     # ccpraxis's own share folders live under ~/.cache, which cleanup tools
-    # empty. Recreate them (empty) first; the launcher refills container-files.
+    # empty. Recreate them (empty) first; the launcher refills container-files
+    # and the live-install mirror before any container starts.
     if ($^O eq 'darwin') {
         my $home = PodmanMachine::account_home();
-        eval { PodmanMachine::ensure_share_dirs(PodmanMachine::layout(home => $home)) }
+        eval { PodmanMachine::ensure_share_dirs(PodmanMachine::layout(home => $home),
+                                                grep { defined } $LIVE_MIRROR) }
             if defined $home && length $home;
         # Any other shared folder that is gone (a project deleted or moved)
         # stops the start too; say which, and how to fix it, instead of

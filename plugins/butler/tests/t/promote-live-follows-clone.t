@@ -21,6 +21,9 @@
 #   LF-5  a symlink to the shared payload file is replaced by the built file
 #         when this host has a part of its own (would-replace-link in
 #         --dry-run).
+#   LF-6  macOS: a promotion refreshes the sandbox's live-install mirror when
+#         it exists (never creates it, never in --dry-run), and a mirror that
+#         cannot be refreshed is a warning line, not a failed promotion.
 #
 # Every invocation passes --clone/--live/--home; nothing here touches the real
 # ~/.claude or the real live install. Fixture helpers are the house pattern
@@ -406,6 +409,84 @@ SKIP: {
     ok(!-l "$f->{home}/.claude/CLAUDE.md", 'LF-5: the link is now a regular file');
     is(read_bytes("$f->{home}/.claude/CLAUDE.md"), "shared\n\nhost\n", 'LF-5: with the built content');
     is(read_bytes("$f->{live}/global-config/CLAUDE.md"), "shared\n", 'LF-5: the payload file it pointed at is untouched');
+}
+
+# ===========================================================================
+# LF-6 (macOS): promotion refreshes the sandbox's live-install mirror.
+# ===========================================================================
+# The podman machine shares a copy of the live install's plugins, skills and
+# statusline (plugins/sandbox/scripts/LiveMirror.pm), never the live install.
+# A promotion must still reach running sandboxes, so promote.pl refreshes that
+# copy -- only where it exists, and never at the cost of the promotion.
+SKIP: {
+    skip 'LF-6: the live-install mirror exists on macOS only', 17 unless $^O eq 'darwin';
+    my $f = new_fixture(clone_commits => [
+        [ { 'plugins/p/a.pl' => "v1\n", 'plugins/p/old.pl' => "old\n", 'skills/s/SKILL.md' => "skill\n",
+            'scripts/statusline.pl' => "status\n", 'scripts/other.pl' => "not mounted\n", 'README.md' => "readme\n" }, 'seed' ],
+    ]);
+    my $mirror = "$f->{home}/.cache/ccpraxis/live-mirror";
+    my $tree = sub {
+        my ($root) = @_;
+        my %t;
+        my $walk;
+        $walk = sub {
+            my ($d, $rel) = @_;
+            opendir(my $dh, $d) or return;
+            for my $n (grep { $_ ne '.' && $_ ne '..' } readdir $dh) {
+                my $r = length $rel ? "$rel/$n" : $n;
+                if (-d "$d/$n" && !-l "$d/$n") { $walk->("$d/$n", $r) } else { $t{$r} = read_bytes("$d/$n") }
+            }
+        };
+        $walk->($root, '');
+        return \%t;
+    };
+    my $live_part = sub {
+        my $t = $tree->($f->{live});
+        return { map { $_ => $t->{$_} } grep { m{\A(?:plugins|skills)/} || $_ eq 'scripts/statusline.pl' } keys %$t };
+    };
+
+    my $r = run_promote($f);
+    is($r->{exit}, 0, 'LF-6 (no mirror): exit 0') or diag($r->{out} . $r->{err});
+    unlike($r->{out}, qr/^mirror:/m, 'LF-6 (no mirror): no mirror line when the machine was never set up to share one');
+    ok(!-e $mirror, 'LF-6 (no mirror): promote does not create it (podman-machine.pl apply does)');
+
+    make_path($mirror);
+    write_bytes("$f->{clone}/plugins/p/a.pl", "v2\n");
+    unlink "$f->{clone}/plugins/p/old.pl";
+    git_run($f, $f->{clone}, 'add', '-A');
+    git_run($f, $f->{clone}, 'commit', '-q', '-m', 'plugin change');
+
+    my $d = run_promote($f, '--dry-run');
+    unlike($d->{out}, qr/^mirror:/m, 'LF-6 (dry-run): no mirror line') or diag($d->{out});
+    is_deeply($tree->($mirror), {}, 'LF-6 (dry-run): the mirror is untouched');
+
+    $r = run_promote($f);
+    is($r->{exit}, 0, 'LF-6: exit 0') or diag($r->{out} . $r->{err});
+    like($r->{out}, qr/^mirror: refreshed \Q$mirror\E \(\d+ written, 0 removed\)$/m, 'LF-6: the mirror is refreshed') or diag($r->{out});
+    is(read_bytes("$f->{live}/plugins/p/a.pl"), "v2\n", 'LF-6: the live install was fast-forwarded');
+    is_deeply($tree->($mirror), $live_part->(), 'LF-6: the mirror holds exactly the live install\'s plugins, skills and statusline');
+    ok(!-e "$mirror/README.md" && !-e "$mirror/.git" && !-e "$mirror/scripts/other.pl", 'LF-6: ...and nothing else (no .git)');
+
+    $r = run_promote($f);
+    like($r->{out}, qr/^mirror: up-to-date \Q$mirror\E$/m, 'LF-6 (second run): up-to-date') or diag($r->{out});
+
+    # Something the VM planted is removed by the next promotion.
+    write_bytes("$mirror/plugins/planted", "x\n");
+    $r = run_promote($f);
+    like($r->{out}, qr/^mirror: refreshed \Q$mirror\E \(0 written, 1 removed\)$/m, 'LF-6: a stray entry in the mirror is removed') or diag($r->{out});
+
+    # A mirror that cannot be refreshed is a warning, never a failed promotion.
+    my $elsewhere = tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+    rename($mirror, "$elsewhere/moved") or die "rename: $!";
+    symlink("$elsewhere/moved", $mirror) or die "symlink: $!";
+    clone_extra_commit($f, { 'plugins/p/a.pl' => "v3\n" }, 'another plugin change');
+    $r = run_promote($f);
+    is($r->{exit}, 0, 'LF-6 (mirror failure): the promotion still succeeds') or diag($r->{out} . $r->{err});
+    like($r->{out}, qr/^mirror: warning \Q$mirror\E was not refreshed \(.*not a directory.*\); running sandboxes keep the previous copy$/m,
+        'LF-6 (mirror failure): one warning line says so') or diag($r->{out});
+    like($r->{out}, qr/^result: ok$/m, 'LF-6 (mirror failure): result ok') or diag($r->{out});
+    is(read_bytes("$f->{live}/plugins/p/a.pl"), "v3\n", 'LF-6 (mirror failure): the live install was still fast-forwarded');
+    is(read_bytes("$elsewhere/moved/plugins/p/a.pl"), "v2\n", 'LF-6 (mirror failure): nothing was written through the symlink');
 }
 
 done_testing();

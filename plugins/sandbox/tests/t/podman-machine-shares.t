@@ -30,10 +30,11 @@ use FindBin qw($Bin);
 use lib "$Bin/../../scripts";
 use Test::More;
 use File::Temp qw(tempdir);
-use File::Path qw(make_path);
+use File::Path qw(make_path remove_tree);
 use Cwd ();
 use JSON::PP ();
 use PodmanMachine ();
+use LiveMirror ();
 use HostPlatform ();
 
 my $SCRIPT = Cwd::abs_path("$Bin/../../scripts/podman-machine.pl");
@@ -45,7 +46,7 @@ sub slurp { my ($p) = @_; open my $fh, '<:raw', $p or return undef; local $/; my
 sub fake_home {
     my $h = Cwd::abs_path(tempdir(CLEANUP => 1));
     make_path("$h/.claude/ccpraxis/plugins/sandbox/scripts", "$h/Projects/app", "$h/Projects/other");
-    spew("$h/.claude/ccpraxis/plugins/sandbox/scripts/PodmanMachine.pm", "1;\n");   # a promoted install
+    spew("$h/.claude/ccpraxis/plugins/sandbox/scripts/$_", "1;\n") for qw(PodmanMachine.pm LiveMirror.pm);   # a promoted install
     return $h;
 }
 
@@ -58,6 +59,7 @@ sub fake_home {
     is($L->{install_root},    '/Users/u/.claude/ccpraxis',                     'A: the live install claude-sandbox runs from');
     is($L->{container_files}, '/Users/u/.cache/ccpraxis/container-files',      'A: the read-only container-files share');
     is($L->{test_scratch},    '/Users/u/.cache/ccpraxis/container-test-scratch', 'A: the read-write test-scratch share');
+    is($L->{live_mirror},     '/Users/u/.cache/ccpraxis/live-mirror',         'A: the read-only live-install mirror share');
     is(PodmanMachine::container_files_dir(os => 'darwin', home => '/Users/u'), $L->{container_files},
         'A: container_files_dir on darwin');
     is(PodmanMachine::test_scratch_dir(os => 'darwin', home => '/Users/u'), $L->{test_scratch}, 'A: test_scratch_dir on darwin');
@@ -90,8 +92,10 @@ sub fake_home {
     my $want = PodmanMachine::desired_machine(layout => PodmanMachine::layout(home => '/Users/u'), state => $ir,
                                               current => { exists => 0 });
     is_deeply([ map { "$_->{role}:$_->{source}" } grep { $_->{readonly} } @{ $want->{shares} } ],
-        ['install:/opt/ccp', 'container-files:/Users/u/.cache/ccpraxis/container-files'],
-        'B: ...and the desired machine shares that install read-only instead of ~/.claude/ccpraxis');
+        ['live-mirror:' . LiveMirror::mirror_dir(os => 'darwin', home => '/Users/u', install_root => '/opt/ccp'),
+         'container-files:/Users/u/.cache/ccpraxis/container-files'],
+        'B: ...and the desired machine shares that install\'s own mirror read-only, not the install and not ~/.claude/ccpraxis\'s mirror');
+    like($want->{shares}[0]{source}, qr{\A/Users/u/\.cache/ccpraxis/live-mirror-[0-9a-f]{8}\z}, 'B: ...keyed by that install root');
 
     spew("$d/bad.json", '{ not json');
     ($st, $err) = PodmanMachine::read_state("$d/bad.json");
@@ -174,7 +178,7 @@ sub default_config {
 sub narrow_config {
     my ($home, @projects) = @_;
     my $L = PodmanMachine::layout(home => $home);
-    my @m = ([$L->{install_root}, 1], [$L->{container_files}, 1], [$L->{test_scratch}, 0], map { [$_, 0] } @projects);
+    my @m = ([$L->{live_mirror}, 1], [$L->{container_files}, 1], [$L->{test_scratch}, 0], map { [$_, 0] } @projects);
     return JSON::PP->new->canonical->encode({ Name => 'podman-machine-default',
         HostUser => { Rootful => JSON::PP::true() },
         Resources => { CPUs => 6, DiskSize => 100, Memory => 12288 },
@@ -280,7 +284,9 @@ sub cli_run {
     like($text, qr/cpus\s+6\s+6/, 'D: CPUs preserved from the current machine');
     like($text, qr/memory \(MiB\)\s+12288\s+12288/, 'D: memory preserved');
     like($text, qr/disk \(GiB\)\s+100\s+100/, 'D: disk preserved');
-    like($text, qr{add\s+ro\s+\Q$home\E/\.claude/ccpraxis\n}, 'D: adds the live install read-only');
+    like($text, qr{add\s+ro\s+\Q$home\E/\.cache/ccpraxis/live-mirror\n\s+a copy of the live install's plugins, skills and statusline, refreshed by promote and by each launch; the Mac never runs anything from it\n},
+        'D: adds the live-install mirror read-only, and says what it is');
+    unlike($text, qr{(?:add|keep)\s+\S+\s+\Q$home\E/\.claude/ccpraxis\n}, 'D: the live install itself is NOT shared (the VM can write an "ro" share; the Mac runs that code)');
     like($text, qr{add\s+ro\s+\Q$home\E/\.cache/ccpraxis/container-files\n}, 'D: adds container-files read-only');
     like($text, qr{add\s+rw\s+\Q$home\E/\.cache/ccpraxis/container-test-scratch\n}, 'D: adds the test scratch read-write');
     like($text, qr{remove\s+rw\s+/Users\n}, 'D: removes /Users');
@@ -370,7 +376,7 @@ is_deeply([PodmanMachine::keep_image_names('garbage')], [], 'F: unreadable outpu
         "save -m -o $archive.partial localhost/claude-sandbox:2.1.301 localhost/claude-sandbox:latest",
         'machine rm -f podman-machine-default',
         "machine init --rootful --cpus 6 --memory 12288 --disk-size 100"
-          . " --volume $home/.claude/ccpraxis:$home/.claude/ccpraxis:ro"
+          . " --volume $L->{live_mirror}:$L->{live_mirror}:ro"
           . " --volume $L->{container_files}:$L->{container_files}:ro"
           . " --volume $L->{test_scratch}:$L->{test_scratch}"
           . " podman-machine-default",
@@ -386,9 +392,9 @@ is_deeply([PodmanMachine::keep_image_names('garbage')], [], 'F: unreadable outpu
        && (grep { $_ eq 'run: image exists localhost/claude-sandbox:2.1.301' } @$calls),
         'G: every saved name is verified after the load');
     ok(!-e $archive && !-e "$archive.names", 'G: the archive is deleted once every image is back');
-    ok(-d $L->{container_files} && -d $L->{test_scratch}, 'G: the dedicated share folders exist before init (vfkit needs them)');
+    ok(-d $L->{container_files} && -d $L->{test_scratch} && -d $L->{live_mirror}, 'G: the dedicated share folders and the mirror exist before init (vfkit needs them)');
     like(join("\n", @$calls), qr/run: info --format \{\{\.Host\.Security\.Rootless\}\}/, 'G: podman is asked whether it now talks to the rootful service');
-    like($text, qr/Done: the machine is rootful and shares only:\n  ro  \Q$home\E\/\.claude\/ccpraxis/, 'G: the summary lists the shares');
+    like($text, qr/Done: the machine is rootful and shares only:\n  ro  \Q$L->{live_mirror}\E\n/, 'G: the summary lists the shares');
     ok(!-e $L->{state_file}, 'G: apply alone does not write the share list');
 }
 
@@ -490,13 +496,13 @@ is_deeply([PodmanMachine::keep_image_names('garbage')], [], 'F: unreadable outpu
     like($text, qr/WARNING: podman reports Rootless=true after the switch/, 'G: a connection that stays rootless is reported');
 }
 
-{   # a live install from before podman-machine.pl blocks apply: its launcher
-    # binds ~/.claude/almanac-global-counts.json, which the machine will not share
+{   # a live install from before the mirror blocks apply: its launcher binds the
+    # live install itself, which the machine will not share
     my $home = fake_home();
-    unlink "$home/.claude/ccpraxis/plugins/sandbox/scripts/PodmanMachine.pm";
+    unlink "$home/.claude/ccpraxis/plugins/sandbox/scripts/LiveMirror.pm";
     my %m = machine_seams(home => $home);
     my ($rc, $text, $calls) = cli_run(['plan'], %m);
-    like($text, qr/predates podman-machine\.pl.*Promote first/s, 'G: plan says an unpromoted live install must be promoted first');
+    like($text, qr/predates the live-install mirror: its launcher binds the live install itself.*Promote first/s, 'G: plan says an unpromoted live install must be promoted first');
     ($rc, $text, $calls) = cli_run(['apply', '--confirm'], %m);
     is($rc, 1, 'G: ...and apply --confirm refuses');
     is_deeply([ grep { /\Astream:/ } @$calls ], [], 'G: ...before touching the machine');
@@ -626,9 +632,48 @@ is_deeply([PodmanMachine::keep_image_names('garbage')], [], 'F: unreadable outpu
     my %m = machine_seams(home => $home);
     my ($rc, $text) = cli_run(['plan'], %m);
     like($text, qr{add\s+ro\s+\Q$mkt\E\n\s+a directory-source plugin marketplace}, 'M: another directory marketplace is shared read-only');
-    unlike($text, qr{add\s+\S+\s+\Q$home\E/\.claude/ccpraxis/plugins\n}, 'M: ccpraxis-local is served by the install share, not a second one');
+    unlike($text, qr{add\s+\S+\s+\Q$home\E/\.claude/ccpraxis/plugins\n}, 'M: ccpraxis-local is served by the mirror share, not a second one');
     like($text, qr{Not shared, so every launch is refused while it stays registered:\n  \Q$home\E/\.claude/local-mkt \(marketplace inside-claude\): it is inside ~/\.claude},
         'M: one inside ~/.claude is not shared, and the plan says what that costs');
+
+    # Inside the live install: served from the mirror when it lies in the part
+    # the mirror copies, refused when it does not (the install is never shared).
+    make_path("$home/.claude/ccpraxis/plugins/extra-mkt", "$home/.claude/ccpraxis/references/mkt");
+    spew("$home/.claude/plugins/known_marketplaces.json", JSON::PP->new->encode({
+        'in-plugins' => { source => { source => 'directory', path => "$home/.claude/ccpraxis/plugins/extra-mkt" } },
+        'in-refs'    => { source => { source => 'directory', path => "$home/.claude/ccpraxis/references/mkt" } },
+    }));
+    my @mk = PodmanMachine::directory_marketplaces(PodmanMachine::layout(home => $home), "$home/.claude/ccpraxis", os => 'darwin');
+    is_deeply([ map { $_->{name} } @mk ], ['in-refs'], 'M: one inside the mirrored plugins/ needs no share of its own');
+    like($mk[0]{problem} // '', qr/inside the live install .*never shared.*outside the part its mirror copies/,
+        'M: one elsewhere in the live install is not shared, and the plan says why');
+}
+
+{   # the machine this change finds on a Mac: rootful, sharing the live install
+    # itself. The plan moves that share to the mirror.
+    my $home = fake_home();
+    my $L = PodmanMachine::layout(home => $home);
+    make_path($L->{container_files}, $L->{test_scratch});
+    my $old = JSON::PP->new->canonical->encode({ Name => 'podman-machine-default', HostUser => { Rootful => JSON::PP::true() },
+        Resources => { CPUs => 6, DiskSize => 100, Memory => 12288 },
+        Mounts => [ map { { ReadOnly => ($_->[1] ? JSON::PP::true() : JSON::PP::false()), Source => $_->[0], Target => $_->[0] } }
+                    [$L->{install_root}, 1], [$L->{container_files}, 1], [$L->{test_scratch}, 0] ] });
+    my %m = machine_seams(home => $home, config => $old, rootful => 1);
+    my ($rc, $text) = cli_run(['plan'], %m);
+    like($text, qr{add\s+ro\s+\Q$L->{live_mirror}\E\n}, 'MIG: the mirror is added read-only');
+    like($text, qr{remove\s+ro\s+\Q$home\E/\.claude/ccpraxis\n}, 'MIG: the live install share is removed');
+    like($text, qr{keep\s+ro\s+\Q$L->{container_files}\E\n}, 'MIG: container-files is kept');
+    like($text, qr/apply will RECREATE the machine/, 'MIG: a share change is a recreate');
+    like($text, qr{Missing on disk:\n  \Q$L->{live_mirror}\E \(apply creates it; promote and each launch fill it\)},
+        'MIG: a mirror not made yet is created by apply, and filled by promote and each launch');
+
+    # The live install itself missing: nothing to fill the mirror from.
+    remove_tree("$home/.claude/ccpraxis");
+    my $calls;
+    ($rc, $text, $calls) = cli_run(['apply', '--confirm'], %m);
+    is($rc, 1, 'MIG: no live install -> apply refuses');
+    like($text, qr/do not exist on disk:\n  \Q$home\E\/\.claude\/ccpraxis/, 'MIG: ...naming it');
+    is_deeply([ grep { /\Astream:/ } @$calls ], [], 'MIG: ...before touching the machine');
 }
 
 {   # HOME is not the account home
@@ -660,7 +705,7 @@ is_deeply([PodmanMachine::keep_image_names('garbage')], [], 'F: unreadable outpu
     my %m = machine_seams(home => $home, config => '{"Name":"podman-machine-default","HostUser":{"Rootful":true},"Mounts":null}', rootful => 1);
     my ($rc, $text) = cli_run(['plan'], %m);
     is($rc, 0, 'L9: a machine config with "Mounts": null plans (no shares yet)') or diag($text);
-    like($text, qr{add\s+ro\s+\Q$home\E/\.claude/ccpraxis\n}, 'L9: ...adding every share');
+    like($text, qr{add\s+ro\s+\Q$home\E/\.cache/ccpraxis/live-mirror\n}, 'L9: ...adding every share');
 }
 
 # ---------------------------------------------------------------------------
@@ -722,8 +767,9 @@ PERL
     is($? >> 8, 0, 'J: add-project --confirm exits 0') or diag($apply);
     $log = slurp("$fake/log") // '';
     like($log, qr/^machine rm -f podman-machine-default$/m, 'J: the machine was removed');
-    like($log, qr{^machine init --rootful --cpus 6 --memory 12288 --disk-size 100 --volume \Q$home\E/\.claude/ccpraxis:\Q$home\E/\.claude/ccpraxis:ro .*--volume \Q$home\E/Projects/app:\Q$home\E/Projects/app podman-machine-default$}m,
-        'J: ...and created rootful, sharing the install read-only and the project read-write');
+    like($log, qr{^machine init --rootful --cpus 6 --memory 12288 --disk-size 100 --volume \Q$L->{live_mirror}\E:\Q$L->{live_mirror}\E:ro .*--volume \Q$home\E/Projects/app:\Q$home\E/Projects/app podman-machine-default$}m,
+        'J: ...and created rootful, sharing the live-install mirror read-only and the project read-write');
+    unlike($log, qr{--volume \Q$home\E/\.claude/ccpraxis:}, 'J: ...and never the live install itself');
     like($log, qr/^load -i \Q$L->{cache_dir}\E\/podman-machine-images-\d{8}T\d{6}\.tar$/m, 'J: ...and the saved images were loaded');
     my ($st) = PodmanMachine::read_state($L->{state_file});
     is_deeply($st->{projects}, ["$home/Projects/app"], 'J: the share list records the project');
@@ -739,8 +785,8 @@ PERL
         'launcher: the refusal also checks read-write binds under read-only shares');
     like($src, qr/outside_shares_message\(\\\@outside, \$shares,\s*read_only => \\\@ro, project => \$PROJECT_PATH\)/,
         'launcher: ...and hands the message the project, so it can name add-project <dir>');
-    like($src, qr/_refuse_unshared_mounts\('preflight', \{ source => \$PROJECT_PATH, readonly => 0 \},\s*\{ source => \$INSTALL_ROOT, readonly => 1 \}\)/,
-        'launcher: preflight checks the project read-write and the install read-only');
+    like($src, qr/_refuse_unshared_mounts\('preflight', \{ source => \$PROJECT_PATH, readonly => 0 \},\s*\{ source => \(\$LIVE_MIRROR \/\/ \$INSTALL_ROOT\), readonly => 1 \}\)/,
+        'launcher: preflight checks the project read-write and the install\'s binds (its mirror on macOS) read-only');
     like($src, qr/_refuse_unshared_mounts\('create', HostPlatform::bind_mounts\(\@podman_args\)\)/,
         'launcher: create checks every bind with its mode');
 }

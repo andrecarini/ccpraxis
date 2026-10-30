@@ -21,9 +21,12 @@ package PodmanMachine;
 #              (--cpus 6 --memory 12288 for a new one; disk is podman's 100).
 #   shares     each mounted at its own path in the VM, because podman hands a
 #              bind source to the VM as written:
-#     ro  the live install (~/.claude/ccpraxis): the plugins/ marketplace,
-#         skills/<name>, scripts/statusline.pl and the backpack scripts the
-#         launcher binds read-only;
+#     ro  the live-install mirror (~/.cache/ccpraxis/live-mirror, LiveMirror.pm):
+#         a copy of the live install's plugins/ marketplace (backpack scripts
+#         included), skills/ and scripts/statusline.pl, which the launcher
+#         binds read-only. Refreshed by promote.pl and before each container
+#         create and start. NEVER the live install itself: "ro" is not enforced
+#         here (below), and the Mac runs the live install's hooks and scripts;
 #     ro  container-files (~/.cache/ccpraxis/container-files): host files a
 #         container reads; today a copy of ~/.claude/almanac-global-counts.json,
 #         which the launcher refreshes. ~/.claude itself is never shared;
@@ -65,6 +68,7 @@ use File::Path ();
 use JSON::PP ();
 use POSIX ();
 use HostPlatform ();
+use LiveMirror ();
 use SandboxIdentity ();
 
 our $DEFAULT_MACHINE = 'podman-machine-default';
@@ -81,7 +85,9 @@ our @VM_RESERVED = qw(bin boot dev etc home lib lib64 media mnt opt proc root
 # ---------------------------------------------------------------------------
 
 # layout(home => $h) -> { home, state_file, install_root, cache_dir,
-#                         container_files, test_scratch }
+#                         container_files, test_scratch, live_mirror }
+# live_mirror is the live install's mirror; another install root has its own
+# (LiveMirror::mirror_dir).
 sub layout {
     my (%o) = @_;
     my $home = $o{home};
@@ -95,7 +101,16 @@ sub layout {
         cache_dir       => $cache,
         container_files => "$cache/container-files",
         test_scratch    => "$cache/container-test-scratch",
+        live_mirror     => LiveMirror::mirror_dir(os => 'darwin', home => $home),
     };
+}
+
+# live_mirror_for($layout, $install_root) -> the mirror the machine shares for
+# that install root (the share list's install_root, or the live install).
+sub live_mirror_for {
+    my ($L, $install) = @_;
+    return LiveMirror::mirror_dir(os => 'darwin', home => $L->{home},
+                                  install_root => (defined $install ? $install : $L->{install_root}));
 }
 
 # account_home() -> the home the machine's shares were laid out under: the
@@ -125,13 +140,15 @@ sub container_files_dir { return _darwin_dir('container_files', @_) }
 # or undef off darwin. %o: os, home.
 sub test_scratch_dir { return _darwin_dir('test_scratch', @_) }
 
-# ensure_share_dirs($layout) -> list of problems (empty = ok). The dedicated
-# shares must exist before the machine starts: vfkit refuses to start a VM
-# whose shared directory is missing.
+# ensure_share_dirs($layout, @more) -> list of problems (empty = ok). The
+# dedicated shares must exist before the machine starts: vfkit refuses to start
+# a VM whose shared directory is missing. @more: the live-install mirror the
+# machine shares (it may be keyed by another install root), created empty here;
+# the launcher fills it before any container starts.
 sub ensure_share_dirs {
-    my ($L) = @_;
+    my ($L, @more) = @_;
     my @err;
-    for my $d ($L->{container_files}, $L->{test_scratch}) {
+    for my $d ($L->{container_files}, $L->{test_scratch}, grep { defined && length } @more) {
         next if -d $d;
         eval { File::Path::make_path($d); 1 };
         push @err, "cannot create $d" unless -d $d;
@@ -298,7 +315,7 @@ sub project_problem {
     return $why if defined $why;
     return '~/.claude holds transcripts, credentials, the vault and this share list; it is never shared'
         if _overlap($p, "$L->{home}/.claude", $os);
-    return "it overlaps the live install ($install), which is shared read-only"
+    return "it overlaps the live install ($install), whose hooks and scripts run on the Mac; the VM gets a copy of it instead"
         if _overlap($p, $install, $os);
     return undef;
 }
@@ -337,7 +354,8 @@ sub state_problems {
 # every directory-source marketplace in ~/.claude/plugins/known_marketplaces.json
 # whose folder the launcher would bind read-only, except ccpraxis-local, which
 # the launcher serves from the install's own plugins/ (SandboxIdentity::
-# directory_marketplace_source), and any already inside the install share.
+# directory_marketplace_source), and any inside the part of the install the
+# live-install mirror copies (the launcher binds those from the mirror).
 # `problem` says why one must not be shared; such a marketplace makes every
 # launch refuse at create for as long as it stays registered.
 sub directory_marketplaces {
@@ -358,8 +376,10 @@ sub directory_marketplaces {
         $p =~ s{\\}{/}g;
         $p =~ s{/+\z}{} unless $p eq '/';
         next unless $p =~ m{\A/} && -d $p;
-        next if _under(_fold($p, $os), _fold($install, $os));
+        next if grep { _under(_fold($p, $os), _fold("$install/$_", $os)) } @LiveMirror::PATHS;
         my $why = _shape_problem($p, $L, $os);
+        $why = "it is inside the live install ($install), which is never shared, and outside the part its mirror copies"
+            if !defined $why && _under(_fold($p, $os), _fold($install, $os));
         $why = 'it is inside ~/.claude, which is never shared'
             if !defined $why && _overlap($p, "$L->{home}/.claude", $os);
         push @out, { source => $p, name => $name, problem => $why };
@@ -433,7 +453,7 @@ sub current_machine {
 }
 
 my %WHY = (
-    install         => 'the live ccpraxis install: the plugins marketplace, selected skills, statusline and backpack scripts every sandbox mounts read-only',
+    'live-mirror'   => "a copy of the live install's plugins, skills and statusline, refreshed by promote and by each launch; the Mac never runs anything from it",
     'container-files' => 'host files a container reads: the copy of almanac-global-counts.json the launcher refreshes (~/.claude itself is never shared)',
     'test-scratch'  => "fixtures for ccpraxis's container tests, nothing else (drop it with: test-scratch off)",
     project         => 'a project directory, mounted read-write at /project (add-project / remove-project)',
@@ -453,7 +473,7 @@ sub desired_machine {
     my $install = defined $st->{install_root} ? $st->{install_root} : $L->{install_root};
     my $share = sub { my ($src, $ro, $role) = @_; return { source => $src, target => $src, readonly => $ro, role => $role } };
     my @shares = (
-        $share->($install, 1, 'install'),
+        $share->(live_mirror_for($L, $install), 1, 'live-mirror'),
         $share->($L->{container_files}, 1, 'container-files'),
         ($st->{test_scratch} ? $share->($L->{test_scratch}, 0, 'test-scratch') : ()),
         (map { $share->($_->{source}, 1, 'marketplace') } grep { !defined $_->{problem} } @{ $o{marketplaces} || [] }),
@@ -492,14 +512,18 @@ sub compute_plan {
     my ($cur, $want) = @o{qw(current desired)};
     my %p = (current => $cur, desired => $want, resource_changes => [], set_args => [], shares => [], missing => []);
 
+    # The live install is not shared, but its mirror is filled from it: without
+    # it there is nothing for a sandbox to mount.
+    my $inst = $want->{install_root};
+    push @{ $p{missing} }, { source => $inst, role => 'install' } if defined $inst && !-d $inst;
     for my $s (@{ $want->{shares} }) {
         push @{ $p{missing} }, { source => $s->{source}, role => $s->{role} } unless -d $s->{source};
     }
-    # A live install from before this module still binds ~/.claude/almanac-
-    # global-counts.json in place and puts test fixtures under /private/tmp;
-    # against the narrowed machine every launch from it would be refused.
-    my $inst = $want->{install_root};
-    $p{stale_install} = (defined $inst && -d $inst && !-f "$inst/plugins/sandbox/scripts/PodmanMachine.pm") ? 1 : 0;
+    # A live install from before the mirror still binds the live install itself
+    # (and, older still, ~/.claude/almanac-global-counts.json and test fixtures
+    # under /private/tmp); against this machine every launch from it would be
+    # refused.
+    $p{stale_install} = (defined $inst && -d $inst && !-f "$inst/plugins/sandbox/scripts/LiveMirror.pm") ? 1 : 0;
 
     unless ($cur && $cur->{exists}) {
         $p{action} = 'create';
@@ -594,11 +618,12 @@ sub render_plan {
             'Note: "ro" is recorded, not enforced, on this provider. podman 6.1.4 on applehv stores the flag but vfkit 0.6.4 has no read-only virtio-fs share and the VM mounts it read-write, so a process that escaped into the VM could write an "ro" folder. Containers still get read-only binds.';
     }
     if ($p->{stale_install}) {
-        push @l, '', "The live install ($want->{install_root}) predates podman-machine.pl: its launcher would bind ~/.claude/almanac-global-counts.json, which this machine does not share, so every launch from it would be refused. Promote first (perl scripts/promote.pl in the dev clone); apply refuses until then.";
+        push @l, '', "The live install ($want->{install_root}) predates the live-install mirror: its launcher binds the live install itself, which this machine does not share, so every launch from it would be refused. Promote first (perl scripts/promote.pl in the dev clone); apply refuses until then.";
     }
     push @l, '', 'Missing on disk:' if @{ $p->{missing} };
     for my $m (@{ $p->{missing} }) {
         my $fix = ($m->{role} eq 'container-files' || $m->{role} eq 'test-scratch') ? 'apply creates it'
+                : $m->{role} eq 'live-mirror' ? 'apply creates it; promote and each launch fill it'
                 : $m->{role} eq 'install' ? 'promote first (perl scripts/promote.pl in the dev clone); apply refuses until it exists'
                 : 'remove-project it, or recreate the directory; apply refuses until then';
         push @l, "  $m->{source} ($fix)";
@@ -794,14 +819,15 @@ sub apply {
 
     # Preconditions that need no machine: every share source must exist (vfkit
     # will not start a VM with a missing shared folder). The dedicated folders
-    # are created below; the install and project folders are the operator's.
+    # and the mirror are created below; the project folders are the operator's,
+    # and so is the live install the mirror is filled from.
     my @blocking = grep { $_->{role} eq 'install' || $_->{role} eq 'project' } @{ $p->{missing} };
     if (@blocking && $act ne 'none') {
-        $out->("Refusing: these shared folders do not exist on disk:", map { "  $_->{source}" } @blocking);
+        $out->("Refusing: these folders do not exist on disk:", map { "  $_->{source}" } @blocking);
         return 1;
     }
     if ($p->{stale_install} && $act ne 'none') {
-        $out->("Refusing: the live install $want->{install_root} predates podman-machine.pl; promote first.");
+        $out->("Refusing: the live install $want->{install_root} predates the live-install mirror; promote first.");
         return 1;
     }
 
@@ -812,7 +838,7 @@ sub apply {
     }
     $out->('');
 
-    my @mk = ensure_share_dirs($L);
+    my @mk = ensure_share_dirs($L, map { $_->{source} } grep { $_->{role} eq 'live-mirror' } @{ $want->{shares} });
     if (@mk) { $out->("Refusing: $_") for @mk; return 1 }
 
     my $step = sub {

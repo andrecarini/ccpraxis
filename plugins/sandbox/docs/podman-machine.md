@@ -50,13 +50,13 @@ written.
 
 | mode | host folder | why |
 |---|---|---|
-| ro | `~/.claude/ccpraxis` | the live install: the `plugins/` marketplace, selected `skills/<name>`, `scripts/statusline.pl` and the backpack scripts, all bound read-only into every sandbox |
+| ro | `~/.cache/ccpraxis/live-mirror` | a copy of the live install's plugins, skills and statusline, refreshed by promote and by each launch; the Mac never runs anything from it. It holds exactly what the launcher binds read-only from the live install: the `plugins/` marketplace (the backpack script and hook included), `skills/` and `scripts/statusline.pl`. No `.git`, nothing else |
 | ro | `~/.cache/ccpraxis/container-files` | host files a container reads. Today that is a copy of `~/.claude/almanac-global-counts.json`, which the launcher writes at each container create and before each start. `~/.claude` itself holds transcripts, credentials and the vault, so it is never shared |
 | rw | `~/.cache/ccpraxis/container-test-scratch` | fixtures for ccpraxis's own container tests (`tests/lib/TestSandbox.pm`), nothing else. Those tests cannot run without it, so it is on by default; it holds only throwaway files the Mac never executes |
 | rw | each directory added with `add-project` | the project, at `/project`, and its `.ccpraxis-local-data/claude-home` at `/root/.claude` |
-| ro | any other `directory` marketplace in `~/.claude/plugins/known_marketplaces.json` | the launcher binds it read-only into every sandbox (`ccpraxis-local` is served from the live install; there is none other on a usual machine). One inside `~/.claude` is not shared, and the plan says every launch is refused while it stays registered |
+| ro | any other `directory` marketplace in `~/.claude/plugins/known_marketplaces.json` | the launcher binds it read-only into every sandbox (`ccpraxis-local` is served from the mirror; there is none other on a usual machine). One inside `~/.claude` is not shared, and the plan says every launch is refused while it stays registered |
 
-Nothing else: not `/Users`, `/private`, `/var/folders`, or `~/.config/containers` (which podman 6
+Nothing else: not the live install, not `/Users`, `/private`, `/var/folders`, or `~/.config/containers` (which podman 6
 mounts at `/etc/containers` so its config can be edited from the Mac; the VM has its own). With no
 project in the list, `claude-sandbox` refuses every launch before asking anything, and its message
 gives the `add-project <dir>` command to run. It refuses the same way when a bind would need to write
@@ -76,6 +76,31 @@ read-write, so a process that escaped into the VM could write an `ro` folder. A 
 read-only binds are enforced. The mode is still recorded, so the launcher refuses a read-write bind
 through a read-only share, and a provider that enforces it gets it for free.
 
+### Why the machine shares a copy of the live install
+
+Because `ro` is not enforced, sharing `~/.claude/ccpraxis` would let a process that escaped into the
+VM rewrite the plugin hooks, `scripts/statusline.pl` and `.git/hooks`, all of which run on the Mac
+later. So the machine shares a copy of the part containers mount, and the Mac only ever writes it
+(`plugins/sandbox/scripts/LiveMirror.pm`). The container paths and read-only binds are the same as
+before; only the host side of the bind changed.
+
+- **Who refreshes it.** `scripts/promote.pl`, right after it fast-forwards the live install, when the
+  mirror folder exists (a `mirror:` line in its report; a mirror it cannot refresh is a
+  `mirror: warning` line and never fails the promotion). The launcher, before each container create
+  and before each start. Plugin code therefore still reaches running sandboxes on promotion alone.
+- **How.** In place, file by file: each file is written under a temporary name and renamed over the
+  old one, so no reader sees a half-written file, and directories keep their inode, so a running
+  container's bind of `plugins/` or `skills/<name>` keeps seeing them. During a refresh a reader can
+  see some files new and some old, as it always could during the git checkout that updates the live
+  install. Files are compared by content. The refresh never follows a symlink inside the mirror (the
+  VM can plant one) and removes anything that is not in the source, so it also undoes whatever the VM
+  wrote there.
+- **Whose.** The live install's mirror is `~/.cache/ccpraxis/live-mirror`. A launcher run from another
+  checkout (a fork, or a clone run by path) keeps its own, `live-mirror-<8 hex of its path>`, so it can
+  never put its code in front of the live install's sandboxes. The machine shares the mirror of the
+  share list's `install_root` (the live install unless set); another checkout's launcher is refused
+  until its mirror is the shared one.
+
 ### Rootful
 
 Container root is root in the VM; there is no user namespace between them, and the VM is the
@@ -88,8 +113,9 @@ machine still runs as your user and needs no admin rights on the Mac.
 ### What a recreate costs
 
 `apply --confirm` recreates the machine when rootful or a share differs. It refuses first when a
-listed folder is missing, or when the live install predates `podman-machine.pl` (its launcher would
-bind `~/.claude/almanac-global-counts.json`, which this machine does not share): promote first.
+listed folder or the live install is missing, or when the live install predates the mirror (its
+launcher would bind the live install itself, which this machine does not share): promote first. It
+creates the mirror folder empty; the next launch, or promotion, fills it.
 Then, in order, it:
 
 1. starts the machine if it is stopped, and refuses if any container is running, or if the VM holds
@@ -125,8 +151,8 @@ and `registries.conf`, and `podman info --format '{{.Host.Security.Rootless}}'` 
   limit is not what it occupies: `du -sh` on the `.raw` file shows the real usage, which grows as
   images are built.
 - **A missing shared folder stops the machine from starting.** vfkit refuses a share whose folder is
-  gone. The launcher recreates the two `~/.cache/ccpraxis` folders before it starts the machine, and
-  for any other missing folder it stops with the folder's name and the `remove-project` command
-  instead of trying. A start by hand (`podman machine start`, Podman Desktop) gets only vfkit's own
-  error.
+  gone. The launcher recreates its `~/.cache/ccpraxis` folders (the mirror included) before it starts
+  the machine, and for any other missing folder it stops with the folder's name and the
+  `remove-project` command instead of trying. A start by hand (`podman machine start`, Podman
+  Desktop) gets only vfkit's own error.
 - **The machine keeps running** (and holding its memory) until `podman machine stop`.

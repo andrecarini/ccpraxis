@@ -783,6 +783,19 @@ sub main {
     }
 
     # -----------------------------------------------------------------
+    # The sandbox's live-install mirror (macOS)
+    # -----------------------------------------------------------------
+    # On macOS the podman machine shares a copy of the live install's
+    # plugins, skills and statusline, never the live install itself
+    # (plugins/sandbox/scripts/LiveMirror.pm). Refreshing it right after the
+    # fast-forward is what keeps plugin code live on promotion alone for
+    # running sandboxes. A failure is a warning line, never a failed promotion.
+    if ($mode eq 'apply') {
+        my $line = live_mirror_line($live_dir, $home_dir);
+        push @out, $line if defined $line;
+    }
+
+    # -----------------------------------------------------------------
     # CLAUDE.md (spec 3.3)
     # -----------------------------------------------------------------
     # The installed file is built, not copied: the shared payload file plus
@@ -1264,6 +1277,34 @@ sub main {
 
     print join("\n", @out) . "\n";
     exit $exit_code;
+}
+
+# live_mirror_line($live_dir, $home_dir) -> the report line for the sandbox's
+# live-install mirror, or undef when there is nothing to refresh: off macOS
+# (LiveMirror::mirror_dir decides), or when the mirror directory does not
+# exist yet (podman-machine.pl apply creates it). LiveMirror.pm is loaded from
+# this clone, as the steward modules above are, and only here, so nothing it
+# does can stop a promotion: every failure becomes a warning line.
+sub live_mirror_line {
+    my ($live_dir, $home_dir) = @_;
+    my ($dir, $r);
+    my $ok = eval {
+        local @INC = ("$Bin/../plugins/sandbox/scripts", @INC);
+        require LiveMirror;
+        $dir = LiveMirror::mirror_dir(home => $home_dir, install_root => $live_dir);
+        $r = LiveMirror::refresh(source => $live_dir, mirror => $dir) if defined $dir && -d $dir;
+        1;
+    };
+    unless ($ok) {
+        (my $why = defined $@ && length $@ ? $@ : 'unknown error') =~ s/\s+/ /g;
+        $why =~ s/\s+\z//;
+        return "mirror: warning the sandbox mirror was not refreshed ($why); running sandboxes keep the previous copy";
+    }
+    return undef unless $r;
+    return "mirror: warning $dir was not refreshed ($r->{error}); running sandboxes keep the previous copy"
+        unless $r->{ok};
+    return "mirror: up-to-date $dir" unless $r->{updated} || $r->{removed};
+    return "mirror: refreshed $dir ($r->{updated} written, $r->{removed} removed)";
 }
 
 # rel2abs without pulling in File::Spec's own path-separator assumptions,

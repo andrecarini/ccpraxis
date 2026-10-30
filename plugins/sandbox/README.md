@@ -119,9 +119,11 @@ What differs from Windows, and why:
   (`containerfile-portability.t`); the backpack's Node recipe picks its
   tarball from `dpkg --print-architecture` the same way.
 - **Only the machine's shared folders can be mounted.** The machine
-  shares the live install and ccpraxis's container-files folder read-only,
-  its container-test folder and each project in its list read-write, and
-  nothing else of the Mac
+  shares a copy of the live install's plugins, skills and statusline
+  (refreshed by promotion and by each launch; never the live install
+  itself, whose code runs on the Mac) and ccpraxis's container-files
+  folder read-only, its container-test folder and each project in its
+  list read-write, and nothing else of the Mac
   (`plugins/sandbox/docs/podman-machine.md` has the table and the reasons).
   The launcher reads the machine's share list, with each share's mode, and
   refuses a project outside it before asking anything; the message gives

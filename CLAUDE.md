@@ -31,7 +31,7 @@ differs per surface, and guessing has been wrong in both directions:
 
 | surface | how it reaches a sandbox | effective when |
 |---|---|---|
-| ccpraxis plugin code (`plugins/**`) | **LIVE ro bind mount — of `~/.claude/ccpraxis/plugins`, i.e. THE LIVE INSTALL, _never_ of your clone** — at `/root/.claude/plugins/marketplaces/ccpraxis-local` (`ccpraxis-local` is a `directory`-source marketplace) | **on promotion alone.** No relaunch: a per-call script (`bp-*.pl`) picks it up immediately. Until you promote, the mount keeps serving the OLD code no matter what your clone says |
+| ccpraxis plugin code (`plugins/**`) | **LIVE ro bind mount — of THE LIVE INSTALL's `plugins/`, _never_ of your clone**: `~/.claude/ccpraxis/plugins` itself on Windows and Linux; on macOS its copy in `~/.cache/ccpraxis/live-mirror`, which promotion refreshes — at `/root/.claude/plugins/marketplaces/ccpraxis-local` (`ccpraxis-local` is a `directory`-source marketplace) | **on promotion alone.** No relaunch: a per-call script (`bp-*.pl`) picks it up immediately. Until you promote, the mount keeps serving the OLD code no matter what your clone says |
 | skills (`skills/<name>/`) | bind-mounted **per the picker's selection**, fixed at container create | a **full manager launch** (`--session`/`--resume-session` is the *connector* path and skips the picker entirely) |
 | other marketplaces (e.g. `claude-plugins-official`) | **copied** into `claude-home`, host-authoritative, re-copied every launch | next launch — and an in-container repair is clobbered by that re-copy |
 
