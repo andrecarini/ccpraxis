@@ -70,7 +70,14 @@ sub fixture {
     make_path($clone, "$home/.claude");
     git($home, $clone, 'init', '-q');
     write_text("$clone/.gitignore", ".backup-preferences.json\n*.pre-merge.*\n");
+    # Older payload versions first, so promote.pl sees them in the history.
+    for my $old (@{ $o{history} // [] }) {
+        write_text("$clone/global-config/settings.json", $old);
+        git($home, $clone, 'add', '-A');
+        git($home, $clone, 'commit', '-q', '-m', 'an older payload');
+    }
     write_text("$clone/global-config/settings.json", $o{payload});
+    write_text("$clone/global-config/CLAUDE.md", $o{claude_md}) if defined $o{claude_md};
     write_text("$clone/global-config/known_marketplaces.json", "{}\n");
     write_text("$clone/skills/.keep", '');
     for my $name (qw(ccpraxis-helpers.pl sync-export.pl json-diff.pl filter-diff.pl save-preference.pl
@@ -90,6 +97,12 @@ sub fixture {
     }
     write_text("$live/.backup-preferences.json", $o{prefs}) if defined $o{prefs};
     write_text("$home/.claude/settings.json", $o{live});
+    write_text("$home/.claude/CLAUDE.md", $o{home_claude_md}) if defined $o{home_claude_md};
+    if ($o{ahead}) {
+        write_text("$clone/ahead.txt", "developed since the last promotion\n");
+        git($home, $clone, 'add', '-A');
+        git($home, $clone, 'commit', '-q', '-m', 'development since the last promotion');
+    }
     my $phases = "$scratch/phases";
     make_path($phases);
     write_text("$phases/$_.pm", read_text("$REPO/scripts/backup/$_.pm")) for qw(Preflight Export);
@@ -237,6 +250,54 @@ for my $case (
         '[remove] and promoted');
     ok(!exists json_file("$r->{home}/.claude/settings.json")->{payloadOnly},
         '[remove] the promotion did not put the removed key back into ~/.claude');
+}
+
+# ---------------------------------------------------------------------------
+# A skipped key stays as ~/.claude has it through the automatic second
+# promotion, even where promote.pl would otherwise update it (the ~/.claude
+# value is one the payload once had).
+# ---------------------------------------------------------------------------
+{
+    my $r = fixture(history => [ qq({"keep":1,"theme":"light"}\n) ], payload => $PAYLOAD,
+                    live => qq({"keep":1,"theme":"light","newKey":"from live"}\n));
+    my $resp = backup($r);
+    my %ids = map { $_->{id} => 1 } decisions($resp);
+    is(join(',', sort keys %ids), 'preflight.settings.newKey,preflight.settings.theme', '[skip+promote] both keys are asked');
+    my $resp2 = answer($r, $resp, 'preflight.settings.theme' => 'skip', 'preflight.settings.newKey' => 'export_to_repo');
+    is($resp2->{exit}, 0, '[skip+promote] the run completes') or diag($resp2->{out});
+    is(git_out($r->{home}, $r->{live}, 'rev-parse', 'HEAD'), git_out($r->{home}, $r->{clone}, 'rev-parse', 'main'),
+        '[skip+promote] the export was committed and promoted');
+    is(json_file("$r->{home}/.claude/settings.json")->{theme}, 'light',
+        '[skip+promote] the skipped key kept its ~/.claude value through the second promotion');
+    my $state = json_file($r->{state});
+    my $pac = $state->{phases}{export}{items}{promote_after_commit}{data} // {};
+    is(join(',', @{ $pac->{keep_keys} // [] }), 'theme', '[skip+promote] the promotion was told to keep it');
+    like($pac->{output} // '', qr/^  kept-local theme \(asked\)$/m, '[skip+promote] ...and promote.pl reported keeping it');
+}
+
+# ---------------------------------------------------------------------------
+# promote.pl exit 1 AFTER its fast-forward (a hand-edited ~/.claude/CLAUDE.md
+# it refuses to overwrite): the live install moved, so the export goes on;
+# the refusal lines reach the report, and the CLAUDE.md difference comes
+# back as the export's claude_md_drift question.
+# ---------------------------------------------------------------------------
+{
+    my $r = fixture(payload => $PAYLOAD, live => $PAYLOAD, ahead => 1,
+                    claude_md => "# shared\nevery host\n", home_claude_md => "# shared\nevery host\na hand edit\n");
+    my $resp = backup($r);
+    is(((decisions($resp))[0] // {})->{kind}, 'promote_pending', '[refused] the dev clone is ahead: promote_pending');
+    my $resp2 = answer($r, $resp, 'preflight.promote_pending' => 'promote');
+    my $state = json_file($r->{state});
+    my $p = $state->{phases}{preflight}{items}{promotion}{data} // {};
+    is($p->{exit}, 1, '[refused] promote.pl exited 1 (it refused ~/.claude/CLAUDE.md)');
+    is(git_out($r->{home}, $r->{live}, 'rev-parse', 'HEAD'), git_out($r->{home}, $r->{clone}, 'rev-parse', 'main'),
+        '[refused] ...after fast-forwarding the live install');
+    ok($p->{ok}, '[refused] the promotion counts as done');
+    like(join("\n", @{ $p->{refusals} // [] }), qr/claude-md: refused-local-edit/, '[refused] the refusal lines are kept for the report');
+    is($state->{phases}{preflight}{items}{export_target}{data}{ready}, 1, '[refused] the export target is ready');
+    is($resp2->{exit}, 10, '[refused] the run goes on to the export') or diag($resp2->{out});
+    is(((decisions($resp2))[0] // {})->{kind}, 'claude_md_drift', '[refused] ...which asks about the CLAUDE.md difference');
+    ok(!$state->{phases}{preflight}{error}, '[refused] the preflight did not fail over it');
 }
 
 done_testing();

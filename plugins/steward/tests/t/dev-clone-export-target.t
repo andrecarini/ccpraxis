@@ -333,4 +333,27 @@ sub check_in  { my ($f) = @_; my %e = _env(); local @ENV{ keys %e } = values %e;
     is_deeply((json_of($out) // {})->{only_keys_unmatched}, [ 'nosuch' ], 'E2: an --only-key that matches nothing is reported');
 }
 
+# ---------------------------------------------------------------------------
+# F. promote_outcome: exit 1 after the fast-forward is a promotion that
+#    happened (with refusals to report); exit 2, or a live install that did
+#    not move, is a stop.
+# ---------------------------------------------------------------------------
+{
+    my $out = "merge: fast-forward a..b (1 commits)\nclaude-md: refused-local-edit 1 line(s) the payload never had\n  L3: x\n  resolve: fold ...\nsettings: unchanged\n";
+    my $o = DevClone::promote_outcome(exit => 0, output => "merge: up-to-date\n", live_head_after => 'b', target => 'b');
+    ok($o->{ok} && !defined $o->{reason}, 'F1: exit 0 is a promotion');
+    $o = DevClone::promote_outcome(exit => 1, output => $out, live_head_after => 'b', target => 'b');
+    ok($o->{ok}, 'F2: exit 1 with the live install at the target is a promotion');
+    is_deeply($o->{refusals}, [ 'claude-md: refused-local-edit 1 line(s) the payload never had', '  L3: x', '  resolve: fold ...' ],
+        'F2: ...whose refusal lines are kept');
+    $o = DevClone::promote_outcome(exit => 1, output => $out, live_head_after => 'a', target => 'b');
+    ok(!$o->{ok}, 'F3: exit 1 with the live install NOT at the target is a stop');
+    $o = DevClone::promote_outcome(exit => 2, output => "merge: refused-dirty\n", live_head_after => 'b', target => 'b');
+    ok(!$o->{ok}, 'F4: exit 2 is a stop');
+    like($o->{reason}, qr/exited 2/, 'F4: ...naming the exit code');
+    my @argv = DevClone::promote_argv(dev_clone => '/c', live_root => '/l', home => '/h', keep_keys => [ 'a', 'env.X' ], perl => 'perl');
+    is(join(' ', @argv), 'perl /c/scripts/promote.pl --clone /c --live /l --home /h --keep-key a --keep-key env.X',
+        'F5: promote_argv passes each kept key');
+}
+
 done_testing();

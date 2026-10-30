@@ -381,7 +381,7 @@ sub _do_u1 {
 
     my %d = (state => undef, skipped_reason => undef, fix => undef, live_head => undef, clone_main => undef,
              commits => [], count => 0, answer => undef, ran => 0, exit => undef, output => undef,
-             live_head_after => undef);
+             live_head_after => undef, ok => undef, refusals => []);
     my $done = sub {
         my ($ret) = @_;
         my $data = _sanitize_utf8(\%d);
@@ -463,10 +463,19 @@ sub _do_u1 {
     # Verbatim, for the report: promote.pl's own lines, then its stderr.
     $d{output} = _clamp(join('', $r->{out} // '', (length($r->{err} // '') ? $r->{err} : '')), 8000);
     $d{live_head_after} = _git_head($root);
-    if (!$r->{spawned} || $r->{exit} != 0) {
-        $d{skipped_reason} = $r->{spawned} ? "promote.pl exited $r->{exit}" : 'promote.pl could not be started';
+    my $po = DevClone::promote_outcome(exit => $d{exit}, output => $d{output},
+                                       live_head_after => $d{live_head_after}, target => $rel->{clone_main});
+    $d{ok}       = $po->{ok};
+    $d{refusals} = $po->{refusals};
+    unless ($po->{ok}) {
+        $d{skipped_reason} = $po->{reason};
         return $done->({ failed => "promotion: $d{skipped_reason} -- the ccpraxis part stopped; its output is in the report" });
     }
+    # Exit 1 after the fast-forward: a payload file was refused (a hand-edited
+    # ~/.claude/CLAUDE.md, say). The live install moved, so the export goes on;
+    # the refusal lines go to the report (the CLAUDE.md case comes back as the
+    # export's claude_md_drift question).
+    $ctx->{note}->('promotion_refusals', { lines => $po->{refusals}, reason => $po->{reason} }) if defined $po->{reason};
     return $done->();
 }
 
@@ -487,7 +496,7 @@ sub _do_u2 {
         $d{reason} = $target->{reason} // ($load_err ? "cannot locate the dev clone: $load_err" : 'the dev clone was not located');
         $d{fix}    = $target->{fix};
     }
-    elsif ($promotion->{ran} && ($promotion->{exit} // -1) != 0) {
+    elsif ($promotion->{ran} && !$promotion->{ok}) {
         $d{reason} = "promotion failed ($promotion->{skipped_reason}), so the ccpraxis part stopped";
         $d{fix}    = "read promote.pl's output in the report, resolve what it names, then back up again";
     }

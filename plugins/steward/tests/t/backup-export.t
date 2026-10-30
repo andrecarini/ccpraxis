@@ -1745,6 +1745,21 @@ for my $variant (
     like(($pac->{output} // ''), qr/promote: stand-in/, "AC24 ($variant->{label}): ...with promote.pl's output verbatim");
 }
 
+{
+    # KEEP -- every key answered "skip" in the preflight reaches the second
+    # promotion as --keep-key, so the promotion cannot change it either.
+    my $r = setup_root(with_origin => 0);
+    seed_preflight_outcome($r->{state_path}, { skip_keys => [ 'other', 'env.X' ], preferences_saved => [],
+        answers => { theme => 'use_live', other => 'skip', 'env.X' => 'skip', kept => 'keep_different_remember' },
+        to_payload => [ 'theme' ] });
+    pending_export($r, 'keep');
+    my $resp = run_backup($r, {});
+    is($resp->{exit}, 0, 'KEEP: the run completes') or diag($resp->{out} . $resp->{err});
+    my ($promote) = grep { /^promote\.pl / } log_lines($r->{log_path});
+    is(($promote // ''), "promote.pl --clone $r->{clone} --live $r->{ccpx} --home $r->{home} --keep-key env.X --keep-key other",
+        'KEEP: the skipped keys (and only they) are passed as --keep-key');
+}
+
 # ===========================================================================
 # AC27 -- DC6 crash safety, asked of git: a run killed after the commit and
 # before the promotion (state-file surgery, t/21's AC20 technique) re-enters,

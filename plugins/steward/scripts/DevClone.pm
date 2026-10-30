@@ -38,7 +38,7 @@ use File::Temp ();
 use Exporter 'import';
 
 our @EXPORT_OK = qw(
-    PAYLOAD_PATHS default_live_root locate payload_check relation promote_argv
+    PAYLOAD_PATHS default_live_root locate payload_check relation promote_argv promote_outcome
     git_path same_dir promote_hint redact run_capture run_git
 );
 
@@ -340,13 +340,43 @@ sub relation {
 
 # The one way to promote: the dev clone's own scripts/promote.pl, the only
 # thing that writes the live install, told exactly which checkouts and home
-# it is working on. A list for a list-form spawn.
+# it is working on. keep_keys => [...] are settings units the operator
+# answered "skip" this run: promote.pl leaves them as ~/.claude has them
+# (--keep-key). A list for a list-form spawn.
 sub promote_argv {
     my (%a) = @_;
     my ($clone, $live, $home) = @a{qw(dev_clone live_root home)};
     my @argv = ($a{perl} // $^X, "$clone/scripts/promote.pl", '--clone', $clone, '--live', $live);
     push @argv, '--home', $home if defined $home && length $home;
+    push @argv, map { ('--keep-key', $_) } grep { defined && length } @{ $a{keep_keys} // [] };
     return @argv;
+}
+
+# promote_outcome(exit => N, output => TEXT, live_head_after => SHA, target => SHA)
+# -> { ok, moved, refusals => [lines], reason }
+#
+# What a promote.pl run means for the caller. Exit 0 is success. Exit 1 is a
+# payload file promote.pl refused (a hand-edited ~/.claude/CLAUDE.md, a
+# symlink to some other file) AFTER its fast-forward: when the live install
+# did reach the target, the promotion happened and the caller carries on,
+# with the refusal lines kept for the report. Anything else -- exit 2 (the
+# merge refused or failed), a live install that did not move -- is a stop.
+sub promote_outcome {
+    my (%a) = @_;
+    my $exit  = $a{exit} // -1;
+    my $moved = (defined $a{live_head_after} && defined $a{target} && $a{live_head_after} eq $a{target}) ? 1 : 0;
+    my @refusals;
+    my $in = 0;
+    for my $l (split /\r?\n/, $a{output} // '') {
+        if ($l =~ /^(?:claude-md|settings|marketplaces): (?:refused|error)\b/) { push @refusals, $l; $in = 1; next; }
+        if ($in && $l =~ /^\s/) { push @refusals, $l; next; }
+        $in = 0;
+    }
+    return { ok => 1, moved => $moved, refusals => \@refusals, reason => undef } if $exit == 0;
+    return { ok => 1, moved => 1, refusals => \@refusals,
+             reason => 'promote.pl refused a payload file after its fast-forward (exit 1)' } if $exit == 1 && $moved;
+    return { ok => 0, moved => $moved, refusals => \@refusals,
+             reason => $exit < 0 ? 'promote.pl could not be started' : "promote.pl exited $exit" };
 }
 
 1;

@@ -1332,7 +1332,7 @@ sub _do_promote_after_commit {
 
     my $rel = DevClone::relation(live_root => $root, dev_clone => $repo, git => _git_runner());
     my %d = (needed => 0, ran => 0, exit => undef, output => undef, commits => [], reason => undef, fix => undef,
-             live_head => $rel->{live_head}, clone_main => $rel->{clone_main});
+             live_head => $rel->{live_head}, clone_main => $rel->{clone_main}, keep_keys => [], refusals => []);
     my $done = sub {
         my ($ret) = @_;
         my $data = _sanitize_utf8(\%d);
@@ -1364,14 +1364,29 @@ sub _do_promote_after_commit {
         return $done->();
     }
 
-    my $r = _run_capture(DevClone::promote_argv(dev_clone => $repo, live_root => $root, home => $home_n));
+    # The settings units the operator answered "skip" this run: the promotion
+    # must leave them exactly as ~/.claude has them (promote.pl --keep-key).
+    # The remembered answers reach promote.pl through .backup-preferences.json.
+    my $outcome = $ctx->{get_phase_item}->('preflight', 'settings_outcome');
+    my $answers = (ref($outcome) eq 'HASH' && ref($outcome->{answers}) eq 'HASH') ? $outcome->{answers} : {};
+    my @keep = map { _item_bytes($_) } sort grep { ($answers->{$_} // '') eq 'skip' } keys %$answers;
+    $d{keep_keys} = \@keep;
+
+    my $r = _run_capture(DevClone::promote_argv(dev_clone => $repo, live_root => $root, home => $home_n, keep_keys => \@keep));
     $d{ran}    = 1;
     $d{exit}   = $r->{spawned} ? $r->{exit} : -1;
     $d{output} = _clamp(join('', $r->{out} // '', (length($r->{err} // '') ? $r->{err} : '')), 8000);
-    if (!$r->{spawned} || $r->{exit} != 0) {
-        $d{reason} = $r->{spawned} ? "promote.pl exited $r->{exit}" : 'promote.pl could not be started';
+    my $po = DevClone::promote_outcome(exit => $d{exit}, output => $d{output},
+                                       live_head_after => _git_head($root), target => $rel->{clone_main});
+    $d{refusals} = $po->{refusals};
+    unless ($po->{ok}) {
+        $d{reason} = $po->{reason};
         return $done->({ failed => "promote_after_commit: $d{reason}; its output is in the report" });
     }
+    # Exit 1 after the fast-forward (a refused payload file): the live
+    # install has the commit; the refusal lines go to the report.
+    $d{reason} = $po->{reason};
+    $ctx->{note}->('promote_refusals', { lines => $po->{refusals}, reason => $po->{reason} }) if defined $po->{reason};
     $ctx->{note}->('promoted_after_commit', { commits => \@commits });
     return $done->();
 }
