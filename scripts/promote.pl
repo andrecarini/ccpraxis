@@ -1,9 +1,23 @@
 #!/usr/bin/env perl
-# promote.pl -- the one promotion command: merge this clone's main into the
-# live install, then sync the global-config/ payload into <home>/.claude.
+# promote.pl -- the one promotion command: fast-forward the live install to
+# this clone's main (creating it on first run), then sync the global-config/
+# payload into <home>/.claude.
 #
 # Spec: .ccpraxis-local-data/blueprints/hook-continuity-remake/specs/
 # 33-promote-syncs-global-config-spec.md, Decision 109.
+#
+# THE LIVE INSTALL IS PRODUCED BY PROMOTION AND NOTHING ELSE. The dev clone
+# is the only checkout that talks to GitHub; the live install takes its code
+# from the dev clone alone. So this script:
+#   - creates the live install, when it does not exist yet, as a clone of the
+#     dev clone (its `origin` is then the dev clone, never GitHub);
+#   - moves it forward by fast-forward only. A live install holding commits
+#     the dev clone lacks was changed some other way (the backup used to
+#     commit and push from there); that is refused, with the one command that
+#     brings those commits into the dev clone, instead of being papered over
+#     with a merge commit that would diverge the two for good;
+#   - points the live install's `origin` at the dev clone it promotes from,
+#     replacing a GitHub `origin` left by the old workflow.
 #
 # Two syncs re-implement rules that live in
 # plugins/steward/scripts/ccpraxis-helpers.pl (settings-export-merge,
@@ -26,6 +40,10 @@ use B ();
 # so a promote and a backup agree on what is machine-local.
 use lib "$Bin/../plugins/steward/scripts";
 use MachineLocalSettings ();
+# GlobalClaudeMd: ~/.claude/CLAUDE.md is the shared global-config/CLAUDE.md
+# plus this host's own part (CLAUDE.windows.md, CLAUDE.macos.md), never a
+# copy of one file. Shared with the backup side's drift check.
+use GlobalClaudeMd ();
 
 # ---------------------------------------------------------------------------
 # Usage / argument parsing
@@ -33,15 +51,15 @@ use MachineLocalSettings ();
 
 sub usage_text {
     return <<'EOF';
-promote.pl -- merge this clone's main into the live install, then sync the global-config/ payload into <home>/.claude.
+promote.pl -- fast-forward the live install to this clone's main (creating it on first run), then sync the global-config/ payload into <home>/.claude.
 
 Usage:
   perl scripts/promote.pl [--dry-run] [--clone DIR] [--live DIR] [--home DIR] [--help]
 
 Options:
-  --clone DIR   source repo whose main branch gets merged (default: this script's repo)
+  --clone DIR   the dev clone whose main branch is promoted (default: this script's repo)
   --home DIR    user home; <home>/.claude is the target (default: $HOME or $USERPROFILE)
-  --live DIR    the live install repo (default: <home>/.claude/ccpraxis)
+  --live DIR    the live install repo, created if missing (default: <home>/.claude/ccpraxis)
   --dry-run     compute and print everything; write nothing anywhere
   --help        this text
 
@@ -112,7 +130,8 @@ sub norm_for_cmp {
     my $a = -e $p ? (abs_path($p) // $p) : $p;
     $a =~ s{\\}{/}g;
     $a =~ s{/+\z}{};
-    return ($^O =~ /^(MSWin32|cygwin|msys)$/) ? lc($a) : $a;
+    # NTFS and APFS are case-insensitive, and abs_path keeps the case typed.
+    return ($^O =~ /^(MSWin32|cygwin|msys|darwin)$/) ? lc($a) : $a;
 }
 
 sub read_bytes {
@@ -586,27 +605,34 @@ sub main {
     # -----------------------------------------------------------------
     # Preflight (spec 3.1)
     # -----------------------------------------------------------------
-    my $preflight_error;
-    if (!-d $clone_dir || !is_git_worktree($clone_dir)) {
-        $preflight_error = "clone is missing or not a git work tree: $clone_dir";
-    } elsif (!-d $live_dir || !is_git_worktree($live_dir)) {
-        $preflight_error = "live is missing or not a git work tree: $live_dir";
-    } else {
-        my ($rc) = git_capture($clone_dir, 'rev-parse', '--verify', 'refs/heads/main');
-        $preflight_error = "clone has no main branch: $clone_dir" if $rc != 0;
-    }
-
-    if (defined $preflight_error) {
-        push @out, "merge: error $preflight_error";
+    # Every early stop prints the merge line(s) it was handed, then the
+    # not-run lines for the three syncs, and exits 2.
+    my $stop = sub {
+        my ($stderr_msg, @merge_lines) = @_;
+        push @out, @merge_lines;
         push @out, "claude-md: not-run";
         push @out, "settings: not-run";
         push @out, "marketplaces: not-run";
         push @out, "backup: none";
         push @out, "result: error";
-        print STDERR "promote: $preflight_error\n";
+        print STDERR "promote: $stderr_msg\n";
         print join("\n", @out) . "\n";
         exit 2;
+    };
+
+    # A missing live install is not an error: promotion is how one comes to
+    # exist. A path that exists but is not a git work tree is.
+    my $live_absent = !-e $live_dir;
+    my $preflight_error;
+    if (!-d $clone_dir || !is_git_worktree($clone_dir)) {
+        $preflight_error = "clone is missing or not a git work tree: $clone_dir";
+    } elsif (!$live_absent && (!-d $live_dir || !is_git_worktree($live_dir))) {
+        $preflight_error = "live exists but is not a git work tree: $live_dir";
+    } else {
+        my ($rc) = git_capture($clone_dir, 'rev-parse', '--verify', 'refs/heads/main');
+        $preflight_error = "clone has no main branch: $clone_dir" if $rc != 0;
     }
+    $stop->($preflight_error, "merge: error $preflight_error") if defined $preflight_error;
 
     # .backup-preferences.json is promote.pl's own control input (spec S3.5
     # item 16), not repo content -- functionally the same as an ignored file
@@ -615,109 +641,152 @@ sub main {
     # matching any depth per gitignore's basename-pattern rule). Exclude it
     # from the dirty check via pathspec magic rather than depending on a
     # .gitignore entry existing in every fixture.
-    my ($srtc, $status_text) = git_capture(
-        $live_dir, 'status', '--porcelain', '--untracked-files=all',
-        '--', '.', ':(exclude).backup-preferences.json',
-    );
-    if ($srtc == 0 && length $status_text) {
-        push @out, "merge: refused-dirty";
-        for my $line (split /\n/, $status_text) {
-            next unless length $line;
-            push @out, "  $line";
+    unless ($live_absent) {
+        my ($srtc, $status_text) = git_capture(
+            $live_dir, 'status', '--porcelain', '--untracked-files=all',
+            '--', '.', ':(exclude).backup-preferences.json',
+        );
+        if ($srtc == 0 && length $status_text) {
+            $stop->('live install has a dirty working tree',
+                'merge: refused-dirty', map { "  $_" } grep { length } split /\n/, $status_text);
         }
-        push @out, "claude-md: not-run";
-        push @out, "settings: not-run";
-        push @out, "marketplaces: not-run";
-        push @out, "backup: none";
-        push @out, "result: error";
-        print STDERR "promote: live install has a dirty working tree\n";
-        print join("\n", @out) . "\n";
-        exit 2;
     }
 
     # -----------------------------------------------------------------
-    # Merge (spec 3.2 / 3.8)
+    # Merge (spec 3.2 / 3.8): create, or fast-forward, never a merge commit
     # -----------------------------------------------------------------
     my ($crc, $clone_main) = git_line($clone_dir, 'rev-parse', 'main');
-    if ($crc != 0 || !length $clone_main) {
-        push @out, "merge: error cannot resolve clone main";
-        push @out, "claude-md: not-run";
-        push @out, "settings: not-run";
-        push @out, "marketplaces: not-run";
-        push @out, "backup: none";
-        push @out, "result: error";
-        print STDERR "promote: cannot resolve clone main\n";
-        print join("\n", @out) . "\n";
-        exit 2;
-    }
+    $stop->('cannot resolve clone main', 'merge: error cannot resolve clone main')
+        if $crc != 0 || !length $clone_main;
 
     my $payload_dir; # repo to read global-config/* from
     my $payload_ref; # ref within that repo
     my $sync_stopped = 0;
-    my $live_only_commits = 0; # dry-run only: live HEAD has commits clone main lacks
 
     # Decision 27's baseline for the settings.json array-unit widening merge:
-    # the live install's HEAD *before* this run's merge changes it. Captured
-    # here, before the pull below can move it. --dry-run never pulls, so
-    # live's HEAD is unchanged throughout and IS the baseline (spec: "in
-    # --dry-run the live HEAD is the baseline").
+    # the live install's HEAD *before* this run moves it. Captured before the
+    # fast-forward below; --dry-run never moves live, so there live's HEAD is
+    # the baseline throughout (spec: "in --dry-run the live HEAD is the
+    # baseline"). A live install created by this run has no baseline.
     my $baseline_sha;
 
-    if ($mode eq 'apply') {
+    # The live-only-commits refusal, shared by apply and dry-run (AC-13: the
+    # preview refuses exactly where the real run would).
+    my $refuse_live_only = sub {
+        my ($live_head, @commit_lines) = @_;
+        $stop->('the live install has commits the dev clone does not',
+            'merge: refused-live-only-commits ' . short_sha($live_head) . ' is not in the clone\'s main',
+            (map { "  $_" } @commit_lines),
+            '  the live install only ever takes code from the dev clone, so these were made in it some other way',
+            '  resolve: bring them into the dev clone, then promote again:',
+            '    git -C ' . git_path($clone_dir) . ' pull --no-rebase ' . git_path($live_dir) . ' main');
+    };
+
+    if ($live_absent) {
+        if ($mode eq 'apply') {
+            my $parent = dirname($live_dir);
+            make_path($parent) unless -d $parent;
+            my ($rc, undef, $err) = git_capture($parent, 'clone', '-q', '--no-hardlinks',
+                '--branch', 'main', git_path($clone_dir), basename($live_dir));
+            if ($rc != 0) {
+                $stop->("cannot create the live install\n$err", 'merge: failed creating the live install',
+                    map { "  $_" } grep { length } split /\n/, $err);
+            }
+            push @out, 'merge: created ' . git_path($live_dir) . ' from the clone\'s main at ' . short_sha($clone_main);
+            push @out, '  next: perl ' . git_path(pjoin($live_dir, 'install.pl')) . ' (PATH, skill links and plugin registration)';
+            $payload_dir = $live_dir;
+            $payload_ref = 'HEAD';
+        } else {
+            push @out, 'merge: would-create ' . git_path($live_dir) . ' from the clone\'s main at ' . short_sha($clone_main);
+            $payload_dir = $clone_dir;
+            $payload_ref = 'main';
+        }
+    } elsif ($mode eq 'apply') {
         my $pre_head = head_sha($live_dir);
         $baseline_sha = $pre_head;
-        if (is_ancestor($live_dir, $clone_main, 'HEAD')) {
+        if (defined $pre_head && $pre_head eq $clone_main) {
             push @out, "merge: up-to-date";
         } else {
-            my ($prc, undef, $perr) = git_capture(
-                $live_dir, 'pull', '--no-rebase', '--ff', '--no-edit', '-q', git_path($clone_dir), 'main',
-            );
-            if ($prc != 0) {
-                if (-f pjoin($live_dir, '.git', 'MERGE_HEAD')) {
-                    git_capture($live_dir, 'merge', '--abort');
-                }
-                push @out, "merge: failed";
-                for my $line (split /\n/, $perr) {
-                    next unless length $line;
-                    push @out, "  $line";
-                }
-                push @out, "claude-md: not-run";
-                push @out, "settings: not-run";
-                push @out, "marketplaces: not-run";
-                push @out, "backup: none";
-                push @out, "result: error";
-                print STDERR "promote: merge failed\n$perr";
-                print join("\n", @out) . "\n";
-                exit 2;
+            # Bring the clone's main into live's object store first, so the
+            # ancestry test below sees both histories. Writes only under
+            # .git (objects, FETCH_HEAD), never the work tree.
+            my ($frc, undef, $ferr) = git_capture($live_dir, 'fetch', '-q', '--no-tags', git_path($clone_dir), 'main');
+            if ($frc != 0) {
+                $stop->("fetching the clone's main into the live install failed\n$ferr", 'merge: failed',
+                    map { "  $_" } grep { length } split /\n/, $ferr);
+            }
+            if (!is_ancestor($live_dir, $pre_head, $clone_main)) {
+                my (undef, $log) = git_line($live_dir, 'log', '--format=%h %s', '-n', '20', "$clone_main..$pre_head");
+                $refuse_live_only->($pre_head, grep { length } split /\n/, $log);
+            }
+            my ($mrc, undef, $merr) = git_capture($live_dir, 'merge', '--ff-only', '-q', $clone_main);
+            if ($mrc != 0) {
+                $stop->("fast-forward failed\n$merr", 'merge: failed',
+                    map { "  $_" } grep { length } split /\n/, $merr);
             }
             my $new_head = head_sha($live_dir);
-            my ($pcrc, $parents) = git_line($live_dir, 'log', '-1', '--pretty=%P');
-            my $parent_count = length($parents) ? scalar(split ' ', $parents) : 0;
             my (undef, $count) = git_line($live_dir, 'rev-list', '--count', "$pre_head..$new_head");
-            my $kind = ($parent_count == 2) ? 'merged' : 'fast-forward';
-            push @out, "merge: $kind " . short_sha($pre_head) . '..' . short_sha($new_head) . " ($count commits)";
+            push @out, "merge: fast-forward " . short_sha($pre_head) . '..' . short_sha($new_head) . " ($count commits)";
         }
         $payload_dir = $live_dir;
         $payload_ref = 'HEAD';
     } else {
         my $live_head = head_sha($live_dir);
         $baseline_sha = $live_head;
-        if (is_ancestor($live_dir, $clone_main, 'HEAD')) {
+        if (defined $live_head && $live_head eq $clone_main) {
             push @out, "merge: up-to-date";
+        } elsif (defined $live_head && is_ancestor($clone_dir, $live_head, 'main')) {
+            push @out, "merge: would-fast-forward " . short_sha($live_head) . ' <- ' . short_sha($clone_main);
         } else {
-            push @out, "merge: would-merge " . short_sha($live_head) . ' <- ' . short_sha($clone_main);
-        }
-        if (defined $live_head) {
-            $live_only_commits = is_ancestor($clone_dir, $live_head, 'main') ? 0 : 1;
+            # The clone may not even hold live's HEAD object; then it cannot
+            # list the commits, but the verdict is the same.
+            my ($lrc, $log) = defined $live_head
+                ? git_line($clone_dir, 'log', '--format=%h %s', '-n', '20', "main..$live_head")
+                : (1, '');
+            $refuse_live_only->($live_head // '', $lrc == 0 ? (grep { length } split /\n/, $log) : ());
         }
         $payload_dir = $clone_dir;
         $payload_ref = 'main';
     }
 
+    # The live install's origin is the dev clone it is promoted from. A
+    # GitHub origin left by the old workflow (when the backup pushed from the
+    # live install) is replaced: removing the remote drops its stale
+    # remote-tracking refs and upstream config with it.
+    unless ($live_absent) {
+        my $want = git_path($clone_dir);
+        my ($orc, $origin) = git_line($live_dir, 'remote', 'get-url', 'origin');
+        my $same = $orc == 0 && length $origin && do {
+            (my $o = $origin) =~ s{^file://}{};
+            my $no = norm_for_cmp($o);
+            defined $no && $no eq norm_for_cmp($clone_dir);
+        };
+        unless ($same) {
+            my $was = $orc == 0 && length $origin ? " (was $origin)" : '';
+            if ($mode eq 'apply') {
+                git_capture($live_dir, 'remote', 'remove', 'origin') if $orc == 0;
+                my ($arc, undef, $aerr) = git_capture($live_dir, 'remote', 'add', 'origin', $want);
+                if ($arc != 0) {
+                    $bump->(2);
+                    push @out, "  origin: error setting it to $want: $aerr";
+                } else {
+                    push @out, "  origin: set to the dev clone $want$was";
+                }
+            } else {
+                push @out, "  origin: would-set to the dev clone $want$was";
+            }
+        }
+    }
+
     # -----------------------------------------------------------------
     # CLAUDE.md (spec 3.3)
     # -----------------------------------------------------------------
-    my $relpath_claude = 'global-config/CLAUDE.md';
+    # The installed file is built, not copied: the shared payload file plus
+    # this host's own part (GlobalClaudeMd). Every comparison below is
+    # against that rendering, and the local-edit check accepts a line that
+    # any version of any part ever held, so a line moving between the shared
+    # file and a platform part is never mistaken for a hand edit.
+    my $relpath_claude = GlobalClaudeMd::SHARED_RELPATH;
     my $home_claude = pjoin($home_dir, '.claude', 'CLAUDE.md');
     my @claude_lines;
     my $claude_status;
@@ -725,15 +794,31 @@ sub main {
     if (!blob_exists($payload_dir, $payload_ref, $relpath_claude)) {
         $claude_status = 'skipped-no-payload';
     } else {
-        my $payload_bytes = show_blob($payload_dir, $payload_ref, $relpath_claude);
-        $payload_bytes = '' unless defined $payload_bytes;
+        my $payload_bytes = GlobalClaudeMd::render_with(
+            sub { show_blob($payload_dir, $payload_ref, $_[0]) }) // '';
+        my $shared_bytes = show_blob($payload_dir, $payload_ref, $relpath_claude) // '';
 
         if (-l $home_claude) {
             my $target = readlink($home_claude) // '';
             my $target_abs = norm_for_cmp(rel2abs_ourselves($target, dirname($home_claude)));
             my $expected = norm_for_cmp(pjoin($live_dir, $relpath_claude));
-            if (defined $target_abs && $target_abs eq $expected) {
+            my $to_payload = defined $target_abs && $target_abs eq $expected;
+            if ($to_payload && $payload_bytes eq $shared_bytes) {
+                # A link to the shared file is still the whole answer on a
+                # host with no part of its own.
                 $claude_status = 'linked';
+            } elsif ($to_payload) {
+                # This host has a part of its own, which a link to the shared
+                # file cannot carry: replace the link with the built file.
+                # The link holds no content, so there is nothing to back up.
+                if ($mode eq 'apply') {
+                    unlink $home_claude;
+                    my $err = write_bytes_atomic($home_claude, $payload_bytes);
+                    if (defined $err) { $bump->(2); $claude_status = "error $err"; }
+                    else { $claude_status = 'replaced-link'; }
+                } else {
+                    $claude_status = 'would-replace-link';
+                }
             } else {
                 $bump->(1);
                 $claude_status = "refused-symlink $target";
@@ -752,9 +837,10 @@ sub main {
             if ($norm->($home_bytes) eq $norm->($payload_bytes)) {
                 $claude_status = 'unchanged';
             } else {
-                my @hist = ($payload_bytes, payload_versions_bytes($payload_dir, $payload_ref, $relpath_claude));
-                if ($mode eq 'dry-run') {
-                    push @hist, payload_versions_bytes($live_dir, 'HEAD', $relpath_claude);
+                my @hist = ($payload_bytes);
+                for my $part (GlobalClaudeMd::all_part_relpaths()) {
+                    push @hist, payload_versions_bytes($payload_dir, $payload_ref, $part);
+                    push @hist, payload_versions_bytes($live_dir, 'HEAD', $part) if $mode eq 'dry-run';
                 }
                 my %line_set;
                 for my $ver (@hist) {
@@ -789,7 +875,8 @@ sub main {
                         push @claude_lines, "  L$o->{n}: $o->{text}";
                     }
                     push @claude_lines,
-                        "  resolve: fold these lines into global-config/CLAUDE.md in the clone and promote again, or delete them from the live file.";
+                        "  resolve: fold these lines into the dev clone's global-config/CLAUDE.md (every host) or this host's part ("
+                        . (GlobalClaudeMd::host_part_relpath() // 'none on this host') . ") and promote again, or delete them from the live file.";
                 }
             }
         }
@@ -1025,14 +1112,6 @@ sub main {
         }
     }
     push @out, "settings: $settings_status";
-    if ($mode eq 'dry-run' && $live_only_commits) {
-        push @out,
-            "  caveat: preview ignores live-only commits -- live HEAD " . short_sha($baseline_sha)
-            . " has commits clone main " . short_sha($clone_main)
-            . " lacks; a real promote merges first, so the result may differ either way --"
-            . " apply may report or perform changes this preview doesn't show, or this"
-            . " preview's 'removed'/'updated' lines may not happen";
-    }
     push @out, @settings_lines;
 
     # -----------------------------------------------------------------

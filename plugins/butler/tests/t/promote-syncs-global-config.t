@@ -21,8 +21,9 @@
 #   AC-2  stale-by-line-union (home built from lines each in SOME version)
 #   AC-3  local edit refused, offending line(s) reported, no backup
 #   AC-4  dirty live refuses the merge (tracked-modified and untracked cases)
-#   AC-5  fast-forward vs merge-commit vs up-to-date on a second run
-#   AC-6  merge conflict aborts cleanly, no half state
+#   AC-5  fast-forward, then up-to-date on a second run; a live install
+#         with commits of its own is refused, never merged
+#   AC-6  a would-be merge conflict is refused the same way, no half state
 #   AC-7  payload read AFTER the merge (post-merge HEAD, not pre-merge)
 #   AC-8  unchanged (CRLF-only) / installed (missing home file) / symlink
 #   AC-9  the settings.json unit-merge table, row by row
@@ -408,10 +409,11 @@ for my $case (qw(tracked-modified untracked)) {
 }
 
 # ===========================================================================
-# AC-5: merge happens. Clone main ahead of live: without a live-only commit
-# -> fast-forward (1 parent). With one -> merged (2 parents). Either way
-# clone main becomes an ancestor of live HEAD. A second run reports
-# up-to-date.
+# AC-5: the live install moves by fast-forward only. Clone main ahead of
+# live -> fast-forward (1 parent), clone main becomes live HEAD, and a
+# second run reports up-to-date. A live install with a commit of its own
+# (the old backup committed there) is REFUSED: exit 2, the commit is named,
+# the resolve line says how to bring it into the clone, live is untouched.
 # ===========================================================================
 {
     my $f = new_fixture(clone_commits => [
@@ -439,15 +441,30 @@ for my $case (qw(tracked-modified untracked)) {
     ]);
     clone_extra_commit($f, { 'clone-only.txt' => "clone-side commit\n" }, 'clone ahead');
 
+    my $pre_head = head_sha($f, $f->{live});
+
     my $r = run_promote($f);
-    is($r->{exit}, 0, 'AC-5 (merge commit): exit 0') or diag($r->{out} . $r->{err});
-    like($r->{out}, qr/^merge: merged/m, 'AC-5 (merge commit): report says merged') or diag($r->{out});
-    is(head_parent_count($f, $f->{live}), 2, 'AC-5 (merge commit): live HEAD has exactly 2 parents');
+    is($r->{exit}, 2, 'AC-5 (live-only commit): exit 2') or diag($r->{out} . $r->{err});
+    like($r->{out}, qr/^merge: refused-live-only-commits/m, 'AC-5 (live-only commit): report says refused-live-only-commits') or diag($r->{out});
+    like($r->{out}, qr/^  \S+ live-only commit$/m, 'AC-5 (live-only commit): the live-only commit is listed by subject') or diag($r->{out});
+    like($r->{out}, qr/pull --no-rebase \S+ main/, 'AC-5 (live-only commit): the resolve line names the pull into the clone') or diag($r->{out});
+    is(head_sha($f, $f->{live}), $pre_head, 'AC-5 (live-only commit): live HEAD unchanged');
+    is(head_parent_count($f, $f->{live}), 1, 'AC-5 (live-only commit): no merge commit was made');
+    like($r->{out}, qr/^claude-md: not-run/m, 'AC-5 (live-only commit): the syncs did not run') or diag($r->{out});
+
+    # Following the resolve line converges the two: the clone takes the live
+    # commit, and the next promote is a plain fast-forward.
+    git_run($f, $f->{clone}, 'pull', '-q', '--no-rebase', '--no-edit', to_gp($f->{live}), 'main');
+    my $r2 = run_promote($f);
+    is($r2->{exit}, 0, 'AC-5 (after the resolve pull): exit 0') or diag($r2->{out} . $r2->{err});
+    like($r2->{out}, qr/^merge: fast-forward/m, 'AC-5 (after the resolve pull): fast-forward') or diag($r2->{out});
+    is(head_sha($f, $f->{live}), head_sha($f, $f->{clone}), 'AC-5 (after the resolve pull): live HEAD == clone main');
 }
 
 # ===========================================================================
-# AC-6: merge conflict. Clone and live change the same line of one tracked
-# file. Exit 2, merge: failed, live HEAD == pre-run HEAD, status clean, no
+# AC-6: what used to be a merge conflict (clone and live change the same
+# line of one tracked file) never reaches a merge now: live's own commit is
+# refused up front. Exit 2, live HEAD == pre-run HEAD, status clean, no
 # MERGE_HEAD, home files unchanged.
 # ===========================================================================
 {
@@ -463,8 +480,8 @@ for my $case (qw(tracked-modified untracked)) {
     my $pre_claude = read_bytes("$f->{home}/.claude/CLAUDE.md");
 
     my $r = run_promote($f);
-    is($r->{exit}, 2, 'AC-6: exit 2 on a merge conflict') or diag($r->{out} . $r->{err});
-    like($r->{out}, qr/^merge: failed/m, 'AC-6: report says merge: failed') or diag($r->{out});
+    is($r->{exit}, 2, 'AC-6: exit 2 when live has a conflicting commit of its own') or diag($r->{out} . $r->{err});
+    like($r->{out}, qr/^merge: refused-live-only-commits/m, 'AC-6: report says refused-live-only-commits') or diag($r->{out});
     is(head_sha($f, $f->{live}), $pre_head, 'AC-6: live HEAD equals the pre-run HEAD');
     is(status_porcelain($f, $f->{live}), '', 'AC-6: git status --porcelain is empty (no half-finished merge)');
     ok(!-f "$f->{live}/.git/MERGE_HEAD", 'AC-6: no MERGE_HEAD file remains');
@@ -751,7 +768,7 @@ SKIP: {
 
 # ===========================================================================
 # AC-13: dry-run writes nothing. Stale CLAUDE.md + updatable settings +
-# clone-ahead-of-live: --dry-run exits 0, prints would-merge/would-refresh/
+# clone-ahead-of-live: --dry-run exits 0, prints would-fast-forward/would-refresh/
 # would-update, and afterward live HEAD, git status, and every file under
 # the fixture .claude are byte-unchanged, with no .promotion-backups
 # directory. A local-edit CLAUDE.md under --dry-run exits 1 with the same
@@ -775,7 +792,7 @@ SKIP: {
 
     my $r = run_promote($f, '--dry-run');
     is($r->{exit}, 0, 'AC-13: dry-run exits 0') or diag($r->{out} . $r->{err});
-    like($r->{out}, qr/^merge: would-merge/m, 'AC-13: report says would-merge') or diag($r->{out});
+    like($r->{out}, qr/^merge: would-fast-forward/m, 'AC-13: report says would-fast-forward') or diag($r->{out});
     like($r->{out}, qr/^claude-md: would-refresh/m, 'AC-13: report says claude-md: would-refresh') or diag($r->{out});
 
     is(head_sha($f, $f->{live}), $pre_head, 'AC-13: live HEAD is unchanged after dry-run');

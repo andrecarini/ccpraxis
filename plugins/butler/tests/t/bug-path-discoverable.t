@@ -69,6 +69,13 @@ sub read_raw {
 }
 
 my $raw = read_raw($CLAUDE_MD);
+
+# The installed ~/.claude/CLAUDE.md is built from the shared file plus one
+# platform part (GlobalClaudeMd), so the payload as a whole -- what sections B
+# and C guard -- is every part, in GlobalClaudeMd::all_part_relpaths() order.
+use lib "$Bin/../../../steward/scripts";
+use GlobalClaudeMd ();
+my $all = join '', map { -f "$REPO_ROOT/$_" ? read_raw("$REPO_ROOT/$_") : '' } GlobalClaudeMd::all_part_relpaths();
 ok(length($raw) > 0, 'global-config/CLAUDE.md is non-empty') or BAIL_OUT('empty file, nothing to check');
 
 # ---------------------------------------------------------------------------
@@ -122,7 +129,7 @@ sub sentence_matches {
 #    pointer to a channel that no longer exists.
 # ===========================================================================
 {
-    unlike($raw, qr/SendFeedback/,
+    unlike($all, qr/SendFeedback/,
         'B1 (superseded): global-config/CLAUDE.md no longer mentions SendFeedback -- '
       . 'it is denied globally, so no prose should point a reader at it');
 }
@@ -132,16 +139,20 @@ sub sentence_matches {
 #    its original relative order. See "Technique" in the file header.
 # ===========================================================================
 {
-    # Baseline: ordered MD5 hashes of every line in global-config/CLAUDE.md
-    # as of 2026-10-29, regenerated when the file was made platform-aware:
-    # the Windows-only sections moved under "## Windows host" (headings
-    # demoted to ###, bodies byte-identical), a "## macOS host" section and
-    # a "## Host platform" rule were added, and the python house rule lost
-    # its Windows-only claim. The previous floor (2026-09-22, 103 lines) was
-    # itself a regeneration after the SendFeedback pointer was removed per
-    # operator instruction (section B above, bug 20260922-205201-f421). This
-    # IS the floor additive-only checks against, not a historical snapshot.
-    # 149 lines.
+    # Baseline: ordered MD5 hashes of every line of the global payload --
+    # global-config/CLAUDE.md, then CLAUDE.macos.md, then CLAUDE.windows.md
+    # (GlobalClaudeMd::all_part_relpaths order) -- as of 2026-10-30, when the
+    # payload was split per platform on the operator's instruction ("ccpraxis
+    # should put into the live machinery only the relevant parts"): promote
+    # now builds ~/.claude/CLAUDE.md from the shared file plus this host's
+    # part, so the "## Host platform" selection rule was dropped, the Glob
+    # non-ASCII-path rule moved into the Windows part, and the python house
+    # rule lost its host names. The 2026-10-29 floor (149 lines) had been
+    # regenerated during an unattended run for the platform-sections layout
+    # this split replaces; the one before it (2026-09-22, 103 lines) followed
+    # the operator-instructed SendFeedback removal (section B above, bug
+    # 20260922-205201-f421). This IS the floor additive-only checks against,
+    # not a historical snapshot. 146 lines.
     my @BASELINE_LINE_HASHES = (
         '39dbf6c7953b868bed9faa8584f53aa8',
         'd41d8cd98f00b204e9800998ecf8427e',
@@ -181,11 +192,10 @@ sub sentence_matches {
         'd41d8cd98f00b204e9800998ecf8427e',
         '5f35a6b57dc01953c216143005077495',
         'd41d8cd98f00b204e9800998ecf8427e',
-        'dc13154b9f12c51aeb985b69eb605066',
+        'b775238d005a6e5ad88c677a18bd91d6',
         '113485088cd95f98b7f152df317d1c7c',
         '0e28a87a7c1e2ace9d012e97c057ee16',
         '55ef4bf5f0d04b943d333f2ffe6a837a',
-        'ff90a68c47dc83b5bec93f51f5e71cd9',
         'b4159efd6a1d3983495c8244d19e2f31',
         '5d30f0dbefec0be27834152bc6a31d10',
         'd41d8cd98f00b204e9800998ecf8427e',
@@ -217,12 +227,23 @@ sub sentence_matches {
         '0c7b0b1538d13a734e5553195269ae15',
         'd41d8cd98f00b204e9800998ecf8427e',
         'c033b17b8e4215336ce603f595d3c80e',
+        'a37cdee939e47d363e4ff5d0feabd2f7',
         'd41d8cd98f00b204e9800998ecf8427e',
-        'cc36fe138db6d52c6949ba7c2db91774',
-        'd41d8cd98f00b204e9800998ecf8427e',
-        '79f6069d25f7374974dad3229211c935',
-        'd41d8cd98f00b204e9800998ecf8427e',
+        'd41a010f6f00405202e74637f2e8b4af',
+        '8c1e8526a8755b42df35561f8c75766e',
+        '20f04fcb322afef6f33d21d3f6ea5487',
+        'd0421f842d5c47aadcd61567d60f121e',
+        '21475491bb80442b8e1898a9b656be61',
+        '87bf35d4769a4d66e3a6fafa92764845',
+        '9cec9540823250b67625027216d6597f',
+        'f47f86b0d1909d5fdb9d9ecaddbb9936',
+        '37c30bc1c22a55a004d6213c0af98a5e',
+        'aaa9e793f53bcd08b2674602414d7953',
         '640bcf0eba4bf0be54e1dfab20f81303',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        '14601e3e7b83516dc68e1dcb425b27c0',
+        'd41d8cd98f00b204e9800998ecf8427e',
+        '756eaf050da93158d068e45cfab8a614',
         'd41d8cd98f00b204e9800998ecf8427e',
         'bce35cf9e065541867c4b08e02af5da4',
         'd41d8cd98f00b204e9800998ecf8427e',
@@ -279,33 +300,20 @@ sub sentence_matches {
         'c25754e0c6c5e180f9c8bb0b6ef50cb4',
         'e4c45f96d1a4aacdbe6c5deb0760c009',
         'b81a80ad04ee375504da3b8d523d7ce3',
-        'd41d8cd98f00b204e9800998ecf8427e',
-        'a37cdee939e47d363e4ff5d0feabd2f7',
-        'd41d8cd98f00b204e9800998ecf8427e',
-        'd41a010f6f00405202e74637f2e8b4af',
-        '8c1e8526a8755b42df35561f8c75766e',
-        '20f04fcb322afef6f33d21d3f6ea5487',
-        'd0421f842d5c47aadcd61567d60f121e',
-        '21475491bb80442b8e1898a9b656be61',
-        '87bf35d4769a4d66e3a6fafa92764845',
-        '9cec9540823250b67625027216d6597f',
-        'f47f86b0d1909d5fdb9d9ecaddbb9936',
-        '37c30bc1c22a55a004d6213c0af98a5e',
-        'aaa9e793f53bcd08b2674602414d7953',
     );
 
-    is(scalar(@BASELINE_LINE_HASHES), 149,
-        'C0: baseline itself carries the expected 149 lines (sanity check on this test, not the fixture)');
+    is(scalar(@BASELINE_LINE_HASHES), 146,
+        'C0: baseline itself carries the expected 146 lines (sanity check on this test, not the fixture)');
 
     # Re-hash the CURRENT file's lines the same way the baseline was produced:
     # split on \n, strip a trailing \r (tolerate either line-ending style),
     # md5 each line's text.
-    my @current_lines = split /\n/, $raw, -1;
+    my @current_lines = split /\n/, $all, -1;
     pop @current_lines if @current_lines && $current_lines[-1] eq '';
     my @current_hashes = map { my $l = $_; $l =~ s/\r\z//; md5_hex($l) } @current_lines;
 
     ok(scalar(@current_hashes) >= scalar(@BASELINE_LINE_HASHES),
-        'C1: current file has at least as many lines as the baseline (additive, never shrinks)')
+        'C1: the current payload has at least as many lines as the baseline (additive, never shrinks)')
         or diag(sprintf('current=%d baseline=%d', scalar(@current_hashes), scalar(@BASELINE_LINE_HASHES)));
 
     # Subsequence check: every baseline hash must appear in current_hashes,
@@ -319,7 +327,7 @@ sub sentence_matches {
     $first_missing_baseline_index = $bi if $bi <= $#BASELINE_LINE_HASHES;
 
     ok(!defined($first_missing_baseline_index),
-        'C2: every pre-existing line (baseline, 149 lines) is still present in the current file, '
+        'C2: every pre-existing line (baseline, 146 lines) is still present in the current file, '
       . 'in its original relative order -- an additive-only diff')
         or diag(defined($first_missing_baseline_index)
             ? "first baseline line not found as a subsequence element: baseline index $first_missing_baseline_index "
