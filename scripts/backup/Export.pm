@@ -1161,16 +1161,24 @@ sub _do_sensitive_scan {
         return { failed => 'sensitive scan: aborted by operator (findings not resolved)' };
     }
 
-    # The dev clone is what gets committed and pushed, so it is what is
-    # scanned (its non-ignored files: sensitive-check.pl skips what git
-    # ignores).
-    my $r = _run_capture($^X, "$root/plugins/steward/scripts/sensitive-check.pl", $repo);
+    # Exactly the files the export commit can contain -- the ones this run
+    # wrote into the dev clone (the commit takes those of them git sees as
+    # changed, and nothing else). The developer's untracked work in progress
+    # is not the backup's to commit, so it is not the backup's to scan:
+    # /steward:upstream-sync scans what a push actually sends.
+    my @files = grep { -f "$repo/$_" } _written_paths($ctx);
+    unless (@files) {
+        $ctx->{checkpoint}->('sensitive_scan', { attempt => $attempt, clean => 1, files => [] });
+        $ctx->{note}->('sensitive_scan', { attempt => $attempt, clean => 1, files => [] });
+        return {};
+    }
+    my $r = _run_capture($^X, "$root/plugins/steward/scripts/sensitive-check.pl", $repo, map { ('--file', $_) } @files);
     unless ($r->{spawned}) {
         return { failed => 'sensitive-check.pl failed to spawn' };
     }
     if ($r->{exit} == 0) {
-        $ctx->{checkpoint}->('sensitive_scan', { attempt => $attempt, clean => 1 });
-        $ctx->{note}->('sensitive_scan', { attempt => $attempt, clean => 1 });
+        $ctx->{checkpoint}->('sensitive_scan', { attempt => $attempt, clean => 1, files => [ @files ] });
+        $ctx->{note}->('sensitive_scan', { attempt => $attempt, clean => 1, files => [ @files ] });
         return {};
     }
     if ($r->{exit} == 1) {

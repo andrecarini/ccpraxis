@@ -81,10 +81,9 @@ sub fixture {
     write_text("$clone/global-config/known_marketplaces.json", "{}\n");
     write_text("$clone/skills/.keep", '');
     for my $name (qw(ccpraxis-helpers.pl sync-export.pl json-diff.pl filter-diff.pl save-preference.pl
-                     DevClone.pm MachineLocalSettings.pm GlobalClaudeMd.pm)) {
+                     sensitive-check.pl DevClone.pm MachineLocalSettings.pm GlobalClaudeMd.pm)) {
         write_text("$clone/plugins/steward/scripts/$name", read_text("$SCRIPTS/$name"));
     }
-    write_text("$clone/plugins/steward/scripts/sensitive-check.pl", stub("print \"No sensitive data found.\\n\"; exit 0;\n"));
     write_text("$clone/scripts/lint-readme-paths.pl", stub("exit 0;\n"));
     write_text("$clone/scripts/gen-readme-tree.pl", stub("exit 0;\n"));
     write_text("$clone/scripts/promote.pl", read_text("$REPO/scripts/promote.pl"));
@@ -298,6 +297,32 @@ for my $case (
     is($resp2->{exit}, 10, '[refused] the run goes on to the export') or diag($resp2->{out});
     is(((decisions($resp2))[0] // {})->{kind}, 'claude_md_drift', '[refused] ...which asks about the CLAUDE.md difference');
     ok(!$state->{phases}{preflight}{error}, '[refused] the preflight did not fail over it');
+}
+
+# ---------------------------------------------------------------------------
+# The secret scan covers exactly what the export commit will contain: the
+# developer's untracked work in progress (credential-shaped text and all)
+# does not block a local export; a credential going INTO the payload does.
+# ---------------------------------------------------------------------------
+{
+    my $r = fixture(payload => $PAYLOAD, live => $LIVE);
+    write_text("$r->{clone}/wip-notes.json", qq({"token":"sk-ant-api03-work-in-progress"}\n));
+    my $resp = backup($r);
+    my $resp2 = answer($r, $resp, 'preflight.settings.theme' => 'use_live');
+    is($resp2->{exit}, 0, '[scan] untracked work in progress with a credential does not block the export') or diag($resp2->{out});
+    is(git_out($r->{home}, $r->{clone}, 'show', '--name-only', '--format=', 'HEAD'), 'global-config/settings.json',
+        '[scan] the export was committed, without the untracked file');
+    my $state = json_file($r->{state});
+    is(join(',', @{ $state->{phases}{export}{items}{sensitive_scan}{data}{files} // [] }), 'global-config/settings.json',
+        '[scan] exactly the file to be committed was scanned');
+
+    my $r2 = fixture(payload => $PAYLOAD, live => qq({"keep":1,"theme":"dark","apiKey":"sk-ant-api03-exported-by-mistake"}\n));
+    my $resp3 = backup($r2);
+    my $resp4 = answer($r2, $resp3, 'preflight.settings.apiKey' => 'export_to_repo');
+    is($resp4->{exit}, 10, '[scan] a credential sent to the payload stops at the scan') or diag($resp4->{out});
+    is(((decisions($resp4))[0] // {})->{kind}, 'sensitive_finding', '[scan] ...as a sensitive_finding question');
+    like(((decisions($resp4))[0] // {})->{detail} // '', qr{global-config/settings\.json:\d+}, '[scan] ...naming the payload file');
+    is(commits($r2), 1, '[scan] nothing was committed');
 }
 
 done_testing();

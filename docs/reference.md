@@ -113,7 +113,7 @@ are involved ([Working on ccpraxis](working-on-ccpraxis.md)): the live install
    `~/.claude/CLAUDE.md` hand edit is never exported: rebuild it or fold the lines into the
    payload by hand.
 5. **Exports and commits** only what was sent to the payload, into the dev clone's working
-   tree, after a secret scan of the dev clone; the commit (`backup: sync ccpraxis config (N
+   tree, after a secret scan of exactly those files; the commit (`backup: sync ccpraxis config (N
    file(s))`) holds those files and nothing else of the developer's. Values sent back into
    `~/.claude` are written with the token expanded, never the raw `${CCPRAXIS_LIVE}`.
 6. **Promotes again**, without a question, when every commit the live install lacks is a
@@ -179,7 +179,7 @@ To change what's offered by default, edit `@DEFAULT_TRACKABLE` and `%HARD_EXCLUD
 - Two-level locking (vault `.lock` + per-project `.lock`) with PID+ISO-timestamp and 10-min stale reclaim
 - Atomic `.vault-sync.tmp` staging + batch-rename of staged files
 - Journal at `<vault>/projects/<slug>/.sync-journal.json` with phases (`staging` → `awaiting_resolution` → `renaming` → `sensitive_check` → `committing`); reconciliation on every sync start so an interrupted sync recovers cleanly
-- Secret-scanning is intentionally **not** applied to the private vault — it's a personal backup, so it stores project content (CLAUDE.md, blueprints) verbatim. Secret-scanning is the *public* ccpraxis repo's job only (`sensitive-check.pl`, run by `/steward:backup` before its export commit and by `/steward:upstream-sync` before a push). The vault scan hooks (`scan_files_for_secrets`, the `sensitive_check` journal phase) remain in code but are disabled by policy — re-enable by restoring `scan_files_for_secrets`
+- Secret-scanning is intentionally **not** applied to the private vault — it's a personal backup, so it stores project content (CLAUDE.md, blueprints) verbatim. Secret-scanning is the *public* ccpraxis repo's job only (`sensitive-check.pl`, run by `/steward:backup` on the files its export commit will contain, and by `/steward:upstream-sync` on what a push sends). The vault scan hooks (`scan_files_for_secrets`, the `sensitive_check` journal phase) remain in code but are disabled by policy — re-enable by restoring `scan_files_for_secrets`
 - File-modified-during-sync rollback (re-hash before final rename)
 - Path safety (no `..`, no absolute paths, no backslashes; symlinks skipped via `File::Find` preprocess)
 
