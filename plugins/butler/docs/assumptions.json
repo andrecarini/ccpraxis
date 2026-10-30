@@ -59,8 +59,6 @@
       "expected_contract": "$BP_CREDS_PATH, else ~/.claude/.credentials.json exists and is readable; mode 0600 (sandbox) / 0644 (cygwin-cosmetic on host). On macOS, with no such file, the login Keychain generic password 'Claude Code-credentials' holds the same JSON (read with `security find-generic-password -s ... -w`; never written, never copied to a file). One lookup for every reader: plugins/butler/scripts/BpCreds.pm.",
       "check": "stat + parse (file), or one bounded `security` read (macOS Keychain).",
       "supported_envs": ["win32", "sandbox-linux", "macos"],
-      "unverified_envs": ["macos"],
-      "unverified_note": "BpCreds reads the Keychain item through /usr/bin/security, but that read has never been run against the real item on a Mac (only against a stub): whether it succeeds without a Keychain access dialog is unconfirmed.",
       "implement_hint": "Teach BpCreds.pm where the new platform keeps Claude Code's grant; every reader (usage gate, preflight, drive-solo token recovery, sitrep/spend) goes through it.",
       "surface": "preflight"
     },
@@ -70,8 +68,6 @@
       "expected_contract": "claudeAiOauth.{accessToken:str, refreshToken:str, expiresAt:int(epoch ms), scopes:[str], subscriptionType:str, rateLimitTier:str}",
       "check": "parse + assert keys/types; expiresAt is epoch-ms (> 1e12).",
       "supported_envs": ["win32", "sandbox-linux", "macos"],
-      "unverified_envs": ["macos"],
-      "unverified_note": "The Keychain item's payload has never been read and validated on a Mac; the shape is assumed to match the file Claude Code writes elsewhere.",
       "implement_hint": "If Anthropic renames fields, update the contract + the write-back mapping; alarm on drift.",
       "surface": "both"
     },
