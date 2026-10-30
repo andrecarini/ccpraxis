@@ -955,15 +955,25 @@ sub main {
             MachineLocalSettings::expand_live_root($live_cmp, $live_dir);
             my $live_foreign = MachineLocalSettings::strip_foreign_platform_keys($live_cmp);
 
+            my @hist_bytes = payload_versions_bytes($payload_dir, $payload_ref, $relpath_settings);
+            push @hist_bytes, payload_versions_bytes($live_dir, 'HEAD', $relpath_settings) if $mode eq 'dry-run';
             my @hist_versions = ($payload_obj);
-            for my $b (payload_versions_bytes($payload_dir, $payload_ref, $relpath_settings)) {
+            for my $b (@hist_bytes) {
                 my ($v, $e) = decode_json_bytes($b);
                 push @hist_versions, $for_this_host->($v) unless $e;
             }
-            if ($mode eq 'dry-run') {
-                for my $b (payload_versions_bytes($live_dir, 'HEAD', $relpath_settings)) {
-                    my ($v, $e) = decode_json_bytes($b);
-                    push @hist_versions, $for_this_host->($v) unless $e;
+
+            # Every hook group any committed payload version registered, per
+            # event, read from the raw versions (before the foreign strip).
+            # Used below to tell a platform-only hook a promote installed on
+            # the wrong host from one the operator added there themselves.
+            my %payload_hook_groups;
+            for my $b ($payload_bytes, @hist_bytes) {
+                my ($v, $e) = decode_json_bytes($b);
+                next if $e || ref($v) ne 'HASH' || ref($v->{hooks}) ne 'HASH';
+                for my $ev (keys %{ $v->{hooks} }) {
+                    next unless ref($v->{hooks}{$ev}) eq 'ARRAY';
+                    $payload_hook_groups{$ev}{ canon_str($_) } = 1 for @{ $v->{hooks}{$ev} };
                 }
             }
 
@@ -1102,6 +1112,37 @@ sub main {
                             push @settings_lines, "  kept-local $u->{name}";
                         }
                     }
+                }
+            }
+
+            # A platform-only hook group foreign to this host that equals a
+            # group some committed payload version registered was installed by
+            # a promote, not by the operator: the first macOS install
+            # registered the Windows-only guards before they were platform-
+            # only, and they then started a perl process on every Bash and
+            # Edit call there for nothing. Such a group is removed. A foreign
+            # group no payload version ever had is the operator's own and is
+            # kept, like a foreign key.
+            {
+                my $pfx = MachineLocalSettings::HOOK_SAVE_PREFIX();
+                for my $sk (sort grep { index($_, $pfx) == 0 } keys %$live_foreign) {
+                    my $ev = substr($sk, length $pfx);
+                    my @keep;
+                    for my $entry (@{ $live_foreign->{$sk} }) {
+                        my $group = $entry->[1];
+                        if ($payload_hook_groups{$ev}{ canon_str($group) }) {
+                            my ($cmd) = map { (ref($_) eq 'HASH' && defined $_->{command}) ? $_->{command} : () }
+                                        @{ ref($group->{hooks}) eq 'ARRAY' ? $group->{hooks} : [] };
+                            my ($script) = (defined $cmd ? $cmd : '') =~ m{([\w.-]+\.pl)};
+                            push @settings_lines, "  removed-foreign-hook $ev " . ($script // 'hook')
+                                . ' (registered by an earlier promote; it applies to another platform only)';
+                            $count++;
+                        } else {
+                            push @keep, $entry;
+                        }
+                    }
+                    if (@keep) { $live_foreign->{$sk} = \@keep; }
+                    else       { delete $live_foreign->{$sk}; }
                 }
             }
 

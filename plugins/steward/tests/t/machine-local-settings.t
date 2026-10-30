@@ -298,6 +298,29 @@ SKIP: {
     }
     is(scalar(@{ $live->{hooks}{SessionStart} // [] }), 1, 'promote: a hook for every host arrives normally');
 
+    # 4a'. a platform-only hook group an EARLIER promote registered on the
+    # wrong host (the first macOS install had the Windows-only guards) is
+    # removed; a foreign-platform group no payload version ever had is the
+    # operator's own and stays.
+    {
+        my $own = { matcher => 'Write', hooks => [ { type => 'command', command => 'exec perl "$HOME/.claude/ccpraxis/scripts/hooks/block-nonascii-ps1.pl" --mine' } ] };
+        my $f2 = new_promote_fixture(live_settings => { theme => 'dark', hooks => { PreToolUse => [ $NUL_GROUP, $own ], SessionStart => [ $REAP_GROUP ] } });
+        my ($rc2, $out2, $err2) = promote($f2);
+        is($rc2, 0, 'promote (stale foreign hook): exit 0') or diag("$out2\n$err2");
+        my $l2 = read_json_file("$f2->{home}/.claude/settings.json");
+        my @cmds = map { $_->{hooks}[0]{command} } @{ $l2->{hooks}{PreToolUse} // [] };
+        if ($IS_WIN) {
+            ok((grep { /block-nul-redirect/ } @cmds), 'promote (windows host): the NUL guard stays registered');
+            unlike($out2, qr/removed-foreign-hook/, 'promote (windows host): nothing is foreign, nothing removed');
+        } else {
+            ok(!(grep { /block-nul-redirect/ } @cmds), 'promote (non-windows host): the NUL guard an earlier promote registered is removed');
+            like($out2, qr/^  removed-foreign-hook PreToolUse block-nul-redirect\.pl/m, 'promote (non-windows host): and the report says so');
+            ok((grep { /--mine/ } @cmds), 'promote (non-windows host): a foreign-platform group no payload ever had is kept');
+        }
+        my ($rc3, $out3) = promote($f2);
+        like($out3, qr/^settings: unchanged$/m, 'promote (stale foreign hook): a second run changes nothing') or diag($out3);
+    }
+
     # 4b. second promote is a no-op
     my $before = read_file("$f->{home}/.claude/settings.json");
     ($rc, $out, $err) = promote($f);
