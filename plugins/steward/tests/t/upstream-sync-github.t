@@ -257,9 +257,30 @@ sub push_choice {
     my $r = run_sync();
     is($r->{exit}, 20, 'scan: a finding stops the run (exit 20)') or diag($r->{out} . $r->{err});
     is($r->{json}{scan}{clean}, 0, 'scan: scan.clean == 0');
-    like($r->{json}{scan}{findings} // '', qr/leak\.json/, 'scan: the finding names the file');
+    like($r->{json}{scan}{findings} // '', qr/^\s+[0-9a-f]{12}\/leak\.json:1:/m, 'scan: the finding names the commit and the file');
     ok(!@{ $r->{json}{decisions} // [] }, 'scan: no push is offered');
     isnt(git_out($f->{gh}, 'rev-parse', 'main'), git_out($f->{clone}, 'rev-parse', 'main'), 'scan: nothing was pushed');
+}
+{
+    # What a push sends is every outgoing commit: a credential committed and
+    # removed again in a later outgoing commit is still caught.
+    my $f = fixture();
+    commit($f->{clone}, 'config.json', qq({"key":"sk-ant-api03-briefly-committed"}\n), 'add a key');
+    commit($f->{clone}, 'config.json', qq({"key":"from the environment"}\n), 'remove the key again');
+    my $r = run_sync();
+    is($r->{exit}, 20, 'scan: a credential in an intermediate outgoing commit stops the push') or diag($r->{out} . $r->{err});
+    like($r->{json}{scan}{findings} // '', qr/config\.json/, 'scan: ...naming the file');
+    is($r->{json}{scan}{commits_scanned}, 2, 'scan: both outgoing commits were scanned');
+}
+{
+    # A push never sends untracked files, so the developer's work in progress
+    # (credential-shaped text and all) does not block it.
+    my $f = fixture();
+    commit($f->{clone}, 'clean.json', qq({"ok":true}\n), 'clean work');
+    write_text("$f->{clone}/scratch.json", qq({"token":"sk-ant-api03-untracked-wip"}\n));
+    my $r = run_sync();
+    is($r->{exit}, 10, 'scan: an untracked file with a credential does not block the push question') or diag($r->{out} . $r->{err});
+    is($r->{json}{scan}{clean}, 1, 'scan: the outgoing commits scan clean');
 }
 {
     my $f = fixture();

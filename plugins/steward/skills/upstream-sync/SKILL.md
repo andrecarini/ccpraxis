@@ -1,6 +1,6 @@
 ---
 name: upstream-sync
-description: The GitHub side of ccpraxis, for the dev clone only — fetches your fork (origin), integrates origin/main into the dev clone's main (fast-forward or a merge commit; stops cleanly on a conflict or when the merge would touch your uncommitted files), scans for secrets, and pushes main after you confirm the exact list of outgoing commits. Reports how far the dev clone is ahead of the live install. Never touches the live install or ~/.claude; /steward:backup brings changes live. Use when the user wants to pull other machines' ccpraxis changes, publish ccpraxis commits, or says "upstream sync", "push ccpraxis", "pull ccpraxis", "sync with github", "publish my config". ALWAYS confirm via AskUserQuestion when invoked proactively.
+description: The GitHub side of ccpraxis, for the dev clone only — fetches your fork (origin), integrates origin/main into the dev clone's main (fast-forward or a merge commit; stops cleanly on a conflict or when the merge would touch your uncommitted files), scans what the push would send for secrets, and pushes main after you confirm the exact list of outgoing commits. Reports how far the dev clone is ahead of the live install. Never touches the live install or ~/.claude; /steward:backup brings changes live. Use when the user wants to pull other machines' ccpraxis changes, publish ccpraxis commits, or says "upstream sync", "push ccpraxis", "pull ccpraxis", "sync with github", "publish my config". ALWAYS confirm via AskUserQuestion when invoked proactively.
 user-invocable: true
 host-only: true
 allowed-tools: Bash, AskUserQuestion
@@ -56,7 +56,9 @@ Say, in plain terms:
 - `push.status` — `nothing` (nothing to send), `pushed` (and that the remote was checked to
   have it: `push.remote_sha`), `aborted`, `rejected` (with `push.error`), or `not_reached`.
   Never turn a `push.warnings` line such as a protected-branch bypass notice into a failure.
-- `scan` — when it is not clean, the findings verbatim; nothing was pushed.
+- `scan` — when it is not clean, the findings verbatim (each names the outgoing commit and file;
+  a credential removed in a later commit still counts, because the push sends every commit);
+  nothing was pushed.
 - `live.hint` — how far the dev clone's `main` is ahead of the live install, and that
   `/steward:backup` (which promotes it, asking first) brings it live. This skill never
   changes the live install.

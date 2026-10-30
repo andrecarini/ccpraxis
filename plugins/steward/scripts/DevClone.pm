@@ -117,6 +117,7 @@ sub run_capture {
     }
     my ($out, $exit) = ('', -1);
     if (open(my $fh, '-|', @cmd)) {
+        binmode $fh;   # bytes as the child wrote them (a git archive is binary)
         local $/;
         $out = <$fh> // '';
         close $fh;

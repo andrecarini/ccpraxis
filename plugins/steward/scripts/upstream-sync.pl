@@ -15,8 +15,11 @@
 #      and reported with the files; a merge or fast-forward git refuses
 #      because it would overwrite the developer's uncommitted files stops
 #      with nothing changed. Never a stash, never a reset;
-#   4. scan the dev clone for secrets (sensitive-check.pl) before anything
-#      leaves the machine;
+#   4. scan what the push would send for secrets (sensitive-check.pl): every
+#      file version the outgoing commits add or change, taken from git, so a
+#      credential committed and removed again within them is still caught,
+#      and the developer's untracked files (which a push never sends) never
+#      block it;
 #   5. push main to origin, but only after a push_confirmation answer that
 #      named the exact commit it was shown (the choice id carries main's
 #      sha, so a main that moved after the question is asked about again),
@@ -44,6 +47,7 @@ use FindBin ();
 use lib $FindBin::Bin;
 use JSON::PP;
 use Encode ();
+use File::Temp ();
 use DevClone ();
 
 my $HELP = <<'TXT';
@@ -232,14 +236,14 @@ sub main {
         emit(\%r, 0);
     }
 
-    my $scan = "$FindBin::Bin/sensitive-check.pl";
-    my ($src, $sout, $serr) = DevClone::run_capture($^X, $scan, $clone);
-    $r{scan} = { clean => ($src == 0 ? 1 : 0), exit => $src, findings => ($src == 1 ? clamp($sout) : undef) };
+    my ($src, $sout, $serr, $scanned) = scan_outgoing($clone, $has_remote_main);
+    $r{scan} = { clean => ($src == 0 ? 1 : 0), exit => $src, findings => ($src == 1 ? clamp($sout) : undef),
+                 commits_scanned => $scanned };
     if ($src != 0) {
         $r{push}{status} = 'not_reached';
-        $stop->($src == 1 ? 'the secret scan found likely credentials in the dev clone; nothing was pushed'
+        $stop->($src == 1 ? 'the secret scan found likely credentials in what the push would send; nothing was pushed'
                           : "the secret scan could not run (exit $src); nothing was pushed",
-                $src == 1 ? 'remove them (and from history if they were committed), then run this again' : first_line($serr));
+                $src == 1 ? 'remove them -- from the history too, since every outgoing commit is sent -- then run this again' : first_line($serr));
     }
 
     my $short = substr($main, 0, 12);
@@ -306,6 +310,59 @@ sub main {
     $r{status} = 'complete';
     live_report(\%r);
     emit(\%r, 0);
+}
+
+# What a push sends, scanned: for each outgoing commit, the files it adds or
+# changes (a merge: against its first parent), as git has them in that
+# commit, extracted into a temporary tree that sensitive-check.pl walks.
+# Returns ($exit, $stdout, $stderr, $commits_scanned); findings name
+# <commit>/<path>. Past MAX_SCAN_COMMITS (a first push of a long history)
+# the tip's whole tree is scanned instead.
+use constant MAX_SCAN_COMMITS => 300;
+sub scan_outgoing {
+    my ($clone, $has_remote_main) = @_;
+    my $range = $has_remote_main ? 'origin/main..main' : 'main';
+    my ($rc, $out) = git($clone, 'rev-list', '--parents', $range);
+    return (2, '', "cannot list the outgoing commits", 0) if $rc != 0;
+    my @commits = map { [ split / / ] } grep { length } split /\r?\n/, $out;
+    my $tmp = File::Temp::tempdir(CLEANUP => 1);
+    my @plan;   # [ sha, [paths] ]
+    if (@commits > MAX_SCAN_COMMITS) {
+        @plan = ([ $commits[0][0], undef ]);
+    }
+    else {
+        for my $c (@commits) {
+            my ($sha, @parents) = @$c;
+            my ($drc, $dout) = @parents > 1
+                ? git($clone, '-c', 'core.quotePath=false', 'diff', '--name-only', '--diff-filter=AM', $parents[0], $sha)
+                : git($clone, '-c', 'core.quotePath=false', 'diff-tree', '-r', '--root', '--no-commit-id',
+                      '--name-only', '--diff-filter=AM', $sha);
+            return (2, '', "cannot list the files of $sha", 0) if $drc != 0;
+            my @paths = grep { length } split /\r?\n/, $dout;
+            push @plan, [ $sha, \@paths ] if @paths;
+        }
+    }
+    require Archive::Tar;
+    for my $p (@plan) {
+        my ($sha, $paths) = @$p;
+        my ($arc, $tar, $aerr) = git($clone, 'archive', '--format=tar', $sha, ($paths ? ('--', @$paths) : ()));
+        return (2, '', "git archive $sha failed: " . first_line($aerr), 0) if $arc != 0;
+        my ($tfh, $tname) = File::Temp::tempfile(DIR => $tmp, UNLINK => 1);
+        binmode $tfh;
+        print {$tfh} $tar;
+        close $tfh;
+        my $dest = "$tmp/" . substr($sha, 0, 12);
+        mkdir $dest;
+        my $t = Archive::Tar->new;
+        $t->read($tname) or return (2, '', "cannot read the archive of $sha", 0);
+        $t->setcwd($dest);
+        $t->extract or return (2, '', "cannot extract the archive of $sha", 0);
+        unlink $tname;
+    }
+    return (0, "No sensitive data found.\n", '', 0) unless @plan;
+    my ($src, $sout, $serr) = DevClone::run_capture($^X, "$FindBin::Bin/sensitive-check.pl", $tmp);
+    $sout =~ s/\Q$tmp\E\///g;
+    return ($src, $sout, $serr, scalar(@commits));
 }
 
 # How far the dev clone is ahead of the live install, and what brings it live.

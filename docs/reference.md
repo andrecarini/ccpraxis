@@ -134,7 +134,9 @@ stateless: every run recomputes from git):
    commits of its own. A conflict aborts the merge it just started and names the files; a
    merge git refuses because it would overwrite uncommitted files stops with nothing
    changed. Never a stash or a reset.
-3. Scans the dev clone for secrets before anything leaves the machine.
+3. Scans what the push would send for secrets: every file version the outgoing commits add or
+   change, from git, so a credential committed and removed again is still caught and untracked
+   work in progress never blocks it.
 4. Pushes `main` only after a `push_confirmation` that lists the remote and every outgoing
    commit; the answer names the commit it was shown, so a `main` that moved meanwhile is
    asked about again. `ls-remote` confirms the remote has it.
