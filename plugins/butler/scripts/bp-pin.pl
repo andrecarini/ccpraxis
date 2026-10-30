@@ -277,10 +277,20 @@ sub resolve {
     }
 
     # latest-lts-eligible: pick the newest LTS major line that is (a) already
-    # LTS, (b) not yet EOL, as of $now -- then the newest release WITHIN that
-    # line that also clears the age floor. Mirrors the Containerfile's own
-    # comment for Node: 24.18.1 was too new; 24.18.0 was the newest ELIGIBLE
-    # release of the (already-chosen) Active-LTS line.
+    # LTS, (b) not yet EOL, as of $now -- then the newest LTS release WITHIN
+    # that line that also clears the age floor. Measured on 2026-08-03 for
+    # Node: 24.18.1 was too new; 24.18.0 was the newest ELIGIBLE release of the
+    # (already-chosen) Active-LTS line.
+    #
+    # (c) A release counts as an LTS release only if it was published ON OR
+    # AFTER its line's LTS start. Every line spends six months as "Current"
+    # before it becomes LTS, and those Current releases stay in the registry
+    # with their old dates. Without this filter, the week a line turns LTS is
+    # exactly when the policy recommends a release that was never LTS: on
+    # 2026-10-30, two days after Node 26 entered LTS (26.13.0, 2026-10-28), it
+    # picked 26.12.1 (2026-10-21), a Current release, because the only LTS
+    # release of line 26 was still too new. The right answer that day was the
+    # previous line's newest eligible release, 24.22.1.
     my $tbl = $BpDepsCheck::EOL{$package};
     return (undef, 'unknown-lts-package', "no EOL/LTS table entry for '$package' in bp-deps-check.pl's \%EOL")
         unless $tbl;
@@ -295,7 +305,8 @@ sub resolve {
 
         my @in_line = grep {
             my $m = BpDepsCheck::major_of($package, $_->{version});
-            defined $m && $m eq $maj;
+            defined $m && $m eq $maj
+                && BpDepsCheck::parse_iso8601($_->{published}) >= $lts;   # (c): an LTS release, not a Current one
         } @$releases;
         my @eligible = grep {
             my $age = BpDepsCheck::age_days(BpDepsCheck::parse_iso8601($_->{published}), $now);

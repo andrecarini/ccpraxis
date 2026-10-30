@@ -260,6 +260,43 @@ ok($DEPS_LOADED, 'HARNESS: bp-deps-check.pl (source of %EOL) requires cleanly')
 }
 
 # =====================================================================================
+# C2b -- the week a line turns LTS, its older Current releases are NOT LTS releases.
+# Real dates (nodejs.org/dist/index.json, read 2026-10-30): Node 26 entered LTS with 26.13.0
+# on 2026-10-28 (%EOL's lts date for 26). 26.12.1 (2026-10-21) is older than 7 days but was
+# released as Current. The only LTS release of line 26 is 2 days old, so the policy must fall
+# back to line 24 and return 24.22.1 (2026-10-20, 10 days old); 24.22.2 is 3 days old.
+# Before the fix the policy returned 26.12.1 here.
+# =====================================================================================
+{
+    my %node_dates = (
+        '26.13.0' => '2026-10-28T00:00:00Z',   # first LTS release of 26 -- too new
+        '26.12.1' => '2026-10-21T00:00:00Z',   # old enough, but a Current release
+        '26.0.0'  => '2026-05-05T00:00:00Z',   # Current
+        '24.22.2' => '2026-10-27T00:00:00Z',   # LTS, too new
+        '24.22.1' => '2026-10-20T00:00:00Z',   # LTS, 10 days old -- the answer
+        '24.18.0' => '2026-06-23T00:00:00Z',
+    );
+    my $http = sub { return { status => 200, content => pkg_doc_json(%node_dates) } };
+    my $now  = timegm(0, 0, 0, 30, 9, 2026);   # 2026-10-30; month index 9 = October
+
+    my ($v, $c, $d) = try_resolve({
+        policy => 'latest-lts-eligible', package => 'node', min_age_days => 7,
+        now => $now, http => $http,
+    });
+    is($v, '24.22.1',
+        'C2b: two days after line 26 turned LTS, the newest eligible LTS release is still 24.22.1')
+        or diag("cause=" . ($c // '(undef)') . " detail=" . ($d // '(undef)'));
+    isnt($v, '26.12.1', 'C2b: a Current release published before its line entered LTS is never returned');
+
+    # A week later 26.13.0 clears the floor and line 26 wins.
+    my ($v2) = try_resolve({
+        policy => 'latest-lts-eligible', package => 'node', min_age_days => 7,
+        now => $now + 7 * 86400, http => $http,
+    });
+    is($v2, '26.13.0', 'C2b: once the first LTS release of 26 is 7 days old, it is the answer');
+}
+
+# =====================================================================================
 # C3 -- no network anywhere in the suite. Positive: the injected fetcher was actually called.
 # Negative: the whole suite passes with no live fetch -- proven by resolving a package/version
 # that exists NOWHERE except in our injected fixture (no real registry could produce this answer).
