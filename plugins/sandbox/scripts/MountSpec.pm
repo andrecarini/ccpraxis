@@ -39,20 +39,9 @@ sub winify_path {
 # a drive letter), otherwise `volume`. Host paths are winified.
 sub v_to_mount {
     my $spec = shift;
-    my ($src, $tgt, $opts);
-    # Drive-letter-aware: `X:/foo:/container[:opts]`. The drive's `:` is
-    # part of SOURCE; the next `:` is the SOURCE/TARGET separator.
-    if ($spec =~ m{^([A-Za-z]:[^:]+):([^:]+)(?::(.+))?$}) {
-        ($src, $tgt, $opts) = ($1, $2, $3);
-    } elsif ($spec =~ m{^([^:]+):([^:]+)(?::(.+))?$}) {
-        ($src, $tgt, $opts) = ($1, $2, $3);
-    } else {
-        die "v_to_mount: cannot parse mount spec '$spec'\n";
-    }
-    # A path-shaped source = bind mount. A bare identifier = volume
-    # (named or anonymous). Without this branch, named volume mounts
-    # become bind mounts targeted at a host path that doesn't exist.
-    my $is_path = ($src =~ m{^[/.]} || $src =~ m{^[A-Za-z]:});
+    my ($src, $tgt, $opts) = _split_v_spec($spec);
+    die "v_to_mount: cannot parse mount spec '$spec'\n" unless defined $src;
+    my $is_path = _is_path_source($src);
     my $type = $is_path ? 'bind' : 'volume';
     $src = winify_path($src) if $is_path;
     my @kv = ("type=$type", "source=$src", "target=$tgt");
@@ -60,6 +49,48 @@ sub v_to_mount {
         push @kv, 'readonly' if $opts =~ /\bro\b/;
     }
     return join(',', @kv);
+}
+
+# _split_v_spec($spec) -> ($source, $target, $opts) | () for one
+# `SOURCE:TARGET[:OPTS]` spec. Drive-letter-aware: in `X:/foo:/container[:opts]`
+# the drive's `:` is part of SOURCE; the next `:` is the SOURCE/TARGET separator.
+sub _split_v_spec {
+    my ($spec) = @_;
+    return () unless defined $spec;
+    return ($1, $2, $3) if $spec =~ m{^([A-Za-z]:[^:]+):([^:]+)(?::(.+))?$};
+    return ($1, $2, $3) if $spec =~ m{^([^:]+):([^:]+)(?::(.+))?$};
+    return ();
+}
+
+# A path-shaped source = bind mount. A bare identifier = volume (named or
+# anonymous). Without this rule, named volume mounts become bind mounts
+# targeted at a host path that doesn't exist.
+sub _is_path_source { my ($src) = @_; return ($src =~ m{^[/.]} || $src =~ m{^[A-Za-z]:}) ? 1 : 0 }
+
+# map_bind_sources($fn, @args) -> @args with the host path of every `-v` bind
+# replaced by $fn->($path). Named volumes, the target, the options and every
+# other argument are left as they are. Works on the `-v` authoring form, so it
+# runs before convert_v_to_mount. The launcher uses it on macOS to serve its
+# install-root binds from the live-install mirror (LiveMirror.pm).
+sub map_bind_sources {
+    my ($fn, @in) = @_;
+    my @out;
+    while (@in) {
+        my $a = shift @in;
+        if (defined $a && $a eq '-v' && @in) {
+            my $spec = shift @in;
+            my ($src, $tgt, $opts) = _split_v_spec($spec);
+            if (defined $src && _is_path_source($src)) {
+                my $new = $fn->($src);
+                $spec = (defined $new && length $new ? $new : $src) . ":$tgt"
+                      . (defined $opts ? ":$opts" : '');
+            }
+            push @out, '-v', $spec;
+        } else {
+            push @out, $a;
+        }
+    }
+    return @out;
 }
 
 # Walk an argv list, rewriting every `-v SPEC` pair into `--mount KV`
