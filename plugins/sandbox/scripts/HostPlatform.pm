@@ -74,6 +74,21 @@ sub runtime_family {
     return (defined $cli && !ref $cli && $cli =~ /podman/i) ? 'podman' : 'docker';
 }
 
+# build_extra_args($cli) -> extra `build` arguments, shared by every image
+# build (bootstrap.pl and launcher.pl).
+#
+# The Containerfile bakes real device nodes into the bp-jail skeleton with
+# mknod. Podman leaves CAP_MKNOD out of a build step's default capabilities,
+# so even a ROOTFUL machine failed that step (measured 2026-10-30, podman
+# 6.1.4: "mknod: Operation not permitted") and the jail fell back to empty-file
+# stand-ins. Granting it back is all the build needs. On a rootless machine the
+# user namespace still forbids device nodes and the Containerfile records why;
+# Docker's build keeps MKNOD by default and has no such flag.
+sub build_extra_args {
+    my ($cli) = @_;
+    return runtime_family($cli) eq 'podman' ? ('--cap-add', 'MKNOD') : ();
+}
+
 # host_gateway_args($cli, $os) -> extra `create` arguments that give the
 # container a name for the host.
 #

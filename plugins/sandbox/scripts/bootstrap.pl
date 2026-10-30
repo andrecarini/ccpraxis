@@ -455,6 +455,7 @@ if ($? == 0) {
     $host_version = SandboxIdentity::claude_version($host_version);   # a pinned identity wins
     $host_version //= 'latest';
     my $rc = system($PODMAN, 'build',
+        HostPlatform::build_extra_args($PODMAN),
         '--build-arg', "CLAUDE_VERSION=$host_version",
         '-t', SandboxIdentity::image_ref($host_version),
         '-t', $IMAGE_LATEST,

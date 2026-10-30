@@ -358,4 +358,18 @@ JSON
     }
 }
 
+# build_extra_args: podman builds get CAP_MKNOD (the jail skeleton's device
+# nodes), docker builds get nothing, and both image builds pass the result.
+{
+    is_deeply([ HostPlatform::build_extra_args('podman') ], [ '--cap-add', 'MKNOD' ], 'build: podman gets --cap-add MKNOD');
+    is_deeply([ HostPlatform::build_extra_args('/opt/homebrew/bin/podman') ], [ '--cap-add', 'MKNOD' ], 'build: a podman path too');
+    is_deeply([ HostPlatform::build_extra_args('docker') ], [], 'build: docker gets nothing');
+    for my $rel ('plugins/sandbox/scripts/bootstrap.pl', 'plugins/sandbox/scripts/launcher.pl') {
+        open my $fh, '<:raw', "$Bin/../../../../$rel" or die "$rel: $!";
+        local $/;
+        my $src = <$fh>;
+        like($src, qr/'build',\s*\n\s*HostPlatform::build_extra_args\(\$PODMAN\)/, "build: $rel passes build_extra_args");
+    }
+}
+
 done_testing();

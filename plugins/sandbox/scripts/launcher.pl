@@ -2553,6 +2553,7 @@ sub build_image {
     # independent timer: this value changes roughly weekly.
     my $ssh_host_keys_cachebust = int(time() / (7 * 86400));
     my $rc = _tee_system($PODMAN, 'build',
+        HostPlatform::build_extra_args($PODMAN),
         '--build-arg', "CLAUDE_VERSION=${HOST_VERSION}",
         '--build-arg', "P02_SSH_HOST_KEYS_CACHEBUST=${ssh_host_keys_cachebust}",
         '-t', SandboxIdentity::image_ref($HOST_VERSION),

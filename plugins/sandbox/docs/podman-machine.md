@@ -79,7 +79,8 @@ through a read-only share, and a provider that enforces it gets it for free.
 ### Rootful
 
 Container root is root in the VM; there is no user namespace between them, and the VM is the
-boundary. Image builds can create device nodes, so the bp-jail skeleton gets a real `/dev/null`,
+boundary. Image builds can create device nodes (every build passes `--cap-add MKNOD`, which podman
+leaves out of a build's default capabilities), so the bp-jail skeleton gets a real `/dev/null`,
 `/dev/zero`, `/dev/random` and `/dev/urandom`. A rootless machine cannot make them: its build leaves
 `/opt/bp-jail-skel/dev/.no-device-nodes`, and butler's jailed workers get empty-file stand-ins. The
 machine still runs as your user and needs no admin rights on the Mac.

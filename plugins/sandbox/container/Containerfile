@@ -259,7 +259,11 @@ WORKDIR /project
 # ...EXCEPT ON A ROOTLESS BUILD, where it is not available either. Measured on
 # a rootless podman machine (macOS, podman 6.1): `mknod c 1 3` inside `podman
 # build` fails with "Operation not permitted", because a user namespace may not
-# create device nodes, whatever capabilities it holds. This step used to read
+# create device nodes, whatever capabilities it holds. A ROOTFUL podman build
+# needs the capability granted too: podman leaves CAP_MKNOD out of a build
+# step's defaults, so every build passes --cap-add MKNOD
+# (HostPlatform::build_extra_args; measured 2026-10-30 on a rootful podman
+# 6.1.4 machine, which baked the nodes only with it). This step used to read
 # `mknod ... && chmod && cp ... || true && cp ... || true && printf ...`, and
 # shell precedence made the first `|| true` swallow the mknod failure along
 # with everything chained before it: the build went green with no device
@@ -286,9 +290,9 @@ RUN mkdir -p /opt/bp-jail-skel/dev /opt/bp-jail-skel/etc/ssl /opt/bp-jail-skel/t
            echo 'bp-jail-skel: device nodes baked'; \
        else \
            rm -f /opt/bp-jail-skel/dev/null /opt/bp-jail-skel/dev/zero /opt/bp-jail-skel/dev/random /opt/bp-jail-skel/dev/urandom; \
-           echo 'mknod is not permitted in this image build (a rootless build cannot create device nodes); bp-jail.pl falls back to empty-file /dev stand-ins' \
+           echo 'mknod is not permitted in this image build (a rootless build cannot create device nodes, and a podman build without --cap-add MKNOD lacks the capability); bp-jail.pl falls back to empty-file /dev stand-ins' \
              > /opt/bp-jail-skel/dev/.no-device-nodes; \
-           echo 'WARNING: bp-jail-skel: mknod denied (rootless build?) -- jailed workers get bp-jail.pl empty-file /dev stand-ins; see /opt/bp-jail-skel/dev/.no-device-nodes' >&2; \
+           echo 'WARNING: bp-jail-skel: mknod denied (rootless machine, or a build without --cap-add MKNOD) -- jailed workers get bp-jail.pl empty-file /dev stand-ins; see /opt/bp-jail-skel/dev/.no-device-nodes' >&2; \
        fi
 # resolv.conf is deliberately NOT baked: it is generated per-container by the
 # runtime, so a build-time copy would pin a stale nameserver. bp-jail.pl copies
