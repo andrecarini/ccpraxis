@@ -331,6 +331,31 @@ JSON
         is($rc, 0, 'E: catalog-only imports still load with no CLI') or diag($out);
         like($out, qr/^LOADED$/m, 'E: ...and the caller runs');
     }
+
+    # macOS: container-test fixtures live in the podman machine's read-write
+    # test-scratch share, under the OS-recorded home -- not under $HOME, which
+    # the runner moves to /tmp/ccpraxis-sweep-* (a path the machine no longer
+    # shares now that /private is not shared).
+  SKIP: {
+        skip 'E: the test-scratch share is a macOS podman machine folder', 3 unless $^O eq 'darwin';
+        my ($fh, $script) = tempfile(SUFFIX => '.pl', UNLINK => 1);
+        print {$fh} "use strict; use warnings; use lib '$lib', '$scripts';\n"
+                  . "use $mod qw(new_temp_dir);\n"
+                  . "print 'DIR=', new_temp_dir(), \"\\n\";\n";
+        close $fh;
+        my $fake_home = tempdir(CLEANUP => 1);
+        local $ENV{HOME} = $fake_home;
+        local $ENV{CCPRAXIS_TEST_NO_SWEEP} = 1;
+        delete local $ENV{CCPRAXIS_SCRATCH_ROOT};
+        my $out = `"$^X" "$script" 2>&1`;
+        my ($dir) = $out =~ /^DIR=(.*)$/m;
+        require PodmanMachine;
+        my $share = PodmanMachine::layout(home => HostPlatform::owner_home())->{test_scratch};
+        ok(defined $dir, 'E: new_temp_dir() runs with a redirected HOME') or diag($out);
+        like($dir // '', qr{\A\Q$share\E/[^/]+\z}, 'E: darwin: the fixture is a fresh folder directly in the test-scratch share of the account home')
+            or diag($out);
+        unlike($dir // '', qr{\A\Q$fake_home\E}, 'E: ...never under the redirected HOME');
+    }
 }
 
 done_testing();

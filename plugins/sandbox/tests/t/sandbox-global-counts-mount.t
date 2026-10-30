@@ -425,6 +425,12 @@ SKIP: {
         unless $HAVE_CLI;
 
     require TestSandbox;
+    # Asked BEFORE the import: importing create_probe_container would turn an
+    # unshared scratch folder (macOS: podman-machine.pl test-scratch off) into a
+    # whole-file skip_all after AC14-AC19 have already run.
+    if (defined(my $why = TestSandbox::scratch_unshared_reason())) {
+        skip("$why -- AC20/AC21 bind fixtures into a container", 9);
+    }
     TestSandbox->import(qw(podman_run_capture create_probe_container new_temp_dir probe_image));
 
     # A fresh, container-scoped set of paths (TestSandbox's own scratch-root
