@@ -513,6 +513,16 @@ my $G = q{unset BASH_ENV ; f="${CLAUDE_PLUGIN_ROOT}/hooks/guard-almanac-write.sh
         close $dst;
     }
     chmod 0755, $copy;
+    # An installed almanac plugin carries its own payload reader,
+    # scripts/read-payload.sh (the hook sources it; butler has an identical
+    # copy of its own, so this fixture's "butler absent" still holds).
+    File::Path::make_path("$noButlerRoot/almanac/scripts");
+    {
+        my $bytes = slurp_raw("$ALM/scripts/read-payload.sh");
+        open(my $dst, '>:raw', "$noButlerRoot/almanac/scripts/read-payload.sh") or die "cannot write read-payload.sh: $!";
+        print {$dst} $bytes;
+        close $dst;
+    }
     ok(!-d "$noButlerRoot/butler", 'AC16 fixture: no ../../butler sibling exists next to the copy');
 
     assert_allow_bash("sed -i s/a/b/ $R", 'AC16: butler absent -- sed -i on R allows', guard => $copy);

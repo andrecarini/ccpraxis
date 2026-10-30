@@ -166,50 +166,40 @@ done
 
 unset -v BP_PAYLOAD BP_PAYLOAD_TRUNCATED
 
-t=$BP_PAYLOAD_READ_TIMEOUT
-if [[ $t =~ ^[0-9]+$ ]] && [ "$t" -ge 1 ] && [ "$t" -le 10 ]; then
-    :
-else
-    t=10
+# Step 6's scripts directory, resolved before the read because the reader
+# lives there too: ../scripts, or ../../scripts while under next/. Without
+# BpHook.pm every path below ends in exit 0 anyway, so leaving now changes
+# nothing but the unread stdin.
+s=${r%/*}/../scripts
+if [ ! -f "$s/BpHook.pm" ]; then
+    s=${r%/*}/../../scripts
+fi
+if [ ! -f "$s/BpHook.pm" ]; then
+    exit 0
 fi
 
-# RT-M2: "read -N" was added in bash 4.1. On an older bash (stock macOS
-# /bin/bash 3.2) it is an invalid option returning rc 2, which is neither 0
-# nor above 128, so the wrapper would continue with an empty BP_PAYLOAD.
-# Exiting 0 there instead would make every hook a silent no-op on that
-# host -- continuity would quietly never fire. So an old bash reads with
-# -d '' instead: a builtin, slower on large input, but correct. It returns 1
-# at a normal EOF and 0 only if it stopped early at a NUL (never valid JSON),
-# which is treated as truncated. A timeout is the one code that does NOT line
-# up: bash 3.2's read -t returns 1 on a timeout too (bash >= 4 returns >128)
-# and throws away what it had read, so the result looks exactly like an empty
-# payload at EOF and every --pre text: clause quietly skipped perl (measured
-# on macOS /bin/bash 3.2.57). Elapsed time is the only thing that tells the
-# two apart there: a 1 that took the whole budget is mapped to 142. $SECONDS
-# ticks in whole seconds, so a real timeout always reads >= t; the converse
-# (a payload that legitimately took over t-1 seconds to arrive) is judged
-# truncated, which fails toward running perl, never toward skipping it.
-read_n=0
-if [ "${BASH_VERSINFO[0]:-0}" -gt 4 ]; then
-    read_n=1
-fi
-if [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 1 ]; then
-    read_n=1
-fi
-if [ "$read_n" -eq 1 ]; then
-    IFS= read -r -N 8388608 -t "$t" BP_PAYLOAD
-    rc=$?
-else
-    read_t0=$SECONDS
-    IFS= read -r -d '' -t "$t" BP_PAYLOAD
-    rc=$?
-    if [ "$rc" -eq 1 ] && (( SECONDS - read_t0 >= t )); then
-        rc=142
-    fi
-fi
-if [ "$rc" -eq 0 ] || [ "$rc" -gt 128 ]; then
-    export BP_PAYLOAD_TRUNCATED=1
-fi
+# The payload is read by scripts/read-payload.sh, the one reader every bash
+# hook of this plugin and of almanac shares (sourced: no process). It bounds
+# the read by 8 MiB and by BP_PAYLOAD_READ_TIMEOUT (1..10 s, else 10), keeps
+# "read -N" on bash >= 4.1 and falls back to a NUL-delimited read on bash
+# 3.2 (macOS /bin/bash), where it also tells a timeout from an end of input
+# by elapsed time: 3.2's read -t returns 1 for both and drops what it read,
+# which once let every --pre text: clause skip perl on a stalled payload.
+# A truncated read or a timeout marks the payload truncated, so every
+# armed/driver/text: clause below falls through to perl and BpHook treats
+# the payload as unusable (load_payload: payload_ok 0); on a timeout the
+# library leaves BP_PAYLOAD empty on every bash, so perl sees the same bytes
+# on a Mac as on Windows. A missing or broken library is a broken install:
+# exit 0, exactly like a missing BpHook.pm.
+[ -f "$s/read-payload.sh" ] || exit 0
+. "$s/read-payload.sh"
+declare -F ccp_read_payload >/dev/null || exit 0
+BP_PAYLOAD=
+ccp_read_payload BP_PAYLOAD
+case $CCP_PAYLOAD_STATE in
+    truncated) export BP_PAYLOAD_TRUNCATED=1 ;;
+    timeout) export BP_PAYLOAD_TRUNCATED=1 ;;
+esac
 
 # RT-M3: bash's "${x#*pat}" shortest-prefix removal is O(p^2) in the offset
 # of the match (and O(n^2) over the whole payload when there is no match at
@@ -304,14 +294,6 @@ for clause in "${pre_clauses[@]}"; do
     IFS=$saved_ifs
     [ "$holds" -eq 1 ] || exit 0
 done
-
-s=${r%/*}/../scripts
-if [ ! -f "$s/BpHook.pm" ]; then
-    s=${r%/*}/../../scripts
-fi
-if [ ! -f "$s/BpHook.pm" ]; then
-    exit 0
-fi
 
 shopt -s execfail
 exec perl -I"$s" -e 'our $X = 0; END { $? = $X } my $r = eval { require BpHook; BpHook::main(@ARGV) }; $X = (defined $r && $r == 2) ? 2 : 0; exit $X' "$module" "$@" <<<"$BP_PAYLOAD"

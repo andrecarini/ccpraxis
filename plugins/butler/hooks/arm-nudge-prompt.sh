@@ -19,17 +19,23 @@ set -f
 # Step 1: a coordinator or judge environment is not an operator prompt.
 [ -n "$BP_LEDGER" ] && exit 0
 
-# Step 2: read the payload once, bounded. "read -N" is bash >= 4.1; on an
-# older bash (stock macOS /bin/bash 3.2) it is an invalid option, so every
-# prompt read as empty and the hook never did anything there. The fallback
-# is run-hook.sh's own: "read -d ''", a builtin that stops at EOF. A timeout
-# on that path drops the partial payload and exits quietly below, which is
-# the right outcome for a nudge.
-if [ "${BASH_VERSINFO[0]:-0}" -gt 4 ] || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 1 ]; }; then
-    IFS= read -r -N 8388608 -t 10 P
-else
-    IFS= read -r -d '' -t 10 P
-fi
+# Step 2: read the payload once, bounded, through scripts/read-payload.sh (the
+# one reader the bash hooks of butler and almanac share; sourced, so no
+# process). It keeps "read -N" on bash >= 4.1 and reads NUL-delimited on
+# macOS /bin/bash 3.2. A nudge is advisory, so its fail direction is quiet:
+# a timeout leaves P empty on every bash and the hook exits below, and a
+# missing library exits too. A payload over 8 MiB is still read up to the
+# cap, as before; only its first 4096 characters are ever looked at.
+_d=${BASH_SOURCE[0]//\\//}
+case $_d in
+    */*) _d=${_d%/*} ;;
+    *) _d=. ;;
+esac
+[ -f "$_d/../scripts/read-payload.sh" ] || exit 0
+. "$_d/../scripts/read-payload.sh"
+declare -F ccp_read_payload >/dev/null || exit 0
+P=
+ccp_read_payload P
 [ -n "$P" ] || exit 0
 
 # Step 3: must be a main-thread UserPromptSubmit payload.

@@ -225,6 +225,7 @@ sub encode_payload {
 sub fire_reminder {
     my ($payload, %env) = @_;
     my $r = delete $env{__r} // current_R();
+    my $stdin_from = delete $env{__stdin};   # a ready stdin path (fire_reminder_held's fifo)
     my $root = $env{CLAUDE_PLUGIN_ROOT} // $ALM;
 
     my (undef, $script) = tempfile(SUFFIX => '.sh');
@@ -232,10 +233,13 @@ sub fire_reminder {
     print {$sfh} "#!/usr/bin/env bash\n$r\n";
     close $sfh;
 
-    my (undef, $in) = tempfile();
-    open(my $ifh, '>:raw', $in) or die "cannot write $in: $!";
-    print {$ifh} encode_payload($payload);
-    close $ifh;
+    my $in = $stdin_from;
+    unless (defined $in) {
+        (undef, $in) = tempfile();
+        open(my $ifh, '>:raw', $in) or die "cannot write $in: $!";
+        print {$ifh} encode_payload($payload);
+        close $ifh;
+    }
 
     my (undef, $out) = tempfile();
     my (undef, $err) = tempfile();
@@ -253,8 +257,35 @@ sub fire_reminder {
     my $rc = $? >> 8;
     my $o  = slurp($out) // '';
     my $e  = slurp($err) // '';
-    unlink $script, $in, $out, $err;
+    unlink $script, (defined $stdin_from ? () : $in), $out, $err;
     return { rc => $rc, out => $o, err => $e };
+}
+
+# fire_reminder_held($payload, %env) -> fire_reminder()'s result, or undef
+# with no mkfifo. stdin is a fifo whose writer sends the whole payload and
+# then holds the pipe open for 20 s (its lifetime bounds the run), so the
+# gate's read can only end by its timeout -- pass BP_PAYLOAD_READ_TIMEOUT => 1.
+sub fire_reminder_held {
+    my ($payload, %env) = @_;
+    require POSIX;
+    require File::Spec;
+    my $dir = tempdir(CLEANUP => 1);
+    my $fifo = "$dir/stdin.fifo";
+    POSIX::mkfifo($fifo, 0600) or return undef;
+    my $writer = fork();
+    die "fork: $!" unless defined $writer;
+    if ($writer == 0) {
+        open(STDOUT, '>', File::Spec->devnull);
+        open(STDERR, '>', File::Spec->devnull);
+        open(my $w, '>', $fifo) or POSIX::_exit(1);
+        syswrite($w, encode_payload($payload));
+        sleep 20;
+        POSIX::_exit(0);
+    }
+    my $r = fire_reminder($payload, %env, __stdin => $fifo);
+    kill 'KILL', $writer;
+    waitpid($writer, 0);
+    return $r;
 }
 
 sub mkpayload {
@@ -524,6 +555,25 @@ DRIVER
     is_deeply([ticket_names($tdir5)], ['1'],
        'R-5 (behaviour 13 equivalent): a stray non-numeric entry in the ticket directory does not confuse the scan -- the first real call still claims ticket 1');
     ok(-f "$tdir5/garbage.txt", 'R-5: ...and the stray entry itself is left untouched, never deleted or treated as a ticket');
+}
+
+# =============================================================================
+# R-5b: a payload that never finishes arriving (the writer holds stdin open)
+# is silence -- no ticket, no output -- on every bash. The reminder is
+# advisory; scripts/read-payload.sh empties a timed-out read everywhere,
+# where bash >= 4 used to keep the partial text and count the call while
+# macOS bash 3.2 dropped it.
+# =============================================================================
+SKIP: {
+    my $sid = fresh_sid();
+    my ($env, $home, $state, $proj) = base_env();
+    touch_armed($state, $sid);
+    my $r = fire_reminder_held(mkpayload(sid => $sid, cwd => $proj), %$env, BP_PAYLOAD_READ_TIMEOUT => 1);
+    skip 'R-5b: no mkfifo on this host', 4 unless defined $r;
+    is($r->{rc}, 0, 'R-5b: a held-open payload exits 0');
+    is($r->{out}, '', 'R-5b: ...with no output');
+    is($r->{err}, '', 'R-5b: ...and nothing on stderr');
+    is_deeply([ticket_names(ticket_dir($home, $sid))], [], 'R-5b: ...and claims no ticket for a call it never read in full');
 }
 
 # =============================================================================

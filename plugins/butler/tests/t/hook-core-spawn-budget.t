@@ -33,6 +33,7 @@ use Cwd qw(getcwd);
 
 my $BUTLER_DIR      = "$Bin/../..";                                  # plugins/butler
 my $REAL_RUN_HOOK    = "$BUTLER_DIR/hooks/run-hook.sh";
+my $REAL_READ_LIB    = "$BUTLER_DIR/scripts/read-payload.sh";     # sourced by run-hook.sh
 my $REAL_BPHOOK      = "$BUTLER_DIR/scripts/BpHook.pm";
 my $REAL_BPPROJROOT  = "$BUTLER_DIR/scripts/BpProjectRoot.pm";
 
@@ -169,6 +170,7 @@ sub copy_file {
 # ---------------------------------------------------------------------------
 # build_tree() -- T/plugins/butler/{hooks/next/{run-hook.sh (copy),
 # guards/fx.sh}, scripts/{BpHook.pm (copy), BpProjectRoot.pm (copy),
+# read-payload.sh (copy, the payload reader run-hook.sh sources),
 # BpHook/SpawnFx.pm}}. fx.sh is the architecture's hook-file shape,
 # parameterised so each test can supply its own --pre clauses.
 # ---------------------------------------------------------------------------
@@ -178,6 +180,7 @@ sub build_tree {
     make_path("$T/plugins/butler/scripts/BpHook");
 
     copy_file($REAL_RUN_HOOK,   "$T/plugins/butler/hooks/next/run-hook.sh");
+    copy_file($REAL_READ_LIB,   "$T/plugins/butler/scripts/read-payload.sh");
     copy_file($REAL_BPHOOK,     "$T/plugins/butler/scripts/BpHook.pm");
     copy_file($REAL_BPPROJROOT, "$T/plugins/butler/scripts/BpProjectRoot.pm");
 
@@ -537,8 +540,9 @@ sub spawn_fifo_writer {
 # ===========================================================================
 # S6 -- bounded read: a fifo writer sends a partial payload and holds the
 # fifo open. The run returns under a 25s alarm, 1 perl runs, and the fixture
-# observes payload_ok 0 / BP_PAYLOAD_TRUNCATED 1. The source has no $(cat,
-# no read -d '' and no bare pipe, and has read -r -N 8388608 -t.
+# observes payload_ok 0 / BP_PAYLOAD_TRUNCATED 1. Neither run-hook.sh nor the
+# scripts/read-payload.sh it sources has $(cat or a bare pipe; the library has
+# read -r -N 8388608 -t, and -d '' only as its bash < 4.1 fallback.
 # ===========================================================================
 {
     my $T  = build_tree();
@@ -573,12 +577,26 @@ sub spawn_fifo_writer {
         }
     }
 
+    # The read itself lives in scripts/read-payload.sh, which run-hook.sh sources
+    # (no process) -- so the source rules cover both files: neither may cat
+    # stdin or contain a bare pipe, and the bulk -N read must be there.
+    # read -d '' survives only as the library's bash < 4.1 fallback (stock
+    # macOS /bin/bash 3.2 has no -N), selected by BASH_VERSINFO.
     my $src = read_bytes($REAL_RUN_HOOK) // '';
     $src =~ s/#.*$//mg;
-    unlike($src, qr/\$\(cat/, 'S6: run-hook.sh source has no $(cat');
-    unlike($src, qr/read\s+-d\s*''/, "S6: run-hook.sh source has no read -d ''");
-    unlike($src, qr/(?<!\|)\|(?!\|)/, 'S6: run-hook.sh source has no bare pipe (as opposed to ||)');
-    like($src, qr/read\s+-r\s+-N\s+8388608\s+-t/, 'S6: run-hook.sh source has read -r -N 8388608 -t');
+    my $lib = read_bytes($REAL_READ_LIB) // '';
+    $lib =~ s/#.*$//mg;
+    like($src, qr{\.\s+"\$s/read-payload\.sh"}, 'S6: run-hook.sh sources read-payload.sh from the scripts dir it loads BpHook.pm from');
+    like($src, qr/\bccp_read_payload\s+BP_PAYLOAD\b/, 'S6: run-hook.sh reads the payload with ccp_read_payload BP_PAYLOAD');
+    unlike($src, qr/\bread\b[^\n]*\s-[Nd]\s/, 'S6: run-hook.sh keeps no stdin read of its own');
+    for my $pair (['run-hook.sh', $src], ['scripts/read-payload.sh', $lib]) {
+        my ($name, $text) = @$pair;
+        unlike($text, qr/\$\(cat/, "S6: $name source has no \$(cat");
+        unlike($text, qr/(?<!\|)\|(?!\|)/, "S6: $name source has no bare pipe (as opposed to ||)");
+    }
+    like($lib, qr/read\s+-r\s+-N\s+8388608\s+-t/, 'S6: scripts/read-payload.sh has read -r -N 8388608 -t');
+    my @delims = ($lib =~ /\bread\b[^\n]*?\s-d\s+(\S+)/g);
+    is_deeply([grep { $_ ne q{''} } @delims], [], q{S6: the library's only delimiter read is -d '' (to end of input)});
 }
 
 # ===========================================================================
@@ -755,10 +773,14 @@ sub spawn_fifo_writer {
 # fails open (exit 0) before the read, on bash < 4.1.
 # ===========================================================================
 {
-    my $src = read_bytes($REAL_RUN_HOOK) // '';
+    # The version check moved with the read into scripts/read-payload.sh, which
+    # run-hook.sh sources. bash < 4.1 no longer fails open: it reads with
+    # -d '' -n 8388608 instead (read-payload-lib.t runs both branches
+    # wherever both bashes exist).
+    my $src = read_bytes($REAL_READ_LIB) // '';
     $src =~ s/#.*$//mg;
     like($src, qr/BASH_VERSINFO/,
-        'RT-M2: run-hook.sh checks BASH_VERSINFO before relying on "read -N" (explicit fail-open on bash < 4.1)');
+        'RT-M2: scripts/read-payload.sh (sourced by run-hook.sh) checks BASH_VERSINFO before relying on "read -N"');
 }
 
 # ===========================================================================

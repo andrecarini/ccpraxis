@@ -367,10 +367,16 @@ Steps:
 1. `r=${BASH_SOURCE[0]}` (this file's own path). Parse the `--pre` clauses up to `--`.
 2. Evaluate every clause made only of env atoms (`ledger`, `coordinator`, `stopfile`). If one fails,
    `exit 0` before reading stdin, as today's hooks already do.
-3. Bulk read: `IFS= read -r -N 8388608 -t 10 BP_PAYLOAD`. Never `$(cat)`, which hung forever on an
-   inherited pipe (bug 20260828-095201-7c1e), and never `read -d ''`, which reads a pipe one byte per
-   syscall (red-team measured 5.7 s for 200 KB). A status above 128 (timeout), or a payload of exactly
-   the cap, sets `BP_PAYLOAD_TRUNCATED=1`.
+3. Bulk read, through `scripts/read-payload.sh` (sourced, so no process; the one reader every
+   payload-reading bash hook of butler and almanac shares, with a byte-identical copy in each plugin
+   pinned by `read-payload-lib.t`): `ccp_read_payload BP_PAYLOAD`. The scripts directory of step 6
+   is resolved first for that, since the reader lives there. On bash >= 4.1 that is
+   `IFS= read -r -N 8388608 -t 10`. Never `$(cat)`, which hung forever on an inherited pipe (bug
+   20260828-095201-7c1e). `read -d ''` reads a pipe one byte per syscall (red-team measured 5.7 s for
+   200 KB), so it is only the fallback for bash < 4.1 (macOS `/bin/bash` 3.2 has no `-N`), capped at
+   the same 8 MiB with `-n`. A timeout or a payload of exactly the cap sets `BP_PAYLOAD_TRUNCATED=1`.
+   bash 3.2 reports a timeout as an ordinary end of input and drops what it read, so the library
+   tells the two apart by elapsed time, and on a timeout it leaves `BP_PAYLOAD` empty on every bash.
 4. Extract the session id without forking: `sid=${BP_PAYLOAD#*\"session_id\":\"}; sid=${sid%%\"*}`,
    kept only if `[[ $sid =~ ^[A-Za-z0-9_-]{1,128}$ ]]`. If extraction fails, `armed` and `driver`
    count as holding, so the wrapper falls through to perl and never exits on a guess.

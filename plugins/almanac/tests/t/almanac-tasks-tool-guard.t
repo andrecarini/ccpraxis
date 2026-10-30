@@ -112,6 +112,54 @@ sub fire {
     return run_registration($G, $payload_raw, %env);
 }
 
+# fire_held($payload_raw, %env) -> { rc, out, err, finished } | undef (no
+# mkfifo). Like fire(), but stdin is a fifo whose writer sends the whole
+# payload and then holds the pipe open for 20 s, so the guard's read can only
+# end by its timeout. Bounded by a 30 s fork/waitpid deadline.
+sub fire_held {
+    my ($payload_raw, %env) = @_;
+    require POSIX;
+    require Time::HiRes;
+    $env{CLAUDE_PLUGIN_ROOT} //= $ALM;
+    my $dir = tempdir(CLEANUP => 1);
+    my $fifo = "$dir/stdin.fifo";
+    POSIX::mkfifo($fifo, 0600) or return undef;
+    open(my $sfh, '>', "$dir/run.sh") or die "cannot write run.sh: $!";
+    print {$sfh} "#!/usr/bin/env bash\n$G\n";
+    close $sfh;
+    my $writer = fork();
+    die "fork: $!" unless defined $writer;
+    if ($writer == 0) {
+        open(STDOUT, '>', File::Spec->devnull);
+        open(STDERR, '>', File::Spec->devnull);
+        open(my $w, '>', $fifo) or POSIX::_exit(1);
+        syswrite($w, $payload_raw);
+        sleep 20;
+        POSIX::_exit(0);
+    }
+    my $pid = fork();
+    die "fork: $!" unless defined $pid;
+    if ($pid == 0) {
+        open(STDIN, '<', $fifo) or POSIX::_exit(126);
+        open(STDOUT, '>', "$dir/out") or POSIX::_exit(126);
+        open(STDERR, '>', "$dir/err") or POSIX::_exit(126);
+        delete $ENV{$_} for grep { /^(?:BP_|CLAUDE_)/ } keys %ENV;
+        $ENV{CCPRAXIS_NO_WAKELOCK} = 1;
+        $ENV{$_} = $env{$_} for keys %env;
+        exec('bash', "$dir/run.sh") or POSIX::_exit(127);
+    }
+    my $deadline = Time::HiRes::time() + 30;
+    my ($finished, $status) = (0, 0);
+    while (Time::HiRes::time() < $deadline) {
+        if (waitpid($pid, POSIX::WNOHANG()) == $pid) { ($finished, $status) = (1, $?); last }
+        Time::HiRes::sleep(0.05);
+    }
+    unless ($finished) { kill 'KILL', $pid; waitpid($pid, 0) }
+    kill 'KILL', $writer;
+    waitpid($writer, 0);
+    return { rc => $status >> 8, out => slurp("$dir/out") // '', err => slurp("$dir/err") // '', finished => $finished };
+}
+
 sub ev {
     my ($tool, %extra) = @_;
     my $raw = qq({"hook_event_name":"PreToolUse","tool_name":"$tool","tool_input":{}});
@@ -246,16 +294,46 @@ for my $case (
         unlike($src, qr/perl/i, 'G-5: no "perl" anywhere in guard-tasks-tool.sh');
         ok(index($src, '$(cat') == -1, 'G-5: no $(cat');
         ok(index($src, 'read -d') == -1, 'G-5: no read -d');
-        # bash 3.2 (stock macOS) has no "read -N", so the guard falls back to
-        # a NUL-delimited read there. That fallback is the only delimiter read
-        # allowed: never a real delimiter (it would cut the payload short),
-        # and only in the else-branch after the -N read bash >= 4.1 takes.
-        my @delims = ($src =~ /^[^#\n]*\bread\b[^\n]*?\s-d\s+(\S+)/mg);
-        is_deeply([grep { $_ ne q{''} } @delims], [], q{G-5: every delimiter read uses -d '' (to EOF), never a real delimiter});
-        like($src, qr/read -r -N 8388608[^\n]*\n\s*else\s*\n[^\n]*read -r -d ''/,
-             q{G-5: the -d '' read is only the else-branch fallback of the -N read});
         ok(index(lc($src), 'jq') == -1, 'G-5: no jq');
+        # The payload is read by the shared, sourced scripts/read-payload.sh (no
+        # process). The same static rules hold for it.
+        (my $code = $src) =~ s/^\s*#.*$//mg;
+        like($code, qr{\.\s+"\$\w+/\.\./scripts/read-payload\.sh"}, 'G-5: the guard sources scripts/read-payload.sh from its own plugin');
+        like($code, qr/\bccp_read_payload\s+PAYLOAD\b/, 'G-5: ...and reads its payload with ccp_read_payload');
+        unlike($code, qr/\bread\b[^\n]*\s-N\s/, 'G-5: the guard keeps no stdin read of its own');
     }
+    my $lib = slurp("$ALM/scripts/read-payload.sh");
+    ok(defined $lib, 'G-5: scripts/read-payload.sh exists');
+    if (defined $lib) {
+        unlike($lib, qr/perl/i, 'G-5: no "perl" anywhere in the library either');
+        ok(index($lib, '$(cat') == -1, 'G-5: library: no $(cat');
+        ok(index(lc($lib), 'jq') == -1, 'G-5: library: no jq');
+        # bash 3.2 (stock macOS) has no "read -N", so the library falls back
+        # to a NUL-delimited read there. That fallback is the only delimiter
+        # read allowed: never a real delimiter (it would cut the payload
+        # short), and only after the -N read bash >= 4.1 takes.
+        my @delims = ($lib =~ /^[^#\n]*\bread\b[^\n]*?\s-d\s+(\S+)/mg);
+        is_deeply([grep { $_ ne q{''} } @delims], [], q{G-5: library: every delimiter read uses -d '' (to EOF), never a real delimiter});
+        like($lib, qr/read -r -N 8388608.*\n\s*else\s*\n(?:[^\n]*\n)*?[^\n]*read -r -d '' /s,
+             q{G-5: library: the -d '' read is only the else-branch fallback of the -N read});
+    }
+}
+
+# =============================================================================
+# G-7: a payload that never finishes arriving fails CLOSED. The registration
+# only ever runs this guard for the four Tasks tools, all of which it denies
+# whenever it can read the call; before, bash 3.2 (macOS) dropped a timed-out
+# read's partial text and let the call through, while bash >= 4 still found
+# the tool name in it. A writer that sends a whole TaskCreate payload and
+# holds the pipe open now gets the same deny on every bash.
+# =============================================================================
+SKIP: {
+    my $r = fire_held(ev('TaskCreate'), BP_PAYLOAD_READ_TIMEOUT => 1);
+    skip 'G-7: no mkfifo on this host', 4 unless defined $r;
+    ok($r->{finished}, 'G-7: a held-open payload does not hang the guard');
+    is($r->{rc}, 2, 'G-7: a held-open TaskCreate payload is denied (exit 2), not let through');
+    like($r->{err}, qr/did not arrive in full/, 'G-7: ...saying the input did not arrive in full');
+    like($r->{err}, qr{perl \Q$ALM\E/scripts/almanac-thread\.pl create <name>}, 'G-7: ...and still pointing at almanac threads');
 }
 
 # =============================================================================

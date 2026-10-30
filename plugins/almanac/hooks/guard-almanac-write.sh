@@ -28,12 +28,22 @@
 # host settings file, so any project with almanac enabled gets it.
 #
 # Reading is untouched. Fails OPEN on anything unexpected — empty/broken
-# input, a payload with no path, a perl that dies at startup — because a
-# guard that wedges an unrelated project's session is worse than an
-# unguarded edit; the sealed digest (almanac-bug.pl verify) still detects the
-# out-of-band write regardless. That layer does not depend on prevention.
-# The Bash branch fails open the same way, including when butler is absent
-# or GuardBash's public interface changes shape (sec 2.6 of the spec).
+# input, a payload with no path, a perl that dies at startup, a missing
+# payload-reader library — because a guard that wedges an unrelated
+# project's session is worse than an unguarded edit; the sealed digest
+# (almanac-bug.pl verify) still detects the out-of-band write regardless.
+# That layer does not depend on prevention. The Bash branch fails open the
+# same way, including when butler is absent or GuardBash's public interface
+# changes shape (sec 2.6 of the spec).
+#
+# The one exception fails CLOSED: a payload that could not be READ in full
+# (no end of input within 10 s, or over 8 MiB). That is not broken input the
+# guard looked at and could not use; it is input the guard never saw, and
+# the hosts used to disagree about it -- bash >= 4 kept the partial text of
+# a timed-out read and still judged it, while macOS /bin/bash 3.2 dropped it
+# and let every such call through. A deny costs one retry; Claude Code
+# closes a hook's stdin as soon as it has written the payload, so a timeout
+# means something is genuinely stuck.
 #
 # COST DISCIPLINE (DC6, budget 50ms median). Every Edit/Write in every
 # session pays for this hook, so it is built in two stages: a bash-only
@@ -62,28 +72,45 @@
 # that is never opened.
 set -u
 
-# Stage 0: read the payload with a bash BUILTIN — no cat, no $(...), no pipe,
-# no external command. -N is the buffered form, required on a non-tty. Any
-# read status (timeout, short read, EOF) is tolerated; an empty payload just
-# fails open below.
-#
-# "read -N" arrived in bash 4.1. Stock macOS /bin/bash is 3.2, where -N is an
-# invalid option (rc 2, nothing read), so this guard silently allowed every
-# write there. An older bash reads with -d '' instead: still a builtin, still
-# bounded by -t, but it reads byte by byte (measured ~0.35s per MiB on macOS),
-# so bash >= 4.1 keeps -N. Same gate as butler's run-hook.sh. P starts empty
-# so `set -u` can never trip on it, whatever read does.
-P=''
+# Stage 0: read the payload with bash BUILTINS only — no cat, no $(...), no
+# pipe, no external command — through scripts/read-payload.sh, the one bounded
+# reader the bash hooks of almanac and butler share (sourced, so no process
+# is spawned). It keeps "read -N" on bash >= 4.1 and reads NUL-delimited on
+# macOS /bin/bash 3.2, where -N is an invalid option (rc 2, nothing read:
+# this guard once silently allowed every write there). Its states:
+#   complete           judged below; an empty payload fails open.
+#   truncated, timeout the guard never saw the whole call: deny (fail
+#                      CLOSED, see the header).
+#   (library missing)  a broken install: fail open, like a perl that dies.
+# P starts empty so `set -u` can never trip on it, whatever read does.
 _ALM_BASH4=0
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] && _ALM_BASH4=1
-_alm_read_n=0
-[ "${BASH_VERSINFO[0]:-0}" -gt 4 ] && _alm_read_n=1
-[ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 1 ] && _alm_read_n=1
-if [ "$_alm_read_n" -eq 1 ]; then
-  IFS= read -r -N 8388608 -t 10 P
-else
-  IFS= read -r -d '' -t 10 P
-fi
+case "${BASH_SOURCE[0]//\\//}" in
+  */*) _alm_rp_dir="${BASH_SOURCE[0]//\\//}"; _alm_rp_dir="${_alm_rp_dir%/*}" ;;
+  *)   _alm_rp_dir=. ;;
+esac
+[ -f "$_alm_rp_dir/../scripts/read-payload.sh" ] || exit 0
+. "$_alm_rp_dir/../scripts/read-payload.sh"
+declare -F ccp_read_payload >/dev/null || exit 0
+P=''
+ccp_read_payload P
+case "${CCP_PAYLOAD_STATE:-}" in
+  complete) ;;
+  truncated|timeout)
+    if [ "$CCP_PAYLOAD_STATE" = timeout ]; then
+      _alm_why="its hook input did not end within the 10-second read budget"
+    else
+      _alm_why="its hook input is larger than the 8 MiB the guard reads"
+    fi
+    {
+      echo "BLOCKED: the almanac write guard could not read this call in full ($_alm_why), so it cannot tell whether the call writes a bug report or an almanac record."
+      echo
+      echo "Retry the call. A write guard that cannot read its input refuses rather than guessing; Claude Code normally hands a hook its whole input at once, so a repeat of this means the hook's input pipe is stuck."
+    } >&2
+    exit 2
+    ;;
+  *) exit 0 ;;
+esac
 [ -n "${P:-}" ] || exit 0
 
 # _alm_has_marker TEXT -> 0 when TEXT holds either root's literal, a store
