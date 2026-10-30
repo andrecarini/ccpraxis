@@ -208,6 +208,16 @@ my %CHECK = (
         ('skip', 'self-test requires a live claude session; A8 runs the deny-out-of-scope-edit self-test at launch');
     } },
 
+    'jail.devices' => { run => sub {
+        # A rootless image has no device nodes for worker jails; bp-jail.pl
+        # then hands workers empty files. Reported, never gating: building the
+        # image rootful is the operator's decision.
+        require "$Bin/BpJailDevices.pm";
+        my $st = BpJailDevices::skeleton_state();
+        return ('ok', $st->{reason}) if $st->{ok};
+        ('warn', BpJailDevices::warning_text($st->{stand_ins}, $st->{reason}));
+    } },
+
     'harness.wake' => { run => sub {
         ('skip', 'harness property (proven in A0); bounded long-poll + re-arm is the robust fallback');
     } },

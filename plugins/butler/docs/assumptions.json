@@ -151,6 +151,15 @@
       "supported_envs": ["win32", "sandbox-linux", "macos"],
       "implement_hint": "Provide git on PATH and a real repository at the project root; if git is deliberately unavailable, set BP_ALLOW_NO_GIT=1 to accept a degraded, checkpoint-less run.",
       "surface": "preflight"
+    },
+    {
+      "id": "jail.devices",
+      "what": "Worker jails (bp-jail.pl) get real /dev/null, /dev/zero, /dev/random and /dev/urandom device nodes, copied from the image's /opt/bp-jail-skel/dev.",
+      "expected_contract": "/opt/bp-jail-skel/dev/{null,zero,random,urandom} are character devices and no .no-device-nodes marker is present. A rootless image build cannot create device nodes: the Containerfile then leaves the marker, and bp-jail.pl falls back to empty regular files, which a worker redirecting to /dev/null or reading /dev/urandom misbehaves against.",
+      "check": "Are the skeleton's nodes character devices, and is the marker absent? A degraded skeleton is a WARNING, never a failure (BpJailDevices.pm, shared with bp-jail.pl).",
+      "supported_envs": ["sandbox-linux"],
+      "implement_hint": "Build the sandbox image rootful (device nodes need mknod outside a user namespace); until then jailed workers get empty-file stand-ins, and bp-jail.pl warns when it creates a jail.",
+      "surface": "preflight"
     }
   ]
 }

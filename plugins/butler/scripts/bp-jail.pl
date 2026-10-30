@@ -35,6 +35,8 @@ use File::Spec ();
 use Digest::SHA qw(sha256_hex);
 use JSON::PP ();
 use POSIX qw(WNOHANG);
+use Cwd ();
+BEGIN { my $d = File::Basename::dirname(Cwd::abs_path(__FILE__) // __FILE__); require "$d/BpJailDevices.pm"; }
 
 my $META_FILE = '.bp-jail-meta.json';
 my $LOG_FILE  = '.bp-jail-log.jsonl';
@@ -428,30 +430,23 @@ sub populate_os_skeleton {
     # /dev — mknod is denied at runtime (CAP_MKNOD absent) and /dev is tmpfs so a
     # hardlink from the real /dev fails EXDEV against overlayfs. The nodes are
     # therefore BAKED INTO THE IMAGE at /opt/bp-jail-skel (Containerfile, spec
-    # section 3.4), where the build runs privileged and mknod is available.
+    # section 3.4), where a rootful build can run mknod.
     #
     # PREFER the baked skeleton — hardlinking or copying a real device node
     # preserves it as a device, so a jailed worker gets a functional /dev/null
-    # and /dev/urandom. The empty-file path below is a LAST-RESORT fallback for a
-    # container built before this skeleton existed: it satisfies
-    # t/worker-jail-isolation.t (nothing there depends on device
-    # semantics) but is NOT functional for a real worker, which will
-    # misbehave redirecting to an empty regular file or reading it for
-    # entropy. If you are debugging odd worker behaviour and see empty files here,
-    # the container predates the skeleton — rebuild it.
-    make_path("$jail_root/dev");
-    my $SKEL = '/opt/bp-jail-skel';
-    for my $dev (qw(null zero random urandom)) {
-        my $p = "$jail_root/dev/$dev";
-        next if -e $p;
-        my $made = 0;
-        if (-e "$SKEL/dev/$dev") {
-            $made = (system('cp', '-a', "$SKEL/dev/$dev", $p) == 0) ? 1 : 0;
-        }
-        $made ||= eval { system('mknod', $p, 'c', 1, ($dev eq 'null' ? 3 : $dev eq 'zero' ? 5 : $dev eq 'random' ? 8 : 9)) == 0 };
-        write_all_bytes($p, '') unless $made;
-        chmod(0666, $p);   # world rw, matching real /dev/{null,zero,random,urandom}
-    }
+    # and /dev/urandom. The empty-file path (populate_dev) is a LAST-RESORT
+    # fallback for a container whose image has no nodes: one built before the
+    # skeleton existed, or built ROOTLESS, which cannot create device nodes and
+    # leaves $SKEL/dev/.no-device-nodes instead (Containerfile). It satisfies
+    # t/worker-jail-isolation.t (nothing there depends on device semantics) but
+    # is NOT functional for a real worker, which will misbehave redirecting to
+    # an empty regular file or reading it for entropy.
+    #
+    # The fallback is no longer silent: populate_dev reports every stand-in it
+    # had to write and why, and action_create warns on stderr and records it in
+    # the jail's state (devices.functional = false).
+    my $SKEL = BpJailDevices::skel_dir();
+    my $devices = populate_dev($jail_root, $SKEL);
     # /tmp (mode 1777) and the minimal /etc likewise come from the baked skeleton
     # when present; both are cheap to synthesize otherwise.
     if (-d "$SKEL/tmp" && !-d "$jail_root/tmp") {
@@ -492,6 +487,33 @@ sub populate_os_skeleton {
 
     make_path("$jail_root/tmp");
     chmod(01777, "$jail_root/tmp");
+    return $devices;
+}
+
+# populate_dev($jail_root, $skel) -> { functional => 0|1, stand_ins => [...], reason => $text|undef }
+# Gives the jail /dev/{null,zero,random,urandom}: a copy of the baked node,
+# else mknod, else an empty regular file (the last-resort fallback described
+# above). Then says which of them are NOT character devices, and why, from
+# the skeleton's own state (its .no-device-nodes marker when there is one).
+sub populate_dev {
+    my ($jail_root, $skel) = @_;
+    make_path("$jail_root/dev");
+    for my $dev (@BpJailDevices::DEVICES) {
+        my $p = "$jail_root/dev/$dev";
+        next if -e $p;
+        my $made = 0;
+        if (-e "$skel/dev/$dev") {
+            $made = (system('cp', '-a', "$skel/dev/$dev", $p) == 0) ? 1 : 0;
+        }
+        $made ||= eval { system('mknod', $p, 'c', 1, ($dev eq 'null' ? 3 : $dev eq 'zero' ? 5 : $dev eq 'random' ? 8 : 9)) == 0 };
+        write_all_bytes($p, '') unless $made;
+        chmod(0666, $p);   # world rw, matching real /dev/{null,zero,random,urandom}
+    }
+    my @stand_ins = BpJailDevices::stand_ins("$jail_root/dev");
+    return { functional => 1, stand_ins => [], reason => undef } unless @stand_ins;
+    my $sk = BpJailDevices::skeleton_state($skel);
+    my $reason = $sk->{ok} ? "the nodes in $skel/dev could not be copied and mknod is denied" : $sk->{reason};
+    return { functional => 0, stand_ins => \@stand_ins, reason => $reason };
 }
 
 # ---------------------------------------------------------------------------
@@ -581,7 +603,7 @@ sub action_create {
     make_path($jail_root) or io_exit("mkdir $jail_root: $!");
     make_path("$jail_root/work");
 
-    populate_os_skeleton($jail_root);
+    my $devices  = populate_os_skeleton($jail_root);
     my $manifest = populate_work_tree($jail_root, $project_root);
 
     write_state($jail_root, {
@@ -589,7 +611,23 @@ sub action_create {
         uid        => $WORKER_UID,
         gid        => $WORKER_GID,
         manifest   => $manifest,
+        # Whether /dev in this jail is real. functional=false is a jail whose
+        # /dev/null and friends are empty regular files (see populate_dev).
+        devices    => { functional => ($devices->{functional} ? JSON::PP::true() : JSON::PP::false()),
+                        stand_ins  => $devices->{stand_ins},
+                        (defined $devices->{reason} ? (reason => $devices->{reason}) : ()) },
     });
+    unless ($devices->{functional}) {
+        print STDERR 'bp-jail: WARNING: '
+            . BpJailDevices::warning_text($devices->{stand_ins}, $devices->{reason}) . "\n";
+        eval {
+            require "$Bin/bp-log.pl";
+            BpLog::event("$jail_root/$LOG_FILE", 'jail_dev_stand_ins',
+                         { package => $opt->{package}, stand_ins => $devices->{stand_ins},
+                           reason => $devices->{reason} });
+            1;
+        };
+    }
 
     system('chown', '-R', "$WORKER_UID:$WORKER_GID", "$jail_root/work") == 0
         or io_exit("chown -R jail work tree failed (rc=$?)");
