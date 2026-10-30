@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # t/17 — immutable oracle for bp-drive-next.pl (01-director-core).
 # Tests EVERY AC-1..AC-9 + AC-11 from the spec §6.
 # AC-10 is structural: the suite runs with zero network/powershell/real-clock by design.

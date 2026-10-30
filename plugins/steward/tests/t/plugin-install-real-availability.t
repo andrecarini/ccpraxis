@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # 17 -- oracle for blueprint tooling-fixes, package
 # 17-plugin-install-real-availability.
 #

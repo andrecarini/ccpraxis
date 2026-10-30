@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # THE ORACLE for blueprint sandbox-launcher-lifecycle, package
 # 01-launcher-and-its-terminal, written from
 #   .ccpraxis-local-data/blueprints/sandbox-launcher-lifecycle/specs/01-launcher-and-its-terminal-spec.md

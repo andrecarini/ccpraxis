@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # b06-sandbox-fast-test-io — the immutable test oracle.
 
 # Derived ONLY from specs/07-sandbox-fast-test-io-spec.md (the 1117-line

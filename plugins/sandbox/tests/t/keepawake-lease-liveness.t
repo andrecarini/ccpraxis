@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 #
 # 02-lease-distinguishes-quiet-from-gone (host-wake-and-suspend blueprint).
 #

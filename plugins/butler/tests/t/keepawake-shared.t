@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # t/111 — the wake-lock is ONE definition, and the FLEET
 # holds it too.
 #

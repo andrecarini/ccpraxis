@@ -2,7 +2,7 @@
 # backfill-test-platform.pl -- blueprint test-platform-split, package
 # 02-backfill-scan. A ONE-TIME migration aid (Decision 3): it scans .t files
 # for nine textual signals of host-specific test behavior, proposes a
-# platform marker (`windows` or `any`, never `linux` -- the conservative
+# platform marker (`host` or `any`, never `linux` -- the conservative
 # default, spec D3) for every file that does not already carry a legal one,
 # and, given --apply, inserts exactly one marker comment line per file.
 #
@@ -73,7 +73,7 @@ usage: perl scripts/backfill-test-platform.pl --dry-run|--apply [GLOB ...]
 Scans .t files for nine textual signals of host-specific test behavior and proposes a platform marker for every file that does not already carry a legal one (package 01's TestPlatform.pm parser decides "legal").
 
   --dry-run    scan and print the report; write nothing
-  --apply      scan, print the report, and insert exactly one "# platform: windows" or "# platform: any" line into every file classified windows or any. Files already carrying a legal marker, or a marker-shaped-but-invalid line, are left untouched either way.
+  --apply      scan, print the report, and insert exactly one "# platform: host" or "# platform: any" line into every file classified host or any. Files already carrying a legal marker, or a marker-shaped-but-invalid line, are left untouched either way.
   --help, -h   print this message and exit 0
 
 Exactly one of --dry-run/--apply is required; giving neither or both is a usage error (exit 2).
@@ -170,7 +170,7 @@ sub read_file_raw {
 # shebang-only file, or one using bare-\r line endings throughout). Without
 # it, the insertion point falls at end-of-bytes with nothing separating the
 # shebang text from the marker, gluing them into one corrupted physical line
-# (e.g. "#!/usr/bin/env perl# platform: windows") that TestPlatform's
+# (e.g. "#!/usr/bin/env perl# platform: host") that TestPlatform's
 # line-anchored marker regex can never recognise -- breaking both AC-10 (every
 # other byte unchanged) and idempotence (a second run never sees it as
 # already-marked). The caller prepends $eol before the marker line whenever
@@ -260,7 +260,7 @@ for my $pat (@patterns) {
 # =============================================================================
 # Scan + classify + (if --apply) write.
 # =============================================================================
-my %buckets = (windows => [], any => [], 'already-marked' => [], 'needs-review' => []);
+my %buckets = (host => [], any => [], 'already-marked' => [], 'needs-review' => []);
 my (@errors, @attr_warnings);
 
 for my $abs (@files) {
@@ -306,7 +306,7 @@ for my $abs (@files) {
                           text => truncate80(trim($line)) };
         }
     }
-    my $value = @hits ? 'windows' : 'any';
+    my $value = @hits ? 'host' : 'any';
     my $entry = { relpath => relpath($abs), signals => \@hits };
 
     if ($apply) {
@@ -335,11 +335,11 @@ for my $bucket (keys %buckets) {
 # this order, even when empty.
 # =============================================================================
 my $scanned = 0;
-$scanned += scalar(@{ $buckets{$_} }) for qw(windows any already-marked needs-review);
+$scanned += scalar(@{ $buckets{$_} }) for qw(host any already-marked needs-review);
 
 my @out;
-push @out, sprintf('=== windows (%d files) ===', scalar(@{ $buckets{windows} }));
-for my $e (@{ $buckets{windows} }) {
+push @out, sprintf('=== host (%d files) ===', scalar(@{ $buckets{host} }));
+for my $e (@{ $buckets{host} }) {
     push @out, "  $e->{relpath}";
     for my $sig (@{ $e->{signals} }) {
         push @out, sprintf('      %s: %s (line %d)', $sig->{name}, $sig->{text}, $sig->{line_no});
@@ -359,8 +359,8 @@ push @out, sprintf('=== needs-review (%d files) ===', scalar(@{ $buckets{'needs-
 push @out, "  $_->{relpath} (reason: $_->{reason})" for @{ $buckets{'needs-review'} };
 push @out, '';
 
-my $footer = sprintf('TOTAL: %d scanned, %d windows, %d any, %d already-marked, %d needs-review',
-    $scanned, scalar(@{ $buckets{windows} }), scalar(@{ $buckets{any} }),
+my $footer = sprintf('TOTAL: %d scanned, %d host, %d any, %d already-marked, %d needs-review',
+    $scanned, scalar(@{ $buckets{host} }), scalar(@{ $buckets{any} }),
     scalar(@{ $buckets{'already-marked'} }), scalar(@{ $buckets{'needs-review'} }));
 $footer .= sprintf(', errors: %d', scalar(@errors)) if @errors;
 push @out, $footer;

@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Tests for the p01 in-place refusal (blueprint sandbox-refuse-in-place).
 #
 # IMMUTABLE ORACLE: written from the spec BEFORE the implementation exists.

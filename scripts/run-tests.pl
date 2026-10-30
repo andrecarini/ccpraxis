@@ -1147,23 +1147,30 @@ sub _marker_fix_message {
     my $rel = _relpath($file);
     my $body;
     if ($marker->{outcome} eq 'absent') {
-        $body = 'no platform marker found. Fix: add "# platform: windows|linux|any" near the top '
+        $body = 'no platform marker found. Fix: add "# platform: host|linux|any" near the top '
               . 'of the file (within the first 4096 bytes).';
     } elsif ($marker->{outcome} eq 'invalid' && $marker->{reason} eq 'unrecognized-value') {
         my $raw = _escape_marker_text($marker->{raw}[0] // '');
-        $body = qq{unrecognized platform value "$raw". Fix: change it to one of: windows, linux, any.};
+        # Retired values (TestPlatform::renamed_values) get the exact fix, data-driven.
+        my %renamed = TestPlatform::renamed_values();
+        my $rename_hint = '';
+        if (exists $renamed{$marker->{raw}[0] // ''}) {
+            my $old = $marker->{raw}[0];
+            $rename_hint = qq{ "$old" was renamed to "$renamed{$old}"; change the line to "# platform: $renamed{$old}".};
+        }
+        $body = qq{unrecognized platform value "$raw". Fix: change it to one of: host, linux, any.$rename_hint};
     } elsif ($marker->{outcome} eq 'invalid' && $marker->{reason} eq 'conflicting-markers') {
         my $joined = join(', ', map { _escape_marker_text($_) } @{ $marker->{raw} // [] });
         $body = "conflicting platform markers found ($joined). Fix: keep exactly one "
               . '"# platform: ..." line with a single legal value.';
     } elsif ($marker->{outcome} eq 'invalid' && $marker->{reason} eq 'malformed-marker-line') {
         my $raw = _escape_marker_text($marker->{raw}[0] // '');
-        $body = qq{malformed platform marker line ("$raw"). Fix: use exactly "# platform: windows|linux|any" }
+        $body = qq{malformed platform marker line ("$raw"). Fix: use exactly "# platform: host|linux|any" }
               . '(lowercase keyword "platform", one legal value, no trailing text).';
     } else {
         # Defensive fallback for any future fourth reason value -- must never
         # fire against today's TestPlatform.pm.
-        $body = 'platform marker is not legal. Fix: use exactly "# platform: windows|linux|any".';
+        $body = 'platform marker is not legal. Fix: use exactly "# platform: host|linux|any".';
     }
     return "PLATFORM MARKER REFUSED: $rel -- $body";
 }
@@ -1228,7 +1235,9 @@ sub classify_file {
     if ($serial) {
         return { lane => 'host-serial', marker => $marker, serial => 1 };
     }
-    if ($marker->{value} eq 'windows') {
+    # `host` = "must run on the host, not in the container lane" -- NOT "Windows
+    # only" (those tests skip themselves off Windows, inside the file).
+    if ($marker->{value} eq 'host') {
         return { lane => 'host-parallel', marker => $marker, serial => 0 };
     }
     # 'any' or 'linux', not serial-classified.

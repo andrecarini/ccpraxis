@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Companion oracle for bp-drive-next.pl's project-level in-flight set
 # (package 11, hook-continuity-remake). Covers spec AC-1..AC-12 for
 # inflight.json: concurrent hand-out behind BUTLER_CONCURRENCY=1, the load/

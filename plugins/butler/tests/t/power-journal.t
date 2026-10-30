@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 #
 # ORACLE for blueprint package 05-power-journal (host-wake-and-suspend),
 # derived ONLY from

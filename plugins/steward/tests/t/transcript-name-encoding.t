@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Byte-for-byte assertion that encode_project_dir reproduces the
 # six live transcript-dir names (Decision #1 encoding rule), plus the _host-memory
 # in-container /project vector, plus proof that emit_json's _decode_strings_-

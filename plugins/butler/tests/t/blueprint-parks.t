@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # 08-blueprint-parks — immutable oracle for the "a parked blueprint says so in
 # its own blueprint.md" package (where-things-go blueprint). Derived ONLY from
 # .ccpraxis-local-data/blueprints/where-things-go/specs/08-blueprint-parks-spec.md

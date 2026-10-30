@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 #
 # ORACLE for blueprint package 06-plan-follows-arming (host-wake-and-suspend),
 # derived ONLY from

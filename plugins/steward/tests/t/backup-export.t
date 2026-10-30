@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # 22 -- oracle for blueprint backup-driver, package
 # 03-export-and-push (scripts/backup/Export.pm).
 #

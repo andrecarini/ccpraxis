@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 #
 # Package 16-sandbox-picker-missing-host-rows (almanac bug 20261001-192457-
 # f15e): the sandbox session picker showed ZERO host-origin rows despite

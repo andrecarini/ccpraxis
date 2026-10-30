@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Oracle for blueprint package 04-scratch-root (blueprint test-platform-split).
 # Derived ONLY from
 # .ccpraxis-local-data/blueprints/test-platform-split/specs/04-scratch-root-spec.md

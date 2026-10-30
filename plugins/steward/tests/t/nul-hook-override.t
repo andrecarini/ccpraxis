@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # 17 — block-nul-redirect.pl still blocks, and now has a
 # way to say "this one is a false positive".
 #

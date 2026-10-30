@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Oracle for blueprint tooling-fixes, package 16-container-follows-global-answer
 # (scripts/backup/Export.pm, plugins/steward/skills/backup/SKILL.md).
 #

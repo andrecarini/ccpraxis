@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # AN UNREADABLE PROBE IS NOT A DEFINITE NEGATIVE.
 #
 # The rule 20260915-230820-d33e states, and the two places that broke it.

@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Oracle for blueprint package 01-platform-marker (blueprint test-platform-split).
 # Derived ONLY from
 # .ccpraxis-local-data/blueprints/test-platform-split/specs/01-platform-marker-spec.md
@@ -183,9 +183,9 @@ my $PREFIX_BYTES = (defined $PB_RAW && $PB_RAW =~ /^\d+$/) ? $PB_RAW : 4096;
     my ($lv, $died, $warn) = call_legal_values();
     ok(!$died, 'legal_values() does not die') or diag("died: $died");
     is(scalar(@$warn), 0, 'legal_values() does not warn');
-    is_deeply($lv, ['windows', 'linux', 'any'],
+    is_deeply($lv, ['host', 'linux', 'any'],
         "interface contract (spec section 2): legal_values() returns exactly "
-      . "('windows','linux','any') in that order");
+      . "('host','linux','any') in that order");
 }
 
 # =============================================================================
@@ -195,9 +195,9 @@ my $PREFIX_BYTES = (defined $PB_RAW && $PB_RAW =~ /^\d+$/) ? $PB_RAW : 4096;
 # scaffolding / extra explanation.
 # =============================================================================
 
-check_parse_marker('AC-1/oracle#1 (minimal legal marker: windows)',
-    "# platform: windows\n",
-    { outcome => 'legal', value => 'windows', reason => undef, raw => ['windows'] });
+check_parse_marker('AC-1/oracle#1 (minimal legal marker: host)',
+    "# platform: host\n",
+    { outcome => 'legal', value => 'host', reason => undef, raw => ['host'] });
 
 check_parse_marker('AC-1/oracle#2 (minimal legal marker: linux)',
     "# platform: linux\n",
@@ -215,21 +215,30 @@ check_parse_marker('AC-4/oracle#5 (unrecognised value: macos)',
     "# platform: macos\n",
     { outcome => 'invalid', value => undef, reason => 'unrecognized-value', raw => ['macos'] });
 
-check_parse_marker('AC-5/oracle#6 (legal word, wrong case: Windows)',
-    "# platform: Windows\n",
-    { outcome => 'invalid', value => undef, reason => 'unrecognized-value', raw => ['Windows'] });
+check_parse_marker('rename/oracle (retired value "windows" is illegal, not an alias)',
+    "# platform: windows\n",
+    { outcome => 'invalid', value => undef, reason => 'unrecognized-value', raw => ['windows'] });
+
+is_deeply({ TestPlatform::renamed_values() }, { windows => 'host' },
+    'rename/oracle: renamed_values() maps the retired "windows" to "host"');
+ok(!(grep { $_ eq 'windows' } TestPlatform::legal_values()),
+    'rename/oracle: "windows" is not among legal_values()');
+
+check_parse_marker('AC-5/oracle#6 (legal word, wrong case: Host)',
+    "# platform: Host\n",
+    { outcome => 'invalid', value => undef, reason => 'unrecognized-value', raw => ['Host'] });
 
 check_parse_marker('AC-9/oracle#7 (two identical legal markers collapse to one legal result)',
-    "# platform: windows\n# something else\n# platform: windows\n",
-    { outcome => 'legal', value => 'windows', reason => undef, raw => ['windows', 'windows'] });
+    "# platform: host\n# something else\n# platform: host\n",
+    { outcome => 'legal', value => 'host', reason => undef, raw => ['host', 'host'] });
 
 check_parse_marker('AC-10a/oracle#8 (conflicting markers: legal-vs-legal)',
-    "# platform: windows\n# platform: linux\n",
-    { outcome => 'invalid', value => undef, reason => 'conflicting-markers', raw => ['windows', 'linux'] });
+    "# platform: host\n# platform: linux\n",
+    { outcome => 'invalid', value => undef, reason => 'conflicting-markers', raw => ['host', 'linux'] });
 
 check_parse_marker('AC-10b (conflicting markers: legal-vs-illegal)',
-    "# platform: windows\n# platform: macos\n",
-    { outcome => 'invalid', value => undef, reason => 'conflicting-markers', raw => ['windows', 'macos'] });
+    "# platform: host\n# platform: macos\n",
+    { outcome => 'invalid', value => undef, reason => 'conflicting-markers', raw => ['host', 'macos'] });
 
 # D3 (spec section 8): duplicate IDENTICAL ILLEGAL values fold to
 # 'unrecognized-value', never 'conflicting-markers' -- only genuine
@@ -251,35 +260,35 @@ check_parse_marker('AC-12/oracle#11 (binary garbage, no # byte anywhere, no die/
     pack('C*', (0x00, 0x01, 0xFF, 0x10) x 50),
     { outcome => 'absent', value => undef, reason => undef, raw => [] });
 
-check_parse_marker('AC-7a/oracle#12 (no whitespace anywhere: #platform:windows)',
-    "#platform:windows\n",
-    { outcome => 'legal', value => 'windows', reason => undef, raw => ['windows'] });
+check_parse_marker('AC-7a/oracle#12 (no whitespace anywhere: #platform:host)',
+    "#platform:host\n",
+    { outcome => 'legal', value => 'host', reason => undef, raw => ['host'] });
 
 check_parse_marker('AC-7b/oracle#13 (leading indentation before #)',
-    "   # platform: windows\n",
-    { outcome => 'legal', value => 'windows', reason => undef, raw => ['windows'] });
+    "   # platform: host\n",
+    { outcome => 'legal', value => 'host', reason => undef, raw => ['host'] });
 
-check_parse_marker('AC-8/oracle#14 (miscapitalized keyword: # Platform: windows)',
-    "# Platform: windows\n",
-    { outcome => 'invalid', value => undef, reason => 'malformed-marker-line', raw => ['# Platform: windows'] });
+check_parse_marker('AC-8/oracle#14 (miscapitalized keyword: # Platform: host)',
+    "# Platform: host\n",
+    { outcome => 'invalid', value => undef, reason => 'malformed-marker-line', raw => ['# Platform: host'] });
 
 check_parse_marker('AC-15/oracle#15 (trailing prose after an otherwise-legal value)',
-    "# platform: windows extra text\n",
+    "# platform: host extra text\n",
     { outcome => 'invalid', value => undef, reason => 'malformed-marker-line',
-      raw => ['# platform: windows extra text'] });
+      raw => ['# platform: host extra text'] });
 
 check_parse_marker('oracle#16 (CRLF line ending, decision D4)',
-    "# platform: windows\r\n",
-    { outcome => 'legal', value => 'windows', reason => undef, raw => ['windows'] });
+    "# platform: host\r\n",
+    { outcome => 'legal', value => 'host', reason => undef, raw => ['host'] });
 
 check_parse_marker('AC-3 (undef input behaves exactly like the empty string)',
     undef,
     { outcome => 'absent', value => undef, reason => undef, raw => [] });
 
 check_parse_marker('AC-17 (two loose-matching lines, no strict match anywhere)',
-    "# Platform: windows\n# platform : linux extra\n",
+    "# Platform: host\n# platform : linux extra\n",
     { outcome => 'invalid', value => undef, reason => 'malformed-marker-line',
-      raw => ['# Platform: windows', '# platform : linux extra'] });
+      raw => ['# Platform: host', '# platform : linux extra'] });
 
 # =============================================================================
 # never-dies / never-warns -- two more of the named edge cases (very long
@@ -307,7 +316,7 @@ check_parse_marker('never-dies + correctness (legal marker with NO trailing newl
     my $beyond_pad = $PREFIX_BYTES + 1000;
     check_parse_marker(
         "AC-11/oracle#9 (marker begins $beyond_pad bytes in -- strictly beyond prefix_bytes())",
-        ('x' x $beyond_pad) . "\n# platform: windows\n",
+        ('x' x $beyond_pad) . "\n# platform: host\n",
         { outcome => 'absent', value => undef, reason => undef, raw => [] });
 
     # Counter-fixture (non-vacuity): the SAME shape, padded to stay
@@ -317,8 +326,8 @@ check_parse_marker('never-dies + correctness (legal marker with NO trailing newl
     my $within_pad = ($PREFIX_BYTES > 300) ? $PREFIX_BYTES - 300 : 0;
     check_parse_marker(
         "AC-11 counter-fixture (marker begins $within_pad bytes in -- WITHIN prefix_bytes())",
-        ('x' x $within_pad) . "\n# platform: windows\n",
-        { outcome => 'legal', value => 'windows', reason => undef, raw => ['windows'] });
+        ('x' x $within_pad) . "\n# platform: host\n",
+        { outcome => 'legal', value => 'host', reason => undef, raw => ['host'] });
 }
 
 # =============================================================================
@@ -328,16 +337,16 @@ check_parse_marker('never-dies + correctness (legal marker with NO trailing newl
 # bytes at byte offset 0).
 # =============================================================================
 check_parse_marker('D9 (UTF-8 BOM before a first-line marker is stripped -- marker is found)',
-    "\xEF\xBB\xBF# platform: windows\n",
-    { outcome => 'legal', value => 'windows', reason => undef, raw => ['windows'] });
+    "\xEF\xBB\xBF# platform: host\n",
+    { outcome => 'legal', value => 'host', reason => undef, raw => ['host'] });
 
 # Counter-fixture: the identical text with the BOM removed. This isolates
 # the BOM as the only variable between the two fixtures -- proving the
 # assertion above passes because the BOM is correctly stripped, not because
 # every input happens to return `legal` regardless of what precedes it.
 check_parse_marker('D9 counter-fixture (same text, no BOM)',
-    "# platform: windows\n",
-    { outcome => 'legal', value => 'windows', reason => undef, raw => ['windows'] });
+    "# platform: host\n",
+    { outcome => 'legal', value => 'host', reason => undef, raw => ['host'] });
 
 # =============================================================================
 # D10 -- a marker cut mid-value by the prefix_bytes() truncation must never
@@ -369,16 +378,16 @@ check_parse_marker('D9 counter-fixture (same text, no BOM)',
         'D10 headline: value is definitely not the forged "any"')
         if ref($result_forged) eq 'HASH';
 
-    # --- Second reproduction: a LEGAL value ("windows") truncated to its
+    # --- Second reproduction: a LEGAL value ("host") truncated to its
     # first 4 characters ("wind"). Before the fix this returned
     # {outcome=>'invalid', reason=>'unrecognized-value', raw=>['wind']} --
     # a fragment that never appears in the real file as a standalone token.
-    my $cut_after2     = 4;   # chars of "windows" left inside the bound
+    my $cut_after2     = 4;   # chars of "host" left inside the bound
     my $head_pad_len2  = $PREFIX_BYTES - length($prefix_before_value) - $cut_after2;
     my $filler2        = ('z' x ($head_pad_len2 - 1)) . "\n";
-    my $text_fragment  = $filler2 . $prefix_before_value . "windows\n";
+    my $text_fragment  = $filler2 . $prefix_before_value . "host\n";
     my $result_fragment = check_parse_marker(
-        'D10 (legal value "windows" truncated mid-value must not yield the fragment "wind" in raw)',
+        'D10 (legal value "host" truncated mid-value must not yield the fragment "wind" in raw)',
         $text_fragment,
         { outcome => 'absent', value => undef, reason => undef, raw => [] });
     if (ref($result_fragment) eq 'HASH' && ref($result_fragment->{raw}) eq 'ARRAY') {
@@ -393,14 +402,14 @@ check_parse_marker('D9 counter-fixture (same text, no BOM)',
     # at the truncation point (the bounded text's last byte is the marker
     # line's own trailing "\n") must still parse normally. This proves D10's
     # rule triggers only on a genuine mid-line cut, not on every truncation.
-    my $marker_line   = "# platform: windows\n";
+    my $marker_line   = "# platform: host\n";
     my $filler3_len   = $PREFIX_BYTES - length($marker_line);
     my $filler3       = ('z' x ($filler3_len - 1)) . "\n";
     my $text_aligned  = $filler3 . $marker_line . ('q' x 500);  # longer than the bound, cut is line-aligned
     check_parse_marker(
         'D10 counter-fixture (truncation lands exactly on a line boundary -- marker still parses)',
         $text_aligned,
-        { outcome => 'legal', value => 'windows', reason => undef, raw => ['windows'] });
+        { outcome => 'legal', value => 'host', reason => undef, raw => ['host'] });
 }
 
 # =============================================================================
@@ -417,7 +426,7 @@ check_parse_marker('D9 counter-fixture (same text, no BOM)',
 {
     my $result = check_parse_marker(
         'AC-16/oracle#17 (precedence: one malformed line + one strict-valid line)',
-        "# Platform: windows\n# platform: linux\n",
+        "# Platform: host\n# platform: linux\n",
         { outcome => 'legal', value => 'linux', reason => undef, raw => ['linux'] });
 
     # Explicit, separate check (not merely riding on is_deeply having passed
@@ -425,7 +434,7 @@ check_parse_marker('D9 counter-fixture (same text, no BOM)',
     if (ref($result) eq 'HASH' && ref($result->{raw}) eq 'ARRAY') {
         my @leaked = grep { /Platform/ } @{ $result->{raw} };
         is(scalar(@leaked), 0,
-            'AC-16: the malformed line ("# Platform: windows") does not leak into raw at all');
+            'AC-16: the malformed line ("# Platform: host") does not leak into raw at all');
     } else {
         fail('AC-16: the malformed line does not leak into raw at all (no raw array to inspect)');
     }
@@ -435,7 +444,7 @@ check_parse_marker('D9 counter-fixture (same text, no BOM)',
     # first/second line always wins" or some other positional accident.
     check_parse_marker(
         'AC-16 counter-fixture (swapped order: strict-valid line first, malformed line second)',
-        "# platform: any\n# Platform: windows\n",
+        "# platform: any\n# Platform: host\n",
         { outcome => 'legal', value => 'any', reason => undef, raw => ['any'] });
 }
 
@@ -560,8 +569,8 @@ check_parse_marker('D9 counter-fixture (same text, no BOM)',
 # this blueprint's own vacuity gate demands.
 {
     my @fake = (
-        { outcome => 'legal',   value => undef,     reason => undef, raw => ['windows'] }, # bad: legal w/o value
-        { outcome => 'absent',  value => 'windows',  reason => undef, raw => [] },          # bad: absent w/ value
+        { outcome => 'legal',   value => undef,     reason => undef, raw => ['host'] }, # bad: legal w/o value
+        { outcome => 'absent',  value => 'host',  reason => undef, raw => [] },          # bad: absent w/ value
         { outcome => 'bogus',   value => undef,      reason => undef, raw => [] },          # bad: 4th outcome
         { outcome => 'invalid', value => undef,      reason => undef, raw => ['x'] },       # bad: invalid w/o reason
     );

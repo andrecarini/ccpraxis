@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 #
 # ORACLE for blueprint package 11-plan-restored-on-last-off (tooling-fixes),
 # derived ONLY from

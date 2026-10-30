@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # t11-tui-hot-reload -- the oracle for blueprint tui-operator-feedback.
 #
 # Operator: "Could we make source code changes on the TUI be hot-reloaded? I

@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Oracle for blueprint hook-continuity-remake, package
 # 33-promote-syncs-global-config (scripts/promote.pl). Derived ONLY from
 # .ccpraxis-local-data/blueprints/hook-continuity-remake/specs/

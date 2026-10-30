@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # B6 graceful-reap: the container entrypoint's reap logic (container/heartbeat.sh).
 # heartbeat.sh is *sourced* (its main loop is guarded off via the BASH_SOURCE==$0
 # check) so the PURE reap_decision and the filesystem I/O edges can be exercised

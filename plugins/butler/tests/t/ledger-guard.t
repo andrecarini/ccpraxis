@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # b12-ledger-write-integrity oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b12-ledger-write-integrity-spec.md
 # §2 (contracts), §3 (behaviours B1..B26), §4 (AC-1..AC-39) and §5 (edge cases E1..E12).

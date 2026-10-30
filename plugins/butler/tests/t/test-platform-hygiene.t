@@ -186,7 +186,7 @@ my $absent_fixture = write_fixture($FIXDIR, 'ac4-absent-marker.t', $ABSENT_BODY)
         'AC-4: the real run-tests.pl subprocess refuses the fixture, naming the file and '
       . '"no platform marker found" (matched on basename + fixed message text, since _relpath '
       . 'may rewrite an out-of-tree path to a "..".relative form -- spec AC-4)');
-    like($res->{out}, qr/\QFix: add "# platform: windows|linux|any"\E/,
+    like($res->{out}, qr/\QFix: add "# platform: host|linux|any"\E/,
         'AC-9: the refusal message names the fix verbatim (absent-marker wording, spec section 1.4)');
 }
 
@@ -245,7 +245,7 @@ my $unrecog_fixture = write_fixture($FIXDIR, 'ac5-unrecognized-value.t', $UNRECO
 # consuming code treats every non-legal outcome as a refusal and never
 # collapses malformed-marker-line into "no marker").
 # =============================================================================
-my $CONFLICT_BODY = "#!/usr/bin/env perl\n# platform: windows\n# platform: linux\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n";
+my $CONFLICT_BODY = "#!/usr/bin/env perl\n# platform: host\n# platform: linux\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n";
 my $conflict_fixture = write_fixture($FIXDIR, 'ac6-conflicting-markers.t', $CONFLICT_BODY);
 {
     my @offenders = scan_offenders($conflict_fixture);
@@ -253,7 +253,7 @@ my $conflict_fixture = write_fixture($FIXDIR, 'ac6-conflicting-markers.t', $CONF
         'AC-6: scan_offenders() reports "<path> (invalid:conflicting-markers)" for two conflicting strict marker lines');
 }
 
-my $MALFORMED_BODY = "#!/usr/bin/env perl\n# Platform: windows\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n";
+my $MALFORMED_BODY = "#!/usr/bin/env perl\n# Platform: host\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n";
 my $malformed_fixture = write_fixture($FIXDIR, 'ac6-malformed-marker-line.t', $MALFORMED_BODY);
 {
     my @offenders = scan_offenders($malformed_fixture);
@@ -276,7 +276,7 @@ my $malformed_fixture = write_fixture($FIXDIR, 'ac6-malformed-marker-line.t', $M
     is($res->{rc}, 1, 'AC-7: run_runner_bounded rc is exactly 1 for the wrong-case-marker target');
     like($res->{out}, qr/malformed platform marker line/,
         'AC-7: the message contains the word "malformed"');
-    like($res->{out}, qr/\Q"# Platform: windows"\E/,
+    like($res->{out}, qr/\Q"# Platform: host"\E/,
         'AC-7: the message quotes the literal offending line verbatim');
     unlike($res->{out}, qr/no platform marker found/,
         'AC-7: the message never says "no platform marker found" -- the precise failure this reason '
@@ -399,7 +399,7 @@ ok(!-e $ghost, 'PART 7 setup: the ghost fixture path genuinely does not exist on
 # and never pass them through raw.
 # =============================================================================
 {
-    my $cr_body = "#!/usr/bin/env perl\n# Platform: windows\rALL CLEAR - NOTHING TO SEE HERE\nprint \"ok 1\\n\"; exit 0;\n";
+    my $cr_body = "#!/usr/bin/env perl\n# Platform: host\rALL CLEAR - NOTHING TO SEE HERE\nprint \"ok 1\\n\"; exit 0;\n";
     my $cr_fixture = write_fixture($FIXDIR, 'a1-control-char-cr.t', $cr_body);
     my $res = RunnerStateHarness::run_runner_bounded(
         args    => [$cr_fixture],
@@ -409,8 +409,8 @@ ok(!-e $ghost, 'PART 7 setup: the ghost fixture path genuinely does not exist on
     is($res->{rc}, 1, 'A1 (CR injection): the malformed-marker fixture is still refused');
     like($res->{out}, qr/\\x0d/,
         'A1 (CR injection): the embedded \r is rendered as a readable "\x0d" escape, not silently stripped');
-    unlike($res->{out}, qr/windows\rALL CLEAR/,
-        'A1 (CR injection): the raw \r never reaches the output between "windows" and "ALL CLEAR" -- '
+    unlike($res->{out}, qr/host\rALL CLEAR/,
+        'A1 (CR injection): the raw \r never reaches the output between "host" and "ALL CLEAR" -- '
       . 'the exact sequence that would repaint a live terminal line');
     like($res->{out}, qr/\QALL CLEAR - NOTHING TO SEE HERE\E/,
         'A1 (CR injection): the rest of the offending line text is still visible verbatim (escaping, not '
@@ -523,7 +523,7 @@ ok(!-e $ghost, 'PART 7 setup: the ghost fixture path genuinely does not exist on
     # idiom here, since every .t needs a marker so fixtures need one too -- used
     # to parse `invalid/conflicting-markers`: refused, reported red, with the
     # diagnostic pointing at a line its author never meant as a declaration.
-    my $correct = "#!/usr/bin/env perl\n# platform: windows\n"
+    my $correct = "#!/usr/bin/env perl\n# platform: host\n"
                 . "my \$fixture = <<'EOF';\n# platform: any\nEOF\n"
                 . "print \"ok 1\\n\"; exit 0;\n";
     my $cm = TestPlatform::parse_marker($correct);
@@ -531,7 +531,7 @@ ok(!-e $ghost, 'PART 7 setup: the ghost fixture path genuinely does not exist on
         'PART 13b: a CORRECTLY declared file that writes a marker-bearing fixture through a '
       . 'heredoc is legal, not a conflict -- the false-refusal half of 96a7, and the half that '
       . 'fires in ordinary work rather than under a contrived file');
-    is($cm->{value}, 'windows',
+    is($cm->{value}, 'host',
         'PART 13b: ...and it keeps the platform the AUTHOR declared, not the one in the fixture');
 
     # NON-VACUITY: the positional rule must not simply ignore every marker. A
@@ -540,6 +540,25 @@ ok(!-e $ghost, 'PART 7 setup: the ghost fixture path genuinely does not exist on
     is(TestPlatform::parse_marker($plain)->{value}, 'any',
         'PART 13c: NON-VACUITY -- an ordinary declaration with no heredoc anywhere still parses, '
       . 'so 13a and 13b are not passing because the parser stopped seeing markers at all');
+}
+
+# PART 14 -- the retired value "windows" is refused with the exact rename hint.
+{
+    my $f = write_fixture($FIXDIR, 'rename-windows-to-host.t',
+        "#!/usr/bin/env perl\n# platform: windows\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n");
+    my $res = RunnerStateHarness::run_runner_bounded(
+        args    => [$f],
+        env     => { CCPRAXIS_TEST_STATE_DIR => $STATE_DIR },
+        timeout => $BOUND,
+    );
+    is($res->{rc}, 1, 'PART 14: a file still carrying "# platform: windows" is refused (rc 1)');
+    like($res->{out}, qr/unrecognized platform value "windows"/,
+        'PART 14: the refusal names the retired value');
+    like($res->{out}, qr/\Q"windows" was renamed to "host"; change the line to "# platform: host".\E/,
+        'PART 14: the refusal says exactly what to change');
+    my @offenders = scan_offenders($f);
+    is_deeply(\@offenders, [ _relpath($f) . ' (invalid:unrecognized-value)' ],
+        'PART 14: the hygiene scan reports it as invalid:unrecognized-value (no alias)');
 }
 
 done_testing();

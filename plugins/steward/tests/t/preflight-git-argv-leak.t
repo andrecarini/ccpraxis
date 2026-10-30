@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # A GENERIC CHILD SPAWN SHOULD NOT LEAK GIT'S OWN MSYS OPT-OUT INTO IT.
 #
 # Bug report 20260922-211319-19b1: /steward:backup's U4 preflight unit spawns

@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # ORACLE for blueprint sandbox-session-ux, package 04-wt-appearance, spec
 # specs/04-wt-appearance-spec.md (AC-A1..AC-A19), Decisions 9, 15 and 17.
 # Written BLIND to any appearance-copying implementation -- straight from the

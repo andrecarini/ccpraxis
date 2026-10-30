@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # The ORACLE for blueprint tooling-backlog,
 # package 01-statusline-bounded-walkup (specs/01-statusline-bounded-walkup-spec.md).
 #

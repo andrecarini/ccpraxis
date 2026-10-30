@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # b02-durable-checkpoint-commits — hardening regressions (fix-batch 02).
 #
 # t/durable-checkpoint-commits.t is the frozen spec oracle (AC-1..AC-29) and

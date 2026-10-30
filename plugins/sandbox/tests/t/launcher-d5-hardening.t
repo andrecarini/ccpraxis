@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Oracle tests for q05, derived from
 #   .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/q05-spec.md
 #

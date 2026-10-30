@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # blueprint operator-ui-tweaks, package 01-statusline-counters
 # (specs/01-statusline-counters-spec.md). Written BLIND to
 # scripts/statusline.pl and plugins/sandbox/scripts/Theme.pm's counters

@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # b03 — the immutable test oracle.
 #
 # Derived ONLY from specs/04-spec.md (AC-1..AC-11;

@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # b33 oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b33-spec.md
 # section 5, acceptance criteria C1..C12 (mapped 1:1 to ledger DC-1..DC-9, see the spec's own

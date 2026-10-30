@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # A rename() that fails because another process holds the destination open
 # is retried against a bounded deadline instead of being reported as a bare
 # write failure: the retryable errno set (EACCES/EBUSY/EPERM/ETXTBSY) is an

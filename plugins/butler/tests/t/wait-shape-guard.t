@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # b15-wait-shape-and-pipe-guards oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b15-wait-shape-and-pipe-guards-spec.md
 # §2 (interfaces & contracts), §3 (observable behaviours 1..20), §4 (AC-1..AC-37) and §5 (edge

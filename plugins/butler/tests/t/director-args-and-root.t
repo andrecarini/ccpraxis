@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # never-halt package 04 (director args and data root). Immutable oracle,
 # written blind to the implementation, from:
 #   .ccpraxis-local-data/blueprints/never-halt/specs/

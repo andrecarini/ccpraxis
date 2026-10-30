@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # t/109 -- a03 oracle.
 # Derived ONLY from
 # .ccpraxis-local-data/blueprints/butler-and-dashboard-overhaul/specs/a03-spec.md

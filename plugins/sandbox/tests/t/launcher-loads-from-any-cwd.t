@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Regression: launcher.pl must resolve its own scripts/ dir to find
 # MountSpec.pm regardless of the caller's CWD. The .ps1 shim invokes
 # perl from whatever shell the user is in (typically a project dir);

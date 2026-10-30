@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # 186 — ONE answer to "will anything bring this back?"
 #
 # WHY THIS FILE EXISTS. Two guards were answering that question separately:

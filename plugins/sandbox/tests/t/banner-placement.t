@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # WHERE BANNERS RENDER, and what that costs the layout.
 #
 # Operator report, 2026-08-25: "Any errors, warnings and etc could go into that

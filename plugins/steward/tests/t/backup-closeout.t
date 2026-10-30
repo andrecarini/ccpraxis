@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # 24 -- oracle for blueprint backup-driver, package
 # 05-closeout-and-report (scripts/backup/Closeout.pm).
 #

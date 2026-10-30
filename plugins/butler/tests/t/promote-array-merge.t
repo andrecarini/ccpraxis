@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Oracle for blueprint tooling-fixes, package 09 (scripts/promote.pl).
 # Derived from .ccpraxis-local-data/blueprints/tooling-fixes/specs/
 # 09-promote-array-merge-spec.md (AC-1..AC-18), Decision 26, AND Decision 27

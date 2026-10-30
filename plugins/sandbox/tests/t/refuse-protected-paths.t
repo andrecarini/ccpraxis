@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Oracle tests for q03-launcher-refusal, derived from
 #   .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/q03-launcher-refusal-spec.md
 #

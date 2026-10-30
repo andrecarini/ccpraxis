@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # ORACLE: scripts/statusline.pl (repo root) -- NOT
 # plugins/butler/scripts/bp-statusline.pl, which the live statusline never
 # invokes (ledger correction, 2026-08-14).

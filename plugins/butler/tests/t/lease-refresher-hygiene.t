@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 #
 # ORACLE for blueprint package 04-refresher-hygiene (host-wake-and-suspend),
 # derived ONLY from

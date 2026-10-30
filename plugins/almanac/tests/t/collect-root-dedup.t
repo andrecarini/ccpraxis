@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Regression for 20260911-225720-4c57 (defect 1): two spellings of ONE root
 # ("C:/x" vs "/c/x") used to double-count every report under it, because the
 # root dedupe compared raw strings rather than a canonical form. Also pins

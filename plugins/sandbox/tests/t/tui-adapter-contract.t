@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # 62 — the TUI panel-adapter contract's ENFORCEMENT,
 # for blueprint unified-tui-design-system, package 01-adapter-contract
 # (specs/01-adapter-contract-spec.md). Written BLIND to any doc /

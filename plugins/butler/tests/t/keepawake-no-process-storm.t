@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Regression oracle for the 2026-08-13 process storm.
 #
 # WHAT HAPPENED. The operator had to force-restart the machine: terminals stopped

@@ -35,13 +35,14 @@ use warnings;
 # -----------------------------------------------------------------------
 # THE MARKER LINE -- exact syntax, pinned byte-for-byte (spec section 2)
 # -----------------------------------------------------------------------
-# Canonical form: `# platform: windows` (also `linux`, `any`). The STRICT
+# Canonical form: `# platform: host` (also `linux`, `any`). The STRICT
 # pattern below requires lowercase `platform`, tolerates whitespace around
 # `platform`/`:` and leading indentation before `#`, and permits only
 # trailing whitespace plus an optional `\r` after the captured value.
 # Legality of the captured value is decided afterwards by exact string
 # membership in legal_values() -- never by the regex itself, and never with
-# aliasing/case-folding (`Windows`, `win`, `windows ` are all illegal).
+# aliasing/case-folding (`Host`, `win`, `host ` are all illegal; the retired value `windows` is
+# illegal too, with a rename hint -- see renamed_values()).
 #
 # A line that is recognisably TRYING to be a marker -- wrong-case keyword,
 # or trailing prose after an otherwise-legal value -- but fails the strict
@@ -131,8 +132,26 @@ sub prefix_bytes {
 # order, list context. Exists so neither this module's own logic, its test,
 # nor any future consumer hardcodes the three strings in more than one
 # place.
+#
+#   host   -- runs on the host, not in the container lane (scripts/run-tests.pl
+#             routes it to host-parallel). It does NOT mean "Windows only":
+#             on macOS and Linux hosts these files run too. A test that
+#             really is Windows-only skips itself (`plan skip_all`) off
+#             Windows.
+#   linux  -- may run in the Linux container lane when that lane is enabled.
+#   any    -- no platform requirement; routes like `linux`.
 sub legal_values {
-    return ('windows', 'linux', 'any');
+    return ('host', 'linux', 'any');
+}
+
+# renamed_values() -- retired marker values and their replacements, as a flat
+# (old => new) list. A retired value is NOT an alias: it stays illegal
+# (parse_marker reports `invalid`/`unrecognized-value`). The table exists
+# only so a refusal message can name the exact fix. `windows` was the
+# original name of `host`; it was misleading, because the value means "host
+# lane", not "Windows".
+sub renamed_values {
+    return (windows => 'host');
 }
 
 # read_prefix($filepath) -- at most prefix_bytes() bytes of $filepath, read
@@ -202,7 +221,7 @@ sub parse_marker {
     #               marker-shaped line inside a heredoc, parsed `legal`. Under
     #               package 06's routing that no longer merely guesses a
     #               platform, it SELECTS AN OPERATING SYSTEM.
-    #   FALSE CONFLICT -- a file that correctly declares `# platform: windows`
+    #   FALSE CONFLICT -- a file that correctly declares `# platform: host`
     #               at the top and then writes a marker-bearing fixture through
     #               a heredoc (the natural idiom in this suite, since package 02
     #               gave every .t a marker so fixtures need one too) parsed

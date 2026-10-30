@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # 187 — an unattended run does not stop to ask.
 #
 # THE PATTERN THIS EXISTS TO END, in the operator's own words: "a whole

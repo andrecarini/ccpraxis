@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Immutable oracle for blueprint where-things-go, package 12-statusline-threads
 # (specs/12-statusline-threads-spec.md). Written BLIND to scripts/statusline.pl,
 # plugins/almanac/scripts/gen-statusline-counters.pl and

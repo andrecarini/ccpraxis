@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 #
 # Oracle for 08-completion-claims-checked, derived ONLY from
 # .ccpraxis-local-data/blueprints/butler-gate-ergonomics/specs/08-completion-claims-checked-spec.md

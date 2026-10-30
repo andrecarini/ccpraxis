@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # 89 -- ORACLE for package t08 (blueprint
 # tui-operator-feedback), specs/t08-spec.md. Written BLIND to
 # any implementation of the three fixes (c8b0/59a4/9897) -- straight from the

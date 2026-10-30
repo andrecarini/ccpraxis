@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Oracle for blueprint tooling-backlog, package
 # 09-promote-dry-run-merge-tree-preview (scripts/promote.pl). Derived ONLY
 # from .ccpraxis-local-data/blueprints/tooling-backlog/specs/

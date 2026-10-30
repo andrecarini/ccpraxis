@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # 87 -- ORACLE for package t03 (blueprint
 # butler-and-dashboard-overhaul), specs/t03-spec.md. Written
 # BLIND to any dismiss-key implementation in Dashboard.pm / DashboardScreen.pm
