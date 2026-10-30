@@ -286,7 +286,10 @@ sub parse_machine_config_details {
     my $d = _decode_doc($raw);
     return undef unless $d;
     my $hu = ref $d->{HostUser} eq 'HASH' ? $d->{HostUser} : {};
-    return { mounts => _mounts_of($d), rootful => boolish($hu->{Rootful}),
+    # "Mounts": null is a machine created with no shares at all: an empty
+    # list, not "could not tell".
+    my $mounts = (exists $d->{Mounts} && !defined $d->{Mounts}) ? [] : _mounts_of($d);
+    return { mounts => $mounts, rootful => boolish($hu->{Rootful}),
              resources => _resources_of($d) };
 }
 

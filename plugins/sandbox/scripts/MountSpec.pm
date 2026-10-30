@@ -237,6 +237,9 @@ sub stage_global_counts_copy {
     my $copy = "$dir/almanac-global-counts.json";
     return (0, 'not_a_file', undef) if -e $copy && !-f $copy;
     my $tmp = "$copy.tmp.$$";
+    # A temp file under this pid can only be a leftover from a crashed
+    # process that had the same pid; it would make the O_EXCL open fail.
+    unlink $tmp;
     my $fh;
     sysopen($fh, $tmp, O_WRONLY | O_CREAT | O_EXCL) or return (0, 'copy_failed', undef);
     binmode($fh);

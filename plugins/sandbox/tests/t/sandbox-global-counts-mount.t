@@ -335,6 +335,13 @@ my $gc_path_ac16 = "$ac16_base/almanac-global-counts.json";
     is(slurp_raw($copy), $bytes2, 'COPY: ...with the new bytes');
     isnt((stat($copy))[1], $ino1, 'COPY: ...as a new file renamed into place, not a rewrite in place');
 
+    # A temp file left under this very pid (a crashed process that had it)
+    # must not make the exclusive create fail.
+    write_raw("$share/almanac-global-counts.json.tmp.$$", 'stale');
+    ($ok, $reason) = MountSpec::stage_global_counts_copy($src, $share);
+    ok($ok, 'COPY: a stale temp file under the same pid does not block the copy') or diag($reason);
+    ok(!-e "$share/almanac-global-counts.json.tmp.$$", 'COPY: ...and is gone afterwards');
+
     my @direct = eval { MountSpec::claude_home_create_args(
         claude_data => $claude_data, launcher_dir => $launcher_dir, statusline => $statusline,
         global_counts => $src, global_counts_copy_dir => undef) };

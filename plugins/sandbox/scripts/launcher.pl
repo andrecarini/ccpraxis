@@ -2474,7 +2474,8 @@ sub _ensure_machine_ready {
         "ERROR: the podman machine is not running and could not be started.",
         "  reason: " . ($r->{detail} // 'unknown error'),
         "",
-        HostPlatform::machine_remedy_lines($^O, $state),
+        (ref $r->{remedy} eq 'ARRAY' && @{ $r->{remedy} }
+            ? @{ $r->{remedy} } : HostPlatform::machine_remedy_lines($^O, $state)),
         "  Then run claude-sandbox again.",
     );
     return 0;
@@ -6831,6 +6832,15 @@ sub _machine_start_bounded {
         my $home = PodmanMachine::account_home();
         eval { PodmanMachine::ensure_share_dirs(PodmanMachine::layout(home => $home)) }
             if defined $home && length $home;
+        # Any other shared folder that is gone (a project deleted or moved)
+        # stops the start too; say which, and how to fix it, instead of
+        # letting vfkit fail and then advising another `podman machine start`.
+        my $shares = _machine_shares();
+        my @gone = PodmanMachine::missing_share_sources($shares);
+        return { ok => 0, remedy => [ PodmanMachine::missing_share_remedy($shares) ],
+                 detail => 'shared folder missing, so vfkit cannot start the VM: ' . join(', ', @gone)
+                         . ' (recreate it, or podman-machine.pl remove-project <dir> --confirm)' }
+            if @gone;
     }
     my $out = _run_timed(qq{$PODMAN machine start 2>&1}, $secs);
     return { ok => 0, timeout => 1,

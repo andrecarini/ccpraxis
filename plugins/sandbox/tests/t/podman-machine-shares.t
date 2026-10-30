@@ -44,7 +44,8 @@ sub slurp { my ($p) = @_; open my $fh, '<:raw', $p or return undef; local $/; my
 # A fake home with the live install in place (apply refuses without it).
 sub fake_home {
     my $h = Cwd::abs_path(tempdir(CLEANUP => 1));
-    make_path("$h/.claude/ccpraxis/plugins", "$h/Projects/app", "$h/Projects/other");
+    make_path("$h/.claude/ccpraxis/plugins/sandbox/scripts", "$h/Projects/app", "$h/Projects/other");
+    spew("$h/.claude/ccpraxis/plugins/sandbox/scripts/PodmanMachine.pm", "1;\n");   # a promoted install
     return $h;
 }
 
@@ -119,6 +120,11 @@ sub fake_home {
         '/usr/local/src'                   => qr/system directory/,
         '/opt/homebrew/x'                  => qr/system directory/,
         '/Users/u/odd:name'                => qr/':'/,
+        '/Users/u/odd,name'                => qr/','/,
+        '/Users/u/.ssh'                    => qr/holds keys/,
+        '/Users/u/.config/containers/x'    => qr/podman's own machine files/,
+        '/Users/u/.local/share/containers' => qr/podman's own machine files/,
+        '/Users/u/Library/Mobile'          => qr/holds keys/,
         '/'                                => qr/top-level/,
     );
     for my $p (sort keys %cases) {
@@ -128,6 +134,11 @@ sub fake_home {
     is(PodmanMachine::project_problem('/Volumes/Data/work', $L, os => 'darwin'), undef, 'C: allows a folder on another volume');
     like(PodmanMachine::project_problem('/users/U/.CLAUDE', $L, os => 'darwin') // '', qr/never shared/,
         'C: compared case-insensitively on darwin (APFS)');
+    my $e_acute = "\xc3\xa9"; my $E_acute = "\xc3\x89";   # UTF-8 bytes, as paths arrive
+    is(PodmanMachine::_fold("/Users/u/Caf$E_acute", 'darwin'), "/users/u/caf$e_acute", 'C: case folding covers non-ASCII letters (as characters, not bytes)');
+    is(PodmanMachine::install_root_problem('/Users/u/.claude/ccpraxis', $L, os => 'darwin'), undef, 'C: install_root inside ~/.claude is fine');
+    like(PodmanMachine::install_root_problem('/Users/u/.claude', $L, os => 'darwin') // '', qr/contains ~\/\.claude/, 'C: install_root may not be ~/.claude itself');
+    like(PodmanMachine::install_root_problem('/Users/u', $L, os => 'darwin') // '', qr/home folder/, 'C: ...nor the home folder');
 }
 
 # ---------------------------------------------------------------------------
@@ -214,28 +225,37 @@ sub machine_seams {
     make_path($cfgdir);
     spew("$cfgdir/podman-machine-default.json", $o{config} // default_config($home));
     my %state = (absent => $o{absent} ? 1 : 0, running => $o{running} ? 1 : 0);
+    # The images the (fake) machine holds: what `images` reports, emptied by
+    # an rm, filled by a load from the archive's .names file.
+    my $imgs = JSON::PP->new->decode($o{images} // $IMAGES);
+    my %present = $o{absent} ? () : map { $_ => 1 } map { @{ $_->{Names} || [] } } @$imgs;
     my %handlers = (
         'machine list'    => sub { { rc => 0, out => list_json(%state), err => '' } },
         'machine inspect' => sub { { rc => 0, out => inspect_json(cfgdir => $cfgdir, running => $state{running}, rootful => $o{rootful}), err => '' } },
         'images'          => sub { { rc => 0, out => ($o{images} // $IMAGES), err => '' } },
-        'ps'              => sub { { rc => 0, out => ($o{ps} // '[]'), err => '' } },
+        # ps lists running containers, ps -a all of them.
+        'ps'              => sub { my $all = grep { $_ eq '-a' } @_;
+                                   my $l = JSON::PP->new->decode($o{ps} // '[]');
+                                   $l = [ grep { ($_->{State} // '') eq 'running' } @$l ] unless $all;
+                                   { rc => 0, out => JSON::PP->new->encode($l), err => '' } },
         'info'            => sub { { rc => 0, out => ($o{rootless} // "false\n"), err => '' } },
-        'image exists'    => sub { { rc => 0, out => '', err => '' } },
+        'image exists'    => sub { { rc => ($present{ $_[2] } ? 0 : 1), out => '', err => '' } },
+        'volume ls'       => sub { { rc => 0, out => ($o{volumes} // '[]'), err => '' } },
         %{ $o{handlers} || {} },
     );
     my %streams = (
         'machine start' => sub { $state{running} = 1; 0 },
         'machine stop'  => sub { $state{running} = 0; 0 },
-        'machine rm'    => sub { $state{absent} = 1; $state{running} = 0; 0 },
+        'machine rm'    => sub { $state{absent} = 1; $state{running} = 0; %present = (); 0 },
         'machine init'  => sub { $state{absent} = 0; 0 },
         'save'          => sub { my @a = @_; my ($i) = grep { $a[$_] eq '-o' } 0 .. $#a; spew($a[$i + 1], 'TAR'); 0 },
-        'load'          => sub { 0 },
+        'load'          => sub { my @a = @_; my $n = slurp("$a[2].names"); $present{$_} = 1 for @{ $n ? JSON::PP->new->decode($n) : [] }; 0 },
         %{ $o{streams} || {} },
     );
     my ($run, $stream, $calls) = fake_podman(handlers => \%handlers, streams => \%streams);
     my @out;
     return (calls => $calls, out => \@out, state => \%state,
-            seams => { os => 'darwin', home => $home, podman => 'podman', run => $run, stream => $stream,
+            seams => { os => 'darwin', home => $home, account_home => $home, podman => 'podman', run => $run, stream => $stream,
                        out => sub { push @out, @_ }, now => sub { 1_800_000_000 } });
 }
 
@@ -347,7 +367,7 @@ is_deeply([PodmanMachine::keep_image_names('garbage')], [], 'F: unreadable outpu
     my $archive = "$L->{cache_dir}/podman-machine-images-" . POSIX::strftime('%Y%m%dT%H%M%S', localtime(1_800_000_000)) . '.tar';
     is_deeply(\@streams, [
         'machine start podman-machine-default',
-        "save -m -o $archive localhost/claude-sandbox:2.1.301 localhost/claude-sandbox:latest",
+        "save -m -o $archive.partial localhost/claude-sandbox:2.1.301 localhost/claude-sandbox:latest",
         'machine rm -f podman-machine-default',
         "machine init --rootful --cpus 6 --memory 12288 --disk-size 100"
           . " --volume $home/.claude/ccpraxis:$home/.claude/ccpraxis:ro"
@@ -355,9 +375,10 @@ is_deeply([PodmanMachine::keep_image_names('garbage')], [], 'F: unreadable outpu
           . " --volume $L->{test_scratch}:$L->{test_scratch}"
           . " podman-machine-default",
         'machine start podman-machine-default',
+        'system connection default podman-machine-default-root',
         "load -i $archive",
         'machine stop podman-machine-default',
-    ], 'G: start (to save) -> save the sandbox images -> rm -> init rootful with only the desired shares -> start -> load -> stop (it was stopped)')
+    ], 'G: start (to save) -> save the sandbox images (to .partial, renamed when whole) -> rm -> init rootful with only the desired shares -> start -> make its -root connection the default -> load -> stop (it was stopped)')
         or diag(join "\n", @$calls);
     my $before_rm = join "\n", @$calls[0 .. (grep { $calls->[$_] =~ /machine rm/ } 0 .. $#$calls)[0]];
     like($before_rm, qr/run: ps --format json/, 'G: running containers are checked before the rm');
@@ -366,7 +387,7 @@ is_deeply([PodmanMachine::keep_image_names('garbage')], [], 'F: unreadable outpu
         'G: every saved name is verified after the load');
     ok(!-e $archive && !-e "$archive.names", 'G: the archive is deleted once every image is back');
     ok(-d $L->{container_files} && -d $L->{test_scratch}, 'G: the dedicated share folders exist before init (vfkit needs them)');
-    unlike(join("\n", @$calls), qr/system connection default/, 'G: the connection is left alone when podman already reports rootful');
+    like(join("\n", @$calls), qr/run: info --format \{\{\.Host\.Security\.Rootless\}\}/, 'G: podman is asked whether it now talks to the rootful service');
     like($text, qr/Done: the machine is rootful and shares only:\n  ro  \Q$home\E\/\.claude\/ccpraxis/, 'G: the summary lists the shares');
     ok(!-e $L->{state_file}, 'G: apply alone does not write the share list');
 }
@@ -426,11 +447,13 @@ is_deeply([PodmanMachine::keep_image_names('garbage')], [], 'F: unreadable outpu
     ok((grep { $_ eq 'run: ps --format json' } @$calls), 'G: ...after checking that no container is running');
 
     # A leftover archive (an earlier apply died after saving) is loaded even
-    # when the machine already matches.
+    # when the machine already matches -- when the machine lacks its images.
     my $left = "$L->{cache_dir}/podman-machine-images-20300101T000000.tar";
     spew($left, 'TAR');
     spew("$left.names", '["localhost/claude-sandbox:latest"]');
-    my %s = machine_seams(home => $home, config => narrow_config($home), rootful => 1);
+    my %s = machine_seams(home => $home, config => narrow_config($home), rootful => 1, images => '[]');
+    ($rc, $text, $calls) = cli_run(['plan'], %s);
+    like($text, qr/Images saved by an earlier apply that did not finish.*\Q$left\E/s, 'G: plan lists a leftover image archive');
     ($rc, $text, $calls) = cli_run(['apply', '--confirm'], %s);
     is($rc, 0, 'G: a matching machine with a leftover image archive: apply succeeds') or diag($text);
     is_deeply([ grep { /\Astream:/ } @$calls ], [
@@ -439,6 +462,23 @@ is_deeply([PodmanMachine::keep_image_names('garbage')], [], 'F: unreadable outpu
         'stream: machine stop podman-machine-default',
     ], 'G: ...it starts the machine, loads the archive and stops it again');
     ok(!-e $left && !-e "$left.names", 'G: ...and removes the archive once its images are back');
+
+    # ...but never over images the machine already has: a launch may have built
+    # a fresh image since, and loading would point the tags back at the old one.
+    spew($left, 'TAR');
+    spew("$left.names", '["localhost/claude-sandbox:latest"]');
+    my %f = machine_seams(home => $home, config => narrow_config($home), rootful => 1);
+    ($rc, $text, $calls) = cli_run(['apply', '--confirm'], %f);
+    unlike(join("\n", @$calls), qr/stream: load/, 'G: a leftover archive whose names the machine already has is NOT loaded');
+    like($text, qr/Not loading \Q$left\E: the machine already has localhost\/claude-sandbox:latest/, 'G: ...and says why');
+    ok(-e $left, 'G: ...and keeps it for the operator to decide');
+
+    # An archive without its .names file cannot be verified, so it is kept.
+    unlink "$left.names";
+    ($rc, $text, $calls) = cli_run(['apply', '--confirm'], %f);
+    is($rc, 1, 'G: an archive with no .names file -> exit 1');
+    like($text, qr/\.names is missing or unreadable; \Q$left\E is kept/, 'G: ...it is kept, with the manual load command');
+    unlink $left;
 }
 
 {   # podman still talking to the rootless service after init
@@ -447,7 +487,19 @@ is_deeply([PodmanMachine::keep_image_names('garbage')], [], 'F: unreadable outpu
     my (undef, $text, $calls) = cli_run(['apply', '--confirm'], %m);
     ok((grep { $_ eq 'stream: system connection default podman-machine-default-root' } @$calls),
         'G: when podman reports Rootless=true after init, the -root connection is made the default');
-    like($text, qr/WARNING: podman still reports Rootless=true/, 'G: ...and a connection that stays rootless is reported');
+    like($text, qr/WARNING: podman reports Rootless=true after the switch/, 'G: a connection that stays rootless is reported');
+}
+
+{   # a live install from before podman-machine.pl blocks apply: its launcher
+    # binds ~/.claude/almanac-global-counts.json, which the machine will not share
+    my $home = fake_home();
+    unlink "$home/.claude/ccpraxis/plugins/sandbox/scripts/PodmanMachine.pm";
+    my %m = machine_seams(home => $home);
+    my ($rc, $text, $calls) = cli_run(['plan'], %m);
+    like($text, qr/predates podman-machine\.pl.*Promote first/s, 'G: plan says an unpromoted live install must be promoted first');
+    ($rc, $text, $calls) = cli_run(['apply', '--confirm'], %m);
+    is($rc, 1, 'G: ...and apply --confirm refuses');
+    is_deeply([ grep { /\Astream:/ } @$calls ], [], 'G: ...before touching the machine');
 }
 
 {   # a missing project folder blocks apply before anything happens
@@ -503,6 +555,112 @@ is_deeply([PodmanMachine::keep_image_names('garbage')], [], 'F: unreadable outpu
     is($rc, 2, 'H: test-scratch takes on or off');
     ($rc, $text) = cli_run(['frobnicate'], %m);
     is($rc, 2, 'H: an unknown command is a usage error');
+}
+
+{   # a stopped machine: what the rm would delete is listed once apply has started it,
+    # and anything the sandbox does not recreate blocks the recreate
+    my $home = fake_home();
+    my %m = machine_seams(home => $home,
+        ps => '[{"Names":["claude-app-12345678"],"State":"exited"},{"Names":["postgres"],"State":"exited"}]',
+        volumes => '[{"Name":"pgdata"}]');
+    my ($rc, $text, $calls) = cli_run(['apply', '--confirm'], %m);
+    is($rc, 1, 'G: an operator container or a volume in the VM -> apply refuses');
+    like($text, qr/would delete these, which the sandbox does not recreate:\n  container postgres\n  volume pgdata/,
+        'G: ...naming the container and the volume (the sandbox container is not in that list)');
+    unlike(join("\n", @$calls), qr/stream: (?:save|machine rm|machine init)/, 'G: ...before saving or removing anything');
+    is((grep { /\Astream: machine stop/ } @$calls), 1, 'G: ...and stops the machine it started only to look');
+
+    my %ok = machine_seams(home => $home, ps => '[{"Names":["claude-app-12345678"],"State":"exited"},{"Names":["claude-sandbox-test-1-1-c"]}]');
+    ($rc, $text, $calls) = cli_run(['apply', '--confirm'], %ok);
+    is($rc, 0, 'G: only sandbox containers in the VM -> the recreate goes ahead') or diag($text);
+    like($text, qr/Deleting with the machine: claude-app-12345678, claude-sandbox-test-1-1-c\./, 'G: ...listing what goes with it');
+    like($text, qr/Not kept \(pulled again when needed\): docker\.io\/library\/debian:bookworm-slim, localhost\/not-claude-sandbox:latest\./,
+        'G: ...and the images it does not keep');
+}
+
+{   # add-project after a rename by case alone replaces the old spelling
+    my $home = fake_home();
+    my $L = PodmanMachine::layout(home => $home);
+    make_path("$home/Projects/Mixed");
+    spew($L->{state_file}, JSON::PP->new->encode({ schema => 1, projects => ["$home/Projects/mixed"] }));
+    my %m = machine_seams(home => $home);
+    my ($rc, $text) = cli_run(['add-project', "$home/Projects/Mixed"], %m);
+    if ($^O eq 'darwin') {
+        like($text, qr/Replacing \Q$home\E\/Projects\/mixed with its current spelling\./,
+            'H: add-project of a folder renamed by case replaces the stale spelling (APFS: one folder, the VM: two paths)');
+        like($text, qr{add\s+rw\s+\Q$home\E/Projects/Mixed\n}, 'H: ...and the plan shares the current spelling');
+    } else {
+        pass('H: (case-rename check needs APFS)') for 1 .. 2;
+    }
+
+    # a hand-edited list cannot share the home folder
+    spew($L->{state_file}, JSON::PP->new->encode({ schema => 1, projects => [$home] }));
+    ($rc, $text) = cli_run(['plan'], %m);
+    is($rc, 1, 'H: a hand-edited list that shares the home folder -> refused');
+    like($text, qr/holds entries that must not be shared:\n  \Q$home\E: it contains your home folder/, 'H: ...naming the entry');
+    ($rc, $text) = cli_run(['remove-project', $home], %m);
+    is($rc, 0, 'H: ...and remove-project still works, to take it out') or diag($text);
+
+    # remove-project of a deleted folder, given relative to the current directory
+    spew($L->{state_file}, JSON::PP->new->encode({ schema => 1, projects => ["$home/Projects/gone"] }));
+    my $cwd = Cwd::getcwd();
+    chdir "$home/Projects" or die;
+    ($rc, $text) = cli_run(['remove-project', 'gone', '--confirm'], %m);
+    chdir $cwd;
+    my ($st) = PodmanMachine::read_state($L->{state_file});
+    is_deeply($st->{projects}, [], 'H: remove-project takes a relative path for a folder that no longer exists');
+    ($rc, $text) = cli_run(['remove-project', '/Users/nobody/x'], %m);
+    like($text, qr/is not in the share list\. It holds:\n  \(no projects\)/, 'H: ...and shows the list when the path is not in it');
+}
+
+{   # directory-source marketplaces registered on the Mac
+    my $home = fake_home();
+    my $mkt = "$home/dev/my-marketplace";
+    make_path($mkt, "$home/.claude/plugins", "$home/.claude/local-mkt");
+    spew("$home/.claude/plugins/known_marketplaces.json", JSON::PP->new->encode({
+        'ccpraxis-local' => { source => { source => 'directory', path => "$home/.claude/ccpraxis/plugins" } },
+        'mine'           => { source => { source => 'directory', path => "$mkt/" } },
+        'inside-claude'  => { source => { source => 'directory', path => "$home/.claude/local-mkt" } },
+        'official'       => { source => { source => 'github', repo => 'x/y' } },
+    }));
+    my %m = machine_seams(home => $home);
+    my ($rc, $text) = cli_run(['plan'], %m);
+    like($text, qr{add\s+ro\s+\Q$mkt\E\n\s+a directory-source plugin marketplace}, 'M: another directory marketplace is shared read-only');
+    unlike($text, qr{add\s+\S+\s+\Q$home\E/\.claude/ccpraxis/plugins\n}, 'M: ccpraxis-local is served by the install share, not a second one');
+    like($text, qr{Not shared, so every launch is refused while it stays registered:\n  \Q$home\E/\.claude/local-mkt \(marketplace inside-claude\): it is inside ~/\.claude},
+        'M: one inside ~/.claude is not shared, and the plan says what that costs');
+}
+
+{   # HOME is not the account home
+    my $home = fake_home();
+    my %m = machine_seams(home => $home);
+    $m{seams}{account_home} = '/Users/someone-else';
+    my (undef, $text) = cli_run(['plan'], %m);
+    like($text, qr/Note: HOME \(\Q$home\E\) is not your account's home \(\/Users\/someone-else\)/, 'H: plan notes a HOME that is not the account home');
+}
+
+{   # a deleted project folder stops the machine from starting: say which, and the fix
+    my $home = fake_home();
+    my @remedy = PodmanMachine::missing_share_remedy([
+        { source => "$home/Projects/app", target => "$home/Projects/app", readonly => 0 },
+        { source => "$home/Projects/gone", target => "$home/Projects/gone", readonly => 0 } ]);
+    my $r = join "\n", @remedy;
+    like($r, qr/shares a folder that no longer exists, and it cannot start without it:\n    \Q$home\E\/Projects\/gone/,
+        'M1: missing_share_remedy names the missing shared folder');
+    like($r, qr/\Q$SCRIPT\E remove-project \Q$home\E\/Projects\/gone --confirm/, 'M1: ...and the remove-project command');
+    unlike($r, qr{Projects/app\b}, 'M1: ...and not the folders that exist');
+    is_deeply([PodmanMachine::missing_share_remedy([{ source => "$home/Projects/app" }])], [], 'M1: nothing to say when every folder exists');
+
+    my $src = slurp("$Bin/../../scripts/launcher.pl");
+    like($src, qr/PodmanMachine::missing_share_sources\(\$shares\)/, 'M1: the launcher checks the shares before it starts the machine');
+    like($src, qr/ref \$r->\{remedy\} eq 'ARRAY' && \@\{ \$r->\{remedy\} \}\s*\?\s*\@\{ \$r->\{remedy\} \} : HostPlatform::machine_remedy_lines/,
+        'M1: ...and shows that remedy instead of "podman machine start"');
+
+    # "Mounts": null -- a machine created with no shares at all
+    my %m = machine_seams(home => $home, config => '{"Name":"podman-machine-default","HostUser":{"Rootful":true},"Mounts":null}', rootful => 1);
+    my ($rc, $text) = cli_run(['plan'], %m);
+    is($rc, 0, 'L9: a machine config with "Mounts": null plans (no shares yet)') or diag($text);
+    like($text, qr{add\s+ro\s+\Q$home\E/\.claude/ccpraxis\n}, 'L9: ...adding every share');
 }
 
 # ---------------------------------------------------------------------------

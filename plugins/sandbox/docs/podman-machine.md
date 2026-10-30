@@ -54,6 +54,7 @@ written.
 | ro | `~/.cache/ccpraxis/container-files` | host files a container reads. Today that is a copy of `~/.claude/almanac-global-counts.json`, which the launcher writes at each container create and before each start. `~/.claude` itself holds transcripts, credentials and the vault, so it is never shared |
 | rw | `~/.cache/ccpraxis/container-test-scratch` | fixtures for ccpraxis's own container tests (`tests/lib/TestSandbox.pm`), nothing else. Those tests cannot run without it, so it is on by default; it holds only throwaway files the Mac never executes |
 | rw | each directory added with `add-project` | the project, at `/project`, and its `.ccpraxis-local-data/claude-home` at `/root/.claude` |
+| ro | any other `directory` marketplace in `~/.claude/plugins/known_marketplaces.json` | the launcher binds it read-only into every sandbox (`ccpraxis-local` is served from the live install; there is none other on a usual machine). One inside `~/.claude` is not shared, and the plan says every launch is refused while it stays registered |
 
 Nothing else: not `/Users`, `/private`, `/var/folders`, or `~/.config/containers` (which podman 6
 mounts at `/etc/containers` so its config can be edited from the Mac; the VM has its own). With no
@@ -62,8 +63,12 @@ gives the `add-project <dir>` command to run. It refuses the same way when a bin
 through a folder the machine shares read-only.
 
 `add-project` refuses your home folder and anything containing it, `~/.claude` and anything inside
-it, the live install, `~/.cache/ccpraxis`, a top-level folder, a path under one of the VM's own
-system directories (`/usr`, `/opt`, `/var`, ...) and a path with a `:`.
+it, the live install, `~/.cache/ccpraxis`, `~/.ssh`, `~/.gnupg`, `~/Library`, podman's own
+`~/.config/containers` and `~/.local/share/containers`, a top-level folder, a path under one of the
+VM's own system directories (`/usr`, `/opt`, `/var`, ...) and a path with a `:` or a `,`. The same
+rules are checked against the list file before every plan, so a hand edit cannot get round them. A
+folder renamed by case alone is fixed by running `add-project` on the new spelling: APFS calls the
+two one folder, the VM does not.
 
 `ro` is recorded, not enforced, on this provider. podman 6.1.4 stores `-v SRC:DST:ro` as the mount's
 `ReadOnly` flag, but vfkit 0.6.4 has no read-only virtio-fs share and the VM's mount unit is
@@ -81,25 +86,34 @@ machine still runs as your user and needs no admin rights on the Mac.
 
 ### What a recreate costs
 
-`apply --confirm` recreates the machine when rootful or a share differs. In order, it:
+`apply --confirm` recreates the machine when rootful or a share differs. It refuses first when a
+listed folder is missing, or when the live install predates `podman-machine.pl` (its launcher would
+bind `~/.claude/almanac-global-counts.json`, which this machine does not share): promote first.
+Then, in order, it:
 
-1. starts the machine if it is stopped, and refuses if any container is running;
+1. starts the machine if it is stopped, and refuses if any container is running, or if the VM holds
+   a container the sandbox does not recreate (anything but its own, the test probes and the
+   container lane) or any volume: remove those yourself first if they can go. It lists what will go
+   with the machine, and the images it does not keep;
 2. saves every `claude-sandbox*` image with `podman save` to `~/.cache/ccpraxis/podman-machine-images-<time>.tar`
-   (rootful storage is separate from rootless storage, so save and load are what carry them);
+   (written as `.tar.partial` and renamed once whole; the new machine starts with empty storage, so
+   save and load are what carry them);
 3. removes the machine (`podman machine rm -f`), which deletes every container in it. Sandbox
    containers are recreated by the next launch; each project's `claude-home` lives on the Mac and is
    kept;
 4. creates the new one (`podman machine init --rootful ... --volume SRC:DST[:ro]`). podman downloads
    the machine OS image (about 1 GB) unless it has it cached;
-5. starts it, makes sure podman talks to the rootful service (`podman system connection default
-   <name>-root` when it does not), loads the saved images, checks each name came back and deletes the
-   archive;
+5. starts it, makes its rootful connection the default (`podman system connection default
+   <name>-root`) and checks podman reports `Rootless=false`, loads the saved images, checks each name
+   came back and deletes the archive;
 6. stops it again if it was stopped before.
 
-If a step after the removal fails, the archive is kept and the message says where; the next
-`apply --confirm` creates the machine and loads it. Images other than `claude-sandbox*` are not kept.
-Images carried over from a rootless machine were built without the device nodes; take
-`claude-sandbox`'s rebuild offer, or `podman rmi` the image, to build one on the rootful machine.
+If a step after the removal fails, the archive is kept and the message says where; `plan` lists it,
+and the next `apply --confirm` creates the machine and loads it -- unless the machine already has
+images under those names (a launch built a fresh one meanwhile), which it does not overwrite.
+Images other than `claude-sandbox*` are not kept. Images carried over from a rootless machine were
+built without the device nodes; take `claude-sandbox`'s rebuild offer, or `podman rmi` the image, to
+build one on the rootful machine.
 
 After a recreate, `podman machine ssh ls /etc/containers` should list the VM's own `policy.json`
 and `registries.conf`, and `podman info --format '{{.Host.Security.Rootless}}'` should print `false`.
@@ -110,6 +124,8 @@ and `registries.conf`, and `podman info --format '{{.Host.Security.Rootless}}'` 
   limit is not what it occupies: `du -sh` on the `.raw` file shows the real usage, which grows as
   images are built.
 - **A missing shared folder stops the machine from starting.** vfkit refuses a share whose folder is
-  gone. The launcher recreates the two `~/.cache/ccpraxis` folders before it starts the machine; for
-  a project folder you deleted or moved, run `remove-project` on it.
+  gone. The launcher recreates the two `~/.cache/ccpraxis` folders before it starts the machine, and
+  for any other missing folder it stops with the folder's name and the `remove-project` command
+  instead of trying. A start by hand (`podman machine start`, Podman Desktop) gets only vfkit's own
+  error.
 - **The machine keeps running** (and holding its memory) until `podman machine stop`.

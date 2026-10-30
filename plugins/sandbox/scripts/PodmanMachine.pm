@@ -33,6 +33,8 @@ package PodmanMachine;
 #         `test-scratch off` drops it;
 #     rw  every project directory in the list (add-project / remove-project);
 #         the list starts empty.
+#     ro  any other directory-source marketplace in known_marketplaces.json,
+#         which the launcher binds too (none on a usual machine).
 #   Nothing else: not /Users, /private, /var/folders or ~/.config/containers.
 #   The VM has its own /etc/containers; the host copy was a convenience
 #   (podman 6.0 release notes: "allowing users to edit the config files").
@@ -56,7 +58,9 @@ package PodmanMachine;
 use strict;
 use warnings;
 use Cwd ();
+use Encode ();
 use File::Basename qw(dirname);
+use File::Spec ();
 use File::Path ();
 use JSON::PP ();
 use POSIX ();
@@ -135,6 +139,30 @@ sub ensure_share_dirs {
     return @err;
 }
 
+# missing_share_sources(\@shares) -> the shared folders that do not exist.
+sub missing_share_sources {
+    my ($shares) = @_;
+    return () unless ref $shares eq 'ARRAY';
+    return grep { defined $_ && length $_ && !-d $_ } map { ref $_ eq 'HASH' ? $_->{source} : $_ } @$shares;
+}
+
+# missing_share_remedy(\@shares) -> () when every shared folder exists, else
+# the lines that explain why the machine cannot start and what fixes it.
+# vfkit refuses to start a VM whose shared folder is gone, and "try podman
+# machine start" cannot fix that: the folder must come back, or the share must
+# go (remove-project, which recreates the machine).
+sub missing_share_remedy {
+    my ($shares) = @_;
+    my @gone = missing_share_sources($shares);
+    return () unless @gone;
+    my $s = 'perl ' . HostPlatform::machine_script_path();
+    return ("  The podman machine shares " . (@gone == 1 ? 'a folder that no longer exists' : 'folders that no longer exist')
+                . ', and it cannot start without ' . (@gone == 1 ? 'it' : 'them') . ':',
+            (map { "    $_" } @gone),
+            '  Recreate ' . (@gone == 1 ? 'it' : 'them') . ', or stop sharing a project folder you removed:',
+            (map { "    $s remove-project $_ --confirm" } @gone));
+}
+
 # ---------------------------------------------------------------------------
 # The share list (machine-local state file)
 # ---------------------------------------------------------------------------
@@ -200,7 +228,16 @@ sub write_state {
 # Project directories
 # ---------------------------------------------------------------------------
 
-sub _fold { my ($p, $os) = @_; return ($os eq 'darwin') ? lc $p : $p }
+# _fold($path, $os) -> the spelling APFS treats as equal: case-folded on darwin
+# (as characters, so a non-ASCII letter folds too), unchanged elsewhere.
+sub _fold {
+    my ($p, $os) = @_;
+    return $p unless $os eq 'darwin' && defined $p;
+    my $copy = $p;
+    my $chars = eval { Encode::decode('UTF-8', $copy, Encode::FB_CROAK()) };
+    return lc $p unless defined $chars;
+    return Encode::encode('UTF-8', lc $chars);
+}
 sub _under { my ($p, $d) = @_; return $d eq '/' || $p eq $d || index($p, "$d/") == 0 }
 sub _overlap {
     my ($x, $y, $os) = @_;
@@ -223,27 +260,111 @@ sub canonical_project {
     return ($abs, undef);
 }
 
+# Folders that hold keys, or podman's own machine config and disk (whose
+# contents run on the Mac at the next `podman machine start`): never shared.
+sub _sensitive_dirs {
+    my ($L) = @_;
+    my $h = $L->{home};
+    return ("$h/.ssh", "$h/.gnupg", "$h/.config/containers", "$h/.local/share/containers", "$h/Library");
+}
+
+# _shape_problem($path, $layout, $os) -> undef | why no share may have this
+# path at all.
+sub _shape_problem {
+    my ($p, $L, $os) = @_;
+    return "a ':' in the path cannot be passed to `podman machine init --volume`" if $p =~ /:/;
+    return "a ',' in the path would break vfkit's virtio-fs device options and the launcher's --mount spec"
+        if $p =~ /,/;
+    return 'the path contains a control character' if $p =~ /[\x00-\x1f\x7f]/;
+    my @parts = grep { length } split m{/}, $p;
+    return 'sharing a top-level folder would hand the VM everything under it' if @parts < 2;
+    return "/$parts[0] is the VM's own system directory there; a share cannot be mounted at that path"
+        if grep { lc($parts[0]) eq $_ } @VM_RESERVED;
+    return 'it contains your home folder' if _under(_fold($L->{home}, $os), _fold($p, $os));
+    for my $s (_sensitive_dirs($L)) {
+        return "it overlaps $s, which holds keys or podman's own machine files" if _overlap($p, $s, $os);
+    }
+    return "it overlaps ccpraxis's own share folders ($L->{cache_dir})" if _overlap($p, $L->{cache_dir}, $os);
+    return undef;
+}
+
 # project_problem($path, $layout, %o) -> undef | why this directory must not
 # be shared read-write with the VM. $path is canonical. %o: os, install_root.
 sub project_problem {
     my ($p, $L, %o) = @_;
     my $os = defined $o{os} ? $o{os} : $^O;
     my $install = defined $o{install_root} ? $o{install_root} : $L->{install_root};
-    return "a ':' in the path cannot be passed to `podman machine init --volume`" if $p =~ /:/;
-    return 'the path contains a control character' if $p =~ /[\x00-\x1f\x7f]/;
-    my @parts = grep { length } split m{/}, $p;
-    return 'sharing a top-level folder would hand the VM everything under it' if @parts < 2;
-    return "/$parts[0] is the VM's own system directory there; a share cannot be mounted at that path"
-        if grep { lc($parts[0]) eq $_ } @VM_RESERVED;
-    my $fp = _fold($p, $os);
-    return 'it contains your home folder' if _under(_fold($L->{home}, $os), $fp);
+    my $why = _shape_problem($p, $L, $os);
+    return $why if defined $why;
     return '~/.claude holds transcripts, credentials, the vault and this share list; it is never shared'
         if _overlap($p, "$L->{home}/.claude", $os);
     return "it overlaps the live install ($install), which is shared read-only"
         if _overlap($p, $install, $os);
-    return "it overlaps ccpraxis's own share folders ($L->{cache_dir})"
-        if _overlap($p, $L->{cache_dir}, $os);
     return undef;
+}
+
+# install_root_problem($path, $layout, %o) -> undef | why the share list's
+# install_root must not be shared. Inside ~/.claude is expected (the default
+# is ~/.claude/ccpraxis); ~/.claude itself, or anything containing it, is not.
+sub install_root_problem {
+    my ($p, $L, %o) = @_;
+    my $os = defined $o{os} ? $o{os} : $^O;
+    my $why = _shape_problem($p, $L, $os);
+    return $why if defined $why;
+    return 'it contains ~/.claude (transcripts, credentials, the vault, this share list)'
+        if _under(_fold("$L->{home}/.claude", $os), _fold($p, $os));
+    return undef;
+}
+
+# state_problems($state, $layout, %o) -> list of "path: why" for entries a
+# hand-edited share list must not hold. Checked before every plan, so an edit
+# cannot share the home folder by the back door.
+sub state_problems {
+    my ($st, $L, %o) = @_;
+    my @bad;
+    if (defined $st->{install_root}) {
+        my $why = install_root_problem($st->{install_root}, $L, %o);
+        push @bad, "install_root $st->{install_root}: $why" if defined $why;
+    }
+    for my $p (@{ $st->{projects} || [] }) {
+        my $why = project_problem($p, $L, %o, install_root => $st->{install_root});
+        push @bad, "$p: $why" if defined $why;
+    }
+    return @bad;
+}
+
+# directory_marketplaces($layout, $install, %o) -> ( { source, problem } ... ):
+# every directory-source marketplace in ~/.claude/plugins/known_marketplaces.json
+# whose folder the launcher would bind read-only, except ccpraxis-local, which
+# the launcher serves from the install's own plugins/ (SandboxIdentity::
+# directory_marketplace_source), and any already inside the install share.
+# `problem` says why one must not be shared; such a marketplace makes every
+# launch refuse at create for as long as it stays registered.
+sub directory_marketplaces {
+    my ($L, $install, %o) = @_;
+    my $os = defined $o{os} ? $o{os} : $^O;
+    my $raw = _slurp_file("$L->{home}/.claude/plugins/known_marketplaces.json");
+    return () unless defined $raw;
+    my $d = eval { JSON::PP::decode_json($raw) };
+    return () unless ref $d eq 'HASH';
+    my @out;
+    for my $name (sort keys %$d) {
+        next if $name eq 'ccpraxis-local';
+        my $src = ref $d->{$name} eq 'HASH' ? $d->{$name}{source} : undef;
+        next unless ref $src eq 'HASH' && ($src->{source} // '') eq 'directory';
+        my $p = $src->{path};
+        next unless defined $p && !ref $p && length $p;
+        $p = Encode::encode('UTF-8', $p) if utf8::is_utf8($p);
+        $p =~ s{\\}{/}g;
+        $p =~ s{/+\z}{} unless $p eq '/';
+        next unless $p =~ m{\A/} && -d $p;
+        next if _under(_fold($p, $os), _fold($install, $os));
+        my $why = _shape_problem($p, $L, $os);
+        $why = 'it is inside ~/.claude, which is never shared'
+            if !defined $why && _overlap($p, "$L->{home}/.claude", $os);
+        push @out, { source => $p, name => $name, problem => $why };
+    }
+    return @out;
 }
 
 # ---------------------------------------------------------------------------
@@ -316,12 +437,14 @@ my %WHY = (
     'container-files' => 'host files a container reads: the copy of almanac-global-counts.json the launcher refreshes (~/.claude itself is never shared)',
     'test-scratch'  => "fixtures for ccpraxis's container tests, nothing else (drop it with: test-scratch off)",
     project         => 'a project directory, mounted read-write at /project (add-project / remove-project)',
+    marketplace     => 'a directory-source plugin marketplace registered on the Mac, bound read-only into every sandbox',
 );
 sub why_text { my ($role) = @_; return $WHY{$role} // '' }
 
 # desired_machine(%o) -> { name, rootful, cpus, memory, disk, install_root,
 #                          shares => [ {source,target,readonly,role} ] }
-# %o: layout, state, current, overrides => { cpus, memory, disk }.
+# %o: layout, state, current, overrides => { cpus, memory, disk },
+#     marketplaces => [ { source, problem } ] (directory_marketplaces).
 sub desired_machine {
     my (%o) = @_;
     my ($L, $st, $cur) = @o{qw(layout state current)};
@@ -333,6 +456,7 @@ sub desired_machine {
         $share->($install, 1, 'install'),
         $share->($L->{container_files}, 1, 'container-files'),
         ($st->{test_scratch} ? $share->($L->{test_scratch}, 0, 'test-scratch') : ()),
+        (map { $share->($_->{source}, 1, 'marketplace') } grep { !defined $_->{problem} } @{ $o{marketplaces} || [] }),
         (map { $share->($_, 0, 'project') } @{ $st->{projects} || [] }),
     );
     my $pick = sub {
@@ -371,6 +495,11 @@ sub compute_plan {
     for my $s (@{ $want->{shares} }) {
         push @{ $p{missing} }, { source => $s->{source}, role => $s->{role} } unless -d $s->{source};
     }
+    # A live install from before this module still binds ~/.claude/almanac-
+    # global-counts.json in place and puts test fixtures under /private/tmp;
+    # against the narrowed machine every launch from it would be refused.
+    my $inst = $want->{install_root};
+    $p{stale_install} = (defined $inst && -d $inst && !-f "$inst/plugins/sandbox/scripts/PodmanMachine.pm") ? 1 : 0;
 
     unless ($cur && $cur->{exists}) {
         $p{action} = 'create';
@@ -423,7 +552,8 @@ sub compute_plan {
 
 my %LABEL = (cpus => 'cpus', memory => 'memory (MiB)', disk => 'disk (GiB)');
 
-# render_plan($plan, %o) -> lines. %o: state_file, state_exists, script.
+# render_plan($plan, %o) -> lines. %o: state_file, state_exists, marketplaces,
+# pending (leftover image archives), home, account_home.
 sub render_plan {
     my ($p, %o) = @_;
     my ($cur, $want) = @{$p}{qw(current desired)};
@@ -465,12 +595,31 @@ sub render_plan {
             '  but vfkit 0.6.4 has no read-only virtio-fs share and the VM mounts it read-write, so a process',
             '  that escaped into the VM could write an "ro" folder. Containers still get read-only binds.';
     }
+    if ($p->{stale_install}) {
+        push @l, '', "The live install ($want->{install_root}) predates podman-machine.pl: its launcher would",
+                 '  bind ~/.claude/almanac-global-counts.json, which this machine does not share, so every launch',
+                 '  from it would be refused. Promote first (perl scripts/promote.pl in the dev clone); apply',
+                 '  refuses until then.';
+    }
     push @l, '', 'Missing on disk:' if @{ $p->{missing} };
     for my $m (@{ $p->{missing} }) {
         my $fix = ($m->{role} eq 'container-files' || $m->{role} eq 'test-scratch') ? 'apply creates it'
                 : $m->{role} eq 'install' ? 'promote first (perl scripts/promote.pl in the dev clone); apply refuses until it exists'
                 : 'remove-project it, or recreate the directory; apply refuses until then';
         push @l, "  $m->{source} ($fix)";
+    }
+    my @bad_mkt = grep { defined $_->{problem} } @{ $o{marketplaces} || [] };
+    if (@bad_mkt) {
+        push @l, '', 'Not shared, so every launch is refused while it stays registered:',
+                 map { "  $_->{source} (marketplace $_->{name}): $_->{problem}" } @bad_mkt;
+    }
+    if (ref $o{pending} eq 'ARRAY' && @{ $o{pending} }) {
+        push @l, '', 'Images saved by an earlier apply that did not finish (apply --confirm loads them):',
+                 map { "  $_" } @{ $o{pending} };
+    }
+    if (defined $o{account_home} && defined $o{home} && $o{account_home} ne $o{home}) {
+        push @l, '', "Note: HOME ($o{home}) is not your account's home ($o{account_home}); the launcher",
+                 '  and the tests lay their folders out under the account home, so shares planned here would miss them.';
     }
     push @l, '';
     return @l;
@@ -510,10 +659,17 @@ sub cost_lines {
     } elsif ($cur && ($cur->{state} // '') ne 'running') {
         push @l, '  - the machine is stopped, so apply starts it to list and save the images.';
     }
+    my @foreign = ref $o{containers} eq 'ARRAY' ? grep { !is_sandbox_container($_) } @{ $o{containers} } : ();
+    my @vols    = ref $o{volumes} eq 'ARRAY' ? @{ $o{volumes} } : ();
     if (ref $o{containers} eq 'ARRAY' && @{ $o{containers} }) {
         push @l, '  - containers that will be deleted: ' . join(', ', @{ $o{containers} });
     }
-    push @l, '  - apply refuses while any container is running.';
+    if (@foreign || @vols) {
+        push @l, '  - apply refuses until you remove what the sandbox does not recreate: '
+                 . join(', ', (map { "container $_" } @foreign), (map { "volume $_" } @vols));
+    }
+    push @l, '  - apply refuses while any container is running, and before deleting a container or volume',
+             '    the sandbox does not recreate itself (it lists them once the machine runs).';
     push @l, '  - the machine is left ' . (($cur && ($cur->{state} // '') eq 'running') ? 'running' : 'stopped') . ', as it was.';
     return @l;
 }
@@ -579,18 +735,56 @@ sub init_args {
 # ---------------------------------------------------------------------------
 
 sub _archive_dir   { my ($L) = @_; return $L->{cache_dir} }
-sub _pending_archives {
+
+# pending_archives($layout) -> image archives a finished save left behind
+# (an apply that died after `podman save`). A save writes <name>.tar.partial
+# and renames it only once podman save succeeded, so a killed save never
+# looks like a pending archive.
+sub pending_archives {
     my ($L) = @_;
     my $d = _archive_dir($L);
     opendir(my $dh, $d) or return ();
-    my @a = sort map { "$d/$_" } grep { /\Apodman-machine-images-[0-9T-]+\.tar\z/ } readdir $dh;
+    my @a = sort map { "$d/$_" } grep { /\Apodman-machine-images-[0-9T]+\.tar\z/ } readdir $dh;
     closedir $dh;
     return grep { -f $_ } @a;
 }
 
+# is_sandbox_container($name) -> 1 when the sandbox recreates this container by
+# itself: a launcher container (SandboxIdentity's <prefix>-<project>-<hash8>),
+# a container-test probe, or a container-lane run. Anything else is the
+# operator's, and a recreate would delete it.
+sub is_sandbox_container {
+    my ($n) = @_;
+    return 0 unless defined $n && length $n;
+    return 1 if $n =~ /\Aclaude-sandbox-test-/ || $n =~ /\Accpraxis-container-lane-/;
+    return SandboxIdentity::is_sandbox_container_name($n) ? 1 : 0;
+}
+
+# volume_names($volume_ls_json) -> names of podman volumes.
+sub volume_names {
+    my ($raw) = @_;
+    my $d = eval { JSON::PP->new->decode(defined $raw ? $raw : '') };
+    return () unless ref $d eq 'ARRAY';
+    return map { (ref $_ eq 'HASH' && defined $_->{Name} && !ref $_->{Name}) ? $_->{Name} : () } @$d;
+}
+
+# other_image_names($images_json) -> tagged images a recreate does NOT keep.
+sub other_image_names {
+    my ($raw) = @_;
+    my %keep = map { $_ => 1 } keep_image_names($raw);
+    my $d = eval { JSON::PP->new->decode(defined $raw ? $raw : '') };
+    return () unless ref $d eq 'ARRAY';
+    my %n;
+    for my $img (@$d) {
+        next unless ref $img eq 'HASH' && ref $img->{Names} eq 'ARRAY';
+        $n{$_} = 1 for grep { defined && !ref && !$keep{$_} } @{ $img->{Names} };
+    }
+    return sort keys %n;
+}
+
 # apply(%o) -> exit code. %o: env (podman, run, stream, out, now), layout,
-# state, plan, confirm. Prints the plan's cost, refuses what it must, and with
-# confirm executes the plan.
+# plan, confirm, images, containers. Prints the plan's cost, refuses what it
+# must, and with confirm executes the plan.
 sub apply {
     my (%o) = @_;
     my ($e, $L, $p) = @o{qw(env layout plan)};
@@ -599,7 +793,7 @@ sub apply {
     my $cur = $p->{current};
     my $want = $p->{desired};
     my $act = $p->{action};
-    my @pending = _pending_archives($L);
+    my @pending = pending_archives($L);
 
     if ($act eq 'none' && !@pending) {
         $out->('The machine already matches; nothing to do.');
@@ -614,11 +808,12 @@ sub apply {
         $out->("Refusing: these shared folders do not exist on disk:", map { "  $_->{source}" } @blocking);
         return 1;
     }
-
-    $out->(cost_lines($p, images => $o{images}, containers => $o{containers})) unless $act eq 'none';
-    if (@pending) {
-        $out->('', 'Images saved by an earlier apply that did not finish will be loaded:', map { "  $_" } @pending);
+    if ($p->{stale_install} && $act ne 'none') {
+        $out->("Refusing: the live install $want->{install_root} predates podman-machine.pl; promote first.");
+        return 1;
     }
+
+    $out->(cost_lines($p, images => $o{images}, containers => $o{containers}, volumes => $o{volumes})) unless $act eq 'none';
     unless ($o{confirm}) {
         $out->('', 'Nothing has changed. To do this, run again with --confirm.');
         return 0;
@@ -633,6 +828,13 @@ sub apply {
         $out->('$ ' . join(' ', map { /[\s'"]/ ? "'$_'" : $_ } $pod, @argv));
         return $e->{stream}->([$pod, @argv]);
     };
+    my $query = sub {
+        my ($what, @argv) = @_;
+        my $r = $e->{run}->([$pod, @argv]);
+        return $r if _run_ok($r);
+        $out->("Refusing: cannot list $what: " . _one_line($r->{err} || $r->{out}));
+        return undef;
+    };
     my $have        = $cur && $cur->{exists};
     my $was_running = $have && ($cur->{state} // '') eq 'running';
     my $name        = $want->{name};
@@ -645,11 +847,7 @@ sub apply {
         return 1;
     };
     my $running_refusal = sub {
-        my $ps = $e->{run}->([$pod, 'ps', '--format', 'json']);
-        unless (_run_ok($ps)) {
-            $out->('Refusing: cannot list running containers: ' . _one_line($ps->{err} || $ps->{out}));
-            return 1;
-        }
+        my $ps = $query->('running containers', 'ps', '--format', 'json') or return 1;
         my @run = container_names($ps->{out});
         return 0 unless @run;
         $out->('Refusing: these containers are running, and changing the machine would stop them:',
@@ -659,6 +857,7 @@ sub apply {
     };
 
     my @archives = @pending;
+    my %written;             # archives this run saved (always loaded)
 
     if ($act eq 'set') {
         if ($was_running) {
@@ -677,28 +876,44 @@ sub apply {
         return _fail($out, 'podman machine start failed; nothing was changed') unless $ensure_running->();
         if ($running_refusal->()) { $restore->(); return 1 }
 
-        my $im = $e->{run}->([$pod, 'images', '--format', 'json']);
-        unless (_run_ok($im)) {
-            $out->('Refusing: cannot list images: ' . _one_line($im->{err} || $im->{out}));
+        # Everything the rm deletes, now that it can be listed. Only what the
+        # sandbox recreates by itself may go without the operator removing it.
+        my $all = $query->('containers', 'ps', '-a', '--format', 'json') or do { $restore->(); return 1 };
+        my $vol = $query->('volumes', 'volume', 'ls', '--format', 'json') or do { $restore->(); return 1 };
+        my $im  = $query->('images', 'images', '--format', 'json') or do { $restore->(); return 1 };
+        my @containers = container_names($all->{out});
+        my @foreign = grep { !is_sandbox_container($_) } @containers;
+        my @volumes = volume_names($vol->{out});
+        if (@foreign || @volumes) {
+            $out->('Refusing: the recreate would delete these, which the sandbox does not recreate:',
+                   (map { "  container $_" } @foreign), (map { "  volume $_" } @volumes),
+                   'Remove them yourself (podman rm / podman volume rm) if they can go, then run apply --confirm again.');
             $restore->();
             return 1;
         }
+        $out->('Deleting with the machine: ' . (@containers ? join(', ', @containers) : 'no containers') . '.');
+        my @other = other_image_names($im->{out});
+        $out->('Not kept (pulled again when needed): ' . join(', ', @other) . '.') if @other;
+
         my @keep = keep_image_names($im->{out});
         if (@keep) {
             my $dir = _archive_dir($L);
             eval { File::Path::make_path($dir) unless -d $dir; 1 };
             my $ts = POSIX::strftime('%Y%m%dT%H%M%S', localtime($e->{now} ? $e->{now}->() : time));
             my $archive = "$dir/podman-machine-images-$ts.tar";
+            my $partial = "$archive.partial";
+            unlink $partial;
             my ($ok, $err) = _write_names("$archive.names", \@keep);
             unless ($ok) { $out->("Refusing: $err"); $restore->(); return 1 }
             $out->('Saving images: ' . join(', ', @keep));
-            if ($step->('save', '-m', '-o', $archive, @keep) != 0 || !-s $archive) {
-                unlink $archive, "$archive.names";
+            if ($step->('save', '-m', '-o', $partial, @keep) != 0 || !-s $partial || !rename($partial, $archive)) {
+                unlink $partial, "$archive.names";
                 $out->('Refusing: podman save failed; nothing was removed.');
                 $restore->();
                 return 1;
             }
             push @archives, $archive;
+            $written{$archive} = 1;
         } else {
             $out->("No $SandboxIdentity::ID images to keep.");
         }
@@ -721,18 +936,14 @@ sub apply {
         }
         $started = 1;
 
-        # The client must talk to the rootful service. podman normally makes
-        # the new machine's -root connection the default; this makes sure.
-        my $rootless = sub {
-            my $r = $e->{run}->([$pod, 'info', '--format', '{{.Host.Security.Rootless}}']);
-            return _run_ok($r) ? _one_line($r->{out}) : 'unknown';
-        };
-        if ($rootless->() ne 'false') {
-            $step->('system', 'connection', 'default', "$name-root");
-            my $again = $rootless->();
-            $out->("WARNING: podman still reports Rootless=$again; check `podman system connection list`.")
-                if $again ne 'false';
-        }
+        # The client must talk to THIS machine's rootful service, whatever
+        # connection was the default before (another machine's, or the
+        # rootless one): make it the default, then check.
+        $step->('system', 'connection', 'default', "$name-root");
+        my $r = $e->{run}->([$pod, 'info', '--format', '{{.Host.Security.Rootless}}']);
+        my $rootless = _run_ok($r) ? _one_line($r->{out}) : 'unknown';
+        $out->("WARNING: podman reports Rootless=$rootless after the switch; check `podman system connection list`.")
+            if $rootless ne 'false';
     }
 
     my $load_failed = 0;
@@ -742,6 +953,23 @@ sub apply {
         }
         for my $archive (@archives) {
             my @names = _read_names("$archive.names");
+            unless (@names) {
+                # Without the names there is nothing to verify a load against.
+                $out->("WARNING: $archive.names is missing or unreadable; $archive is kept, load it by hand: podman load -i $archive");
+                $load_failed = 1;
+                next;
+            }
+            unless ($written{$archive}) {
+                # Left by an earlier run. If the machine already has any of its
+                # names (a launch built a fresh image meanwhile), loading it
+                # would point them back at the older image.
+                my @there = grep { _run_ok($e->{run}->([$pod, 'image', 'exists', $_])) } @names;
+                if (@there) {
+                    $out->("Not loading $archive: the machine already has @there, and loading it would replace them",
+                           "  with the older images. Delete it, or load it by hand (podman load -i $archive).");
+                    next;
+                }
+            }
             if ($step->('load', '-i', $archive) != 0) {
                 $out->("WARNING: podman load failed for $archive; it is kept.");
                 $load_failed = 1;
@@ -762,7 +990,7 @@ sub apply {
         $out->('', 'Done: the machine is rootful and shares only:',
                map { "  $_" } HostPlatform::share_lines($want->{shares}));
     } elsif ($act eq 'none') {
-        $out->('', 'Done: the images left by the earlier apply were loaded.') unless $load_failed;
+        $out->('', 'Done with the images left by the earlier apply.') unless $load_failed;
     }
     $out->('Some images were not restored; see the warnings above.') if $load_failed;
     return $load_failed ? 1 : 0;
@@ -893,7 +1121,7 @@ sub _not_darwin_lines {
 }
 
 # cli(\@argv, %seams) -> exit code.
-# %seams (tests): os, home, podman, run, stream, read_file, out, now.
+# %seams (tests): os, home, account_home, podman, run, stream, read_file, out, now.
 sub cli {
     my ($argv, %s) = @_;
     my @args = @{ $argv || [] };
@@ -965,20 +1193,27 @@ sub cli {
         if ($err) { $out->("ERROR: $err"); return 1 }
         my $why = project_problem($p, $L, os => $os, install_root => $state->{install_root});
         if ($why) { $out->("Refusing to share $p: $why."); return 1 }
-        if (grep { _fold($_, $os) eq _fold($p, $os) } @{ $new{projects} }) {
+        my ($same) = grep { _fold($_, $os) eq _fold($p, $os) } @{ $new{projects} };
+        if (defined $same && $same eq $p) {
             $out->("$p is already in the share list.");
         } else {
-            push @{ $new{projects} }, $p;
-            @{ $new{projects} } = sort @{ $new{projects} };
+            # A folder renamed by case alone (APFS: one folder; the VM: two
+            # paths) replaces its old spelling, which the launcher no longer binds.
+            $out->("Replacing $same with its current spelling.") if defined $same;
+            $new{projects} = [ sort((grep { _fold($_, $os) ne _fold($p, $os) } @{ $new{projects} }), $p) ];
             $changed = 1;
         }
     } elsif ($cmd eq 'remove-project') {
         my $given = $pos[0];
         my ($p) = -d $given ? canonical_project($given, os => $os) : ();
-        $p = do { (my $x = $given) =~ s{/+\z}{}; $x } unless defined $p;
+        unless (defined $p) {
+            $p = $given =~ m{\A/} ? $given : File::Spec->rel2abs($given);
+            $p =~ s{/+\z}{} unless $p eq '/';
+        }
         my @keep = grep { _fold($_, $os) ne _fold($p, $os) } @{ $new{projects} };
         if (@keep == @{ $new{projects} }) {
-            $out->("$p is not in the share list.");
+            $out->("$p is not in the share list. It holds:",
+                   @{ $new{projects} } ? (map { "  $_" } @{ $new{projects} }) : ('  (no projects)'));
         } else {
             $new{projects} = \@keep;
             $changed = 1;
@@ -993,26 +1228,42 @@ sub cli {
         }
     }
 
+    # A hand-edited list must not share what add-project refuses. remove-project
+    # stays usable, since it is how a bad entry is taken out.
+    my @bad = state_problems(\%new, $L, os => $os);
+    if (@bad) {
+        $out->("ERROR: the share list $L->{state_file} holds entries that must not be shared:",
+               (map { "  $_" } @bad),
+               'Take them out (remove-project <dir>, or edit the file), then run this again.');
+        return 1;
+    }
+
     my ($cur, $cerr) = current_machine(%env);
     if ($cerr) { $out->("ERROR: $cerr"); return 1 }
-    my $want = desired_machine(layout => $L, state => \%new, current => $cur,
+    my $install = defined $new{install_root} ? $new{install_root} : $L->{install_root};
+    my @mkts = directory_marketplaces($L, $install, os => $os);
+    my $want = desired_machine(layout => $L, state => \%new, current => $cur, marketplaces => \@mkts,
                                overrides => { map { exists $opt{$_} ? ($_ => $opt{$_}) : () } qw(cpus memory disk) });
     my $plan = compute_plan(current => $cur, desired => $want);
-    $out->(render_plan($plan, state_file => $L->{state_file}, state_exists => $state->{exists}));
+    $out->(render_plan($plan, state_file => $L->{state_file}, state_exists => $state->{exists},
+                       marketplaces => \@mkts, pending => [ pending_archives($L) ],
+                       home => $L->{home}, account_home => $s{account_home} // account_home()));
 
     # What a running machine can tell before anything changes: the images a
-    # recreate keeps and the containers it deletes. Read-only queries; a
-    # stopped machine is not started for them.
-    my ($images, $containers);
+    # recreate keeps, the containers it deletes and any volume. Read-only
+    # queries; a stopped machine is not started for them.
+    my ($images, $containers, $volumes);
     if ($cur->{exists} && ($cur->{state} // '') eq 'running' && $plan->{action} eq 'recreate') {
         my $im = $env{run}->([$podman, 'images', '--format', 'json']);
         $images = [ keep_image_names($im->{out}) ] if _run_ok($im);
         my $ps = $env{run}->([$podman, 'ps', '-a', '--format', 'json']);
         $containers = [ container_names($ps->{out}) ] if _run_ok($ps);
+        my $vl = $env{run}->([$podman, 'volume', 'ls', '--format', 'json']);
+        $volumes = [ volume_names($vl->{out}) ] if _run_ok($vl);
     }
 
     if ($cmd eq 'plan') {
-        $out->(cost_lines($plan, images => $images, containers => $containers));
+        $out->(cost_lines($plan, images => $images, containers => $containers, volumes => $volumes));
         $out->('', 'To make the machine match: ' . 'perl ' . HostPlatform::machine_script_path() . ' apply --confirm')
             unless $plan->{action} eq 'none';
         return 0;
@@ -1026,7 +1277,7 @@ sub cli {
         $out->('(The share list is written only with --confirm.)');
     }
     my $rc = apply(env => \%env, layout => $L, plan => $plan, confirm => $opt{confirm},
-                   images => $images, containers => $containers);
+                   images => $images, containers => $containers, volumes => $volumes);
     if ($rc != 0 && $changed && $opt{confirm}) {
         $out->("The share list already includes this change; once the cause is fixed, run apply --confirm to bring the machine in line.");
     }
