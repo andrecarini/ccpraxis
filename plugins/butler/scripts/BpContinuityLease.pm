@@ -31,7 +31,9 @@ package BpContinuityLease;
 #   Windows host      -> the wake-lock (BpKeepAwake -> keep-awake.ps1). There is
 #                        no container to keep alive; the risk is S0 standby.
 #   macOS host        -> the same wake-lock, actuated as `caffeinate -i` held by
-#                        BpKeepAwake's `hold` process. The risk is idle sleep.
+#                        BpKeepAwake's `hold` process, and only on AC power
+#                        (KeepAwake.pm). The risk is idle sleep; a closed lid
+#                        always sleeps the Mac, by the operator's rule.
 #   Linux (a sandbox) -> the busy-lease (/tmp/.butler-busy). There is no
 #                        SetThreadExecutionState to call, and the risk is
 #                        heartbeat.sh reaping the container. Touching the lease
@@ -645,7 +647,7 @@ sub _owner_desc_for {
 }
 
 # ---------------------------------------------------------------------------
-# state($dir) -> 'held' | 'released'
+# state($dir) -> 'held' | 'released' | 'starting' | 'standby' | 'unsupported'
 #
 # What is ACTUALLY asserted right now, read off the artifacts — not what the
 # registry says ought to be. The distinction is the whole discipline of
@@ -672,7 +674,15 @@ sub state {
         }
         my $alive = $opts{pid_alive} // \&BpKeepAwake::pid_alive;
         my $pid = BpKeepAwake::read_pid($pf);
-        return (defined $pid && $alive->($pid)) ? 'held' : 'released';
+        return 'released' unless defined $pid && $alive->($pid);
+        # A live macOS holder off AC power asserts nothing: it stands by until
+        # AC returns (KeepAwake::hold_main). Saying "held" then would be the
+        # false claim this function exists to avoid.
+        if ($plat eq 'darwin') {
+            my $hs = BpKeepAwake::holder_state($pf);
+            return 'standby' if defined $hs && $hs eq 'standby';
+        }
+        return 'held';
     }
 
     my $bp = $opts{busy_path} // busy_path();

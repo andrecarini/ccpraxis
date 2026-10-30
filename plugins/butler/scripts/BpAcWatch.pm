@@ -312,18 +312,19 @@ sub _probe_darwin {
     return parse_pmset_ps($r->{out});
 }
 
-# parse_pmset_ps($text) -> 'ac' | 'dc' | 'unknown'. PURE. Only the FIRST line
-# decides ("Now drawing from 'AC Power'" / 'Battery Power' / 'UPS Power'); the
-# battery rows below it describe a battery, not the source. A UPS is mains
-# that has already been lost, so it counts as DC.
+# parse_pmset_ps($text) -> 'ac' | 'dc' | 'unknown'. PURE. The parser is the
+# sandbox plugin's KeepAwake::parse_pmset_ps -- the same one the macOS
+# wake-lock holder uses to drop caffeinate on battery, so "is this Mac on AC"
+# has one answer. Only the FIRST line decides ("Now drawing from 'AC Power'" /
+# 'Battery Power' / 'UPS Power'); a UPS counts as DC. 'unknown' when that
+# library cannot be loaded.
 sub parse_pmset_ps {
     my ($text) = @_;
-    return 'unknown' unless defined $text && !ref $text;
-    my ($first) = split /\r?\n/, $text, 2;
-    return 'unknown' unless defined $first;
-    return 'ac' if $first =~ /'AC Power'/;
-    return 'dc' if $first =~ /'(?:Battery|UPS) Power'/;
-    return 'unknown';
+    unless (defined &KeepAwake::parse_pmset_ps) {
+        my $p = "$DIR/../../sandbox/scripts/KeepAwake.pm";
+        return 'unknown' unless -f $p && eval { require $p; 1 } && defined &KeepAwake::parse_pmset_ps;
+    }
+    return KeepAwake::parse_pmset_ps($text);
 }
 
 # ---------------------------------------------------------------------------

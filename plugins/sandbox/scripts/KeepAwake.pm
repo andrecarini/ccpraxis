@@ -18,12 +18,393 @@ package KeepAwake;
 # read live in the launcher; whether the machine ACTUALLY stays awake is verified
 # on a real desktop (attended).
 #
-# On macOS the helper is `caffeinate -i -s -w <launcher pid>` instead: a system
-# binary that holds a power assertion for as long as it lives and exits on its
-# own when the launcher does, so it can never be orphaned. Hosts with neither
-# mechanism get no helper, and held() below says so.
+# On macOS the helper is this module's own holder (hold_main, below): a small
+# process that runs `caffeinate -i -w <its own pid>` only while the Mac is on AC
+# power, and exits when the launcher does, so nothing can be orphaned. Butler's
+# managed wake-lock (bp-keepawake.pl) runs the same holder: one macOS
+# assertion, not one per owner. Hosts with neither mechanism get no helper, and
+# held() below says so.
 use strict;
 use warnings;
+
+# ---------------------------------------------------------------------------
+# THE macOS ASSERTION -- one definition, one holder process, for every owner.
+#
+# Two owners take it: the launcher's dashboard lock (launcher.pl
+# _keepawake_start_caffeinate, owner = the launcher) and butler's managed
+# wake-lock (bp-keepawake.pl, owner = the continuity refresher or a driver).
+# They used to build their own caffeinate command lines and had drifted (the
+# launcher -i -s, the managed lock -i). Both now run the holder below,
+# hold_main, and it builds the command line with caffeinate_argv.
+#
+# THE OPERATOR'S RULE (2026-10-30): caffeinate must never take effect while
+# the Mac is off AC power, and closing the lid must always sleep it. So:
+#
+# -i  is the ONLY assertion: it prevents idle system sleep, and nothing else.
+#     Closing the lid still sleeps the machine, on AC or battery. Measured
+#     2026-10-29 on this host, the flag this rules out: a hand-run
+#     `caffeinate -i -s -m -t 50400` kept a lid-closed Mac on AC in DarkWake
+#     ("Entering DarkWake state due to 'Clamshell Sleep'") from 23:01, when
+#     its work ended, to 08:52. -s (system sleep, AC only), -d (display),
+#     -u (user activity: wakes the display and resets the idle timer) and
+#     -m (disk) are never passed: none is needed to stop idle sleep, and -s
+#     and -u are exactly the flags that override a closed lid or a sleeping
+#     display.
+# -w  ties the assertion to its owner's pid: caffeinate exits by itself when
+#     its owner does, whatever killed it (SIGKILL included), so nothing can
+#     orphan the assertion. There is no -t: an assertion lasts exactly as long
+#     as its holder decides, never a guessed duration.
+#
+# AC ONLY. hold_main reads the power source every $POWER_POLL_SECONDS and runs
+# caffeinate only while it reads 'AC Power'. It never starts one on battery,
+# stops a running one within one poll of the switch (see hold_main for the
+# bound), and takes it again when AC returns while its lease is still live.
+# An unreadable power source counts as battery: the failure is a Mac that may
+# sleep, never one held awake off AC.
+#
+# Nothing here decides WHETHER work wants the machine awake. That is the
+# owner's business (the dashboard's busy-lease probe; the continuity lease's
+# in-flight check), and it says so by keeping the holder alive (and, for a
+# leased holder, by touching its pid file).
+# ---------------------------------------------------------------------------
+our @CAFFEINATE_FLAGS = ('-i');
+
+# How often the holder reads the power source, i.e. the longest it can keep
+# caffeinate running after the Mac switches to battery (plus one bounded
+# pmset read and the stop itself; see hold_main). One `pmset -g ps` costs a
+# few milliseconds on this host, so a 2-second cadence is ~30 cheap reads a
+# minute for the life of a hold: the price of a bound in seconds rather than
+# minutes. The lease and owner checks ride the same tick for free.
+our $POWER_POLL_SECONDS = 2;
+
+# The longest one power-source read may take before it counts as unreadable
+# (and so as battery).
+our $PMSET_TIMEOUT_SECONDS = 3;
+
+# caffeinate_bin() -> path | undef. CCPRAXIS_CAFFEINATE_BIN names a substitute
+# (the test seam: a fake that asserts nothing); otherwise the system binary at
+# its fixed path, then PATH. undef when there is none (not a Mac).
+sub caffeinate_bin {
+    my $o = $ENV{CCPRAXIS_CAFFEINATE_BIN};
+    return $o if defined $o && length $o;
+    return '/usr/bin/caffeinate' if -x '/usr/bin/caffeinate';
+    for my $d (split /:/, ($ENV{PATH} // '')) {
+        next unless length $d;
+        return "$d/caffeinate" if -x "$d/caffeinate";
+    }
+    return undef;
+}
+
+# caffeinate_argv($bin, $owner_pid) -> ($bin, '-i', '-w', $owner_pid) | ()
+# The exec list for one assertion owned by $owner_pid. Empty list (and so
+# nothing to exec) unless both are usable: an assertion with no owner is the
+# orphan -w exists to rule out.
+sub caffeinate_argv {
+    my ($bin, $owner) = @_;
+    return () unless defined $bin && length $bin;
+    return () unless defined $owner && "$owner" =~ /\A[1-9][0-9]*\z/;
+    return ($bin, @CAFFEINATE_FLAGS, '-w', "$owner");
+}
+
+# parse_pmset_ps($text) -> 'ac' | 'dc' | 'unknown'. PURE. Only the FIRST line
+# decides ("Now drawing from 'AC Power'" / 'Battery Power' / 'UPS Power'); the
+# battery rows below it describe a battery, not the source. A UPS is mains
+# that has already been lost, so it counts as DC. The one parser: butler's
+# AC-loss watch (BpAcWatch::parse_pmset_ps) delegates here.
+sub parse_pmset_ps {
+    my ($text) = @_;
+    return 'unknown' unless defined $text && !ref $text;
+    my ($first) = split /\r?\n/, $text, 2;
+    return 'unknown' unless defined $first;
+    return 'ac' if $first =~ /'AC Power'/;
+    return 'dc' if $first =~ /'(?:Battery|UPS) Power'/;
+    return 'unknown';
+}
+
+# power_source() -> 'ac' | 'dc' | 'unknown'. The test seam comes first, and it
+# is the AC-loss watch's own: CCPRAXIS_AC_PROBE_FILE, an absolute path whose
+# first line is ac, dc or unknown, read on every call so a test can switch the
+# "power source" under a running holder. Otherwise one bounded
+# `pmset -g ps` -- refused (unknown) under a .t and under CCPRAXIS_NO_WAKELOCK,
+# the AC-loss watch's rule: a test reads the seam, never the real machine.
+sub power_source {
+    my $pf = $ENV{CCPRAXIS_AC_PROBE_FILE};
+    if (defined $pf && length $pf && $pf =~ m{\A/}) {
+        open(my $fh, '<:raw', $pf) or return 'unknown';
+        my $line = <$fh>;
+        close $fh;
+        return 'unknown' unless defined $line;
+        $line =~ s/\A\s+|\s+\z//g;
+        $line = lc $line;
+        return ($line eq 'ac' || $line eq 'dc') ? $line : 'unknown';
+    }
+    return 'unknown' if defined $0 && $0 =~ /\.t\z/;
+    return 'unknown' if $ENV{CCPRAXIS_NO_WAKELOCK};
+    return parse_pmset_ps(_pmset_ps_bounded($PMSET_TIMEOUT_SECONDS));
+}
+
+# _pmset_ps_bounded($secs) -> stdout of `pmset -g ps` | undef. No shell; stderr
+# to /dev/null; a read that outlasts $secs kills the child and returns undef.
+sub _pmset_ps_bounded {
+    my ($secs) = @_;
+    my $bin = -x '/usr/bin/pmset' ? '/usr/bin/pmset' : 'pmset';
+    require POSIX;
+    my $pid = open(my $fh, '-|');
+    return undef unless defined $pid;
+    if (!$pid) {
+        open(STDERR, '>', '/dev/null');
+        { no warnings 'exec'; exec { $bin } 'pmset', '-g', 'ps'; }
+        POSIX::_exit(127);
+    }
+    my $out;
+    my $ok = eval {
+        local $SIG{ALRM} = sub { die "pmset-timeout\n" };
+        alarm($secs);
+        local $/;
+        $out = <$fh>;
+        alarm(0);
+        1;
+    };
+    alarm(0);
+    kill('KILL', $pid) unless $ok;
+    close $fh;
+    return $ok ? $out : undef;
+}
+
+# state_path($pid_file) -> the holder's state file beside its pid file
+# (keepawake.pid -> keepawake.state). One word: 'asserted' while caffeinate
+# runs, 'standby' while the holder waits off AC power. Readers use it to
+# report what is TRUE -- a live holder on battery holds nothing.
+sub state_path {
+    my ($pid_f) = @_;
+    return undef unless defined $pid_f && length $pid_f;
+    (my $s = $pid_f) =~ s/\.pid\z//;
+    return "$s.state";
+}
+
+# holder_state($pid_file) -> 'asserted' | 'standby' | undef (no state file).
+sub holder_state {
+    my ($pid_f) = @_;
+    my $sf = state_path($pid_f);
+    return undef unless defined $sf;
+    open(my $fh, '<:raw', $sf) or return undef;
+    my $w = <$fh>;
+    close $fh;
+    return undef unless defined $w;
+    $w =~ s/\s+//g;
+    return ($w eq 'asserted' || $w eq 'standby') ? $w : undef;
+}
+
+sub _write_state {
+    my ($pid_f, $word) = @_;
+    my $sf = state_path($pid_f);
+    return unless defined $sf;
+    my $tmp = "$sf.tmp.$$";
+    open(my $fh, '>', $tmp) or return;
+    print {$fh} "$word\n";
+    close $fh;
+    rename($tmp, $sf) or unlink $tmp;
+    return;
+}
+
+# holder_argv(%o) -> the exec list that starts the holder as its own process:
+# perl KeepAwake.pm hold --pid-file F [--log-file L] [--lease S]
+# [--owner-pid P]. For an owner that is not itself `bp-keepawake.pl hold`
+# (the launcher). %o: pid_file (required), log_file, lease, owner_pid.
+sub holder_argv {
+    my (%o) = @_;
+    return () unless defined $o{pid_file} && length $o{pid_file};
+    (my $self = __FILE__) =~ s{\\}{/}g;
+    require Cwd;
+    $self = Cwd::abs_path($self) // $self;
+    my @a = ($^X, $self, 'hold', '--pid-file', $o{pid_file});
+    push @a, '--log-file', $o{log_file}  if defined $o{log_file} && length $o{log_file};
+    push @a, '--lease', $o{lease}        if defined $o{lease};
+    push @a, '--owner-pid', $o{owner_pid} if defined $o{owner_pid} && "$o{owner_pid}" =~ /\A[1-9][0-9]*\z/;
+    return @a;
+}
+
+# hold_main(@argv) -> exit code. THE macOS holder. Blocks.
+#
+#   hold --pid-file F [--log-file L] [--lease S] [--owner-pid P]
+#        [--owner-desc D] [--poll S]
+#
+# Writes ITS OWN pid into F (the identity readers check, and the lease's
+# heartbeat: whoever wants the hold touches F), then loops every --poll
+# seconds (default $POWER_POLL_SECONDS):
+#
+#   - lets go for good, and exits 0, when signalled (TERM/INT/HUP), when F
+#     stops naming it (released or replaced), when F goes untouched for more
+#     than --lease seconds (0 = no lease: an owner that holds until it stops
+#     the holder), or when --owner-pid has exited;
+#   - otherwise follows the power source: on AC it runs `caffeinate -i -w
+#     <its own pid>` (caffeinate_argv), off AC it stops that caffeinate and
+#     stands by, and it takes the assertion again when AC returns.
+#
+# THE BATTERY BOUND. A switch to battery stops caffeinate within one poll
+# (2 s) plus one pmset read (milliseconds; at most $PMSET_TIMEOUT_SECONDS,
+# 3 s, after which the read counts as battery) plus the stop (caffeinate exits
+# on TERM at once; KILL after 1 s): normally about 2 seconds, never more than
+# about 6.
+#
+# Log lines carry "pid=<holder pid>": ASSERTED when caffeinate starts (on AC),
+# STANDBY when the holder is up off AC or stops caffeinate for battery,
+# RELEASE reason=... on the way out, FAILED when caffeinate will not run.
+# BpKeepAwake::replace waits for ASSERTED or STANDBY ("the new holder is
+# working") before it stops the old one.
+#
+# Exit 0 after a release, 2 on bad arguments, 3 when refused (a test
+# environment with no substitute caffeinate), 4 when caffeinate would not start.
+sub hold_main {
+    my (@argv) = @_;
+    my %a = (lease => 900, poll => undef);
+    while (@argv) {
+        my $k = shift @argv;
+        my $v = shift @argv;
+        return 2 unless defined $v;
+        if    ($k eq '--pid-file')   { $a{pid_f} = $v }
+        elsif ($k eq '--log-file')   { $a{log_f} = $v }
+        elsif ($k eq '--lease')      { return 2 unless $v =~ /^\d+(?:\.\d+)?$/; $a{lease} = $v }
+        elsif ($k eq '--owner-pid')  { return 2 unless $v =~ /^[1-9]\d*$/; $a{owner} = $v }
+        elsif ($k eq '--owner-desc') { ($a{desc} = $v) =~ s/[^A-Za-z0-9._,=#+-]/_/g; $a{desc} = substr($a{desc}, 0, 100) }
+        elsif ($k eq '--poll')       { return 2 unless $v =~ /^\d+(?:\.\d+)?$/ && $v > 0; $a{poll} = $v }
+        else                         { return 2 }
+    }
+    return 2 unless defined $a{pid_f} && length $a{pid_f};
+    # The real assertion is never taken from a test environment; a substitute
+    # binary asserts nothing, so it is what a test of this loop runs.
+    return 3 if $ENV{CCPRAXIS_NO_WAKELOCK} && !(defined $ENV{CCPRAXIS_CAFFEINATE_BIN}
+                                                && length $ENV{CCPRAXIS_CAFFEINATE_BIN});
+    my $bin = caffeinate_bin();
+    return 4 unless defined $bin;
+    my $poll = $a{poll} // $POWER_POLL_SECONDS;
+    $poll = $POWER_POLL_SECONDS if $poll > $POWER_POLL_SECONDS;
+
+    require POSIX;
+    require Time::HiRes;
+    my $pid_f = $a{pid_f};
+    my $log = sub {
+        my ($msg) = @_;
+        return unless defined $a{log_f};
+        my @t = localtime(time);
+        open(my $fh, '>>', $a{log_f}) or return;
+        printf {$fh} "%04d-%02d-%02d %02d:%02d:%02d pid=%d %s\n",
+            $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0], $$, $msg;
+        close $fh;
+    };
+    my $read_pid = sub {
+        open(my $fh, '<', $pid_f) or return undef;
+        my $t = do { local $/; <$fh> };
+        close $fh;
+        return ($t && $t =~ /^(\d+)/) ? $1 : undef;
+    };
+    my $names_me = sub { my $p = $read_pid->(); return (defined $p && $p eq "$$") ? 1 : 0 };
+
+    # Identity first, the way keep-awake.ps1 does it: overwrite whatever claim
+    # or predecessor the file named. The mtime this sets is the lease's start.
+    open(my $pfh, '>', $pid_f) or do { $log->("FAILED cannot write $pid_f: $!"); return 4 };
+    print {$pfh} "$$\n";
+    close $pfh;
+
+    my $stop = 0;
+    local $SIG{TERM} = sub { $stop = 'signal-term' };
+    local $SIG{INT}  = sub { $stop = 'signal-int' };
+    local $SIG{HUP}  = sub { $stop = 'signal-hup' };
+
+    my $caf;            # our caffeinate child, while one runs
+    my $announced = 0;  # first ASSERTED/STANDBY written
+    my $standby_why;    # why we are standing by, once announced
+    my $desc = defined $a{desc} ? " desc=$a{desc}" : '';
+    my $who  = sprintf('lease=%ss owner=%s%s', $a{lease}, $a{owner} // 'none', $desc);
+
+    my $stop_caf = sub {
+        return unless defined $caf;
+        if (waitpid($caf, POSIX::WNOHANG()) == 0) {
+            kill('TERM', $caf);
+            my $deadline = Time::HiRes::time() + 1;
+            while (waitpid($caf, POSIX::WNOHANG()) == 0 && Time::HiRes::time() < $deadline) {
+                Time::HiRes::sleep(0.02);
+            }
+            if (kill(0, $caf)) { kill('KILL', $caf); waitpid($caf, 0) }
+        }
+        undef $caf;
+    };
+    my $finish = sub {
+        my ($why, $rc) = @_;
+        $stop_caf->();
+        if ($names_me->()) {
+            unlink $pid_f;
+            my $sf = state_path($pid_f);
+            unlink $sf if defined $sf;
+        }
+        $log->(($rc ? 'FAILED ' : 'RELEASE reason=') . $why);
+        return $rc // 0;
+    };
+
+    while (1) {
+        return $finish->($stop) if $stop;
+        if (defined $caf && waitpid($caf, POSIX::WNOHANG()) == $caf) {
+            my $rc = $? >> 8;
+            undef $caf;
+            return $finish->("caffeinate-exited rc=$rc");
+        }
+        unless ($names_me->()) {
+            return $finish->(-e $pid_f ? 'replaced' : 'pid-file-removed');
+        }
+        if ($a{lease} > 0) {
+            my $mtime = (stat($pid_f))[9];
+            return $finish->('lease-expired') if defined $mtime && (time() - $mtime) > $a{lease};
+        }
+        return $finish->('owner-exited')
+            if defined $a{owner} && !kill(0, $a{owner}) && $!{ESRCH};
+
+        my $src = power_source();
+        if ($src eq 'ac') {
+            unless (defined $caf) {
+                my @cmd = caffeinate_argv($bin, $$);
+                my $kid = fork();
+                return $finish->("fork: $!", 4) unless defined $kid;
+                if ($kid == 0) {
+                    open(STDIN,  '<', '/dev/null');
+                    open(STDOUT, '>', '/dev/null');
+                    open(STDERR, '>', '/dev/null');
+                    exec(@cmd) or POSIX::_exit(127);
+                }
+                $caf = $kid;
+                # A caffeinate that dies at once never asserted anything; say
+                # so rather than log a hold that is not there.
+                Time::HiRes::sleep(0.2);
+                if (waitpid($caf, POSIX::WNOHANG()) == $caf) {
+                    my $rc = $? >> 8;
+                    undef $caf;
+                    return $finish->("caffeinate exited at start rc=$rc", 4);
+                }
+                _write_state($pid_f, 'asserted') if $names_me->();
+                # The log prefix already says pid=<us>, which makes this the
+                # "pid=<pid> ASSERTED" line BpKeepAwake::replace waits for.
+                $log->(sprintf('ASSERTED caffeinate=%d power=ac %s%s', $caf, $who,
+                    $announced ? ' reason=ac-restored' : ''));
+                $announced = 1;
+                undef $standby_why;
+            }
+        } else {
+            my $why = $src eq 'dc' ? 'battery' : 'power-unknown';
+            if (defined $caf) {
+                my $was = $caf;
+                $stop_caf->();
+                _write_state($pid_f, 'standby') if $names_me->();
+                $log->("STANDBY reason=$why caffeinate-stopped=$was");
+                $standby_why = $why;
+            } elsif (!$announced || !defined $standby_why || $standby_why ne $why) {
+                _write_state($pid_f, 'standby') if $names_me->();
+                $log->("STANDBY reason=$why $who");
+                $standby_why = $why;
+            }
+            $announced = 1;
+        }
+        Time::HiRes::sleep($poll);
+    }
+}
 
 # should_stay_awake($lease_age_secs, $stale_secs) -> 1|0
 #   $lease_age_secs = seconds since the busy-lease's mtime, or undef if the lease
@@ -269,6 +650,19 @@ sub filetime_ticks {
     my ($t) = @_;
     return undef unless defined($t) && !ref($t) && $t =~ /\A\d+(?:\.\d+)?\z/;
     return sprintf('%.0f', ($t + 11644473600) * 10_000_000);
+}
+
+
+# `perl KeepAwake.pm hold ...` -- the macOS holder's entry point for an owner
+# that is not bp-keepawake.pl (the launcher; see holder_argv). Loading this
+# module (every other use) never reaches it.
+unless (caller) {
+    if (@ARGV && $ARGV[0] eq 'hold') {
+        shift @ARGV;
+        exit hold_main(@ARGV);
+    }
+    print STDERR "usage: perl KeepAwake.pm hold --pid-file F [--log-file L] [--lease S] [--owner-pid P]\n";
+    exit 2;
 }
 
 1;

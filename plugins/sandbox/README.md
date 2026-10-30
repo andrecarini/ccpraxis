@@ -133,8 +133,11 @@ What differs from Windows, and why:
   virtiofs shares are usable as they are; files the container's root
   writes appear on the Mac owned by you, and O_APPEND, rename and
   utimensat behave (`bind-honors-append-and-utimensat.t`).
-- **Keep-awake** is `caffeinate -i -s -w <launcher pid>` (idle sleep
-  always, system sleep on AC power); it exits by itself with the launcher.
+- **Keep-awake** is `caffeinate -i`, run by a small holder only while the
+  Mac is on AC power: idle sleep is held off, closing the lid always sleeps
+  the Mac, and on battery nothing is asserted (the holder drops caffeinate
+  within seconds of unplugging and takes it again on AC). It exits by
+  itself with the launcher.
 - **The Resources panel** reads the Mac's RAM, swap, CPU and disk from
   `sysctl`, `vm_stat`, `ps` and `df`.
 - **Published ports** (`$SANDBOX_OPEN_PORTS`, 9000-9019 for the first

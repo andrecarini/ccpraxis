@@ -1266,6 +1266,9 @@ if ($verb eq 'status') {
                   return $age < $stale_after ? 1 : 0;
               })
             : 'released';
+        # Only a macOS holder stands by: it is up, but the Mac is off AC
+        # power, so nothing is asserted until AC returns.
+        $wl = 'standby (off AC power: nothing is asserted until AC returns)' if $wl eq 'standby';
     }
     push @lines, "wake-lock: $wl";
 
