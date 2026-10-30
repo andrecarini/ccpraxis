@@ -442,6 +442,82 @@ sub bp_status_of {
 }
 
 # ============================================================================
+# 8a. --abandon: the operator dropped a blueprint whose packages are not all
+#     delivered. /blueprint:manage used to tell the agent to set the status
+#     by hand and `mv` the directory, then explain a Windows-only failure of
+#     that `mv` and a PowerShell workaround. The script's own move (rename,
+#     then copy-then-remove) now does it, so the skill names one command.
+# ============================================================================
+{
+    my $root = tempdir(CLEANUP => 1);
+    my $dir  = make_blueprint($root, 'dropped',
+        status   => 'audited',
+        packages => [ { pkg => '01-a', ledger => 'done',    table => 'done' },
+                      { pkg => '02-b', ledger => 'pending', table => 'pending' } ],
+    );
+    my ($rc, $data) = run_lifecycle('reconcile', '--blueprint', 'dropped', '--data-dir', $root, '--abandon');
+    is($rc, 0, '--abandon: exit 0');
+    ok(!-d $dir, '--abandon: the undelivered blueprint leaves the active listing');
+    ok(-f "$root/blueprints/_archive/dropped/blueprint.md", '--abandon: moved into _archive/, content intact');
+    is(bp_status_of("$root/blueprints/_archive/dropped/blueprint.md"), 'archived',
+        '--abandon: blueprint.md says archived, matching where it lives');
+    ok((grep { $_->{kind} eq 'archive' && $_->{detail} =~ /\(abandoned\)/ } @{ $data->[0]{actions} || [] }),
+        '--abandon: the report says it was abandoned, not finished');
+    ok(-f "$root/blueprints/_archive/dropped/packages/02-b.md", '--abandon: undelivered ledgers are kept, never deleted');
+}
+{
+    my $root = tempdir(CLEANUP => 1);
+    my $dir  = make_blueprint($root, 'dropped-dry', status => 'drafting',
+        packages => [ { pkg => '01-a', ledger => 'pending', table => 'pending' } ]);
+    my ($rc, $data) = run_lifecycle('reconcile', '--blueprint', 'dropped-dry', '--data-dir', $root,
+                                    '--abandon', '--dry-run');
+    is($rc, 0, '--abandon --dry-run: exit 0');
+    ok(-d $dir, '--abandon --dry-run: nothing moves');
+    is(bp_status_of("$dir/blueprint.md"), 'drafting', '--abandon --dry-run: nothing is written');
+    ok((grep { $_->{kind} eq 'archive' && !$_->{applied} && $_->{detail} =~ /would archive.*abandoned/ }
+            @{ $data->[0]{actions} || [] }),
+        '--abandon --dry-run: reports what it would do');
+}
+{
+    my $root = tempdir(CLEANUP => 1);
+    make_blueprint($root, 'one', status => 'audited',
+        packages => [ { pkg => '01-a', ledger => 'pending', table => 'pending' } ]);
+    my ($rc) = run_lifecycle('reconcile', '--all', '--data-dir', $root, '--abandon');
+    is($rc, 2, '--abandon with --all is a usage error: abandoning is a decision about one blueprint');
+    ok(-d "$root/blueprints/one", '...and nothing was archived');
+    ($rc) = run_lifecycle('reconcile', '--blueprint', 'one', '--data-dir', $root, '--abandon', '--no-archive');
+    is($rc, 2, '--abandon with --no-archive is a usage error');
+    ok(-d "$root/blueprints/one", '...and nothing was archived');
+}
+{
+    # A live run owns its state: --abandon refuses rather than moving the
+    # directory out from under it. The marker names this test's own pid,
+    # which is alive by construction.
+    my $root = tempdir(CLEANUP => 1);
+    my $dir  = make_blueprint($root, 'live-one', status => 'audited',
+        packages => [ { pkg => '01-a', ledger => 'pending', table => 'pending' } ],
+        marker   => "$$\n");
+    my ($rc, $data) = run_lifecycle('reconcile', '--blueprint', 'live-one', '--data-dir', $root, '--abandon');
+    is($rc, 2, '--abandon on a live run: exit 2');
+    ok(-d $dir, '--abandon on a live run: the directory stays put');
+    ok((grep { /live run/ } @{ $data->[0]{errors} || [] }), '--abandon on a live run: the error says why');
+}
+{
+    # Already filed away: a blueprint under _archive/ is never moved into
+    # _archive/_archive/.
+    my $root = tempdir(CLEANUP => 1);
+    make_path("$root/blueprints/_archive");
+    my $dir = make_blueprint($root, 'x', status => 'audited',
+        packages => [ { pkg => '01-a', ledger => 'pending', table => 'pending' } ]);
+    # make_blueprint puts it at <root>/blueprints/x; file it away first.
+    rename($dir, "$root/blueprints/_archive/x") or die "rename: $!";
+    my ($rc, $data) = run_lifecycle('reconcile', '--blueprint', "$root/blueprints/_archive/x",
+                                    '--data-dir', $root, '--abandon');
+    is($rc, 2, 'a blueprint already under _archive/: exit 2');
+    ok(!-e "$root/blueprints/_archive/_archive", '...and no _archive/_archive/ is created');
+}
+
+# ============================================================================
 # 8b (F3, s04 fix-batch step 7). The archive-rollback failure branch flips
 # blueprint.md back to 'audited' when the move fails, but before this fix it
 # never updated $r{status_after} to match -- the JSON report kept claiming

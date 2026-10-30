@@ -54,9 +54,13 @@ For a blueprint whose packages are **all delivered**, this is automatic and need
 
    It sets `status: archived`, refreshes `last_updated`, clears a stale marker, and moves the directory into `_archive/` — which is invisible to listing and to butler's status/sweep by construction. It is a **move, never a delete**.
 
-   For the deliberately-abandoned case the packages are *not* all delivered, so the reconciler will decline. Set `status: archived` yourself with `bp-blueprint.pl set-meta --field status --value archived`, then `mv` the directory into `_archive/`.
+   For the deliberately-abandoned case the packages are *not* all delivered, so the reconciler declines. Add `--abandon`, which archives it anyway: the same `status: archived` write and the same move.
 
-   > On Windows, `mv` of a blueprint directory can fail with **`Device or resource busy`** even when nothing of yours holds it — a background handle (search indexer, AV) on any one of hundreds of files is enough. A native move of the same directory succeeds. If `mv` fails, use PowerShell `Move-Item`; `bp-lifecycle.pl` already falls back to a copy-then-remove for exactly this.
+   ```
+   perl "${CLAUDE_PLUGIN_ROOT}/../butler/scripts/bp-lifecycle.pl" reconcile --blueprint <name> --abandon
+   ```
+
+   Never move a blueprint directory by hand. A plain rename of one can fail even when nothing of yours holds it (a background handle on any one of hundreds of files is enough); the script then falls back to copy-then-remove, and a hand `mv` does not.
 
 ## delete <name>
 Destructive. Show what will be removed (package count, reports, runs), require explicit confirmation, then `rm -rf` the blueprint dir (or its `_archive/` copy). Suggest archive instead when the blueprint reached `done`.
