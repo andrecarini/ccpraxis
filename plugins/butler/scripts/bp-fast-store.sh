@@ -24,7 +24,7 @@ usage() {                     # printf only: reachable with an empty PATH (2.2)
   printf '%s\n' \
 'usage: bp-fast-store.sh [--project DIR] [--native-root DIR] [--store DIR] [--virtual-store DIR]' \
 '' \
-"Point pnpm's storeDir + virtualStoreDir at container-native storage (the overlay FS) instead of the slow 9p/WSL2 bind mount, via a gitignored project pnpm-workspace.yaml." \
+"Point pnpm's storeDir + virtualStoreDir at container-native storage (the overlay FS) instead of the slower host bind mount, via a gitignored project pnpm-workspace.yaml." \
 "NOTE: pnpm 10+ silently IGNORES kebab-case store-dir/virtual-store-dir written to .npmrc (confirmed broken, spec b38-node-pnpm-toolchain 1.3) -- the camelCase keys must live in pnpm-workspace.yaml, which pnpm actually honours." \
 '' \
 '  --project DIR          project dir to configure               (default: the current directory)' \

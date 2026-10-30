@@ -318,7 +318,7 @@ So: **an undeterminable subject is ALIVE, and the wait continues.** Unknown is n
 
 ## Fast test I/O — heavy artifacts on container-native storage
 
-Your project dir is a **bind mount**. On Windows/WSL2 that is a 9p filesystem, and every per-file syscall costs an order of magnitude more than it does on the container's own overlay FS. `node_modules` is the pathological case — hundreds of thousands of small files, ~95% of them under `node_modules/.pnpm`. It is the difference between a 30-second install and a 15-minute one, on every attempt of your convergence loop.
+Your project dir is a **bind mount** from the host. Podman's machine and Docker Desktop both run containers in a VM, so every file operation on that mount crosses the VM boundary and costs far more than one on the container's own overlay FS; the container's CLAUDE.md says what this host's mount is, when it is known to be slow. `node_modules` is the pathological case — hundreds of thousands of small files, ~95% of them under `node_modules/.pnpm`. It can be the difference between a 30-second install and a 15-minute one, on every attempt of your convergence loop.
 
 **The fix is the package manager's own config, not a copy of your tree** (blueprint Decision #18, superseding #6).
 
