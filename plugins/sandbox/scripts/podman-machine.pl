@@ -14,7 +14,14 @@ use strict;
 use warnings;
 use File::Basename qw(dirname);
 use Cwd qw(abs_path);
-use lib dirname(abs_path(__FILE__));
+# Separators normalised before abs_path/dirname (turn-cap-consistency.t C9):
+# a raw __FILE__ can carry backslashes on Windows.
+my $SCRIPT_DIR;
+BEGIN {
+    (my $f = __FILE__) =~ s{\\}{/}g;
+    $SCRIPT_DIR = dirname(abs_path($f) // $f);
+}
+use lib $SCRIPT_DIR;
 use PodmanMachine ();
 
 binmode STDOUT, ':raw';

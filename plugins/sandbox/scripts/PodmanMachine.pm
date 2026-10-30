@@ -591,15 +591,10 @@ sub render_plan {
     }
     if (grep { $_->{readonly} && $_->{op} ne 'remove' } @{ $p->{shares} }) {
         push @l, '',
-            'Note: "ro" is recorded, not enforced, on this provider. podman 6.1.4 on applehv stores the flag',
-            '  but vfkit 0.6.4 has no read-only virtio-fs share and the VM mounts it read-write, so a process',
-            '  that escaped into the VM could write an "ro" folder. Containers still get read-only binds.';
+            'Note: "ro" is recorded, not enforced, on this provider. podman 6.1.4 on applehv stores the flag but vfkit 0.6.4 has no read-only virtio-fs share and the VM mounts it read-write, so a process that escaped into the VM could write an "ro" folder. Containers still get read-only binds.';
     }
     if ($p->{stale_install}) {
-        push @l, '', "The live install ($want->{install_root}) predates podman-machine.pl: its launcher would",
-                 '  bind ~/.claude/almanac-global-counts.json, which this machine does not share, so every launch',
-                 '  from it would be refused. Promote first (perl scripts/promote.pl in the dev clone); apply',
-                 '  refuses until then.';
+        push @l, '', "The live install ($want->{install_root}) predates podman-machine.pl: its launcher would bind ~/.claude/almanac-global-counts.json, which this machine does not share, so every launch from it would be refused. Promote first (perl scripts/promote.pl in the dev clone); apply refuses until then.";
     }
     push @l, '', 'Missing on disk:' if @{ $p->{missing} };
     for my $m (@{ $p->{missing} }) {
@@ -645,14 +640,11 @@ sub cost_lines {
     my @l = ('apply will RECREATE the machine (podman machine rm, then init):',
              '  - every container in the VM is deleted. Sandbox containers are recreated by the next launch;',
              '    each project\'s claude-home (sessions, settings, credentials) lives on the Mac and is kept.',
-             "  - $SandboxIdentity::ID* images are kept: saved with podman save before the rm and loaded into",
-             '    the new machine, which starts with empty storage.',
+             "  - $SandboxIdentity::ID* images are kept: saved with podman save before the rm and loaded into the new machine, which starts with empty storage.",
              '    Other images (e.g. the test probe image) are not kept; they are pulled again when needed.',
              '  - podman downloads the machine OS image again (about 1 GB) unless it has it cached.');
     if ($cur && !$cur->{rootful}) {
-        push @l, '  - the kept images were built on this rootless machine, so their bp-jail skeleton has no',
-                 '    device nodes (/opt/bp-jail-skel/dev/.no-device-nodes); the first image build on the',
-                 '    rootful machine bakes them (take claude-sandbox\'s rebuild offer, or podman rmi the image).';
+        push @l, '  - the kept images were built on this rootless machine, so their bp-jail skeleton has no device nodes (/opt/bp-jail-skel/dev/.no-device-nodes); the first image build on the rootful machine bakes them (take claude-sandbox\'s rebuild offer, or podman rmi the image).';
     }
     if (ref $o{images} eq 'ARRAY') {
         push @l, @{ $o{images} } ? '  - images to keep: ' . join(', ', @{ $o{images} }) : '  - no images to keep.';
