@@ -150,11 +150,12 @@ sub _gb_a {
     my ($match_text, $reason) = _match_text_and_reason($cmd);
     my $A = _anchor_for($reason);
     my $GITOPT = BpHook::Guards::Common::git_opt_re();
+    my $GIT    = BpHook::Guards::Common::git_word_re();
     my $cmd_line = 'Command: ' . BpHook::Guards::Common::echo_cmd($cmd);
 
     # 1: git working-tree / history mutations.
     if (BpHook::Guards::Common::line_match(
-            qr/${A}git[[:space:]]+${GITOPT}(checkout|switch|restore|reset|clean|rebase|merge|commit|push)\b/,
+            qr/${A}${GIT}[[:space:]]+${GITOPT}(checkout|switch|restore|reset|clean|rebase|merge|commit|push)\b/,
             $match_text))
     {
         return [
@@ -167,7 +168,7 @@ sub _gb_a {
     # against the SAME occurrence, not the whole command (redteam M3), so
     # "git stash list && git stash pop" still denies on the pop.
     if (BpHook::Guards::Common::line_match(
-            qr/${A}git[[:space:]]+${GITOPT}stash\b(?![[:space:]]+(list|show)\b)/, $match_text))
+            qr/${A}${GIT}[[:space:]]+${GITOPT}stash\b(?![[:space:]]+(list|show)\b)/, $match_text))
     {
         return [
             'BLOCKED: git stash mutations are forbidden in coordinator sessions (list/show are fine).',
@@ -1758,6 +1759,10 @@ sub _is_full_sweep_runner {
     return 0 if index($cmd, 'run-tests.pl') < 0; # fast path: one index call
     my $text = _blank_data_heredocs($cmd);
     $text =~ s/\\\n/ /g;
+    # zsh redirection spellings (">! log", ">>| log", "&>! log", the macOS
+    # Bash tool's shell) read as the bash operator they mean, so the drop
+    # below takes the log file with them instead of keeping it as an operand.
+    $text = BpHook::normalize_redirects($text);
     for my $line (split /\n/, $text) {
         for my $seg (split $RUNNER_SEPARATOR_RE, $line) {
             next unless defined $seg;
@@ -2136,8 +2141,8 @@ sub _hyg_is_ci { return ($^O =~ /^(?:MSWin32|msys|cygwin|darwin)$/) ? 1 : 0 }
 # sort and curl are added to both alternations, with the same .exe/case
 # rules as every other trigger verb.
 my $HYG_TRIGGER_RE = _hyg_is_ci()
-    ? qr/(?:^|[;&|\s(){}\x60'"])(?:[^\s;&|()'"\x60{}]*\/)?(?i:cd|pushd|rm|rmdir|mv|cp|ln|touch|mkdir|tee|sed|perl|truncate|unlink|shred|dd|sort|curl)(?i:\.exe)?(?=[\s;&|()'"\x60]|$)|>/
-    : qr/(?:^|[;&|\s(){}\x60'"])(?:[^\s;&|()'"\x60{}]*\/)?(?:cd|pushd|rm|rmdir|mv|cp|ln|touch|mkdir|tee|sed|perl|truncate|unlink|shred|dd|sort|curl)(?:\.exe)?(?=[\s;&|()'"\x60]|$)|>/;
+    ? qr/(?:^|[;&|\s(){}\x60'"])=?(?:[^\s;&|()'"\x60{}]*\/)?(?i:cd|pushd|rm|rmdir|mv|cp|ln|touch|mkdir|tee|sed|perl|truncate|unlink|shred|dd|sort|curl)(?i:\.exe)?(?=[\s;&|()'"\x60]|$)|>/
+    : qr/(?:^|[;&|\s(){}\x60'"])=?(?:[^\s;&|()'"\x60{}]*\/)?(?:cd|pushd|rm|rmdir|mv|cp|ln|touch|mkdir|tee|sed|perl|truncate|unlink|shred|dd|sort|curl)(?:\.exe)?(?=[\s;&|()'"\x60]|$)|>/;
 
 sub _hyg_is_abs {
     my ($v) = @_;
@@ -2374,39 +2379,6 @@ sub _hyg_classify_redirect {
     return (1, 0, $op, $rest_raw) if $op eq '<>';
     my $is_output = ($op =~ /^(?:>>|>\||&>>|&>|>)$/) ? 1 : 0;
     return ($is_output, 0, $op, $rest_raw);
-}
-
-# _hyg_rewrite_clobber_redirect($text) -> $text with every unquoted ">|"
-# rewritten to "> " (redteam S4). BpHook::_segments splits unconditionally
-# on a bare "|", so an unrewritten ">|" is torn into two "commands" and its
-# target is lost; converting it to a plain ">" first (before _segments ever
-# sees it) keeps the target parseable and only gives up the no-clobber-
-# override semantics, which this rule has no way to represent anyway.
-sub _hyg_rewrite_clobber_redirect {
-    my ($t) = @_;
-    return $t unless defined $t && index($t, '>|') >= 0;
-    my $len = length($t);
-    my $out = '';
-    my $i = 0;
-    my $q = 'none';
-    while ($i < $len) {
-        my $c = substr($t, $i, 1);
-        if ($q eq 'squote') { $out .= $c; $q = 'none' if $c eq "'"; $i++; next }
-        if ($q eq 'dquote') {
-            if ($c eq '\\' && $i + 1 < $len) { $out .= $c . substr($t, $i + 1, 1); $i += 2; next }
-            $out .= $c;
-            $q = 'none' if $c eq '"';
-            $i++;
-            next;
-        }
-        if ($c eq "'") { $q = 'squote'; $out .= $c; $i++; next }
-        if ($c eq '"') { $q = 'dquote'; $out .= $c; $i++; next }
-        if ($c eq '\\' && $i + 1 < $len) { $out .= $c . substr($t, $i + 1, 1); $i += 2; next }
-        if ($c eq '>' && $i + 1 < $len && substr($t, $i + 1, 1) eq '|') { $out .= '> '; $i += 2; next }
-        $out .= $c;
-        $i++;
-    }
-    return $out;
 }
 
 # _hyg_raw_value_and_flags($raw) -> ($value, \@flags). Mirrors
@@ -3094,11 +3066,22 @@ sub _hyg_command_name {
         $s = _hyg_dequote($w->{raw});
     }
     return undef unless defined $s;
-    (my $b = $s) =~ s{.*[/\\]}{};
+    return _hyg_cmd_basename($s);
+}
+
+# _hyg_cmd_basename($word) -> the command a shell runs for this command word:
+# the basename after the last '/' or '\', without a ".exe" suffix, folded on
+# case-insensitive hosts (redteam S3: there RM/TOUCH/etc resolve
+# case-insensitively; _hyg_is_ci: Windows-family perls and darwin). A leading
+# '=' goes too: zsh -- the macOS Bash tool's shell -- replaces a word "=rm"
+# with the path of rm, so "=rm <file>" deletes exactly like "rm <file>" (and
+# under bash it is merely a command not found).
+sub _hyg_cmd_basename {
+    my ($s) = @_;
+    return undef unless defined $s;
+    (my $b = $s) =~ s/\A=(?=[^=])//;
+    $b =~ s{.*[/\\]}{};
     $b =~ s/\.exe$//i;
-    # redteam S3: this host's shell resolves RM/TOUCH/etc case-
-    # insensitively on case-insensitive hosts (_hyg_is_ci: Windows-family
-    # perls and darwin).
     $b = lc($b) if _hyg_is_ci();
     return $b;
 }
@@ -3166,10 +3149,7 @@ sub _hyg_reduce {
         # strip a path prefix and a ".exe" suffix (case-insensitively) the
         # same way _hyg_command_name does, so "/usr/bin/env" and "env.exe"
         # are recognised as "env" too, not just a bare "env" word.
-        my $lit_fold = $lit;
-        $lit_fold =~ s{.*[/\\]}{};
-        $lit_fold =~ s/\.exe$//i;
-        $lit_fold = lc($lit_fold) if _hyg_is_ci();
+        my $lit_fold = _hyg_cmd_basename($lit);
         if ($lit_fold =~ /^(?:builtin|exec|nohup|then|do|else|elif|if|while|until)$/) {
             $i++;
             $progress = 1;
@@ -3373,10 +3353,11 @@ sub _hyg_commands {
     return () if $depth > 3;
     return () unless defined $text;
     (my $t = $text) =~ s/\\\n//g;
-    # redteam S4: rewrite an unquoted ">|" to a plain ">" BEFORE _segments
-    # ever splits on the bare '|' it contains, or the clobber redirect's
-    # target is torn into a separate "command" and lost.
-    $t = _hyg_rewrite_clobber_redirect($t);
+    # redteam S4: an unquoted ">|" must become a plain ">" before anything
+    # splits on the bare '|' it contains, or the clobber redirect's target is
+    # torn into a separate "command" and lost. BpHook::_segments() does that
+    # itself now, inside its own quote-aware walk, together with zsh's
+    # spellings (">!", ">>|", "&>!", ">>&", ...) -- see %BASH_FOR_ZSH_REDIR.
     my @segs = BpHook::_segments($t);
     my @out;
     for my $seg (@segs) {

@@ -1464,6 +1464,56 @@ sub file_stop_bug {
 # parsed for real commands, even when it sits inside an outer pair of double
 # quotes. Its matching ')'/backtick pops back to the enclosing frame, which
 # resumes with whatever quote state it had frozen at push time.
+#
+# zsh redirection spellings. The Bash tool runs zsh on macOS, and zsh has
+# output redirections bash does not: ">!" (">|": clobber even under
+# noclobber), ">>!" / ">>|" (append, creating the file), "&>!" / "&>|" /
+# ">&!" / ">&|" (stdout and stderr, clobbering), ">>&" and "&>>!" / "&>>|" /
+# ">>&!" / ">>&|" (append both). Read as bash, ">! f" redirects to a file
+# named "!" and leaves f a mere argument, and "a >>| f" tears into a
+# redirect with no target plus a pipe into a command named f -- so every
+# guard that parses a command as bash judged the wrong file (measured: the
+# almanac guard allowed "echo x >! <bug report>" and zsh wrote it). Each is
+# mapped to the bash operator with the same effect, padded with spaces to
+# the same length so every offset into the text stays valid. ">|" itself is
+# bash too; it is mapped to ">" for the same reason (its "|" is otherwise a
+# pipe to every splitter here). Under bash proper ">! f" really does write
+# a file named "!"; reading it the zsh way only ever judges the named file
+# instead, which is the one a person writing ">!" means.
+my $ZSH_REDIR_RE = qr/>>&[!|]?|&>>[!|]|>>[!|]|(?:&>|>&)[!|]|>[!|]/;
+my %BASH_FOR_ZSH_REDIR = (
+    '>!'   => '> ',   '>|'   => '> ',
+    '>>!'  => '>> ',  '>>|'  => '>> ',
+    '&>!'  => '&> ',  '&>|'  => '&> ',  '>&!' => '&> ', '>&|' => '&> ',
+    '>>&'  => '&>>',
+    '&>>!' => '&>> ', '&>>|' => '&>> ', '>>&!' => '&>> ', '>>&|' => '&>> ',
+);
+
+# _zsh_redirect_at($text, $i) -> the bash spelling (same length) of the zsh
+# redirection operator starting at offset $i of $text, or undef. Callers
+# only ask at an unquoted '>' or '&'; _segments() below is the quote-aware
+# one, so it is the place a shell command's text should be lexed.
+sub _zsh_redirect_at {
+    my ($text, $i) = @_;
+    my $w = substr($text, $i, 4);
+    return undef unless $w =~ /\A($ZSH_REDIR_RE)/;
+    return $BASH_FOR_ZSH_REDIR{$1};
+}
+
+# normalize_redirects($text) -> $text with every zsh redirection spelling
+# above rewritten to its bash form, same length. NOT quote-aware: for text
+# whose quoted parts and heredoc bodies are already blanked (Guards::Shell::
+# strip_noise output), or for heuristics that read a command's text without
+# lexing it. A separately quote-tracking pass would be the very desync
+# _segments() was rebuilt to avoid; _segments() applies the same mapping
+# inside its own walk instead.
+sub normalize_redirects {
+    my ($text) = @_;
+    return $text unless defined $text && $text =~ $ZSH_REDIR_RE;
+    $text =~ s/($ZSH_REDIR_RE)/$BASH_FOR_ZSH_REDIR{$1}/g;
+    return $text;
+}
+
 sub _segments {
     my ($text) = @_;
     # never-halt/01 fix-batch 3 (M2): work on a BYTE copy. A decoded
@@ -1753,6 +1803,17 @@ sub _segments {
             $frame->{buf} = '';
             $i++;
             next;
+        }
+        # An unquoted zsh redirection spelling (">!", ">>|", "&>!", ">>&",
+        # ...; see %BASH_FOR_ZSH_REDIR) becomes the bash operator it means
+        # before the '|' or '&' inside it can split the segment.
+        if ($c eq '>' || $c eq '&') {
+            my $rep = _zsh_redirect_at($text, $i);
+            if (defined $rep) {
+                $frame->{buf} .= $rep;
+                $i += length $rep;
+                next;
+            }
         }
         if ($c eq ';' || $c eq '|') {
             push @segs, $frame->{buf};
@@ -2053,6 +2114,7 @@ sub _reduce_and_match {
     $cmd = $words->[$i]{tail} unless defined $cmd;
     return undef unless defined $cmd;
     my $base = $cmd;
+    $base =~ s{\A=(?=[^=])}{};   # zsh: "=name" runs the name found on PATH
     $base =~ s{.*[/\\]}{};
     return undef unless $base =~ /^\Q$name\E(?:\.sh|\.pl)?$/;
 

@@ -838,6 +838,31 @@ my $G = q{unset BASH_ENV ; f="${CLAUDE_PLUGIN_ROOT}/hooks/guard-almanac-write.sh
         'MF2d: cd "C:\\P\\plugins\\almanac" && touch x (backslash path unrelated to the store -- must allow)');
 }
 
+# =============================================================================
+# Z-ALM -- zsh spellings (the macOS Bash tool runs zsh). Read as bash,
+# "echo x >! R" writes a file named "!" and leaves R an argument, and
+# "=rm R" is a command not found; zsh writes / deletes R. Measured before
+# the fix: every case below was ALLOWED and zsh did the write. The parsing
+# itself is pinned in plugins/butler/tests/t/zsh-command-spellings.t.
+# =============================================================================
+{
+    for my $op ('>!', '>>!', '&>!', '&>>', '&>|', '>&!', '>&|', '>>&', '>>|', '&>>!', '>>&!', '2>!') {
+        assert_deny_bash("echo x $op $R", "Z-ALM: echo x $op R");
+    }
+    assert_deny_bash("print -r -- x >>! $R", 'Z-ALM: print -r -- x >>! R');
+    assert_deny_bash("echo x>!$R", 'Z-ALM: a glued x>!R');
+    assert_deny_bash("echo x >! $T", 'Z-ALM: echo x >! T (a store record)');
+    assert_deny_bash("=rm $R", 'Z-ALM: =rm R');
+    assert_deny_bash("=tee $T < /dev/null", 'Z-ALM: =tee T');
+    assert_deny_bash("=sed -i s/a/b/ $R", 'Z-ALM: =sed -i on R');
+    assert_deny_bash(q{=python3 -c "import os; os.remove('/c/P/.ccpraxis-local-data/bug-reports/a.md')"},
+        'Z-ALM: =python3 -c one-liner (rule I reads the =word as python3)');
+
+    assert_allow_bash(qq{echo '>! $R'}, 'Z-ALM: a single-quoted ">! R" is text, not a redirect');
+    assert_allow_bash('echo x >! /tmp/elsewhere.md', 'Z-ALM: >! onto an unrelated path allows');
+    assert_allow_bash("=cat $R", 'Z-ALM: =cat R only reads');
+}
+
 # ---- Decision 43's accepted residual risk is deliberately NOT tested here:
 # subshell-scoped cd (e.g. "(cd /tmp); rm a.md"), cd -, pushd/popd, and a
 # write placed before a later cd in the same compound command. Properly

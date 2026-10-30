@@ -1312,7 +1312,7 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 | guard-writes.sh | 3 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
 | ledger-guard.sh | 1 | --pre text:/packages/ --pre ledger,driver : exits when the payload text lacks /packages/, or when BP_LEDGER is unset and the session is not an armed driver |
 | guard-bash.sh | 2 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
-| guard-git-mutations.sh | 2 | --pre text:git, plus --pre ledger,armed when its argument is --only-during-butler-run : exits when the payload text lacks git, or for that registration when BP_LEDGER is unset and the session is unarmed |
+| guard-git-mutations.sh | 2 | --pre text:git,text:Git,...,text:GIT (all eight letter cases: macOS and Windows resolve "GIT" to git), plus --pre ledger,armed when its argument is --only-during-butler-run : exits when the payload text lacks git in any case, or for that registration when BP_LEDGER is unset and the session is unarmed |
 | wait-shape-guard.sh | 2 | --pre ledger : exits when BP_LEDGER is unset |
 | context-ceiling.sh | 2 | --pre coordinator : exits when BP_LEDGER is unset or BP_ROLE is set to anything but coordinator |
 | gate-shutdown.sh | 2 | --pre ledger --pre stopfile : exits when BP_LEDGER is unset or none of runs/.shutdown, runs/.paused, runs/<pkg>.force-stop exists under BP_DIR |

@@ -884,7 +884,10 @@ OUT=$(printf "%s" "$P" | perl -MJSON::PP -MTime::HiRes -e '
         my $n = scalar @$toks;
         for (my $k = 0; $k < $n; $k++) {
             my $word = $toks->[$k];
-            (my $base = $word) =~ s{.*[/\\]}{};
+            # zsh (the macOS Bash tool shell) expands a command word
+            # "=perl" to the path of perl, so "=perl -e CODE" runs perl.
+            (my $base = $word) =~ s{\A=(?=[^=])}{};
+            $base =~ s{.*[/\\]}{};
             $base =~ s/\.exe\z//i;
             my $interp;
             if    ($base =~ /^perl\z/i)                 { $interp = "perl"; }
@@ -1030,7 +1033,7 @@ OUT=$(printf "%s" "$P" | perl -MJSON::PP -MTime::HiRes -e '
     # and never emits a kind=>"cd" entry for it. Treat it like an explicit
     # cd: this disables the (wrong) cwd join below for a relative literal
     # and lets the Rule E relative-write check below see it.
-    $any_cd = 1 if $cmd =~ /(?:^|[\s;&|(])(?:env|sudo)\b[^;&|]*\s(?:-C|--chdir(?:=\S+)?|-D)\b/;
+    $any_cd = 1 if $cmd =~ /(?:^|[\s;&|(])(?:=|[^\s;&|()]*\/)?(?:env|sudo)\b[^;&|]*\s(?:-C|--chdir(?:=\S+)?|-D)\b/;
 
     # FIX-BATCH (item 3, architectural): resolve $cwd through every cd this
     # command performs, textually, BEFORE deciding whether a relative write
@@ -1079,7 +1082,7 @@ OUT=$(printf "%s" "$P" | perl -MJSON::PP -MTime::HiRes -e '
         unless ($has_marker) {
             # M2: the directory argument of env -C/sudo -D is a cd target
             # too.
-            while ($hcmd =~ /(?:^|[\s;&|(])(?:env|sudo)\b[^;&|]*?\s(?:-C|--chdir(?:=)?|-D)[= ]?(\S+)/g) {
+            while ($hcmd =~ /(?:^|[\s;&|(])(?:=|[^\s;&|()]*\/)?(?:env|sudo)\b[^;&|]*?\s(?:-C|--chdir(?:=)?|-D)[= ]?(\S+)/g) {
                 my $cd_tgt = $1;
                 if ($cd_tgt =~ /ccpraxis-local-data|claude-code-vault|ccprax~\d+|claude~\d+/i) {
                     $has_marker = 1;

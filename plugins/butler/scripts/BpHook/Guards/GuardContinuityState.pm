@@ -148,14 +148,19 @@ sub _edit_rule {
 # ---------------------------------------------------------------------------
 # Rule 2: a Bash command that names a location and has a mutation shape.
 # ---------------------------------------------------------------------------
-my $VERB_RE = qr{(?:\A|[;&|(`\x7b\n]|\$\()\s*(?:(?:sudo|exec|command|nohup|xargs(?:\s+-\S+)*)\s+)*(?:/\S*/)?(?:rm|mv|cp|tee|touch|truncate|ln|dd|install|chmod|unlink|rmdir)(?=\s|\z)};
-my $INPLACE_RE = qr{(?:\A|[\s;&|(`])(?:sed\s+(?:[^\s;&|]+\s+)*?-(?:-in-place|[a-zA-Z]*i)|perl\s+(?:[^\s;&|]+\s+)*?-(?![IMmeE])[a-zA-Z]*i)};
+# A mutating verb may be spelled with a path (/bin/rm) or, under zsh -- the
+# macOS Bash tool's shell -- as "=rm", which zsh expands to the path of rm.
+my $VERB_RE = qr{(?:\A|[;&|(`\x7b\n]|\$\()\s*(?:(?:sudo|exec|command|nohup|xargs(?:\s+-\S+)*)\s+)*(?:=|/\S*/)?(?:rm|mv|cp|tee|touch|truncate|ln|dd|install|chmod|unlink|rmdir)(?=\s|\z)};
+my $INPLACE_RE = qr{(?:\A|[\s;&|(`])(?:=|[^\s;&|(`]*/)?(?:sed\s+(?:[^\s;&|]+\s+)*?-(?:-in-place|[a-zA-Z]*i)|perl\s+(?:[^\s;&|]+\s+)*?-(?![IMmeE])[a-zA-Z]*i)};
 
 sub _mutates {
     my ($cmd) = @_;
     my $text = BpHook::Guards::Common::is_shell_or_eval_invocation($cmd)
         ? $cmd
         : BpHook::Guards::Shell::strip_noise($cmd);
+    # zsh redirection spellings (">!", "&>!", ">>|", ...) as the bash
+    # operator they mean, so "&>! /dev/null" is recognised just below.
+    $text = BpHook::normalize_redirects($text);
     # Redirections that write nothing the guard cares about.
     $text =~ s{[0-9]*>&[0-9-]+}{ }g;
     $text =~ s{(?:&|[0-9]*)>>?\s*/dev/null\b}{ }g;
