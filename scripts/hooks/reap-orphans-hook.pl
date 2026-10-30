@@ -7,11 +7,19 @@
 # still accumulated until somebody happened to look at a process list -- which
 # is the report's original complaint, not a detail of it.
 #
-# WHY SessionStart. Anything matching at session start belongs, by definition,
-# to a session that is over: the reaper only selects processes whose PARENT is
-# gone, and a live session's children have a live parent. The event also fires
-# once per session rather than on a timer, so the cost is paid at the one moment
-# a small delay is invisible.
+# WHY SessionStart. The event fires once per session rather than on a timer,
+# so the cost is paid at the one moment a small delay is invisible. It does NOT
+# mean that whatever matches belongs to a session that is over. The reaper
+# selects processes whose PARENT is gone, and a live session's detached job
+# loses its launching shell at once; with several windows open, or a drive-
+# solo run in one of them, every other session's start sweeps that job too.
+# On macOS and Linux (where such a job is adopted by pid 1) the reaper
+# therefore kills an adopted process only when the session owning its
+# scratchpad is shown to be over -- no live Claude Code process claims it and
+# its transcript has been idle for the age floor -- and otherwise logs it as
+# spared. On Windows the dead parent's pid is kept and that extra check does
+# not apply; a live session's hour-old detached job there is still exposed to
+# other sessions' sweeps.
 #
 # WHY GLOBALLY (global-config/settings.json, not a project plugin). The leak is
 # per-MACHINE. The orphan in that report was spawned by a ccpraxis session and
@@ -26,9 +34,10 @@
 #      tax on the whole machine to clean up after a rare failure.
 #   2. IT NEVER FAILS THE SESSION. Every path exits 0. A hook that can refuse a
 #      session start is far more expensive than the leak it is cleaning up.
-#   3. IT NEVER TOUCHES THE LIVE SESSION. The session id arrives on stdin and is
-#      passed through as --session-id, so this session's own processes are
-#      excluded by name as well as by the reaper's parent-alive test.
+#   3. IT NEVER TOUCHES THE SESSION RUNNING IT. The session id (from the
+#      environment, see below) is passed through as --session-id, so this
+#      session's own processes are excluded by name. OTHER live sessions are
+#      protected only by the reaper's own rules (see WHY SessionStart).
 #
 # Set CCPRAXIS_REAP_ORPHANS=0 to disable; set it to `report` to sweep without
 # killing (the findings land in the log either way).

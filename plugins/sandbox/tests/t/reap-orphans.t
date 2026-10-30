@@ -7,7 +7,8 @@
 # session had exited, parent gone, 0.016s of CPU burnt in total. Nothing
 # recorded it, killed it, or swept for it. It was found by accident.
 
-# THIS TEST NEVER SPAWNS OR KILLS A PROCESS. scripts/reap-orphans.pl is split
+# THIS TEST NEVER KILLS A PROCESS, AND SPAWNS ONLY THE REPORT-ONLY CLI AGAINST A
+# STUB `ps` (AC12). scripts/reap-orphans.pl is split
 # into a pure selection library and a `unless (caller)` CLI precisely so the
 # oracle can feed it synthetic process lists. A test for a process reaper that
 # actually reaps is a test that can take out something it did not mean to --
@@ -21,6 +22,9 @@ use strict;
 use warnings;
 use FindBin qw($Bin);
 use Test::More;
+use File::Temp qw(tempdir);
+use File::Path qw(make_path);
+use JSON::PP ();
 
 my $SCRIPT = "$Bin/../../../../scripts/reap-orphans.pl";
 ok(-f $SCRIPT, 'reap-orphans.pl exists') or BAIL_OUT('script missing');
@@ -200,6 +204,152 @@ sub pad {
         'AC10: the CLI treats pid 1 as the adopter off Windows only (Windows keeps the dead parent\'s pid)');
     like($src, qr/\$\^O ne 'darwin'.*?etimes=/s,
         'AC10: darwin never trusts the etimes query (macOS ps prints the other columns anyway)');
+}
+
+# ---------------------------------------------------------------------------
+# AC11 -- AN ADOPTED PROCESS IS NOT PROOF THAT ITS SESSION IS OVER. On macOS and
+# Linux a live session's detached job (nohup, setsid) is adopted by pid 1 the
+# moment its launching shell exits, so "parent is pid 1" says nothing about
+# the session. Another session's SessionStart sweep killed such jobs after an
+# hour. An adopted candidate is now killed only when session_over says the
+# owning session has ended; every way of failing to show that spares it.
+# ---------------------------------------------------------------------------
+{
+    my $mac = "/usr/bin/perl /private/tmp/claude-501/-Users-x-Projects-ccpraxis/$UUID/scratchpad/probe.pl";
+    my ($slug, $uuid) = ReapOrphans::scratchpad_owner($mac);
+    is($slug, '-Users-x-Projects-ccpraxis', 'AC11: the scratchpad path yields the project slug');
+    is($uuid, $UUID, 'AC11: ...and the session');
+    is_deeply([ ReapOrphans::scratchpad_owner('perl x.pl') ], [], 'AC11: a non-scratchpad command yields nothing');
+
+    my @procs = (
+        { pid => 1,    ppid => 0,    age => 999999, cmd => '/sbin/launchd' },
+        { pid => 4242, ppid => 1,    age => 7200,   cmd => $mac },             # adopted
+        { pid => 4343, ppid => 9999, age => 7200,   cmd => pad($OTHER) },      # parent truly gone
+    );
+    my %by = map { $_->{pid} => $_ } @{ ReapOrphans::select_orphans(\@procs, min_age => 3600, reparented => { 1 => 1 }) };
+    is($by{4242}{adopted}, 1, 'AC11: a candidate whose parent is the adopter is marked adopted');
+    is($by{4242}{slug}, '-Users-x-Projects-ccpraxis', 'AC11: ...and carries its slug');
+    is($by{4343}{adopted}, 0, 'AC11: a candidate whose parent is really gone is not');
+    my %win = map { $_->{pid} => $_ } @{ ReapOrphans::select_orphans(\@procs, min_age => 3600) };
+    is($win{4343}{adopted}, 0, 'AC11: with no adopter set (Windows) nothing is ever adopted');
+
+    my $NOW   = 1_800_000_000;
+    my %alive = (1 => 1, 500 => 1, 4242 => 1);
+    my $live_other = [ { pid => 500, session_id => $OTHER } ];
+    my %base = (uuid => $UUID, alive => \%alive, now => $NOW, min_idle => 3600);
+
+    my @cases = (
+        [ 'registry unreadable',            { registry => undef, transcript_mtime => $NOW - 86400 }, 0 ],
+        [ 'registry has no live entry',     { registry => [ { pid => 777, session_id => $OTHER } ],
+                                              transcript_mtime => $NOW - 86400 }, 0 ],
+        [ 'a live process claims the session', { registry => [ @$live_other, { pid => 4242, session_id => uc $UUID } ],
+                                              transcript_mtime => $NOW - 86400 }, 0 ],
+        [ 'no transcript',                  { registry => $live_other, transcript_mtime => undef }, 0 ],
+        [ 'transcript written recently',    { registry => $live_other, transcript_mtime => $NOW - 60 }, 0 ],
+        [ 'dead claimant + idle transcript', { registry => [ @$live_other, { pid => 31337, session_id => $UUID } ],
+                                              transcript_mtime => $NOW - 7200 }, 1 ],
+        [ 'unclaimed + idle transcript',    { registry => $live_other, transcript_mtime => $NOW - 3600 }, 1 ],
+    );
+    for my $c (@cases) {
+        my ($name, $over, $want) = @$c;
+        my ($got, $why) = ReapOrphans::session_over(%base, %$over);
+        is($got, $want, "AC11: session_over -- $name -> " . ($want ? 'over' : 'not over') . " ($why)");
+        like($why, qr/\S/, "AC11: ...and says why ($name)");
+    }
+    my ($nosid) = ReapOrphans::session_over(%base, uuid => undef, registry => $live_other, transcript_mtime => 0);
+    is($nosid, 0, 'AC11: no session id is never over');
+
+    # The registry and transcript readers, against a fake config dir.
+    my $cfg = tempdir(CLEANUP => 1);
+    make_path("$cfg/sessions", "$cfg/projects/-Users-x-Projects-ccpraxis", "$cfg/projects/elsewhere");
+    my $wf = sub { my ($p, $c) = @_; open my $fh, '>:raw', $p or die "$p: $!"; print {$fh} $c; close $fh };
+    $wf->("$cfg/sessions/500.json", qq({"pid":500,"sessionId":"$OTHER","kind":"interactive"}));
+    $wf->("$cfg/sessions/600.json", qq({"sessionId":"$UUID"}));
+    $wf->("$cfg/sessions/700.json", 'not json');
+    $wf->("$cfg/sessions/800.json", qq({"pid":800}));
+    $wf->("$cfg/sessions/500.abcdef.key", 'secret-looking, never read');
+    my $reg = ReapOrphans::read_session_registry("$cfg/sessions");
+    is_deeply($reg, [ { pid => 500, session_id => $OTHER }, { pid => 600, session_id => $UUID } ],
+        'AC11: read_session_registry keeps parseable <pid>.json entries (pid from the name when absent), skips the rest');
+    is(ReapOrphans::read_session_registry("$cfg/no-such-dir"), undef,
+        'AC11: a missing registry is undef (no evidence), not an empty list');
+
+    is(ReapOrphans::transcript_mtime($cfg, '-Users-x-Projects-ccpraxis', $UUID), undef,
+        'AC11: no transcript -> undef');
+    $wf->("$cfg/projects/-Users-x-Projects-ccpraxis/$UUID.jsonl", "{}\n");
+    utime($NOW - 5000, $NOW - 5000, "$cfg/projects/-Users-x-Projects-ccpraxis/$UUID.jsonl");
+    is(ReapOrphans::transcript_mtime($cfg, '-Users-x-Projects-ccpraxis', $UUID), $NOW - 5000,
+        'AC11: the transcript under the scratchpad\'s own slug is found');
+    $wf->("$cfg/projects/elsewhere/$OTHER.jsonl", "{}\n");
+    utime($NOW - 10, $NOW - 10, "$cfg/projects/elsewhere/$OTHER.jsonl");
+    is(ReapOrphans::transcript_mtime($cfg, 'some-other-slug', $OTHER), $NOW - 10,
+        'AC11: ...and looked up by session id across projects when the slug differs');
+
+    # The CLI applies it: adopted candidates go through session_over, and only
+    # those it confirms stay candidates. Source assertions, like NS1-NS7 below,
+    # because this file never runs the CLI (it would enumerate and kill).
+    open my $sfh, '<', $SCRIPT or BAIL_OUT("cannot read $SCRIPT");
+    my $src = do { local $/; <$sfh> };
+    close $sfh;
+    my ($cli) = $src =~ /(\n\s*unless \(caller\) \{.*)\z/s;
+    like($cli, qr/unless\s*\(\$c->\{adopted\}\)\s*\{\s*push\s+\@kept/,
+        'AC11: the CLI passes a non-adopted candidate straight through');
+    like($cli, qr/ReapOrphans::session_over\(.*?if\s*\(\$over\)\s*\{\s*push\s+\@kept.*?else\s*\{\s*push\s+\@spared/s,
+        'AC11: an adopted candidate is kept only when session_over confirms; otherwise it is spared');
+    like($cli, qr/\@candidates\s*=\s*\@kept;.*?terminate_pid\(\$_->\{pid\}\)\s+for\s+\@candidates/s,
+        'AC11: ...and the filtering happens before anything is terminated');
+}
+
+# ---------------------------------------------------------------------------
+# AC12 -- the CLI end to end, REPORT-ONLY, against a FAKE process list. The
+# one exception to "this file never spawns": a stub `ps` first on PATH hands
+# the CLI synthetic processes with pids far above any real one, --kill is never
+# passed, and CLAUDE_CONFIG_DIR points at a fake registry and transcripts. So
+# nothing real is enumerated, judged or signalled. POSIX only: Windows
+# enumerates through PowerShell/CIM, which no stub on PATH replaces.
+# ---------------------------------------------------------------------------
+SKIP: {
+    skip 'AC12: Windows enumerates via CIM, not ps', 9 if $^O =~ /^(MSWin32|cygwin|msys)$/;
+    my $root = File::Temp::tempdir(CLEANUP => 1);
+    my ($A, $B, $C) = ('aaaaaaaa-0000-4000-8000-00000000000a', 'bbbbbbbb-0000-4000-8000-00000000000b',
+                       'cccccccc-0000-4000-8000-00000000000c');
+    my $sp = sub { "/usr/bin/perl /private/tmp/claude-501/-proj/$_[0]/scratchpad/job.pl" };
+    my @rows = (
+        [ 1,          0, '10-00:00:00', '/sbin/launchd' ],
+        [ 2000000100, 1, '05:00:00',    'claude' ],              # the live session A's claude
+        [ 2000000001, 1, '02:00:00',    $sp->($A) ],             # A is live: spared
+        [ 2000000002, 1, '02:00:00',    $sp->($B) ],             # B unclaimed, idle transcript: candidate
+        [ 2000000003, 1, '02:00:00',    $sp->($C) ],             # C has no transcript: spared
+    );
+    File::Path::make_path("$root/bin", "$root/cfg/sessions", "$root/cfg/projects/-proj");
+    my $wf = sub { my ($p, $c) = @_; open my $fh, '>:raw', $p or die "$p: $!"; print {$fh} $c; close $fh };
+    $wf->("$root/ps.txt", join('', map { sprintf "%d %d %s %s\n", @$_ } @rows));
+    $wf->("$root/bin/ps", "#!/bin/sh\ncat '$root/ps.txt'\n");
+    chmod 0755, "$root/bin/ps";
+    $wf->("$root/cfg/sessions/2000000100.json", qq({"pid":2000000100,"sessionId":"$A"}));
+    for my $s ($A, $B) {
+        $wf->("$root/cfg/projects/-proj/$s.jsonl", "{}\n");
+        utime(time - 7200, time - 7200, "$root/cfg/projects/-proj/$s.jsonl");
+    }
+
+    my $json;
+    {
+        local $ENV{PATH} = "$root/bin:$ENV{PATH}";
+        local $ENV{CLAUDE_CONFIG_DIR} = "$root/cfg";
+        $json = `"$^X" "$SCRIPT" --json 2>&1`;    # report-only: no --kill
+    }
+    is($? >> 8, 0, 'AC12: the report-only CLI exits 0') or diag($json);
+    my $d = eval { JSON::PP->new->decode($json) } || {};
+    is($d->{status}, 'ok', 'AC12: it enumerated the stub list');
+    is_deeply([ map { $_->{pid} } @{ $d->{candidates} || [] } ], [2000000002],
+        'AC12: only the process of the session shown to be over is a candidate') or diag($json);
+    my %sp = map { $_->{pid} => $_ } @{ $d->{spared} || [] };
+    is_deeply([ sort keys %sp ], [2000000001, 2000000003], 'AC12: the other two adopted processes are spared');
+    like($sp{2000000001}{reason} // '', qr/session is live/, 'AC12: ...the live session\'s job, because its session is live');
+    like($sp{2000000003}{reason} // '', qr/no transcript/,   'AC12: ...the unknown one, because there is no transcript');
+    like($d->{candidates}[0]{evidence} // '', qr/transcript idle/, 'AC12: the candidate records the evidence it was judged on');
+    is_deeply($d->{killed}, [], 'AC12: report-only kills nothing');
+    is_deeply($d->{failed}, [], 'AC12: ...and fails nothing');
 }
 
 # ===========================================================================
