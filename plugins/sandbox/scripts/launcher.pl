@@ -2474,14 +2474,16 @@ sub _ensure_machine_ready {
     return 0;
 }
 
-# _machine_shares() -> [ host dirs the podman machine shares into its VM ] |
-# undef. Memoized for the launch. darwin + podman only: a macOS podman machine
-# (applehv/libkrun) sees ONLY the folders it was created with -- /Users,
-# /private and /var/folders by default -- and a bind source anywhere else
-# fails `podman create` with "statfs <path>: no such file or directory", which
-# names neither the machine nor the remedy. On Windows the WSL machine reaches
-# every drive through /mnt, and Linux has no machine at all, so neither is
-# asked. undef ("could not tell") never refuses anything.
+# _machine_shares() -> [ { source, target, readonly } ] | undef: what the
+# podman machine shares into its VM. Memoized for the launch. darwin + podman
+# only: a macOS podman machine (applehv/libkrun) sees ONLY the folders it was
+# created with -- the ones podman-machine.pl lists: the live install and
+# ccpraxis's own folders read-only, project directories read-write -- and a
+# bind source anywhere else fails `podman create` with "statfs <path>: no such
+# file or directory", which names neither the machine nor the remedy. On
+# Windows the WSL machine reaches every drive through /mnt, and Linux has no
+# machine at all, so neither is asked. undef ("could not tell") never refuses
+# anything.
 my ($MACHINE_SHARES, $MACHINE_SHARES_DONE);
 sub _machine_shares {
     return $MACHINE_SHARES if $MACHINE_SHARES_DONE;
@@ -2494,19 +2496,26 @@ sub _machine_shares {
     return $MACHINE_SHARES;
 }
 
-# _refuse_unshared_mounts($stage, @host_paths) -- exit with an explanation if
-# any of @host_paths lies outside the podman machine's shares. Returns quietly
-# when every path is covered or when the shares cannot be determined.
+# _refuse_unshared_mounts($stage, @binds) -- exit with an explanation if any
+# bind ({ source, readonly }, as HostPlatform::bind_mounts returns them) lies
+# outside the podman machine's shares, or is read-write through a share the
+# machine has read-only. Returns quietly when every bind is served or when the
+# shares cannot be determined. The message names podman-machine.pl
+# (add-project <dir>), never hand-typed `podman machine` flags.
 sub _refuse_unshared_mounts {
-    my ($stage, @paths) = @_;
+    my ($stage, @binds) = @_;
     my $shares = _machine_shares();
     return unless ref $shares eq 'ARRAY' && @$shares;
-    my @outside = HostPlatform::sources_outside_shares(\@paths, $shares);
-    return unless @outside;
-    log_ev('launch_failed', { reason => 'bind source outside the podman machine shares',
-                              outside => join(' ', @outside) });
-    _launch_fail($stage, 'a bind-mount source is outside the podman machine shares', undef);
-    _fail_visibly(HostPlatform::outside_shares_message(\@outside, $shares));
+    my @outside = HostPlatform::sources_outside_shares(\@binds, $shares);
+    my @ro      = HostPlatform::rw_binds_under_ro_shares(\@binds, $shares);
+    return unless @outside || @ro;
+    log_ev('launch_failed', { reason => 'bind source not served by the podman machine shares',
+                              outside => join(' ', @outside),
+                              rw_under_ro => join(' ', map { $_->{source} } @ro) });
+    _launch_fail($stage, (@outside ? 'a bind-mount source is outside the podman machine shares'
+                                   : 'a read-write bind lies under a read-only podman machine share'), undef);
+    _fail_visibly(HostPlatform::outside_shares_message(\@outside, $shares,
+        read_only => \@ro, project => $PROJECT_PATH));
     LaunchLog::close_log($LAUNCH_LOG);
     SandboxLock::release($LOCK_DIR);
     reset_terminal();
@@ -2681,8 +2690,10 @@ my $IMAGE_EXISTS;
 # picker and the rebuild prompt, rather than after the operator has answered
 # them and `podman create` fails with a bare statfs error. The project tree
 # (which holds claude-home) and this checkout (statusline, plugin tree) are
-# the sources every launch mounts; the full list is checked again at create.
-_refuse_unshared_mounts('preflight', $PROJECT_PATH, $INSTALL_ROOT);
+# the sources every launch mounts -- the project read-write (/project and
+# claude-home), the checkout read-only; the full list is checked again at create.
+_refuse_unshared_mounts('preflight', { source => $PROJECT_PATH, readonly => 0 },
+                                     { source => $INSTALL_ROOT, readonly => 1 });
 
 # =====================================================================
 # Container name (generate + persist)
@@ -5230,7 +5241,7 @@ if (! _container_exists($CONTAINER_NAME)) {
     };
 
     @podman_args = $build_create_args->();
-    _refuse_unshared_mounts('create', HostPlatform::bind_sources(@podman_args));
+    _refuse_unshared_mounts('create', HostPlatform::bind_mounts(@podman_args));
 
     # _tee_system: `podman create`'s diagnostics are the whole content of a
     # create failure, and a bare system() writes them into the alt buffer that

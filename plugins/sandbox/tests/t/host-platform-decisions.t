@@ -7,11 +7,13 @@
 #   A. container CLI choice: darwin prefers podman (a Mac may carry an
 #      unrelated docker wrapper on PATH); Windows and Linux orders unchanged;
 #      CCPRAXIS_CONTAINER_CLI is the only candidate when set.
-#   B. operator-facing remedies name `podman machine init` when there is no
-#      machine to start.
+#   B. operator-facing remedies: when there is no machine to start, macOS is
+#      sent to podman-machine.pl, Windows to `podman machine init --provider wsl`.
 #   C. canonical_dir: the stored case of a directory on APFS (darwin only).
 #   D. machine shares + bind sources: which bind mounts a podman machine
-#      cannot see. Fixtures are the real shapes podman 6.1.4 printed on macOS.
+#      cannot see, or would write through a share it has read-only, and a
+#      refusal that names podman-machine.pl. Fixtures are the real shapes
+#      podman 6.1.4 printed on macOS.
 #   E. TestSandbox with no container CLI: a clean skip_all, not a load-time die.
 use strict;
 use warnings;
@@ -83,17 +85,25 @@ is_deeply([HostPlatform::cli_candidates('linux')], ['docker', 'podman'],
 # ---------------------------------------------------------------------------
 {
     my $mac = join "\n", HostPlatform::no_cli_message('darwin');
-    like($mac, qr/podman machine init/, 'B: darwin no-CLI message says how to create the podman machine');
+    my $script = HostPlatform::machine_script_path();
+    like($script, qr{/plugins/sandbox/scripts/podman-machine\.pl\z}, 'B: machine_script_path() is the podman-machine.pl beside HostPlatform.pm');
+    ok(-f $script, 'B: ...and that file exists');
+    like($mac, qr/\Q$script\E apply/, 'B: darwin no-CLI message creates the machine with podman-machine.pl apply');
+    unlike($mac, qr/podman machine init/, 'B: ...never with a bare `podman machine init` (its defaults share /Users read-write)');
     like($mac, qr/CCPRAXIS_CONTAINER_CLI/, 'B: darwin no-CLI message names the override');
     unlike($mac, qr/Docker Desktop/, 'B: darwin no-CLI message does not send a Mac user to Docker Desktop');
     my $win = join "\n", HostPlatform::no_cli_message('cygwin');
     like($win, qr/Docker Desktop.*Podman Desktop/s, 'B: Windows no-CLI message is the established wording');
 
     my $absent = join "\n", HostPlatform::machine_remedy_lines('darwin', 'absent');
-    like($absent, qr/podman machine init\b/, 'B: an absent machine is remedied with `podman machine init`');
-    like($absent, qr/podman machine start/, 'B: ...followed by `podman machine start`');
+    like($absent, qr/\Q$script\E apply --confirm/, 'B: an absent macOS machine is remedied with podman-machine.pl apply --confirm');
+    unlike($absent, qr/podman machine init/, 'B: ...not with a hand-typed `podman machine init`');
     my $absent_win = join "\n", HostPlatform::machine_remedy_lines('cygwin', 'absent');
-    like($absent_win, qr/--provider wsl/, 'B: on Windows the init remedy keeps the WSL2 provider');
+    like($absent_win, qr/podman machine init --provider wsl && podman machine start/,
+        'B: on Windows the init remedy is unchanged (WSL2 provider, then start)');
+    unlike($absent_win, qr/podman-machine\.pl/, 'B: ...and never mentions the macOS script');
+    my $absent_linux = join "\n", HostPlatform::machine_remedy_lines('linux', 'absent');
+    like($absent_linux, qr/podman machine init && podman machine start/, 'B: the Linux wording is unchanged');
     my $stopped = join "\n", HostPlatform::machine_remedy_lines('darwin', 'stopped');
     unlike($stopped, qr/machine init/, 'B: a merely stopped machine is NOT told to init a new one');
     like($stopped, qr/podman machine start/, 'B: ...it is told to start it');
@@ -133,16 +143,32 @@ my $INSPECT = <<'JSON';
      }
 ]
 JSON
+# podman's default machine, as podman 6.1.4 recorded it on this Mac.
 my $CONFIG = <<'JSON';
 { "Name": "podman-machine-default",
+  "HostUser": { "HostUserModified": false, "Rootful": false, "UID": 501 },
+  "Resources": { "CPUs": 6, "DiskSize": 100, "Memory": 12288, "USBs": [] },
   "Mounts": [
-    { "Source": "/Users", "Target": "/Users", "Type": "virtiofs" },
-    { "Source": "/private", "Target": "/private", "Type": "virtiofs" },
-    { "Source": "/var/folders", "Target": "/var/folders", "Type": "virtiofs" },
-    { "Source": "/Users/u/.config/containers", "Target": "/etc/containers", "Type": "virtiofs" }
+    { "OriginalInput": "", "ReadOnly": false, "Source": "/Users", "Tag": "a2a0", "Target": "/Users", "Type": "virtiofs", "VSockNumber": null },
+    { "OriginalInput": "", "ReadOnly": false, "Source": "/private", "Tag": "7170", "Target": "/private", "Type": "virtiofs", "VSockNumber": null },
+    { "OriginalInput": "", "ReadOnly": false, "Source": "/var/folders", "Tag": "a0bb", "Target": "/var/folders", "Type": "virtiofs", "VSockNumber": null },
+    { "OriginalInput": "", "ReadOnly": false, "Source": "/Users/u/.config/containers", "Tag": "9dde", "Target": "/etc/containers", "Type": "virtiofs", "VSockNumber": null }
+  ] }
+JSON
+# The machine podman-machine.pl creates: rootful, the live install and the
+# container-files folder read-only, the test scratch and one project read-write.
+my $NARROW = <<'JSON';
+{ "Name": "podman-machine-default",
+  "HostUser": { "Rootful": true, "UID": 501 },
+  "Mounts": [
+    { "ReadOnly": true,  "Source": "/Users/u/.claude/ccpraxis", "Target": "/Users/u/.claude/ccpraxis", "Type": "virtiofs" },
+    { "ReadOnly": true,  "Source": "/Users/u/.cache/ccpraxis/container-files", "Target": "/Users/u/.cache/ccpraxis/container-files", "Type": "virtiofs" },
+    { "ReadOnly": false, "Source": "/Users/u/.cache/ccpraxis/container-test-scratch", "Target": "/Users/u/.cache/ccpraxis/container-test-scratch", "Type": "virtiofs" },
+    { "ReadOnly": false, "Source": "/Users/u/Projects/app", "Target": "/Users/u/Projects/app", "Type": "virtiofs" }
   ] }
 JSON
 {
+    my $script = HostPlatform::machine_script_path();
     my $info = HostPlatform::parse_machine_inspect($INSPECT);
     is($info->{name}, 'podman-machine-default', 'D: inspect parse: machine name');
     is($info->{config_dir}, '/Users/u/.config/containers/podman/machine/applehv', 'D: inspect parse: config dir');
@@ -160,12 +186,27 @@ JSON
         read_file => sub { push @read, $_[0]; $CONFIG });
     is_deeply(\@read, ['/Users/u/.config/containers/podman/machine/applehv/podman-machine-default.json'],
         'D: shares are read from <ConfigDir>/<Name>.json (podman 6.x inspect omits them)');
-    is_deeply($shares, ['/Users', '/private', '/var/folders', '/Users/u/.config/containers'],
-        'D: every share source is returned');
+    is_deeply($shares, [
+            { source => '/Users',       target => '/Users',       readonly => 0 },
+            { source => '/private',     target => '/private',     readonly => 0 },
+            { source => '/var/folders', target => '/var/folders', readonly => 0 },
+            { source => '/Users/u/.config/containers', target => '/etc/containers', readonly => 0 },
+        ], 'D: every share is returned with its VM path and mode');
 
     my $older = '[{"Name":"m","Mounts":[{"Source":"/Users/"}]}]';
     is_deeply(HostPlatform::machine_shares(inspect => sub { $older }, read_file => sub { die 'not read' }),
-        ['/Users'], 'D: an inspect document that carries Mounts is used directly (trailing slash trimmed)');
+        [{ source => '/Users', target => '/Users', readonly => 0 }],
+        'D: an inspect document that carries Mounts is used directly (trailing slash trimmed; no Target = same path)');
+
+    my $narrow = HostPlatform::machine_shares(inspect => sub { $INSPECT }, read_file => sub { $NARROW });
+    is_deeply([ map { $_->{readonly} } @$narrow ], [1, 1, 0, 0],
+        'D: ReadOnly true in the machine config reads as a read-only share');
+    my $details = HostPlatform::parse_machine_config_details($CONFIG);
+    is($details->{rootful}, 0, 'D: config details: HostUser.Rootful false -> rootful 0');
+    is_deeply($details->{resources}, { cpus => 6, memory => 12288, disk => 100 }, 'D: config details: Resources');
+    is(HostPlatform::parse_machine_config_details($NARROW)->{rootful}, 1, 'D: config details: Rootful true -> 1');
+    is(HostPlatform::parse_machine_inspect($INSPECT)->{state}, 'running', 'D: inspect parse: State');
+    is(HostPlatform::parse_machine_inspect($INSPECT)->{rootful}, 0, 'D: inspect parse: Rootful');
 
     ok(!defined HostPlatform::machine_shares(inspect => sub { undef }),
         'D: no inspect output -> undef ("cannot tell"), never an empty share list');
@@ -192,10 +233,70 @@ JSON
     is_deeply([HostPlatform::sources_outside_shares(['/anything'], ['/'])], [],
         'D: a "/" share covers everything');
 
-    my $msg = join "\n", HostPlatform::outside_shares_message(\@out, $shares);
+    is_deeply([HostPlatform::bind_mounts(@args)], [
+            { source => '/Users/u/proj',          readonly => 0 },
+            { source => '/opt/homebrew/share/x',  readonly => 1 },
+            { source => '/tmp/legacy',            readonly => 1 },
+        ], 'D: bind_mounts reads each bind\'s mode (--mount ...,readonly and -v ...:ro)');
+    is_deeply([HostPlatform::bind_mounts('--mount', 'type=bind,source=/a,target=/b,ro=true',
+                                         '--mount', 'type=bind,source=/c,target=/d,readonly=false',
+                                         '-v', '/e:/f:rw,z')],
+        [{ source => '/a', readonly => 1 }, { source => '/c', readonly => 0 }, { source => '/e', readonly => 0 }],
+        'D: ro=true reads as read-only; readonly=false and -v ...:rw,z as read-write');
+
+    # A share mounted somewhere else in the VM does not serve its host path:
+    # podman looks the bind source up at the same path inside the VM.
+    is_deeply([HostPlatform::sources_outside_shares(['/Users/u/.config/containers/x'],
+                [{ source => '/Users/u/.config/containers', target => '/etc/containers', readonly => 0 }])],
+        ['/Users/u/.config/containers/x'],
+        'D: a share whose VM path differs from its host path (-> /etc/containers) covers nothing');
+
+    my $msg = join "\n", HostPlatform::outside_shares_message(\@out, $shares, project => '/Users/u/proj');
     like($msg, qr{/opt/homebrew/share/x}, 'D: the refusal names the unshared source');
-    like($msg, qr{/var/folders}, 'D: ...and lists what the machine does share');
-    like($msg, qr/podman machine init.*--volume <dir>:<dir>/s, 'D: ...and says how to add a share');
+    like($msg, qr{rw  /var/folders}, 'D: ...and lists what the machine does share, with each mode');
+    like($msg, qr{/Users/u/\.config/containers -> /etc/containers}, 'D: ...a share mounted elsewhere is shown with its VM path');
+    unlike($msg, qr/podman machine (?:init|rm)/, 'D: ...and never asks the operator to hand-type podman machine rm/init');
+    like($msg, qr/\Q$script\E plan/, 'D: a refused path that is not the project points at podman-machine.pl plan');
+    unlike($msg, qr/add-project/, 'D: ...and does not offer add-project for it');
+
+    # The machine podman-machine.pl creates, with NO project shared yet: a
+    # launch in any project is refused, and the message names add-project <dir>.
+    my $proj = '/Users/u/Projects/other';
+    my @launch = ({ source => $proj, readonly => 0 },
+                  { source => "$proj/.ccpraxis-local-data/claude-home", readonly => 0 },
+                  { source => "$proj/.ccpraxis-local-data/claude-home/.launcher", readonly => 1 },
+                  { source => '/Users/u/.claude/ccpraxis/plugins', readonly => 1 },
+                  { source => '/Users/u/.claude/ccpraxis/scripts/statusline.pl', readonly => 1 },
+                  { source => '/Users/u/.cache/ccpraxis/container-files/almanac-global-counts.json', readonly => 1 });
+    my @o2 = HostPlatform::sources_outside_shares(\@launch, $narrow);
+    is_deeply(\@o2, [$proj, "$proj/.ccpraxis-local-data/claude-home", "$proj/.ccpraxis-local-data/claude-home/.launcher"],
+        'D: narrowed machine: an unlisted project and its claude-home are outside; the install and counts copy are served');
+    my $m2 = join "\n", HostPlatform::outside_shares_message(\@o2, $narrow, project => $proj);
+    like($m2, qr/\Q$script\E add-project \Q$proj\E/, 'D: ...the refusal names `podman-machine.pl add-project <dir>` for that project');
+    like($m2, qr{ro  /Users/u/\.claude/ccpraxis}, 'D: ...and shows the read-only shares as ro');
+    unlike($m2, qr/\bplan`/, 'D: ...and adds no plan hint when only the project is missing');
+
+    # Read-write through a read-only share.
+    is(HostPlatform::covering_share('/Users/u/Projects/app/src', $narrow)->{source}, '/Users/u/Projects/app',
+        'D: covering_share picks the share the path lies under');
+    my $nested = [{ source => '/Users/u/w', target => '/Users/u/w', readonly => 1 },
+                  { source => '/Users/u/w/rwpart', target => '/Users/u/w/rwpart', readonly => 0 }];
+    is(HostPlatform::covering_share('/Users/u/w/rwpart/x', $nested)->{readonly}, 0,
+        'D: when shares nest, the deepest one decides the mode');
+    my @ro = HostPlatform::rw_binds_under_ro_shares(
+        [{ source => '/Users/u/.claude/ccpraxis/plugins', readonly => 1 },
+         { source => '/Users/u/.claude/ccpraxis/work', readonly => 0 },
+         { source => '/Users/u/Projects/app', readonly => 0 },
+         { source => '/elsewhere', readonly => 0 }], $narrow);
+    is_deeply(\@ro, [{ source => '/Users/u/.claude/ccpraxis/work', share => '/Users/u/.claude/ccpraxis' }],
+        'D: only a READ-WRITE bind under a READ-ONLY share is reported (ro binds and rw shares are fine; unshared is the other check)');
+    my $m3 = join "\n", HostPlatform::outside_shares_message([], $narrow, read_only => \@ro, project => '/Users/u/Projects/app');
+    like($m3, qr/needs to write through this directory, which the podman machine shares read-only/,
+        'D: the read-only refusal says what is wrong');
+    like($m3, qr{/Users/u/\.claude/ccpraxis/work\s+\(inside the read-only share /Users/u/\.claude/ccpraxis\)},
+        'D: ...names the bind and the read-only share it falls in');
+    is_deeply([HostPlatform::share_lines([{ source => '/a', target => '/a', readonly => 1 }, '/b'])], ['ro  /a', 'rw  /b'],
+        'D: share_lines: mode, then path (a plain string reads as rw)');
 }
 
 # ---------------------------------------------------------------------------
