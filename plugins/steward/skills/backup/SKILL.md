@@ -1,6 +1,6 @@
 ---
 name: backup
-description: Syncs everything personal between the live host and your private repos — ccpraxis config (global + container) AND every project registered for vault backup (CLAUDE.md, skills, plans, memory, almanac records — global and project). Scans for secrets before pushing. Resolves vault sync conflicts interactively. If you're in a project that has trackable Claude files but isn't registered for backup, offers to register it. Also surfaces Claude Code binary snapshots taken by /update and supports manual revert. Use when the user wants to sync config, back up settings, push config changes, sync vault projects, list/revert Claude Code snapshots, or says "backup", "sync config", "push config", "sync everything", "back up my work", "revert claude code", "list claude snapshots", "rollback claude".
+description: Brings local state in line and backs it up — promotes the ccpraxis dev clone into the live install (asking first), exports the settings Claude Code wrote into ~/.claude into the dev clone's payload key by key (asking per key, unless a saved preference answers), commits only those files and promotes again, then syncs every project registered for vault backup (CLAUDE.md, skills, plans, memory, almanac records — global and project). Never talks to GitHub; /steward:upstream-sync does. Resolves vault sync conflicts interactively. If you're in a project that has trackable Claude files but isn't registered for backup, offers to register it. Also surfaces Claude Code binary snapshots taken by /update and supports manual revert. Use when the user wants to sync config, back up settings, promote, sync vault projects, list/revert Claude Code snapshots, or says "backup", "sync config", "sync everything", "back up my work", "revert claude code", "list claude snapshots", "rollback claude".
 user-invocable: true
 host-only: true
 allowed-tools: Bash, AskUserQuestion, Skill
@@ -10,12 +10,17 @@ This skill is a thin wrapper. Every mechanical step — git, file merges, the va
 secret scan, the report — is owned by a driver script. The wrapper's whole job is:
 invoke the driver, present its decisions, relay its report, re-invoke with the answers.
 
+Its ccpraxis part is local: promote the dev clone (the live install's `origin`) if it is
+ahead, export only the settings keys sent to its payload, commit those files, promote again.
+It never fetches, merges or pushes; publishing to GitHub is `/steward:upstream-sync`.
+
 ## Modes
 
 Two modes, chosen by intent:
 
-1. **Full sync (default).** Intent like "backup", "sync config", "push config", "sync
-   everything", "back up my work" — go to **Running the driver**.
+1. **Full sync (default).** Intent like "backup", "sync config", "sync everything",
+   "back up my work" — go to **Running the driver**. Pushing to GitHub ("push config",
+   "publish") is `/steward:upstream-sync`, not this skill.
 2. **Snapshot/revert.** Intent like "revert claude code", "list snapshots", "rollback
    claude code", "restore claude code binary" — go directly to **Snapshot/revert mode**
    and never invoke the driver.
@@ -64,18 +69,14 @@ the paused run):
 perl ~/.claude/ccpraxis/scripts/backup.pl run --json --restart
 ```
 
-**A `--resume` call that hangs or times out with no output.** Do not retry the same token:
-the run may already have consumed it, and a replayed token is terminal (`token_replayed`).
-Instead, re-invoke with no token at all, `perl ~/.claude/ccpraxis/scripts/backup.pl run --json`.
-It reports the true state:
-- **exit 3 `token_missing`**: the run is still paused, so the hung call never took effect and
-  the original token is still valid. Retry the same `--resume` call with the same answers.
-- **any other result**: the hung call had already consumed the token, and this call carries
-  the run on from where it got to. Handle its exit as usual.
-
-One case needs the operator first. If the hung call was answering the run's LAST decisions, it
-may have finished the whole backup, and a token-less call on a finished run starts a fresh one.
-Say so and ask before re-invoking.
+**A `--resume` call that hangs or times out with no output.** Do not retry the same token
+(it may be consumed, and a replayed token is terminal). Re-invoke with no token,
+`perl ~/.claude/ccpraxis/scripts/backup.pl run --json`, which reports the true state:
+exit 3 `token_missing` means the run is still paused and the original token is valid, so
+retry the same `--resume` call; any other result means the hung call consumed the token and
+this call carried the run on, so handle its exit as usual. One case needs the operator first:
+if the hung call answered the run's LAST decisions it may have finished the backup, and a
+token-less call on a finished run starts a fresh one. Say so and ask before re-invoking.
 
 Repeat the exit-10 branch until a terminal exit. Bound the loop at **20 driver
 invocations**; if that bound is hit, stop, say plainly that the backup is **incomplete**
@@ -105,16 +106,14 @@ guess a default.
 
 | kind | what it is | how to present it |
 |---|---|---|
-| dirty_worktree | origin/main has commits the dev clone lacks, and the dev clone has uncommitted changes to tracked files | show the dirty file list from detail/data, offer `continue_without_merge` (leave the uncommitted changes untouched) or `merge_anyway` (git itself refuses if the merge would overwrite local changes; that ends as a reported failure with nothing changed) |
-| remote_merge_conflict | merging origin/main into the dev clone hit a real conflict | show the conflicting paths from detail/data, offer `abort_merge` (abort and restore the pre-merge HEAD) or `keep_conflict` (leave the conflict on disk in the dev clone for manual resolution) |
+| promote_pending | the dev clone's `main` has commits the live install lacks | show every commit from detail/data and say that promoting changes the tooling that runs (plugins, hooks, scripts; skills from the next session) and syncs `global-config/` into `~/.claude`; offer `promote` or `skip` (the config export is then skipped too if the payload differs) |
 | readme_drift | README.md or docs/repo-layout.md is stale relative to the tree on disk | show the drift detail (missing paths or a stale generated section), offer `acknowledge` (continue anyway) or `treat_as_failure` (fail the run over it) |
-| settings_key | a live-vs-repo settings.json key differs, or exists on only one side | show the key and both values from detail/data, offer the choices the decision carries (use-live, use-repo, keep-different-remember or skip for a differing key; export-to-repo, keep-live-only-remember or skip for a live-only key; add-to-live, keep-repo-only-remember or skip for a repo-only key), noting that a remember choice is saved as a preference, and that answering use-live or export-to-repo also settles the same key for the container settings later in this run (see container_settings_key) |
-| marketplace_key | a live-vs-repo known_marketplaces.json entry differs | show the marketplace name and both sides, offer export/add, keep-remember, remove, or skip as fits the discrepancy |
+| settings_key | one settings unit (a key, or one level of a dotted key) differs between `~/.claude/settings.json` and the dev clone's payload, or exists on one side only | show the key and both values from detail/data; offer the four choices it carries: into the payload (use-live / export-to-repo / remove-from-repo), back into `~/.claude` (use-repo / remove-from-live / add-to-live), skip, or the keep-…-remember preference. Only units sent to the payload are written there; use-live or export-to-repo also settles the key for the container settings (see container_settings_key) |
+| marketplace_key | a live-vs-dev-clone known_marketplaces.json entry differs | show the marketplace name and both sides, offer export/add, keep-remember, remove, or skip as fits the discrepancy |
 | file_conflict | a synced file differs between live and the dev clone in a way that is not a settings key | show both versions (or a diff) from detail/data, offer use-live, use-export, or merge-manually |
 | claude_md_drift | `~/.claude/CLAUDE.md` is not what promotion builds for this host from the live install's payload; such a difference is never exported | show detail verbatim (the lines only in the file, and only in the build); offer `rerender` (rebuild it, after a backup copy in `~/.claude/.promotion-backups/`) or `leave`. Say that a line worth keeping has to be folded by hand into the dev clone's `global-config/CLAUDE.md` or this host's part, then promoted |
 | container_settings_key | a global-config-vs-container settings.json key differs, or exists on only one side, and was not already settled by this run's settings_key answer | show the key and both values, offer the choices the decision carries (propagate-to-container, keep-container, keep-different-remember or skip for a differing key; add-to-container, keep-global-only-remember or skip for a global-only key; remove-from-container, keep-container-only-remember or skip for a container-only key). It is not asked for a key the operator answered use-live or export-to-repo on its settings_key decision this run when the container differs from or lacks the global value: the driver writes the global-config value into the container settings and lists the key in the container_followed_global note. A global_vs_container preference in .backup-preferences.json still takes precedence, and a container-only key is always asked |
-| sensitive_finding | the pre-push secret scanner found a likely credential | show every finding (file, line, pattern) from detail/data verbatim, offer abort or rescan-after-fixing — never let the operator push past this decision silently |
-| push_confirmation | the dev clone is ready to commit the files this backup exported and push its main | show detail: the remote, EVERY commit in origin/main..main (the developer's unpushed work goes too) and the files the new commit stages; offer push-it or abort |
+| sensitive_finding | the secret scan of the dev clone found a likely credential before the export commit | show every finding (file, line, pattern) from detail/data verbatim, offer abort or rescan-after-fixing — never let the operator commit past this decision silently |
 | vault_conflict | a vault-registered project has both local and vault changes to the same path since the last sync | show the conflict payload, including data.merge_preview when present (a diff3-style preview of both sides), offer use-local, use-vault, use-merged (only when a clean merge exists), or abort-this-project |
 | project_registration | the current directory has trackable Claude files but is not registered for vault backup | show the trackable paths from detail/data, offer register-now, not-now, or dont-ask-again |
 | plugin_install | a plugin the config enables that Claude Code cannot load: no install record for user scope or this project, and its marketplace does not serve it in place from a local directory | show the plugin name, marketplace and detail; offer install or skip. Say plainly that installing is a `/plugin install` the operator types at the Claude Code prompt, which neither you nor the driver can run; see Follow-up actions |
@@ -141,14 +140,15 @@ never read it alone as "everything is fine."
 
 Surface, from the report's fields:
 
-- `ccpraxis_sync` — what merged, what committed, whether the push succeeded; never
-  re-promote a captured `push_warnings` protected-ref notice to a failure. Alongside
-  it, `preferences.applied` / `preferences.ignored` / `preferences.skip_keys_unmatched`.
-  It also carries two purely-informational checks that run every time: `skills` (the
-  skills mirror sync — what changed, if anything) and `claude_md` (the global
-  CLAUDE.md status check between live and repo). Mention both — a `claude_md` status
-  other than `ok` means global CLAUDE.md has drifted, and that is worth surfacing
-  even though nothing failed.
+- `ccpraxis_sync` — `live_root` and `dev_clone`; when `export_target.ready` is false,
+  its `reason` and `fix` verbatim (a missing dev clone, or "promote first"); `promotion`
+  and `promote_after_commit` (relay their `output` verbatim when the promotion ran or
+  failed); `merged`, `committed` (the export commit and its files). Alongside it,
+  `preferences.applied` / `.ignored` / `.skip_keys_unmatched`. Two checks run every
+  time: `skills` (the skills mirror sync — what changed, if anything) and `claude_md`
+  (the global CLAUDE.md status check: `~/.claude/CLAUDE.md` against the build of the
+  live install's payload). Mention both; a `claude_md` status other than `in_sync` or
+  `linked` means drift worth surfacing even though nothing failed.
 - `container_followed_global` notes in `notes[]` — keys the driver wrote into the container settings without asking (operator answered `use_live`/`export_to_repo` on that key's `settings_key` decision this run; each entry: `key`, `relation` (the container-side global-vs-container relation, not the settings_key one), `answer`); list every one. Same as `ccpraxis_sync.container.followed_global`.
 - `marketplaces` — anything added or changed.
 - `vault_projects.projects[]` — per-slug status and class; read the per-project

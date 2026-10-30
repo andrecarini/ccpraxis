@@ -71,6 +71,14 @@ our @EXPORT_OK = qw(
 # by package 06's "every kind has a documented presentation" check, not a
 # copy in prose.
 # ===========================================================================
+# 2026-10-30: the backup stopped talking to GitHub. /steward:backup manages
+# local state only (promote, export, commit, promote, vault); fetching,
+# integrating origin/main and pushing are /steward:upstream-sync's
+# (plugins/steward/scripts/upstream-sync.pl), so dirty_worktree,
+# remote_merge_conflict and push_confirmation left this enum and
+# promote_pending joined it: bringing the live install up to the dev clone
+# changes the tooling that runs, so it is asked once, listing the commits.
+#
 # 2026-10-30: claude_md_drift added. ~/.claude/CLAUDE.md is built per host by
 # promote.pl, so a difference from that build cannot be exported back (a line
 # has no record of which part it belongs to); the export phase offers to
@@ -82,8 +90,7 @@ our @EXPORT_OK = qw(
 # export overwriting unpromoted payload edits) is a precondition the
 # preflight phase checks instead, and a "no" skips the export with a note.
 our @DECISION_KINDS = qw(
-    dirty_worktree
-    remote_merge_conflict
+    promote_pending
     readme_drift
     settings_key
     marketplace_key
@@ -91,7 +98,6 @@ our @DECISION_KINDS = qw(
     claude_md_drift
     container_settings_key
     sensitive_finding
-    push_confirmation
     vault_conflict
     project_registration
     plugin_install

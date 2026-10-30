@@ -3,7 +3,8 @@
 #
 # Absorbs today's SKILL.md Steps 2 (detect differences), 3 (handle each
 # file + settings merge), 3.5 (container settings sync), 4 (sensitive-data
-# scan) and 5 (commit and push). See the spec for the original contract:
+# scan) and 5 (commit; the push moved to /steward:upstream-sync on
+# 2026-10-30). See the spec for the original contract:
 #   .ccpraxis-local-data/blueprints/backup-driver/specs/03-export-and-push-spec.md
 # including its BINDING coordinator rulings (S8, P10-P12), which supersede
 # anything earlier in that document that conflicts -- and the 2026-10-30
@@ -14,33 +15,31 @@
 # scanning. Its job is ordering, exit-code interpretation, turning
 # genuinely-undecided things into decision records, applying answered
 # choices, checkpointing so an interrupted run does not redo finished work,
-# and making a mid-push death safe.
+# and making a mid-commit death safe.
 #
 # THE TWO CHECKOUTS (2026-10-30; plugins/steward/scripts/DevClone.pm has the
 # model). The live install (<home>/.claude/ccpraxis) is produced by promote.pl
 # alone and is only READ here: the wrapped scripts run from it, and its
 # .backup-preferences.json holds this machine's answers. EVERY WRITE AND EVERY
-# GIT OPERATION TARGETS THE DEV CLONE, the only checkout that talks to GitHub:
-# the export goes into its working tree, only the files this run wrote are
-# committed (never `git add -A`, never the developer's other changes or
-# untracked files), and its main is pushed to its origin. Which dev clone, and
-# whether exporting into it is safe at all, is decided ONCE by the preflight
-# phase and read here from its 'export_target' checkpoint; anything but a
-# ready target skips this whole phase (status 'skipped') with the reason.
+# GIT OPERATION TARGETS THE DEV CLONE: the export goes into its working tree,
+# and only the files this run wrote are committed there (never `git add -A`,
+# never the developer's other changes or untracked files). Then the dev
+# clone's promote.pl fast-forwards the live install to that commit, so a run
+# ends with the live install at the dev clone's main and ~/.claude consistent
+# with the payload. Nothing here talks to a remote: fetching, integrating and
+# pushing are /steward:upstream-sync's. Which dev clone, and whether exporting
+# into it is safe at all, is decided ONCE by the preflight phase and read here
+# from its 'export_target' checkpoint; anything but a ready target skips this
+# whole phase (status 'skipped') with the reason.
 #
-# Decision 4 + ruling R6 (01-driver-skeleton-spec.md S8): the push NEVER
-# happens without an explicitly answered push_confirmation, and R6 wipes a
-# phase's stored answers/items on re-entry after a "running" (mid-execution
-# kill) prior status -- so consent can never be silently replayed. Because
-# R6 wipes checkpoints too, this module never trusts its own state to know
-# whether a push already happened after a crash; it asks GIT, in the dev
-# clone: the units re-run (each is idempotent: the merge writes the same
-# file again), and then none of the written files changed and 0 commits in
-# origin/main..main means the push already completed (no second push, no
-# decision asked); N > 0 unpushed means it died between commit and push (ask
-# again); written files still changed means it died before the commit (ask
-# again with the full pending set). See _do_commit_review /
-# _do_push_confirmation_and_push.
+# Ruling R6 (01-driver-skeleton-spec.md S8) wipes a phase's stored
+# answers/items on re-entry after a "running" (mid-execution kill) prior
+# status. So this module never trusts its own state to know whether the
+# commit already happened after a crash; it asks GIT, in the dev clone: the
+# units re-run (each is idempotent: the merge writes the same file again),
+# nothing is pending, and the export commit the interrupted run made is what
+# U9 finds between the live install and the dev clone's main -- and promotes.
+# See _do_commit / _do_promote_after_commit.
 #
 # Ruling P10 (spec S8): sync-export.pl's real emitted status set is
 # {claude_md_differs, export_only, identical, linked, live_only, missing,
@@ -69,8 +68,9 @@
 # both paths for a human to reconcile. See reports/parity/03-export-and-push.md.
 #
 # Decision 10: the decision-kind enum is CLOSED. This module emits exactly
-# five kinds: file_conflict, claude_md_drift, container_settings_key,
-# sensitive_finding, push_confirmation.
+# four kinds: file_conflict, claude_md_drift, container_settings_key,
+# sensitive_finding. The commit and the promotion after it are deterministic
+# and ask nothing.
 #
 # Decision 7 barriers, enforced in code (not prose):
 #   B1 -- the container diff (U5/U6) does not run unless settings_merge
@@ -80,8 +80,7 @@
 #   B2 -- no git verb of any kind is spawned until sensitive_scan (U7)
 #         checkpoints clean. U8/U9 are both gated on is_done('sensitive_scan').
 #   B3 -- sensitive_finding is never batched with anything else (returned
-#         alone, immediately); push_confirmation is likewise always the
-#         sole decision in its needs_decision return.
+#         alone, immediately).
 #
 # This module must never depend on package 01's engine module or its
 # sibling (spec S2.0): everything this
@@ -134,7 +133,7 @@ sub phase_spec {
         name      => 'export',
         order     => 200,   # spec S8 P2: preflight=100, export=200, vault=300, closeout=400
         resumable => 1,
-        title     => 'Export: into the dev clone -- file differences, settings merge, container settings, sensitive scan, commit and push',
+        title     => 'Export: into the dev clone -- file differences, settings merge, container settings, sensitive scan, commit, promote',
     };
 }
 
@@ -205,9 +204,8 @@ sub run_phase {
     # the order failures were first observed within THIS invocation for
     # units that ran here, then any pre-existing durable entries, so the
     # emitted names/first message stay deterministic.
-    my @failed_units;   # [ unit_name, message ] -- still used for the
-                         # push_confirmation warning text (THIS invocation
-                         # only; unchanged behaviour).
+    my @failed_units;   # [ unit_name, message ] -- THIS invocation only;
+                         # orders the names in the final error.
     my $failure_key = 'unit_failures';
     my $load_failures = sub {
         my $h = $ctx->{get_item}->($failure_key);
@@ -317,25 +315,21 @@ sub run_phase {
         else                 { $record_success->('sensitive_scan'); }
     }
 
-    # ---- U8/U9: commit review + push (Step 5) -- BARRIER B2: no git verb
-    #      of any kind may be spawned until sensitive_scan checkpointed
-    #      clean. ----
+    # ---- U8/U9: commit the export, then promote it (Step 5, local since
+    #      2026-10-30) -- BARRIER B2: no git verb of any kind may be spawned
+    #      until sensitive_scan checkpointed clean. ----
     if ($ctx->{is_done}->('sensitive_scan')) {
-        unless ($ctx->{is_done}->('commit_review')) {
-            my $res = _do_commit_review($ctx, $repo);
-            if ($res->{failed}) { $record_failure->('commit_review', $res->{failed}); }
-            else                 { $record_success->('commit_review'); }
+        unless ($ctx->{is_done}->('committed')) {
+            my $res = _do_commit($ctx, $repo);
+            if ($res->{failed}) { $record_failure->('committed', $res->{failed}); }
+            else                 { $record_success->('committed'); }
         }
 
-        if ($ctx->{is_done}->('commit_review')) {
-            unless ($ctx->{is_done}->('pushed')) {
-                my $res = _do_push_confirmation_and_push($ctx, $repo, \@failed_units, $load_failures);
-                if ($res->{pause}) {
-                    $record_success->('pushed');   # see file_conflicts' identical comment above
-                    return { status => 'needs_decision', decisions => [ $res->{pause} ] };
-                }
-                if ($res->{failed}) { $record_failure->('pushed', $res->{failed}); }
-                else                 { $record_success->('pushed'); }
+        if ($ctx->{is_done}->('committed')) {
+            unless ($ctx->{is_done}->('promote_after_commit')) {
+                my $res = _do_promote_after_commit($ctx, $root, $home_n, $repo);
+                if ($res->{failed}) { $record_failure->('promote_after_commit', $res->{failed}); }
+                else                 { $record_success->('promote_after_commit'); }
             }
         }
     }
@@ -710,10 +704,38 @@ sub _do_settings_merge {
         }
     }
 
+    # What goes to the payload is exactly what the operator (per key, in the
+    # preflight) sent there: to_payload takes the ~/.claude value,
+    # remove_from_payload drops the key. An older settings_outcome without the
+    # lists carries the same facts in its answers (use_live / export_to_repo /
+    # remove_from_repo occur for one relation each).
+    my $answers = ref($outcome->{answers}) eq 'HASH' ? $outcome->{answers} : {};
+    my @to_payload = ref($outcome->{to_payload}) eq 'ARRAY' ? @{ $outcome->{to_payload} }
+                   : sort grep { my $c = $answers->{$_} // ''; $c eq 'use_live' || $c eq 'export_to_repo' } keys %$answers;
+    my @remove_from_payload = ref($outcome->{remove_from_payload}) eq 'ARRAY' ? @{ $outcome->{remove_from_payload} }
+                   : sort grep { ($answers->{$_} // '') eq 'remove_from_repo' } keys %$answers;
+    for my $k (@to_payload, @remove_from_payload) {
+        return { failed => 'settings handoff malformed: a to-payload key is a non-scalar or empty element' }
+            unless defined $k && !ref($k) && length $k;
+    }
+    $_ = _item_bytes($_) for @to_payload, @remove_from_payload;
+
+    # Nothing sent to the payload: nothing is merged, and the payload file is
+    # not even rewritten (a rewrite alone could reformat it into a commit).
+    unless (@to_payload || @remove_from_payload) {
+        $ctx->{checkpoint}->('settings_merge', { status => 'nothing_to_export', wrote => [],
+            preferences_applied => [], preferences_ignored => [], skip_keys_unmatched => [] });
+        $ctx->{note}->('settings_merge', { status => 'nothing_to_export' });
+        return {};
+    }
+
     # --live-root: the directory ${CCPRAXIS_LIVE} stands for (collapse
     # against it); --repo-root: the dev clone, the only thing written.
+    # --only-key / --remove-key make the merge selective: no other unit moves.
     my @args = ('settings-export-merge', '--live-root', $root, '--repo-root', $repo);
-    push @args, ('--skip-key', $_) for @$skip_keys;
+    push @args, ('--skip-key', $_)   for @$skip_keys;
+    push @args, ('--only-key', $_)   for @to_payload;
+    push @args, ('--remove-key', $_) for @remove_from_payload;
     my $r = _run_capture($^X, "$root/plugins/steward/scripts/ccpraxis-helpers.pl", @args);
     unless ($r->{spawned}) {
         return { failed => 'ccpraxis-helpers.pl settings-export-merge failed to spawn' };
@@ -729,9 +751,11 @@ sub _do_settings_merge {
         return { failed => "settings-export-merge: $msg" };
     }
     $j = _sanitize_utf8($j);
-    # settings-export-merge rewrites the dev clone's settings.json on every
-    # merge; commit_review commits it only if that changed anything.
+    # settings-export-merge rewrote the dev clone's settings.json; the commit
+    # takes it only if that changed anything.
     $j->{wrote} = [ 'global-config/settings.json' ];
+    $j->{to_payload} = [ @to_payload ];
+    $j->{remove_from_payload} = [ @remove_from_payload ];
 
     $ctx->{checkpoint}->('settings_merge', $j);
     $ctx->{note}->('settings_merge', { status => $j->{status}, merge_rule => $j->{merge_rule} });
@@ -1169,14 +1193,20 @@ sub _do_sensitive_scan {
 }
 
 # ===========================================================================
-# U8 -- commit_review (Step 5, part 1), in the DEV CLONE. Ruling P4: refuse
-# while MERGE_HEAD exists. Read-only: computes the pending change set -- the
-# files this run WROTE that git sees as changed, nothing else -- and the
-# commits a push would send, without staging anything. Recomputed fresh
-# whenever this unit is not yet checkpointed -- which, after an R6/R1 clear,
-# is what makes the post-crash "ask git" behaviour (S2.6) work without any
-# special-casing.
+# U8 -- commit, in the DEV CLONE. Ruling P4: refuse while MERGE_HEAD exists.
+# Commits the files this run WROTE that git sees as changed -- nothing else:
+# never `git add -A`, never the developer's other edits or untracked files,
+# and (through the commit's pathspec) never anything they had staged. No
+# question: the scan above was the gate, and this commit is local -- it
+# reaches GitHub only through /steward:upstream-sync, which shows every
+# outgoing commit before it pushes. Checkpoints 'committed'.
+#
+# Crash safety asks git, not this module's state: after an R6 clear the units
+# re-run, the merge writes the same content again, nothing is pending, and
+# the commit an interrupted run already made is found by U9 instead.
 # ===========================================================================
+
+use constant EXPORT_SUBJECT_RE => qr/^backup: sync ccpraxis config \(\d+ file\(s\)\)\z/;
 
 # Repo-relative paths written into the dev clone by this run: the
 # preflight's W2 (marketplace_outcome.wrote) and this phase's own units.
@@ -1199,32 +1229,22 @@ sub _written_paths {
     return sort keys %w;
 }
 
-sub _count_of {
-    my ($r) = @_;
-    return undef unless $r->{spawned} && $r->{exit} == 0;
-    (my $n = $r->{out} // '') =~ s/\s+//g;
-    return $n =~ /^\d+$/ ? $n + 0 : undef;
-}
-
-sub _do_commit_review {
+sub _do_commit {
     my ($ctx, $repo) = @_;
 
-    # MAJOR (redteam/reviewer): `-f "$repo/.git/MERGE_HEAD"` is a pure
-    # filesystem probe that silently never fires when .git is a FILE (a
-    # linked worktree -- a dev clone can be one). Resolve the REAL git-dir
-    # first; ruling P4 then refuses a merge-in-progress, conflict markers
-    # and all, before it can be committed and pushed.
+    # MAJOR (redteam/reviewer): `-f "$repo/.git/MERGE_HEAD"` silently never
+    # fires when .git is a FILE (a linked worktree -- a dev clone can be
+    # one). Resolve the REAL git-dir first, so a merge in progress, conflict
+    # markers and all, is never committed (ruling P4).
     my $git_dir = _resolve_git_dir($repo);
     if (defined $git_dir && -f "$git_dir/MERGE_HEAD") {
-        return { failed => 'a merge is in progress in the dev clone (MERGE_HEAD present) -- resolve it before committing' };
+        return { failed => 'a merge is in progress in the dev clone (MERGE_HEAD present) -- resolve it before the export can be committed' };
     }
 
     # MAJOR (redteam/reviewer): `--is-inside-work-tree` succeeds from a
-    # SUBDIRECTORY of a repo too. Compare the dev clone against
-    # --show-toplevel instead, after resolving both to their real,
-    # canonical path (HARDEN item4a-followup: a textual compare rejects real
-    # matches over a mere spelling difference). The staged paths below are
-    # relative to this directory, so it has to be the top level.
+    # SUBDIRECTORY too. The staged paths are relative to the dev clone, so
+    # it must BE the top level: compare canonical paths (HARDEN
+    # item4a-followup -- a textual compare rejects a mere respelling).
     my $top = _git_capture($repo, 'rev-parse', '--show-toplevel');
     unless ($top->{spawned} && $top->{exit} == 0) {
         return { failed => 'the dev clone is not a git repository' };
@@ -1247,10 +1267,8 @@ sub _do_commit_review {
                          . ', not main: the exported files were written but nothing is committed' };
     }
 
-    # Only the files this run wrote, and of those only what git sees as
-    # changed. core.quotePath=false: these exact paths are later staged via
-    # `git add --`, where git's C-quoted form of a non-ASCII name is not a
-    # pathspec at all.
+    # core.quotePath=false: these exact paths are staged via `git add --`,
+    # where git's C-quoted form of a non-ASCII name is not a pathspec.
     my @written = _written_paths($ctx);
     my (@added, @modified, @deleted, @untracked, @files, @paths);
     if (@written) {
@@ -1272,281 +1290,115 @@ sub _do_commit_review {
         }
     }
 
-    my $remote_list = _git_capture($repo, 'remote');
-    my $has_origin = 0;
-    if ($remote_list->{spawned} && $remote_list->{exit} == 0) {
-        $has_origin = 1 if grep { $_ eq 'origin' } split(/\r?\n/, $remote_list->{out} // '');
+    my %counts = (added => scalar(@added), modified => scalar(@modified),
+                  deleted => scalar(@deleted), untracked => scalar(@untracked));
+    unless (@paths) {
+        $ctx->{checkpoint}->('committed', { committed => 0, written => [ @written ], %counts, files => [] });
+        $ctx->{note}->('nothing_to_commit', { repo => $repo, written => [ @written ] });
+        return {};
     }
 
-    # What a push of main sends: every commit in origin/main..main, the
-    # developer's unpushed work included, not only this run's commit.
-    my ($unpushed, $behind, @commits);
-    if ($has_origin) {
-        $unpushed = _count_of(_git_capture($repo, 'rev-list', '--count', 'origin/main..main'));
-        $behind   = _count_of(_git_capture($repo, 'rev-list', '--count', 'main..origin/main'));
-        if (defined $unpushed && $unpushed > 0) {
-            my $log = _git_capture($repo, 'log', '--format=%h %s', 'origin/main..main');
-            @commits = grep { length } split /\r?\n/, ($log->{out} // '') if $log->{spawned} && $log->{exit} == 0;
-        }
+    my $n = scalar(@paths);
+    my $subject = "backup: sync ccpraxis config ($n file(s))";
+    my $add = _git_capture($repo, 'add', '--', @paths);
+    unless ($add->{spawned} && $add->{exit} == 0) {
+        return { failed => 'git add failed: ' . _clamp($add->{err} // '') };
     }
-
-    my $data = {
-        repo => $repo, has_origin => $has_origin, branch => $branch,
-        added => scalar(@added), modified => scalar(@modified),
-        deleted => scalar(@deleted), untracked => scalar(@untracked),
-        files => \@files, paths => \@paths, written => \@written,
-        unpushed_commits => $unpushed, behind => $behind, commits => \@commits,
-    };
-    $ctx->{checkpoint}->('commit_review', _sanitize_utf8($data));
+    my $commit = _git_capture($repo, 'commit', '-m', $subject, '-m', "run: $ctx->{run_id}", '--', @paths);
+    unless ($commit->{spawned} && $commit->{exit} == 0) {
+        return { failed => 'git commit failed: ' . _clamp($commit->{err} // '') };
+    }
+    my $new_head = _git_head($repo);
+    $ctx->{checkpoint}->('committed', { committed => 1, sha => $new_head, subject => $subject,
+                                        files => [ sort @files ], written => [ @written ], %counts });
+    $ctx->{note}->('commit', { sha => $new_head, subject => $subject, files => [ sort @files ] });
     return {};
 }
 
 # ===========================================================================
-# U9 -- push_confirmation + stage/commit/push (Step 5, part 2), in the DEV
-# CLONE. Decision 4: the push never happens without an explicitly answered
-# push_confirmation. Nothing is staged before consent (U8 only reads).
-# Checkpoints staged / committed / pushed the instant each git call
-# returns, so a mid-push kill leaves an accurate record for the NEXT
-# invocation's git-truth check.
+# U9 -- promote_after_commit: run the dev clone's promote.pl so the live
+# install fast-forwards to include the export commit, and ~/.claude stays
+# what the payload says. No question: it promotes ONLY when every commit the
+# live install lacks is a backup export commit. Anything else on main -- a
+# promotion the operator skipped this run, a commit made during a pause --
+# is never promoted silently; it is reported. Checkpoints
+# 'promote_after_commit': { needed, ran, exit, output, commits, reason, fix }.
 # ===========================================================================
-sub _do_push_confirmation_and_push {
-    my ($ctx, $repo, $failed_units_ref, $load_failures_ref) = @_;
+sub _do_promote_after_commit {
+    my ($ctx, $root, $home_n, $repo) = @_;
 
-    my $review = $ctx->{get_item}->('commit_review');
-    return { failed => 'commit_review data missing' } unless ref($review) eq 'HASH';
+    my $load_err = _load_shared($root);
+    return { failed => "promote_after_commit: $load_err" } if defined $load_err;
 
-    my $n_changes = ($review->{added} // 0) + ($review->{modified} // 0)
-                   + ($review->{deleted} // 0) + ($review->{untracked} // 0);
-    my $unpushed        = $review->{unpushed_commits};
-    my $behind          = $review->{behind};
-    my $nothing_pending  = ($n_changes == 0);
+    my $rel = DevClone::relation(live_root => $root, dev_clone => $repo, git => _git_runner());
+    my %d = (needed => 0, ran => 0, exit => undef, output => undef, commits => [], reason => undef, fix => undef,
+             live_head => $rel->{live_head}, clone_main => $rel->{clone_main});
+    my $done = sub {
+        my ($ret) = @_;
+        my $data = _sanitize_utf8(\%d);
+        $ctx->{checkpoint}->('promote_after_commit', $data);
+        return $ret // {};
+    };
 
-    # MAJOR (redteam MAJOR-3): "already in sync" and "no remote configured"
-    # are DIFFERENT facts and must not collapse into one note/reason.
-    if ($nothing_pending && !$review->{has_origin}) {
-        $ctx->{checkpoint}->('staged', { staged => 0 });
-        $ctx->{checkpoint}->('committed', { committed => 0 });
-        $ctx->{checkpoint}->('pushed', { pushed => 0, reason => 'no remote configured' });
-        $ctx->{note}->('no_remote_configured', { root => $repo });
-        return {};
+    if (defined $rel->{error}) {
+        $d{reason} = $rel->{error};
+        return $done->({ failed => "promote_after_commit: $rel->{error}" });
     }
-    # An unresolvable ahead-count (fresh remote, never fetched) must ask
-    # rather than assume synced (spec S5 edge case) -- only a CONFIRMED
-    # unpushed == 0 short-circuits here.
-    if ($nothing_pending && defined($unpushed) && $unpushed == 0) {
-        $ctx->{checkpoint}->('staged', { staged => 0 });
-        $ctx->{checkpoint}->('committed', { committed => 0 });
-        $ctx->{checkpoint}->('pushed', { pushed => 0, reason => 'already in sync' });
-        $ctx->{note}->('already_in_sync', { root => $repo });
-        return {};
+    return $done->() if $rel->{state} eq 'same';
+    if ($rel->{state} eq 'live_has_own') {
+        $d{reason} = 'the live install has commits the dev clone does not';
+        $d{fix}    = $rel->{fix};
+        $ctx->{note}->('promote_not_run', { reason => $d{reason}, fix => $d{fix} });
+        return $done->();
     }
 
-    my $id     = 'export.push_confirmation';
-    my $answer = $ctx->{answers}{$id};
-
-    # MAJOR (redteam MAJOR-4 / reviewer M1): name the REAL reason a push is
-    # not offered. A main behind origin/main would be rejected as a
-    # non-fast-forward; it needs origin/main merged in first (the preflight
-    # does that, unless the operator kept a dirty tree out of it or git
-    # refused).
-    my $push_reason;
-    if    (!$review->{has_origin})            { $push_reason = 'no remote is configured'; }
-    elsif (defined $behind && $behind > 0)     { $push_reason = "origin/main has $behind commit(s) the dev clone's main lacks"; }
-    my $offer_push = !defined($push_reason);
-
-    # MAJOR (redteam MAJOR-7): name WHERE the push goes.
-    my $remote_url;
-    if ($review->{has_origin}) {
-        my $ru = _git_capture($repo, 'remote', 'get-url', 'origin');
-        if ($ru->{spawned} && $ru->{exit} == 0) {
-            ($remote_url = $ru->{out} // '') =~ s/\s+\z//;
-            # Displayed paths stay in the POSIX-style form the rest of this
-            # module uses -- inverse of _native_path, a no-op for a URL.
-            $remote_url =~ s{\\}{/}g;
-            $remote_url =~ s{^([A-Za-z]):/}{'/' . lc($1) . '/'}e;
-            $remote_url = _redact_credentials($remote_url);
-        }
+    my @commits = map { substr($_->{sha}, 0, 7) . ' ' . $_->{subject} } @{ $rel->{commits} };
+    $d{commits} = \@commits;
+    $d{needed}  = 1;
+    my @foreign = grep { ($_->{subject} // '') !~ EXPORT_SUBJECT_RE } @{ $rel->{commits} };
+    if (@foreign) {
+        $d{reason} = "the dev clone's main has " . scalar(@foreign) . ' commit(s) the live install lacks that are not '
+                   . 'backup exports; they are promoted only when the operator says so (promote_pending, or promote.pl)';
+        $d{fix}    = 'perl ' . DevClone::git_path($repo) . '/scripts/promote.pl';
+        $ctx->{note}->('promote_not_run', { reason => $d{reason}, fix => $d{fix}, commits => \@commits });
+        return $done->();
     }
 
-    my $subject = "backup: sync ccpraxis config ($n_changes file(s))";
-
-    unless (defined $answer) {
-        my $what = $nothing_pending ? "push the dev clone's main to origin" : "commit the exported files in the dev clone and push main to origin";
-        my @choices = $offer_push
-            ? ( { id => 'push',   label => ucfirst($what) },
-                { id => 'abort',  label => 'Abort (nothing staged, nothing committed, nothing pushed)' } )
-            : ( { id => 'commit_only', label => "Commit only ($push_reason -- push not offered)" },
-                { id => 'abort',       label => 'Abort (nothing staged, nothing committed)' } );
-
-        my @lines;
-        push @lines, 'dev clone: ' . $repo;
-        push @lines, 'remote: ' . $remote_url if defined $remote_url;
-        my @commits = @{ $review->{commits} // [] };
-        push @lines, 'commits already on main that a push sends (origin/main..main): '
-                   . (defined $unpushed ? $unpushed : 'unknown');
-        push @lines, map { "  $_" } @commits;
-        if ($nothing_pending) {
-            push @lines, 'no exported file changed; no new commit';
-        }
-        else {
-            push @lines, "new commit: $subject, staging only the files this backup wrote:";
-            push @lines, sprintf('  modified: %d, deleted: %d, added: %d, untracked: %d',
-                $review->{modified} // 0, $review->{deleted} // 0, $review->{added} // 0, $review->{untracked} // 0);
-            push @lines, map { "  $_" } sort @{ $review->{files} // [] };
-        }
-
-        my $settings_merge = $ctx->{get_item}->('settings_merge');
-        my $skip_unmatched = (ref($settings_merge) eq 'HASH' && ref($settings_merge->{skip_keys_unmatched}) eq 'ARRAY')
-            ? $settings_merge->{skip_keys_unmatched} : [];
-        if (@$skip_unmatched) {
-            push @lines, 'WARNING: ' . scalar(@$skip_unmatched) . ' skip-key(s) matched nothing: '
-                       . join(', ', @$skip_unmatched);
-        }
-        # MAJOR (redteam MAJOR-2): the durable unit_failures record, NOT the
-        # per-invocation lexical -- a failure checkpointed on an EARLIER
-        # invocation must still show here, or consent is given blind.
-        my $durable_failures = $load_failures_ref->();
-        my (%seen_unit, @failed_names);
-        for my $pair (@$failed_units_ref) {
-            my $u = $pair->[0];
-            next unless exists $durable_failures->{$u};
-            next if $seen_unit{$u}++;
-            push @failed_names, $u;
-        }
-        for my $u (sort keys %$durable_failures) {
-            next if $seen_unit{$u}++;
-            push @failed_names, $u;
-        }
-        if (@failed_names) {
-            push @lines, 'WARNING: ' . scalar(@failed_names) . ' earlier step(s) failed: ' . join(', ', @failed_names);
-        }
-        if (!$offer_push) {
-            $ctx->{note}->('push_not_offered', { reason => $push_reason, branch => $review->{branch}, has_origin => $review->{has_origin} });
-        }
-
-        my $dec = $ctx->{decision}->(
-            kind    => 'push_confirmation',
-            id      => $id,
-            # Run.pm's validate_decision rejects a title over 200 chars; a
-            # long dev clone path stays intact in subject/data.
-            title   => ($nothing_pending
-                        ? 'push ' . (defined $unpushed ? $unpushed : 'unpushed') . " commit(s) from the dev clone's main to origin?"
-                        : "commit $n_changes exported file(s) in the dev clone and push main to origin?"),
-            subject => $repo,
-            detail  => join("\n", @lines),
-            data    => { repo => $repo, modified => $review->{modified}, deleted => $review->{deleted},
-                         added => $review->{added}, untracked => $review->{untracked},
-                         files => [ sort @{ $review->{files} // [] } ], unpushed_commits => $unpushed,
-                         commits => \@commits, behind => $behind, remote_url => $remote_url },
-            choices => \@choices,
-        );
-        return { pause => $dec };
+    my $r = _run_capture(DevClone::promote_argv(dev_clone => $repo, live_root => $root, home => $home_n));
+    $d{ran}    = 1;
+    $d{exit}   = $r->{spawned} ? $r->{exit} : -1;
+    $d{output} = _clamp(join('', $r->{out} // '', (length($r->{err} // '') ? $r->{err} : '')), 8000);
+    if (!$r->{spawned} || $r->{exit} != 0) {
+        $d{reason} = $r->{spawned} ? "promote.pl exited $r->{exit}" : 'promote.pl could not be started';
+        return $done->({ failed => "promote_after_commit: $d{reason}; its output is in the report" });
     }
-
-    if ($answer eq 'abort') {
-        $ctx->{checkpoint}->('pushed', { pushed => 0, reason => 'aborted by operator' });
-        $ctx->{note}->('push_aborted', { root => $repo });
-        return {};
-    }
-
-    unless ($nothing_pending) {
-        # Stage and commit exactly the reviewed paths -- the files this run
-        # wrote, as of commit_review -- never `git add -A`: the dev clone is
-        # where someone develops, and their other changes and untracked
-        # files are not the backup's to publish. The pathspec on the commit
-        # (git's --only mode) also keeps anything the developer had already
-        # staged out of this commit.
-        #
-        # $review came back through $ctx->{get_item}; Run.pm's read can hand
-        # a non-ASCII path back utf8-flagged without transcoding, which
-        # passed as argv would mangle it -- _item_bytes undoes that.
-        my @paths = map { _item_bytes($_) } grep { defined && length } @{ $review->{paths} // [] };
-        return { failed => 'commit_review recorded changes but no paths to stage' } unless @paths;
-        my $add = _git_capture($repo, 'add', '--', @paths);
-        unless ($add->{spawned} && $add->{exit} == 0) {
-            return { failed => 'git add failed: ' . _clamp($add->{err} // '') };
-        }
-        $ctx->{checkpoint}->('staged', { staged => 1, files => $n_changes, paths => [ @{ $review->{paths} // [] } ] });
-        $ctx->{note}->('staged_files', { count => $n_changes });
-
-        my $commit = _git_capture($repo, 'commit', '-m', $subject, '-m', "run: $ctx->{run_id}", '--', @paths);
-        unless ($commit->{spawned} && $commit->{exit} == 0) {
-            return { failed => 'git commit failed: ' . _clamp($commit->{err} // '') };
-        }
-        my $new_head = _git_head($repo);
-        # The export commit changed the payload: until the live install is
-        # promoted to it, the next backup's payload check refuses to export.
-        my $promote_next = 'perl ' . _native_path($repo) . '/scripts/promote.pl';
-        $ctx->{checkpoint}->('committed', { sha => $new_head, subject => $subject, promote_next => $promote_next });
-        $ctx->{note}->('commit', { sha => $new_head, subject => $subject });
-        $ctx->{note}->('promote_next', { command => $promote_next,
-            why => 'the export commit is in the dev clone; promote so the live install carries it before the next backup' });
-    }
-    else {
-        $ctx->{checkpoint}->('staged', { staged => 0 })       unless $ctx->{is_done}->('staged');
-        $ctx->{checkpoint}->('committed', { committed => 0 }) unless $ctx->{is_done}->('committed');
-    }
-
-    if ($answer eq 'commit_only') {
-        $ctx->{checkpoint}->('pushed', { pushed => 0, reason => ($push_reason // 'no remote configured') });
-        $ctx->{note}->('commit_only', { root => $repo });
-        return {};
-    }
-
-    my $push = _git_capture($repo, 'push', 'origin', 'main');
-    # MAJOR (redteam MAJOR-6): git prints the remote URL, userinfo included,
-    # in transport/auth failure text -- redact BEFORE it reaches the
-    # checkpoint, notes or a failure message.
-    my $push_err = _redact_credentials($push->{err} // '');
-    my ($verdict, $warnings) = _classify_push($push->{exit}, $push_err);
-    if ($verdict eq 'pushed') {
-        # BLOCKER (coordinator hardening, item 1 effect B): a push client
-        # killed by a signal one hop down a wrapper can leave an exit code
-        # that looks exactly like a clean 0 on Windows. Confirm by asking the
-        # REMOTE (read-only `ls-remote`) that it has the dev clone's main
-        # before recording a durable pushed => 1.
-        my $main = _git_capture($repo, 'rev-parse', 'refs/heads/main');
-        (my $main_sha = ($main->{spawned} && $main->{exit} == 0) ? ($main->{out} // '') : '') =~ s/\s+\z//;
-        if (length $main_sha) {
-            my $confirm = _git_capture($repo, 'ls-remote', 'origin', 'refs/heads/main');
-            if ($confirm->{spawned} && $confirm->{exit} == 0) {
-                (my $remote_sha) = split /\s+/, ($confirm->{out} // '');
-                if (!defined($remote_sha) || $remote_sha ne $main_sha) {
-                    return { failed => 'git push reported success (exit ' . $push->{exit}
-                        . ') but origin/main does not reflect the dev clone\'s main -- the exit code'
-                        . ' cannot be trusted here (e.g. a signal-killed push client); treating'
-                        . ' this as a failed push rather than recording a false pushed:1' };
-                }
-            }
-        }
-        $ctx->{checkpoint}->('pushed', { pushed => 1, exit => $push->{exit}, warnings => $warnings });
-        $ctx->{note}->('push_warnings', $warnings) if @$warnings;
-        return {};
-    }
-    return { failed => "git push rejected (exit $push->{exit}): " . _clamp($push_err) };
+    $ctx->{note}->('promoted_after_commit', { commits => \@commits });
+    return $done->();
 }
 
-# Exit-code-only verdict (spec S2.6): exit 0 is ALWAYS 'pushed', regardless
-# of stderr content -- a protected-ref bypass warning with exit 0 is a
-# documented SUCCESS (.ccpraxis-local-data/guidance/push-straight-to-main.md),
-# never scanned for words like "rejected"/"protected".
-sub _classify_push {
-    my ($exit, $stderr) = @_;
-    my @warnings = grep { length $_ } split /\r?\n/, ($stderr // '');
-    return ($exit == 0) ? ('pushed', \@warnings) : ('rejected', \@warnings);
+# Shared modules, loaded from the live install (the tree every wrapped script
+# runs from). Returns undef on success, else why not.
+sub _load_shared {
+    my ($root) = @_;
+    my $dir = "$root/plugins/steward/scripts";
+    for my $m (qw(DevClone)) {
+        next if $INC{"$m.pm"};
+        return "$dir/$m.pm is missing" unless -f "$dir/$m.pm";
+        local @INC = ($dir, @INC);
+        my $ok = eval { require "$m.pm"; 1 };
+        return "cannot load $dir/$m.pm: " . ($@ || 'unknown error') unless $ok;
+    }
+    return undef;
 }
 
-# MAJOR (redteam MAJOR-6): one redaction applied everywhere `git push`
-# stderr is captured -- a credential-bearing transport/auth-failure URL
-# (`https://user:TOKEN@host/...`) must never survive verbatim into the
-# state file, notes or stdout. Mirrors the spec's own rule for decision
-# `detail` one section earlier (S5): only the shape survives, not the
-# secret.
-sub _redact_credentials {
-    my ($s) = @_;
-    return $s unless defined $s;
-    $s =~ s{(://)[^/@\s]+@}{$1<redacted>@}g;
-    return $s;
+# DevClone's git-runner contract, over this module's own spawner (so the
+# BACKUP_GIT_BIN test seam sees these calls too).
+sub _git_runner {
+    return sub {
+        my ($dir, @args) = @_;
+        my $r = _git_capture($dir, @args);
+        return ($r->{spawned} ? $r->{exit} : -1, $r->{out} // '', $r->{err} // '');
+    };
 }
 
 # ===========================================================================

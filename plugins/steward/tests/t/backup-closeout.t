@@ -880,8 +880,9 @@ sub assert_bare_json_number {
     my $state = seed_state(
         preflight_items => {
             settings_outcome    => { skip_keys => [], preferences_saved => [], answers => {} },
-            remote_integration  => { note => 'seeded-ri' },
-            clone_live          => { note => 'seeded-cl' },
+            ccpraxis_target     => { live_root => '/seeded/live', dev_clone => '/seeded/devclone', located => 1 },
+            promotion           => { state => 'ahead', answer => 'promote', ran => 1, exit => 0, output => "merge: fast-forward a..b (1 commits)\n" },
+            export_target       => { ready => 1, live_root => '/seeded/live', dev_clone => '/seeded/devclone' },
             marketplace_outcome => {
                 export_to_repo => [], remove_from_repo => [], use_live => [], keep => [],
                 instructions => [], preferences_saved => [], answers => {},
@@ -898,9 +899,8 @@ sub assert_bare_json_number {
             file_outcome      => { copied => 1 },
             container_outcome => { copied => 0 },
             sensitive_scan    => { findings => [] },
-            staged            => { count => 1 },
-            committed         => { sha => 'abc123' },
-            pushed            => { pushed => JSON::PP::true, remote => 'origin' },
+            committed         => { committed => 1, sha => 'abc123', subject => 'backup: sync ccpraxis config (1 file(s))' },
+            promote_after_commit => { needed => 1, ran => 1, exit => 0, output => "merge: fast-forward b..c (1 commits)\n" },
         },
         vault_items => {
             vault_check  => { checked => 1 },
@@ -977,9 +977,14 @@ sub assert_bare_json_number {
         is(($report->{sources}{vault} // ''), 'present', 'AC12: sources.vault is "present"');
         ok(defined($report->{ccpraxis_sync}), 'AC12: ccpraxis_sync is non-null when preflight/export are present');
         ok(defined($report->{marketplaces}), 'AC12: marketplaces is non-null when preflight is present');
-        is(ref($report->{ccpraxis_sync}{pushed}), 'HASH', 'AC12: ccpraxis_sync.pushed carries export.pushed verbatim (spot check)') ;
-        ok(($report->{ccpraxis_sync}{pushed}{pushed} // '') eq JSON::PP::true, 'AC12: ccpraxis_sync.pushed.pushed is the seeded true value')
-            if ref($report->{ccpraxis_sync}{pushed}) eq 'HASH';
+        is(ref($report->{ccpraxis_sync}{committed}), 'HASH', 'AC12: ccpraxis_sync.committed carries export.committed verbatim (spot check)');
+        is(($report->{ccpraxis_sync}{committed} // {})->{sha}, 'abc123', 'AC12: ccpraxis_sync.committed.sha is the seeded value');
+        is((($report->{ccpraxis_sync}{promote_after_commit} // {})->{ran}) // '', 1, 'AC12: ccpraxis_sync.promote_after_commit carries export.promote_after_commit');
+        like((($report->{ccpraxis_sync}{promotion} // {})->{output}) // '', qr/fast-forward/, 'AC12: ccpraxis_sync.promotion carries promote.pl\'s output');
+        is($report->{ccpraxis_sync}{dev_clone}, '/seeded/devclone', 'AC12: ccpraxis_sync.dev_clone names the dev clone');
+        is($report->{ccpraxis_sync}{live_root}, '/seeded/live', 'AC12: ccpraxis_sync.live_root names the live install');
+        is((($report->{ccpraxis_sync}{export_target} // {})->{ready}) // '', 1, 'AC12: ccpraxis_sync.export_target carries the preflight verdict');
+        ok(!exists $report->{ccpraxis_sync}{pushed}, 'AC12: there is no pushed field: the backup does not push');
         is(ref($report->{marketplaces}), 'HASH', 'AC12: marketplaces carries preflight.marketplace_outcome verbatim (spot check)');
         is(($report->{marketplaces}{export_to_repo} // 'MISSING'), $report->{marketplaces}{export_to_repo}, 'AC12: (sanity) marketplaces.export_to_repo key exists')
             if ref($report->{marketplaces}) eq 'HASH';
@@ -1607,12 +1612,12 @@ sub make_direct_ctx_closeout {
     set_fixture($r->{fixture_dir}, fixture_name('list', 0), mk_snapshot_list(status => 'ok', count => 0));
     my $state = seed_state(preflight_items => {
         settings_outcome   => { skip_keys => [], preferences_saved => [], answers => {} },
-        remote_integration => 'not-a-hashref-but-a-plain-string',
+        promotion          => 'not-a-hashref-but-a-plain-string',
     });
     write_state_raw($r->{state_path}, $state);
 
     my $resp = run_backup($r, {});
-    isnt($resp->{exit}, 0, 'ITEM4 (MAJOR): a wrong-shaped cross-phase item (preflight.remote_integration not a hashref) makes the run terminate non-zero')
+    isnt($resp->{exit}, 0, 'ITEM4 (MAJOR): a wrong-shaped cross-phase item (preflight.promotion not a hashref) makes the run terminate non-zero')
         or diag($resp->{out} . $resp->{err});
     is($resp->{exit}, 20, 'ITEM4 (MAJOR): ...and specifically exit 20 (complete_with_failures), never a silent 0')
         or diag($resp->{out} . $resp->{err});
@@ -1685,7 +1690,7 @@ sub make_direct_ctx_closeout {
 # ('skills' and 'claude_md'), not as new TOP-LEVEL report keys. Reasoning:
 #   1. ccpraxis_sync ALREADY nests two other preflight-sourced,
 #      decision-free, purely-informational facts this exact same way --
-#      remote_integration and clone_live -- gated on the identical
+#      promotion and export_target (2026-10-30) -- gated on the identical
 #      $pf_present / sources.preflight condition this scenario reuses.
 #      Adding here is the SAME convention the dispatch asked for, not a
 #      second one.
@@ -1695,7 +1700,7 @@ sub make_direct_ctx_closeout {
 #      directly: neither 'sync_skills' nor 'check_claude_md' status ever
 #      drives a decision kind in @Backup::Run::DECISION_KINDS). Skills-sync
 #      and the CLAUDE.md check are purely informational, like
-#      remote_integration/clone_live -- not like plugins/marketplaces.
+#      promotion/export_target -- not like plugins/marketplaces.
 #   3. ccpraxis_sync's own null/present discipline (already gated on
 #      sources.preflight || sources.export being present) gives "absent
 #      preflight" vs "present but clean" for free, with no second

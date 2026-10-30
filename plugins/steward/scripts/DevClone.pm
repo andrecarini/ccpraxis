@@ -8,8 +8,11 @@
 #                     payload is the baseline, its .backup-preferences.json holds
 #                     this machine's answers. No git verb that changes it.
 #   the dev clone     where development happens, and the only checkout that talks
-#                     to GitHub. The backup exports into its working tree,
-#                     commits only the files it wrote, and pushes its main.
+#                     to GitHub (/steward:upstream-sync: fetch, integrate
+#                     origin/main, push). /steward:backup, which never touches
+#                     a remote, promotes it into the live install, exports into
+#                     its working tree, commits only the files it wrote, and
+#                     promotes again.
 #
 # promote.pl sets the live install's `origin` to the dev clone it promotes from,
 # so that remote is how the backup finds the dev clone (locate()). A live install
@@ -23,9 +26,10 @@
 # allowed only while the dev clone's payload (working tree and HEAD) is exactly
 # what the live install was promoted with.
 #
-# Core modules only; no state. Callers: scripts/backup/Preflight.pm (loaded from
-# the live install's copy of this directory), ccpraxis-helpers.pl and
-# sync-export.pl (their own directory).
+# Core modules only; no state. Callers: scripts/backup/Preflight.pm and
+# Export.pm (loaded from the live install's copy of this directory),
+# ccpraxis-helpers.pl, sync-export.pl and upstream-sync.pl (their own
+# directory).
 package DevClone;
 use strict;
 use warnings;
@@ -34,8 +38,8 @@ use File::Temp ();
 use Exporter 'import';
 
 our @EXPORT_OK = qw(
-    PAYLOAD_PATHS default_live_root locate payload_check
-    git_path same_dir promote_hint redact
+    PAYLOAD_PATHS default_live_root locate payload_check relation promote_argv
+    git_path same_dir promote_hint redact run_capture run_git
 );
 
 # What the export writes and the payload check compares: the global-config/
@@ -96,15 +100,13 @@ sub promote_hint {
     return "run `perl $where/scripts/promote.pl` once; it points the live install's origin at the dev clone";
 }
 
-# Default git runner: list form, stdout and stderr captured through real temp
-# files (never an in-memory filehandle: Git-for-Windows perl fails on those),
-# no terminal prompt. Returns ($exit, $stdout, $stderr); $exit is -1 when git
-# could not be started. Callers may pass their own runner with the same contract.
-sub _git_default {
-    my ($dir, @args) = @_;
-    local $ENV{GIT_TERMINAL_PROMPT} = '0';
-    # Paired with git_path() on every path argument below, never set alone.
-    local $ENV{MSYS2_ARG_CONV_EXCL} = '*' if _is_windows();
+# run_capture(@cmd) -> ($exit, $stdout, $stderr): list form, stdout and stderr
+# captured through real temp files (never an in-memory filehandle: Git-for-
+# Windows perl fails on those). $exit is -1 when the command could not be
+# started, and 128+N when a signal killed it (a bare $? >> 8 reads a
+# signal-killed child as a clean 0).
+sub run_capture {
+    my (@cmd) = @_;
     my ($efh, $ename) = File::Temp::tempfile(UNLINK => 1);
     close $efh;
     my $saved;
@@ -114,7 +116,7 @@ sub _git_default {
         return (-1, '', "cannot redirect STDERR: $!");
     }
     my ($out, $exit) = ('', -1);
-    if (open(my $fh, '-|', 'git', '-C', git_path($dir), @args)) {
+    if (open(my $fh, '-|', @cmd)) {
         local $/;
         $out = <$fh> // '';
         close $fh;
@@ -127,6 +129,17 @@ sub _git_default {
     if (open my $rfh, '<:raw', $ename) { local $/; $err = <$rfh> // ''; close $rfh; }
     unlink $ename;
     return ($exit, $out, $err);
+}
+
+# run_git($dir, @args) -> ($exit, $stdout, $stderr): the default git runner,
+# `git -C <dir>` with no terminal prompt. Callers of locate() and friends may
+# pass their own runner with the same contract.
+sub run_git {
+    my ($dir, @args) = @_;
+    local $ENV{GIT_TERMINAL_PROMPT} = '0';
+    # Paired with git_path() on the directory, never set alone.
+    local $ENV{MSYS2_ARG_CONV_EXCL} = '*' if _is_windows();
+    return run_capture('git', '-C', git_path($dir), @args);
 }
 
 sub _line { my ($s) = @_; $s //= ''; $s =~ s/\s+\z//; return $s; }
@@ -157,7 +170,7 @@ sub _is_url {
 # branch and is not the live install itself. Never changes anything.
 sub locate {
     my (%a) = @_;
-    my $git  = $a{git} // \&_git_default;
+    my $git  = $a{git} // \&run_git;
     my $live = $a{live_root};
     my %r = (dev_clone => undef, source => undef, origin => undef, reason => undef, fix => undef);
     my $fail = sub {
@@ -239,7 +252,7 @@ sub _payload_blobs {
 # status, so line-ending conversion on a Windows checkout is not a difference.
 sub payload_check {
     my (%a) = @_;
-    my $git = $a{git} // \&_git_default;
+    my $git = $a{git} // \&run_git;
     my ($live, $clone) = @a{qw(live_root dev_clone)};
     my %r = (equal => 0, differing => [], error => undef);
 
@@ -272,6 +285,68 @@ sub payload_check {
 
     $r{equal} = @{ $r{differing} } ? 0 : 1;
     return \%r;
+}
+
+# relation(live_root => DIR, dev_clone => DIR, git => CODE?) -> hashref
+#
+#   state       'same'          the live install is at the dev clone's main
+#               'ahead'         the dev clone's main has commits the live install
+#                               lacks, and promotion would fast-forward to them
+#               'live_has_own'  the live install's HEAD is not in the dev clone's
+#                               main: it has commits of its own, which
+#                               promote.pl refuses (they were made some other way)
+#   live_head, clone_main   the two shas
+#   commits     for 'ahead': [ { sha, subject } ], newest first
+#   fix         for 'live_has_own': the command that brings them into the dev
+#               clone (promote.pl's own wording)
+#   error       why the relation could not be read (state is undef then)
+#
+# Promotion is a fast-forward of the live install to the dev clone's main, so
+# this is the question every caller asks before running it.
+sub relation {
+    my (%a) = @_;
+    my $git = $a{git} // \&run_git;
+    my ($live, $clone) = @a{qw(live_root dev_clone)};
+    my %r = (state => undef, live_head => undef, clone_main => undef, commits => [], fix => undef, error => undef);
+
+    my ($lrc, $lout) = $git->($live, 'rev-parse', '-q', '--verify', 'HEAD');
+    my ($crc, $cout) = $git->($clone, 'rev-parse', '-q', '--verify', 'refs/heads/main');
+    if ($lrc != 0 || $crc != 0) {
+        $r{error} = $lrc != 0 ? "cannot read the live install's HEAD ($live)" : "cannot read the dev clone's main ($clone)";
+        return \%r;
+    }
+    @r{qw(live_head clone_main)} = (_line($lout), _line($cout));
+    if ($r{live_head} eq $r{clone_main}) {
+        $r{state} = 'same';
+        return \%r;
+    }
+    my ($arc) = $git->($clone, 'merge-base', '--is-ancestor', $r{live_head}, $r{clone_main});
+    if ($arc == 0) {
+        $r{state} = 'ahead';
+        my ($grc, $gout) = $git->($clone, 'log', '--format=%H%x09%s', "$r{live_head}..$r{clone_main}");
+        if ($grc == 0) {
+            for my $l (split /\r?\n/, $gout // '') {
+                my ($sha, $subject) = split /\t/, $l, 2;
+                push @{ $r{commits} }, { sha => $sha, subject => $subject // '' } if defined $sha && length $sha;
+            }
+        }
+        return \%r;
+    }
+    $r{state} = 'live_has_own';
+    $r{fix} = 'bring them into the dev clone, then back up again: git -C ' . git_path($clone)
+            . ' pull --no-rebase ' . git_path($live) . ' main';
+    return \%r;
+}
+
+# The one way to promote: the dev clone's own scripts/promote.pl, the only
+# thing that writes the live install, told exactly which checkouts and home
+# it is working on. A list for a list-form spawn.
+sub promote_argv {
+    my (%a) = @_;
+    my ($clone, $live, $home) = @a{qw(dev_clone live_root home)};
+    my @argv = ($a{perl} // $^X, "$clone/scripts/promote.pl", '--clone', $clone, '--live', $live);
+    push @argv, '--home', $home if defined $home && length $home;
+    return @argv;
 }
 
 1;

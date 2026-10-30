@@ -83,12 +83,14 @@ ok(-f $RUNPM, 'scripts/backup/Run.pm exists on disk')
 # the ORACLE's own list of what the spec requires to exist, not a copy of the
 # implementation's array. Per the AMENDED AC1 (coordinator ruling), we assert
 # a FLOOR against @Backup::Run::DECISION_KINDS -- never its count or order.
-# clone_live_divergence was retired on 2026-10-30 (the live install follows
-# the dev clone by promotion; see Run.pm), and is asserted ABSENT below.
+# 2026-10-30 (see Run.pm): clone_live_divergence was retired (the live
+# install follows the dev clone by promotion), and dirty_worktree,
+# remote_merge_conflict and push_confirmation moved out with the GitHub side
+# to /steward:upstream-sync; all four are asserted ABSENT below.
+# promote_pending is new.
 # ---------------------------------------------------------------------------
 my @REQUIRED_KINDS = qw(
-    dirty_worktree
-    remote_merge_conflict
+    promote_pending
     readme_drift
     settings_key
     marketplace_key
@@ -96,7 +98,6 @@ my @REQUIRED_KINDS = qw(
     claude_md_drift
     container_settings_key
     sensitive_finding
-    push_confirmation
     vault_conflict
     project_registration
     plugin_install
@@ -127,7 +128,9 @@ if ($RUNPM_OK) {
         ok(Backup::Run::is_decision_kind($k), "AC1: is_decision_kind('$k') is true");
     }
     ok(!Backup::Run::is_decision_kind('not_a_kind'), "AC1: is_decision_kind('not_a_kind') is false");
-    ok(!Backup::Run::is_decision_kind('clone_live_divergence'), "AC1: the retired kind clone_live_divergence is gone");
+    for my $gone (qw(clone_live_divergence dirty_worktree remote_merge_conflict push_confirmation)) {
+        ok(!Backup::Run::is_decision_kind($gone), "AC1: the retired kind $gone is gone from the backup's enum");
+    }
     ok(!Backup::Run::is_decision_kind(''),           "AC1: is_decision_kind('') is false");
     ok(!Backup::Run::is_decision_kind(undef),        "AC1: is_decision_kind(undef) is false");
 }
@@ -729,7 +732,7 @@ sub run_phase {
     unless (defined \$ctx->{answers}{'stub_r6.confirm'}) {
         return { status => 'needs_decision', decisions => [ \$ctx->{decision}->(
             id      => 'stub_r6.confirm',
-            kind    => 'push_confirmation',
+            kind    => 'promote_pending',
             title   => 'Confirm the push?',
             choices => [ { id => 'yes', label => 'Yes' }, { id => 'no', label => 'No' } ],
         ) ] };
@@ -1745,7 +1748,7 @@ sub run_phase {
     unless (defined \$ctx->{answers}{'stub_crash_answer.confirm'}) {
         return { status => 'needs_decision', decisions => [ \$ctx->{decision}->(
             id      => 'stub_crash_answer.confirm',
-            kind    => 'push_confirmation',
+            kind    => 'promote_pending',
             title   => 'Confirm the push?',
             choices => [ { id => 'yes', label => 'Yes' }, { id => 'no', label => 'No' } ],
         ) ] };
@@ -1790,7 +1793,7 @@ sub run_phase {
     unless (defined \$ctx->{answers}{'stub_pause_off.q'}) {
         return { status => 'needs_decision', decisions => [ \$ctx->{decision}->(
             id      => 'stub_pause_off.q',
-            kind    => 'push_confirmation',
+            kind    => 'promote_pending',
             title   => 'Proceed?',
             choices => [ { id => 'yes', label => 'Yes' }, { id => 'no', label => 'No' } ],
         ) ] };
@@ -1826,7 +1829,7 @@ sub run_phase {
     unless (defined \$ctx->{answers}{'stub_pause_on.q'}) {
         return { status => 'needs_decision', decisions => [ \$ctx->{decision}->(
             id      => 'stub_pause_on.q',
-            kind    => 'push_confirmation',
+            kind    => 'promote_pending',
             title   => 'Proceed?',
             choices => [ { id => 'yes', label => 'Yes' }, { id => 'no', label => 'No' } ],
         ) ] };

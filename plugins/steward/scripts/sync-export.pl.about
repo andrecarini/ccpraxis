@@ -1,1 +1,1 @@
-Detects drift between live config and this repo
+Detects drift between ~/.claude and the payload: skills and CLAUDE.md against the live install, settings and marketplaces against the dev clone

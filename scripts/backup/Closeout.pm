@@ -585,8 +585,11 @@ sub _assemble_report {
     # before any checkpoint at all, so every unit failure is accumulated and
     # returned only after U9), but getting this sentinel wrong would discard
     # every preflight item that is actually readable on disk -- so also
-    # accept 'remote_integration' (preflight's FIRST checkpoint) as present.
-    my $pf_present = (defined($ctx->{get_phase_item}->('preflight', 'remote_integration'))
+    # accept 'ccpraxis_target' (preflight's FIRST checkpoint since 2026-10-30)
+    # and 'promotion' as present: when the ccpraxis part is skipped, the
+    # preflight never reaches settings_outcome at all.
+    my $pf_present = (defined($ctx->{get_phase_item}->('preflight', 'ccpraxis_target'))
+                    || defined($ctx->{get_phase_item}->('preflight', 'promotion'))
                     || defined($ctx->{get_phase_item}->('preflight', 'settings_outcome'))) ? 1 : 0;
     my $ex_present = defined($ctx->{get_phase_item}->('export',    'file_status'))      ? 1 : 0;
     my $va_present = defined($ctx->{get_phase_item}->('vault',     'vault_check'))      ? 1 : 0;
@@ -624,10 +627,27 @@ sub _assemble_report {
 
     my $marketplaces = $pf_present ? $preflight_marketplace_outcome : undef;
 
+    # ccpraxis_sync (2026-10-30). Which fields are about which checkout:
+    #   the live install (read only; changed by promote.pl alone):
+    #     live_root, promotion (preflight's promote step, promote.pl's output
+    #     verbatim when it ran), promote_after_commit (the promotion of the
+    #     export commit), skills (mirrored from it), claude_md (~/.claude/
+    #     CLAUDE.md against the build of its payload)
+    #   the dev clone (the export target):
+    #     dev_clone, target (how it was located, or why not), export_target
+    #     (ready, or why the export was skipped, and the fix), merged, files,
+    #     container, sensitive, committed
+    # Nothing here is about GitHub: /steward:upstream-sync reports that.
     my $ccpraxis_sync;
     if ($pf_present || $ex_present) {
+        my $target = $pf_present ? _shape_hash(_gpi($ctx, 'preflight', 'ccpraxis_target'), 'preflight.ccpraxis_target', \@shape_failures) : undef;
         $ccpraxis_sync = {
-            present => JSON::PP::true,
+            present   => JSON::PP::true,
+            live_root => ($target ? $target->{live_root} : undef),
+            dev_clone => ($target ? $target->{dev_clone} : undef),
+            target    => $target,
+            promotion => $pf_present ? _shape_hash(_gpi($ctx, 'preflight', 'promotion'),     'preflight.promotion',     \@shape_failures) : undef,
+            export_target => $pf_present ? _shape_hash(_gpi($ctx, 'preflight', 'export_target'), 'preflight.export_target', \@shape_failures) : undef,
             merged  => {
                 status     => ($export_settings_merge ? $export_settings_merge->{status}     : undef),
                 merge_rule => ($export_settings_merge ? $export_settings_merge->{merge_rule} : undef),
@@ -635,17 +655,13 @@ sub _assemble_report {
             files     => $ex_present ? _shape_hash(_gpi($ctx, 'export', 'file_outcome'),      'export.file_outcome',      \@shape_failures) : undef,
             container => $ex_present ? _shape_hash(_gpi($ctx, 'export', 'container_outcome'), 'export.container_outcome', \@shape_failures) : undef,
             sensitive => $ex_present ? _shape_hash(_gpi($ctx, 'export', 'sensitive_scan'),     'export.sensitive_scan',    \@shape_failures) : undef,
-            staged    => $ex_present ? _shape_hash(_gpi($ctx, 'export', 'staged'),             'export.staged',            \@shape_failures) : undef,
             committed => $ex_present ? _shape_hash(_gpi($ctx, 'export', 'committed'),          'export.committed',         \@shape_failures) : undef,
-            pushed    => $ex_present ? _shape_hash(_gpi($ctx, 'export', 'pushed'),             'export.pushed',            \@shape_failures) : undef,
-            remote_integration => $pf_present ? _shape_hash(_gpi($ctx, 'preflight', 'remote_integration'), 'preflight.remote_integration', \@shape_failures) : undef,
-            clone_live         => $pf_present ? _shape_hash(_gpi($ctx, 'preflight', 'clone_live'),         'preflight.clone_live',         \@shape_failures) : undef,
+            promote_after_commit => $ex_present ? _shape_hash(_gpi($ctx, 'export', 'promote_after_commit'), 'export.promote_after_commit', \@shape_failures) : undef,
             # ITEM7 (coordinator): preflight checkpoints these every run the
-            # respective unit succeeds (Preflight.pm:649/:680) but nothing
-            # previously read them back out -- a detected CLAUDE.md drift was
-            # reported to nobody. Nested here, not as new top-level keys,
-            # for the same reason remote_integration/clone_live are: purely
-            # informational, decision-free facts sourced from preflight.
+            # respective unit succeeds but nothing previously read them back
+            # out -- a detected CLAUDE.md drift was reported to nobody.
+            # Nested here, not as new top-level keys: purely informational,
+            # decision-free facts sourced from preflight.
             skills             => $pf_present ? _shape_hash(_gpi($ctx, 'preflight', 'sync_skills'),      'preflight.sync_skills',      \@shape_failures) : undef,
             claude_md          => $pf_present ? _shape_hash(_gpi($ctx, 'preflight', 'check_claude_md'),  'preflight.check_claude_md',  \@shape_failures) : undef,
         };

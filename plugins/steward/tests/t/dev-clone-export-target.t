@@ -307,4 +307,31 @@ sub check_in  { my ($f) = @_; my %e = _env(); local @ENV{ keys %e } = values %e;
     like($err, qr/promote\.pl/, 'D4: ...and the error says how to fix it');
 }
 
+# ---------------------------------------------------------------------------
+# E. settings-export-merge, selective (as the backup driver always runs it):
+#    only the units sent to the payload change.
+# ---------------------------------------------------------------------------
+{
+    my $f = fixture();
+    write_text("$f->{clone}/global-config/settings.json",
+        qq({"a":"payload-a","b":"payload-b","env":{"X":"px","Y":"py"},"gone":"payload-only"}\n));
+    write_text("$HOME/.claude/settings.json",
+        qq({"a":"live-a","b":"live-b","env":{"X":"lx","Y":"ly"},"newKey":"live-only"}\n));
+    my @roots = ('--live-root', $f->{live}, '--repo-root', $f->{clone});
+    my ($rc, $out, $err) = run({}, $^X, $HELPERS, 'settings-export-merge', @roots,
+        '--only-key', 'a', '--only-key', 'env.X', '--remove-key', 'gone');
+    is($rc, 0, 'E1: a selective merge runs') or diag("$out$err");
+    my $j = json_of($out) // {};
+    ok($j->{selective}, 'E1: ...and says it was selective');
+    my $p = json_of(read_text("$f->{clone}/global-config/settings.json")) // {};
+    is($p->{a}, 'live-a', 'E1: a key sent to the payload takes the ~/.claude value');
+    is($p->{b}, 'payload-b', 'E1: a differing key NOT sent keeps the payload value');
+    is($p->{env}{X}, 'lx', 'E1: a dotted unit sent to the payload takes the ~/.claude value');
+    is($p->{env}{Y}, 'py', 'E1: its sibling unit, not sent, keeps the payload value');
+    ok(!exists $p->{newKey}, 'E1: a ~/.claude-only key not sent stays out of the payload');
+    ok(!exists $p->{gone}, 'E1: --remove-key drops a payload-only key');
+    ($rc, $out) = run({}, $^X, $HELPERS, 'settings-export-merge', @roots, '--only-key', 'nosuch');
+    is_deeply((json_of($out) // {})->{only_keys_unmatched}, [ 'nosuch' ], 'E2: an --only-key that matches nothing is reported');
+}
+
 done_testing();

@@ -11,23 +11,32 @@
 #
 # THE TWO CHECKOUTS (2026-10-30). The live install (<home>/.claude/ccpraxis)
 # is produced by scripts/promote.pl and nothing else, and only the dev clone
-# talks to GitHub (plugins/steward/scripts/DevClone.pm has the model). So:
+# talks to GitHub -- through /steward:upstream-sync, never through this
+# driver: /steward:backup manages local state only and runs no git network
+# verb at all (plugins/steward/scripts/DevClone.pm has the model). So:
 #   - the live install is READ ONLY here: its scripts run, its payload is the
 #     baseline, its .backup-preferences.json holds this machine's answers. No
-#     git verb that changes it is ever run against it.
+#     git verb that changes it is ever run against it; promote.pl is the only
+#     thing that does.
 #   - U0 locates the dev clone once (DevClone::locate: the live install's
 #     origin, which promote.pl points at the dev clone) and checkpoints it as
 #     'ccpraxis_target'. Not located -> the ccpraxis part of the backup is
 #     skipped with a note saying why and how to fix it; the vault still syncs.
-#   - U1 integrates origin/main into the DEV CLONE (origin is GitHub there).
+#   - U1 brings the live install up to the dev clone's main. Off main, or
+#     with uncommitted payload edits in the dev clone, the ccpraxis part is
+#     skipped. When main is ahead of the live install, ONE promote_pending
+#     decision lists the commits (promotion changes the tooling that runs);
+#     'promote' runs the dev clone's scripts/promote.pl, 'skip' leaves it. A
+#     promote.pl that refuses or fails stops the ccpraxis part, its output
+#     kept verbatim for the report.
 #   - U2 decides whether exporting is safe and checkpoints 'export_target',
-#     the one item the export phase reads: the dev clone must be on main and
-#     its payload (working tree and HEAD) must equal the live install's
-#     committed payload, or an export would overwrite payload changes that
-#     were never promoted.
+#     the one item the export phase reads: the dev clone on main and its
+#     payload (working tree and HEAD) equal to the live install's committed
+#     payload, or an export would overwrite payload changes that were never
+#     promoted (after U1 that only happens when promotion was skipped).
 #   - the settings and marketplace diffs (U7/U8) and their writes (U9/U10)
-#     run only when U2 said ready. W2 writes the dev clone's
-#     known_marketplaces.json.
+#     run only when U2 said ready, so they compare against what was just
+#     promoted. W2 writes the dev clone's known_marketplaces.json.
 #
 # THIS MODULE WRAPS EXISTING SCRIPTS. It reimplements none of their logic --
 # no JSON diffing, no preference matching, no tree generation, no skill
@@ -42,10 +51,9 @@
 #   - it never invokes git's stashing subcommand -- a repo hook denies any
 #     command whose text mentions it (guard-git-mutations.sh); a clean-tree
 #     CHECK replaces it and a dirty tree becomes a decision instead. Every
-#     git verb this module constructs is one of: rev-parse, remote, fetch,
-#     status, rev-list, ls-tree, merge -- and merge only in the dev clone.
-#   - it never aborts a merge it did not start: a merge already in progress
-#     in the dev clone is reported and left alone.
+#     git verb this module (and DevClone.pm on its behalf) constructs is a
+#     read: rev-parse, remote get-url, status, ls-tree, merge-base, log. No
+#     fetch, no merge, no push: nothing here talks to a remote.
 #   - it never runs gen-readme-tree.pl in its write mode or its bootstrap
 #     mode. Only the --check flag is ever passed.
 #
@@ -121,7 +129,7 @@ sub phase_spec {
         name      => 'preflight',
         order     => 100,   # spec S8 P2: preflight=100, export=200, vault=300, closeout=400
         resumable => 1,
-        title     => 'Preflight: locate the dev clone, remote integration, docs lint, skills/CLAUDE.md, settings and marketplace diffs',
+        title     => 'Preflight: locate the dev clone, promote it, docs lint, skills/CLAUDE.md, settings and marketplace diffs',
     };
 }
 
@@ -161,20 +169,21 @@ sub run_phase {
     $target = {} unless ref($target) eq 'HASH';
     my $clone = $target->{located} ? $target->{dev_clone} : undef;
 
-    # ---- U1: integrate origin/main into the DEV CLONE (Decision 6 clean-
-    #      tree check; Decision 7 ordering -- must complete, unpaused, before
-    #      ANY of U2-U10 run) ----
-    unless ($ctx->{is_done}->('remote_integration')) {
-        my $res = _do_u1($ctx, $clone);
+    # ---- U1: promote the dev clone into the live install (Decision 7
+    #      ordering -- must complete, unpaused, before ANY of U2-U10 run:
+    #      promotion rewrites ~/.claude/settings.json and the scripts U3-U8
+    #      run) ----
+    unless ($ctx->{is_done}->('promotion')) {
+        my $res = _do_u1($ctx, $root, $home_n, $clone);
         if ($res->{pause}) {
             return { status => 'needs_decision', decisions => [ $res->{pause} ] };
         }
-        $record_failure->('remote_integration', $res->{failed}) if $res->{failed};
+        $record_failure->('promotion', $res->{failed}) if $res->{failed};
     }
 
     # ---- U2: is exporting into the dev clone safe? ----
     unless ($ctx->{is_done}->('export_target')) {
-        _do_u2($ctx, $root, $target, $load_err);
+        _do_u2($ctx, $root, $target, $load_err, $ctx->{get_item}->('promotion'));
     }
     my $export_target = $ctx->{get_item}->('export_target');
     my $ready = (ref($export_target) eq 'HASH' && $export_target->{ready}) ? 1 : 0;
@@ -326,243 +335,139 @@ sub _do_u0 {
 }
 
 # ===========================================================================
-# U1 -- integrate origin/main into the dev clone. Returns one of:
-#   { pause => $decision }            -- return needs_decision immediately
-#   { failed => $msg }                -- (with done semantics) unit failure
-#   {}                                 -- done, no failure
-# Checkpoints 'remote_integration' and notes it on every path EXCEPT pause.
-# Never touches the live install. Never touches the developer's uncommitted
-# files: a dirty tree is a question, and a merge git refuses because it would
-# overwrite them stops here with nothing changed.
+# U1 -- bring the live install up to the dev clone's main. Returns one of:
+#   { pause => $decision }   -- the promote_pending question
+#   { failed => $msg }       -- promote.pl refused or failed (checkpointed)
+#   {}                        -- done
+# Checkpoints 'promotion' on every path EXCEPT pause:
+#   { state, skipped_reason, fix, live_head, clone_main, commits, count,
+#     answer, ran, exit, output, live_head_after }
+# The ONLY write is promote.pl's own, and only for an answered 'promote'.
 # ===========================================================================
 sub _do_u1 {
-    my ($ctx, $clone) = @_;
+    my ($ctx, $root, $home_n, $clone) = @_;
 
+    my %d = (state => undef, skipped_reason => undef, fix => undef, live_head => undef, clone_main => undef,
+             commits => [], count => 0, answer => undef, ran => 0, exit => undef, output => undef,
+             live_head_after => undef);
     my $done = sub {
-        my ($data, $ret) = @_;
-        $data = _sanitize_utf8($data);
-        $ctx->{checkpoint}->('remote_integration', $data);
-        $ctx->{note}->('remote_integration', $data);
+        my ($ret) = @_;
+        my $data = _sanitize_utf8(\%d);
+        $ctx->{checkpoint}->('promotion', $data);
+        $ctx->{note}->('promotion', $data);
         return $ret // {};
     };
 
     unless (defined $clone) {
-        return $done->(_u1_data(undef, 0, 0, 0, undef, 0, undef, 0, 0, 0, undef, undef, 'the dev clone was not located'));
+        $d{skipped_reason} = 'the dev clone was not located';
+        return $done->();
     }
-
-    my $probe = _git_capture($clone, 'rev-parse', '--is-inside-work-tree');
-    unless ($probe->{spawned} && $probe->{exit} == 0) {
-        return $done->(_u1_data($clone, 0, 0, 0, undef, 0, undef, 0, 0, 0, undef, undef, 'not a git repository'));
-    }
-
-    my $head_before = _git_head($clone);
-
-    # A merge in progress. Resolve it only when it is this run's own (its
-    # remote_merge_conflict decision has been answered); a merge the
-    # developer has in progress is theirs to finish or abort. After a kill
-    # mid-run the answer is gone too (R6), and the merge is left alone the
-    # same way rather than aborted on a guess.
-    if (_merge_in_progress($clone)) {
-        if (defined $ctx->{answers}{'preflight.remote_merge_conflict'}) {
-            return _u1_resolve_conflict($ctx, $clone, $head_before, undef, undef);
-        }
-        return $done->(_u1_data($clone, 1, 0, 0, undef, 0, undef, 0, 0, 0, $head_before, $head_before,
-                                'a merge is already in progress in the dev clone'),
-            { failed => "a merge is already in progress in the dev clone ($clone) that this backup did not start "
-                      . '-- finish it or abort it there, then back up again' });
-    }
-
-    my $remote_list = _git_capture($clone, 'remote');
-    my $has_origin = 0;
-    if ($remote_list->{spawned} && $remote_list->{exit} == 0) {
-        $has_origin = 1 if grep { $_ eq 'origin' } split(/\r?\n/, $remote_list->{out} // '');
-    }
-    unless ($has_origin) {
-        return $done->(_u1_data($clone, 1, 0, 0, undef, 0, undef, 0, 0, 0, $head_before, $head_before, 'no origin remote'));
-    }
-
-    my $fetch = _git_capture($clone, 'fetch', 'origin');
-    unless ($fetch->{spawned} && $fetch->{exit} == 0) {
-        my $fetch_error = length($fetch->{err} // '') ? $fetch->{err}
-                         : "git fetch exited " . ($fetch->{exit} // -1);
-        # N9 (MINOR): git redacts a URL's password but not its userinfo
-        # USERNAME, where a PAT is conventionally placed
-        # (https://ghp_...@github.com/o/r.git). This is checkpointed to disk
-        # and noted into the driver's stdout JSON -- redact before either.
-        $fetch_error =~ s{://[^/\s@]*@}{://REDACTED@}g;
-        return $done->(_u1_data($clone, 1, 1, 0, $fetch_error, 0, undef, 0, 0, 0, $head_before, $head_before, 'fetch failed'));
-    }
-
-    # M2 (MAJOR): 'origin/main' below is a hard-coded merge target. Resolve
-    # the branch and refuse (skip, don't guess) unless it is genuinely 'main'
-    # -- a developer on a feature branch must never get origin/main merged
-    # into it by a backup.
     my $branch = _git_current_branch($clone);
     unless (defined $branch && $branch eq 'main') {
-        my $reason = defined $branch ? "on branch '$branch', not 'main'" : 'detached HEAD';
-        return $done->(_u1_data($clone, 1, 1, 1, undef, 0, undef, 0, 0, 0,
-                                $head_before, $head_before, "$reason -- remote integration skipped"));
+        $d{skipped_reason} = 'the dev clone is ' . (defined $branch ? "on branch '$branch'" : 'on a detached HEAD') . ', not main';
+        return $done->();
+    }
+    # Uncommitted payload edits: nothing to promote them with, and an export
+    # would overwrite them. Committed-but-unpromoted ones are what U1 is for.
+    my $pc = DevClone::payload_check(live_root => $root, dev_clone => $clone, git => _git_runner());
+    my @dirty = grep { ($_->{why} // '') eq 'uncommitted in the dev clone' } @{ $pc->{differing} // [] };
+    if (defined $pc->{error} || @dirty) {
+        $d{skipped_reason} = defined $pc->{error} ? $pc->{error}
+            : 'the dev clone has uncommitted payload changes: ' . join(', ', map { $_->{path} } @dirty);
+        $d{fix} = 'commit them on main (or discard them) in the dev clone, then back up again' unless defined $pc->{error};
+        return $done->();
     }
 
-    my $ahead = _git_capture($clone, 'rev-list', '--count', 'HEAD..origin/main');
-    my $ahead_count;
-    if ($ahead->{spawned} && $ahead->{exit} == 0) {
-        (my $n = $ahead->{out} // '0') =~ s/\s+//g;
-        # T2 (NIT): guard the numeric coercion.
-        $ahead_count = $n + 0 if $n =~ /^\d+\z/;
+    my $rel = DevClone::relation(live_root => $root, dev_clone => $clone, git => _git_runner());
+    @d{qw(state live_head clone_main)} = @{$rel}{qw(state live_head clone_main)};
+    if (defined $rel->{error}) {
+        $d{skipped_reason} = $rel->{error};
+        return $done->();
     }
-    unless (defined $ahead_count) {
-        # M2 (MAJOR): a failed rev-list (no 'main' on the remote, ...) must
-        # never fall through to an unconditional merge. Skip instead.
-        return $done->(_u1_data($clone, 1, 1, 1, undef, 0, undef, 0, 0, 0,
-                                $head_before, $head_before, 'cannot determine commits-ahead -- remote integration skipped'));
+    if ($rel->{state} eq 'same') {
+        return $done->();
     }
-    if ($ahead_count == 0) {
-        return $done->(_u1_data($clone, 1, 1, 1, undef, 0, undef, 0, 1, 0, $head_before, $head_before, undef));
+    if ($rel->{state} eq 'live_has_own') {
+        $d{skipped_reason} = 'the live install has commits the dev clone does not; promote.pl refuses such a live install';
+        $d{fix} = $rel->{fix};
+        return $done->();
     }
 
-    # Only now, with something to merge, does the dev clone's uncommitted
-    # work matter: in a checkout someone develops in, a dirty tree is the
-    # normal state, and asking about it when there is nothing to merge would
-    # be a question on every backup. --untracked-files=no: an untracked file
-    # is not "uncommitted work" a merge could overwrite.
-    my $status = _git_capture($clone, 'status', '--porcelain', '--untracked-files=no');
-    my @dirty_lines = grep { length $_ } split /\r?\n/, ($status->{out} // '');
-    my $dirty_count = scalar(@dirty_lines);
+    # state 'ahead'
+    my @commits = map { substr($_->{sha}, 0, 7) . ' ' . $_->{subject} } @{ $rel->{commits} };
+    $d{commits} = \@commits;
+    $d{count}   = scalar(@commits);
+    my @argv = DevClone::promote_argv(dev_clone => $clone, live_root => $root, home => $home_n);
+    my $command = join(' ', 'perl', map { DevClone::git_path($_) } @argv[1 .. $#argv]);
 
-    my $dirty_answer;
-    if ($dirty_count > 0) {
-        $dirty_answer = $ctx->{answers}{'preflight.dirty_worktree'};
-        unless (defined $dirty_answer) {
-            my $dec = $ctx->{decision}->(
-                kind    => 'dirty_worktree',
-                id      => 'preflight.dirty_worktree',
-                title   => "the dev clone has $dirty_count uncommitted change(s) and origin/main has $ahead_count new commit(s)",
-                subject => $clone,
-                detail  => _clamp($status->{out} // ''),
-                data    => { dirty_count => $dirty_count, ahead => $ahead_count },
-                choices => [
-                    { id => 'continue_without_merge',
-                      label => 'Continue without merging (leave uncommitted changes untouched)' },
-                    { id => 'merge_anyway',
-                      label => 'Merge anyway (git refuses if it would overwrite local changes)' },
-                ],
-            );
-            return { pause => $dec };
-        }
-        if ($dirty_answer eq 'continue_without_merge') {
-            return $done->(_u1_data($clone, 1, 1, 1, undef, $dirty_count, $dirty_answer, 0, 0, 0,
-                                    $head_before, $head_before, 'dirty worktree'));
-        }
-        # merge_anyway: fall through -- git itself refuses if the merge would
-        # clobber a local change, and that refusal stops cleanly below.
+    my $answer = $ctx->{answers}{'preflight.promote_pending'};
+    unless (defined $answer) {
+        my $dec = $ctx->{decision}->(
+            kind    => 'promote_pending',
+            id      => 'preflight.promote_pending',
+            title   => "the dev clone's main is " . scalar(@commits) . ' commit(s) ahead of the live install: promote it now?',
+            subject => $clone,
+            detail  => _clamp(join("\n",
+                "Promotion fast-forwards the live install (the plugins, hooks, skills and scripts Claude Code runs) "
+                . "to these commits and syncs global-config/ into ~/.claude:",
+                (map { "  $_" } @commits),
+                "It runs: $command",
+                'Skipping leaves the live install as it is; the config export is then skipped too if the payload differs.')),
+            data    => { commits => \@commits, count => scalar(@commits), live_head => $rel->{live_head},
+                         clone_main => $rel->{clone_main}, command => $command },
+            choices => [
+                { id => 'promote', label => 'Promote now (runs the dev clone\'s scripts/promote.pl)' },
+                { id => 'skip',    label => 'Skip promotion this run' },
+            ],
+        );
+        return { pause => $dec };
     }
+    $d{answer} = $answer;
+    return $done->() unless $answer eq 'promote';
 
-    return _u1_resolve_conflict($ctx, $clone, $head_before, $dirty_count, $dirty_answer);
-}
-
-# Shared by the fresh-attempt path and the "resuming mid-conflict" path.
-sub _u1_resolve_conflict {
-    my ($ctx, $clone, $head_before, $dirty_count, $dirty_answer) = @_;
-    $dirty_count //= 0;
-
-    my $done = sub {
-        my ($data, $ret) = @_;
-        $data = _sanitize_utf8($data);
-        $ctx->{checkpoint}->('remote_integration', $data);
-        $ctx->{note}->('remote_integration', $data);
-        return $ret // {};
-    };
-
-    my $merge_answer = $ctx->{answers}{'preflight.remote_merge_conflict'};
-    if (defined $merge_answer && _merge_in_progress($clone)) {
-        if ($merge_answer eq 'abort_merge') {
-            my $abort = _git_capture($clone, 'merge', '--abort');
-            # N11 (MINOR): a refused abort must not be reported as a clean one.
-            my $abort_ok = ($abort->{spawned} && $abort->{exit} == 0) ? 1 : 0;
-            my $head_after = _git_head($clone);
-            my $data = _u1_data($clone, 1, 1, 1, undef, $dirty_count, $dirty_answer, 0, 0, 0,
-                                $head_before, $head_after, $abort_ok ? 'merge aborted' : 'merge abort failed');
-            $data->{abort_failed} = $abort_ok ? 0 : 1;
-            return $done->($data);
-        }
-        elsif ($merge_answer eq 'keep_conflict') {
-            return $done->(_u1_data($clone, 1, 1, 1, undef, $dirty_count, $dirty_answer, 0, 0, 1,
-                                    $head_before, $head_before, undef),
-                { failed => 'remote_merge_conflict: kept unresolved in the dev clone for manual resolution' });
-        }
+    my $r = _run_capture(@argv);
+    $d{ran}    = 1;
+    $d{exit}   = $r->{spawned} ? $r->{exit} : -1;
+    # Verbatim, for the report: promote.pl's own lines, then its stderr.
+    $d{output} = _clamp(join('', $r->{out} // '', (length($r->{err} // '') ? $r->{err} : '')), 8000);
+    $d{live_head_after} = _git_head($root);
+    if (!$r->{spawned} || $r->{exit} != 0) {
+        $d{skipped_reason} = $r->{spawned} ? "promote.pl exited $r->{exit}" : 'promote.pl could not be started';
+        return $done->({ failed => "promotion: $d{skipped_reason} -- the ccpraxis part stopped; its output is in the report" });
     }
-
-    my $merge = _git_capture($clone, 'merge', 'origin/main', '--no-edit');
-    if ($merge->{spawned} && $merge->{exit} == 0) {
-        my $head_after = _git_head($clone);
-        return $done->(_u1_data($clone, 1, 1, 1, undef, $dirty_count, $dirty_answer, 1, 0, 0,
-                                $head_before, $head_after, undef));
-    }
-
-    my $git_says = _clamp(($merge->{err} // '') . ($merge->{out} // ''));
-    unless (_merge_in_progress($clone)) {
-        # Refused before it started (local changes it would overwrite, a
-        # staged index, ...): nothing changed, so there is nothing to abort.
-        my $data = _u1_data($clone, 1, 1, 1, undef, $dirty_count, $dirty_answer, 0, 0, 0,
-                            $head_before, _git_head($clone), 'git refused the merge; nothing was changed');
-        $data->{merge_error} = $git_says;
-        (my $first = $git_says) =~ s/\n.*//s;
-        return $done->($data,
-            { failed => "git refused to merge origin/main into the dev clone, nothing was changed: $first" });
-    }
-
-    my $dec = $ctx->{decision}->(
-        kind    => 'remote_merge_conflict',
-        id      => 'preflight.remote_merge_conflict',
-        title   => 'merging origin/main into the dev clone conflicted',
-        subject => $clone,
-        detail  => $git_says,
-        data    => { head_before => $head_before },
-        choices => [
-            { id => 'abort_merge',   label => 'Abort the merge and restore the pre-merge HEAD' },
-            { id => 'keep_conflict', label => 'Keep the conflict on disk for manual resolution' },
-        ],
-    );
-    return { pause => $dec };
-}
-
-sub _u1_data {
-    my ($repo, $is_git_repo, $has_origin, $fetched, $fetch_error, $dirty_count, $dirty_answer,
-        $merged, $up_to_date, $conflicted, $head_before, $head_after, $skipped_reason) = @_;
-    return {
-        repo => $repo, is_git_repo => $is_git_repo, has_origin => $has_origin, fetched => $fetched,
-        fetch_error => $fetch_error, dirty_count => $dirty_count, dirty_answer => $dirty_answer,
-        merged => $merged, up_to_date => $up_to_date, conflicted => $conflicted,
-        head_before => $head_before, head_after => $head_after, skipped_reason => $skipped_reason,
-    };
-}
-
-sub _merge_in_progress {
-    my ($dir) = @_;
-    my $r = _git_capture($dir, 'rev-parse', '-q', '--verify', 'MERGE_HEAD');
-    return ($r->{spawned} && $r->{exit} == 0) ? 1 : 0;
+    return $done->();
 }
 
 # ===========================================================================
-# U2 -- the export precondition. Never pauses, never fails the run: a "no"
-# skips the ccpraxis export with a note naming why and the fix. Checkpoints
-# 'export_target', the one item the export phase reads:
+# U2 -- the export precondition. Never pauses: a "no" skips the ccpraxis
+# export with a note naming why and the fix. Checkpoints 'export_target',
+# the one item the export phase reads:
 #   { ready, live_root, dev_clone, branch, payload_equal, differing, reason, fix }
 # ===========================================================================
 sub _do_u2 {
-    my ($ctx, $root, $target, $load_err) = @_;
+    my ($ctx, $root, $target, $load_err, $promotion) = @_;
+    $promotion = {} unless ref($promotion) eq 'HASH';
     my %d = (ready => 0, live_root => $root, dev_clone => $target->{dev_clone}, branch => undef,
              payload_equal => undef, differing => [], reason => undef, fix => undef);
 
+    $d{branch} = _git_current_branch($target->{dev_clone}) if $target->{located};
     if (!$target->{located}) {
         $d{reason} = $target->{reason} // ($load_err ? "cannot locate the dev clone: $load_err" : 'the dev clone was not located');
         $d{fix}    = $target->{fix};
     }
+    elsif ($promotion->{ran} && ($promotion->{exit} // -1) != 0) {
+        $d{reason} = "promotion failed ($promotion->{skipped_reason}), so the ccpraxis part stopped";
+        $d{fix}    = "read promote.pl's output in the report, resolve what it names, then back up again";
+    }
+    elsif (defined $promotion->{skipped_reason}) {
+        # Off main, uncommitted payload edits, a live install with commits
+        # of its own: U1 already said why, and the same reason stops the export.
+        $d{reason} = $promotion->{skipped_reason};
+        $d{fix}    = $promotion->{fix};
+    }
     else {
         my $clone = $target->{dev_clone};
-        my $branch = _git_current_branch($clone);
-        $d{branch} = $branch;
+        my $branch = $d{branch};
         if (!defined $branch || $branch ne 'main') {
             $d{reason} = 'the dev clone is ' . (defined $branch ? "on branch '$branch'" : 'on a detached HEAD')
                        . ', not main';
@@ -577,11 +482,11 @@ sub _do_u2 {
             elsif (!$pc->{equal}) {
                 $d{payload_equal} = 0;
                 $d{differing}     = $pc->{differing};
-                $d{reason} = "the dev clone's payload differs from what the live install was promoted with, so "
-                           . 'exporting would overwrite it: '
+                $d{reason} = "the dev clone's payload differs from what the live install was promoted with"
+                           . (($promotion->{answer} // '') eq 'skip' ? ' (promotion was skipped)' : '')
+                           . ', so exporting would overwrite it: '
                            . join('; ', map { "$_->{path} ($_->{why})" } @{ $pc->{differing} });
-                $d{fix}    = 'promote first (perl ' . DevClone::git_path($clone) . '/scripts/promote.pl), then back up;'
-                           . ' an uncommitted change has to be committed (or discarded) before it can be promoted';
+                $d{fix}    = 'promote first (perl ' . DevClone::git_path($clone) . '/scripts/promote.pl), then back up';
             }
             else {
                 $d{payload_equal} = 1;
@@ -840,9 +745,9 @@ sub _do_u9 {
     my $diff = $ctx->{get_item}->('settings_diff');
     my @decisions = (ref($diff) eq 'HASH') ? _settings_decisions($ctx, $diff) : ();
 
-    my (@skip_keys, @prefs_saved, @failed_msgs);
+    my (@skip_keys, @prefs_saved, @failed_msgs, @to_payload, @remove_from_payload);
     my %answers_out;
-    my %live_writes;
+    my (%live_writes, %live_deletes);
     my $prefs_path = "$root/.backup-preferences.json";
 
     for my $d (@decisions) {
@@ -852,9 +757,13 @@ sub _do_u9 {
         next unless defined $choice;
         $answers_out{$key} = $choice;
 
-        if ($choice eq 'use_repo' || $choice eq 'skip' || $choice =~ /_remember\z/) {
+        if ($choice eq 'use_repo' || $choice eq 'skip' || $choice eq 'remove_from_live' || $choice =~ /_remember\z/) {
             push @skip_keys, $key;
         }
+        # What goes to the payload: the export merges exactly these units.
+        push @to_payload, $key          if ($rel eq 'diverged' && $choice eq 'use_live')
+                                         || ($rel eq 'only_left' && $choice eq 'export_to_repo');
+        push @remove_from_payload, $key if $rel eq 'only_right' && $choice eq 'remove_from_repo';
 
         if ($choice =~ /^keep_(different|live_only|repo_only)_remember\z/) {
             my %by_choice = (
@@ -881,9 +790,12 @@ sub _do_u9 {
         elsif ($rel eq 'only_right' && $choice eq 'add_to_live') {
             $live_writes{$key} = $d->{data}{value};
         }
+        elsif ($rel eq 'only_left' && $choice eq 'remove_from_live') {
+            $live_deletes{$key} = 1;
+        }
     }
 
-    if (%live_writes) {
+    if (%live_writes || %live_deletes) {
         my $live_path = "$home_n/.claude/settings.json";
         # B2 (BLOCKER): "absent" (never seen a live settings.json) is safe to
         # start from {}; "present but unreadable/unparseable" is NOT the same
@@ -901,6 +813,7 @@ sub _do_u9 {
             # never changes) and pollutes the file with a key
             # json-diff.pl's own collision guard then trips on the next run.
             _assign_nested($live_data, $_, $live_writes{$_}) for keys %live_writes;
+            _delete_nested($live_data, $_) for keys %live_deletes;
             # The payload spells the live install's own path ${CCPRAXIS_LIVE};
             # Claude Code cannot resolve that, and a settings.json carrying it
             # loses every ccpraxis plugin. Expand it to this live install, and
@@ -921,6 +834,7 @@ sub _do_u9 {
 
     $ctx->{checkpoint}->('settings_outcome', {
         skip_keys => \@skip_keys, preferences_saved => \@prefs_saved, answers => \%answers_out,
+        to_payload => \@to_payload, remove_from_payload => \@remove_from_payload,
     });
     $ctx->{note}->('settings_skip_keys', \@skip_keys) if @skip_keys;
 
@@ -1131,34 +1045,41 @@ sub _settings_items_ordered {
 sub _settings_title {
     my ($key, $rel) = @_;
     my $kd = _title_key($key);
-    return "settings key '$kd' differs between live and repo"   if $rel eq 'diverged';
-    return "settings key '$kd' exists only in live"             if $rel eq 'only_left';
-    return "settings key '$kd' exists only in the repo"         if $rel eq 'only_right';
+    return "settings key '$kd' differs between ~/.claude and the payload" if $rel eq 'diverged';
+    return "settings key '$kd' exists only in ~/.claude"                   if $rel eq 'only_left';
+    return "settings key '$kd' exists only in the payload"                 if $rel eq 'only_right';
     return "settings key '$kd'";
 }
 
+# Every relation offers the same four answers (2026-10-30, the operator's
+# per-key rule): the ~/.claude value goes into the dev clone's payload, the
+# payload's value goes back into ~/.claude, skip this time, or keep them
+# different for good (a saved preference). Nothing reaches the payload
+# unless it is answered here or a saved preference says so; the export phase
+# merges ONLY the units sent to the payload.
+#
+# M1/P6 (MAJOR): the choices that write <home>/.claude/settings.json (U9's
+# W1) say so plainly -- an old label claimed "live left unchanged".
 sub _settings_choices {
     my ($rel) = @_;
-    # M1/P6 (MAJOR): both these choices' code path writes
-    # <home>/.claude/settings.json (U9's W1) -- the OLD labels claimed "live
-    # left unchanged", the exact opposite of what answering them does. Both
-    # relabeled to say plainly that live IS updated.
     return [
-        { id => 'use_live',                label => 'Use the live value' },
-        { id => 'use_repo',                label => 'Use the repo value (updates your live settings.json)' },
-        { id => 'keep_different_remember', label => 'Keep both different, remember' },
+        { id => 'use_live',                label => "Take the ~/.claude value into the dev clone's payload" },
+        { id => 'use_repo',                label => "Put the payload's value back into ~/.claude/settings.json" },
         { id => 'skip',                    label => 'Skip (ask again next run)' },
+        { id => 'keep_different_remember', label => 'Keep both different, always (saved preference)' },
     ] if $rel eq 'diverged';
     return [
-        { id => 'export_to_repo',          label => 'Export the live-only key to the repo' },
-        { id => 'keep_live_only_remember', label => 'Keep live-only, remember' },
+        { id => 'export_to_repo',          label => "Take the key into the dev clone's payload" },
+        { id => 'remove_from_live',        label => 'Remove it from ~/.claude/settings.json (the payload does not have it)' },
         { id => 'skip',                    label => 'Skip (ask again next run)' },
+        { id => 'keep_live_only_remember', label => 'Keep it in ~/.claude only, always (saved preference)' },
     ] if $rel eq 'only_left';
     return [
         # Canonical id, matching SKILL.md's own "Add to live" wording.
-        { id => 'add_to_live',             label => 'Add the repo value to your live settings.json' },
-        { id => 'keep_repo_only_remember', label => 'Keep repo-only, remember' },
+        { id => 'remove_from_repo',        label => "Remove it from the dev clone's payload (~/.claude does not have it)" },
+        { id => 'add_to_live',             label => "Put the payload's value into ~/.claude/settings.json" },
         { id => 'skip',                    label => 'Skip (ask again next run)' },
+        { id => 'keep_repo_only_remember', label => 'Keep it in the payload only, always (saved preference)' },
     ] if $rel eq 'only_right';
     return [];
 }
@@ -1547,6 +1468,22 @@ sub _assign_nested {
     else {
         $data->{$key} = $value;
     }
+}
+
+# Mirror image of _assign_nested (duplicated from Export.pm, as the rest of
+# these helpers are): removes only the leaf, never the whole parent object.
+sub _delete_nested {
+    my ($data, $key) = @_;
+    if ($key =~ /^([^.]+)\.(.+)\z/ && ref($data->{$1}) eq 'HASH') {
+        my ($parent, $child) = ($1, $2);
+        return 0 unless exists $data->{$parent}{$child};
+        delete $data->{$parent}{$child};
+        delete $data->{$parent} unless %{ $data->{$parent} };
+        return 1;
+    }
+    return 0 unless exists $data->{$key};
+    delete $data->{$key};
+    return 1;
 }
 
 sub _write_json_file {

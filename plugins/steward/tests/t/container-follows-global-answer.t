@@ -344,6 +344,11 @@ sub setup_root {
         write_text("$clone/plugins/sandbox/container/settings.json", "{}\n");
     }
 
+    # The export loads DevClone.pm from the live install and runs the dev
+    # clone's scripts/promote.pl after committing; a stand-in that succeeds.
+    write_text("$clone/plugins/steward/scripts/DevClone.pm", read_text("$Bin/../../scripts/DevClone.pm"));
+    write_text("$clone/scripts/promote.pl", "#!/usr/bin/env perl\nprint \"promote: stand-in\\n\";\nexit 0;\n");
+
     _git($home, $clone, 'add', '-A');
     _git($home, $clone, 'commit', '-q', '-m', 'initial fixture commit');
 

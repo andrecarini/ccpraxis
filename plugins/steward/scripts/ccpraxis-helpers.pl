@@ -717,7 +717,21 @@ sub merge_export_level {
             && ref($lv) eq 'HASH' && ref($rv) eq 'HASH'
             && !dotted_collision($k, $lv, $rv, \%all_keys))
         {
+            # A selected parent (--only-key env) selects every unit under it.
+            local $ctx->{select_all_below} = 1 if $ctx->{only}{$name};
+            $ctx->{only_used}{$name} = 1 if $ctx->{only}{$name};
             $out{$k} = merge_export_level($lv, $rv, $ctx, $k, 1);
+            next;
+        }
+
+        # --remove-key: a unit the payload has and ~/.claude no longer does,
+        # which the operator sent to the payload as gone: drop it.
+        if ($ctx->{remove}{$name}) {
+            $ctx->{remove_used}{$name} = 1;
+            push @{ $ctx->{applied} }, {
+                key => $name, relation => $rel, action => 'remove', source => 'remove-key',
+                effect => $in_repo ? 'removed from repo' : 'already absent from repo',
+            };
             next;
         }
 
@@ -734,6 +748,19 @@ sub merge_export_level {
             };
             $out{$k} = $rv if $in_repo;
             next;
+        }
+
+        # Selective mode (any --only-key/--remove-key given, as the backup
+        # driver always does): ONLY the units the operator sent to the payload
+        # take the live value; every other unit keeps the repo side exactly,
+        # whatever its relation. Nothing is exported by default.
+        if ($ctx->{selective}) {
+            if ($ctx->{only}{$name} || $ctx->{select_all_below}) {
+                $ctx->{only_used}{$name} = 1 if $ctx->{only}{$name};
+            } else {
+                $out{$k} = $rv if $in_repo;
+                next;
+            }
         }
 
         # An 'identical' key needs no decision and filter-diff.pl never surfaces
@@ -779,16 +806,23 @@ sub merge_export_level {
 }
 
 sub cmd_settings_export_merge {
-    # Per-run "Skip" answers from /steward:backup Step 1.5. Repeatable.
-    my %skip;
+    # Per-run answers from /steward:backup, each repeatable:
+    #   --skip-key K    leave the repo side of K alone (a "Skip" answer)
+    #   --only-key K    K goes to the payload: it takes the live value
+    #   --remove-key K  K goes to the payload as gone: drop it from the repo
+    # Any --only-key/--remove-key switches to SELECTIVE mode: only those units
+    # change, and every other unit keeps the repo side. The driver always
+    # merges selectively; without them the old live-wins rule applies.
+    my (%skip, %only, %remove);
+    my %bucket = ('--skip-key' => \%skip, '--only-key' => \%only, '--remove-key' => \%remove);
     while (@ARGV) {
         my $arg = shift @ARGV;
-        if ($arg eq '--skip-key') {
+        if ($bucket{$arg}) {
             my $key = shift @ARGV;
-            die_json(3, "--skip-key requires a key name") unless defined $key && length $key;
-            $skip{$key} = 1;
-        } elsif ($arg =~ /^--skip-key=(.+)\z/) {
-            $skip{$1} = 1;
+            die_json(3, "$arg requires a key name") unless defined $key && length $key;
+            $bucket{$arg}{$key} = 1;
+        } elsif ($arg =~ /^(--(?:skip|only|remove)-key)=(.+)\z/) {
+            $bucket{$1}{$2} = 1;
         } else {
             die_json(3, "Unknown argument for settings-export-merge: $arg");
         }
@@ -852,9 +886,14 @@ sub cmd_settings_export_merge {
     my $ctx = {
         prefs     => $prefs,
         skip      => \%skip,
+        only      => \%only,
+        remove    => \%remove,
+        selective => (%only || %remove) ? 1 : 0,
         applied   => [],
         ignored   => [],
         skip_used => {},
+        only_used => {},
+        remove_used => {},
     };
     my $merged = merge_export_level($live_obj, $repo_obj, $ctx, '', 0);
     MachineLocalSettings::restore_foreign_platform_keys($merged, $repo_foreign);
@@ -872,6 +911,8 @@ sub cmd_settings_export_merge {
     # A --skip-key naming something absent from both files is almost always a
     # typo in the caller's invocation — surface it rather than swallow it.
     my @unmatched = sort grep { !$ctx->{skip_used}{$_} } keys %skip;
+    my @only_unmatched   = sort grep { !$ctx->{only_used}{$_} } keys %only;
+    my @remove_unmatched = sort grep { !$ctx->{remove_used}{$_} } keys %remove;
 
     emit_json({
         status              => 'merged',
@@ -882,6 +923,9 @@ sub cmd_settings_export_merge {
         preferences_applied => $ctx->{applied},
         preferences_ignored => $ctx->{ignored},
         skip_keys_unmatched => \@unmatched,
+        selective           => $ctx->{selective} ? JSON::PP::true : JSON::PP::false,
+        only_keys_unmatched   => \@only_unmatched,
+        remove_keys_unmatched => \@remove_unmatched,
     });
     exit 0;
 }
@@ -927,6 +971,8 @@ Subcommands:
   settings-export-merge  Merge live settings.json into the dev clone's global-config/settings.json. Live wins on shared keys; keys only in repo are preserved. Saved backup preferences (.backup-preferences.json, live_vs_repo scope) override that: "keep different" (skip-always) and "keep repo-only" (right-only) keep the repo's value; "keep live-only" (left-only) stays out of the repo entirely. Never writes into the live install.
                          Options:
                            --skip-key KEY  Leave the repo side of KEY alone for this run only (repeatable). Use for the user's per-run "Skip" answers. Dotted names (env.FOO) address one sub-key, matching json-diff.pl.
+                           --only-key KEY  KEY goes to the payload: it takes the live value (repeatable). Any --only-key or --remove-key makes the merge selective: every other key keeps the repo side.
+                           --remove-key KEY  KEY goes to the payload as gone: drop it from the repo (repeatable).
 
   claude-internals  Read-only check that the installed claude binary still contains the undocumented internals our settings rely on. Options: --binary PATH, --data PATH. Exit 0 all present, 1 changed, 2 could not check.
 
