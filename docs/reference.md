@@ -11,6 +11,7 @@ each other, and the contracts they hold to. Start at the
 - [Slash commands](#slash-commands)
 - [Statusline](#statusline)
 - [/steward:backup flow](#stewardbackup-flow)
+- [/steward:upstream-sync flow](#stewardupstream-sync-flow)
 - [Vault sync](#vault-sync)
 - [Sandbox](#sandbox)
 - [Backpack plugin](#backpack-plugin)
@@ -33,7 +34,8 @@ Two deliberate exceptions: the `butler` and `blueprint` plugins each carry a sma
 ## Slash commands
 
 **Config and sync**
-- `/steward:backup` — sync ccpraxis config + every registered vault project (drift detection, AI-assisted conflict merge, secret scan, push). `host-only`.
+- `/steward:backup` — local state: promote the ccpraxis dev clone into the live install (asking first), export `~/.claude` settings into its payload key by key, commit and promote again; then sync every registered vault project. Never talks to GitHub. `host-only`.
+- `/steward:upstream-sync` — the GitHub side, for the dev clone only: fetch your fork, integrate `origin/main`, secret-scan, push `main` after you confirm the outgoing commits. `host-only`.
 - `/steward:setup-project` — bootstrap a project for vault backup (orphan discovery, slug pick, initial sync). `host-only`.
 - `/refresh` — re-read all CLAUDE.md files and summarize key rules.
 
@@ -83,18 +85,61 @@ Opus 4.6 1M  22% |220k 780k| 5h 15%|3h 46m|  7d 12%|4d 22h|
 
 ## /steward:backup flow
 
-Bidirectional sync between your live `~/.claude/` config and your ccpraxis repo:
+Brings local state in line and backs it up; it never fetches, merges or pushes (that is
+[/steward:upstream-sync](#stewardupstream-sync-flow)). The driver is
+`scripts/backup.pl`; the skill presents its decisions and relays its report. Two checkouts
+are involved ([Working on ccpraxis](working-on-ccpraxis.md)): the live install
+(`~/.claude/ccpraxis`, what runs, changed only by `scripts/promote.pl`) and the dev clone
+(the live install's `origin`, where the export lands).
 
-1. Detects drift (identical, live-only, export-only, conflict, settings, marketplace, and container settings changes)
-2. Creates timestamped backups of live settings before any modifications
-3. Three-way settings sync: live host ↔ global-config ↔ plugins/sandbox/container (semantic JSON comparison — ignores key order)
-4. Saves user preferences for intentionally-divergent keys so the same questions aren't re-asked across syncs
-5. Syncs marketplace selections across machines (strips machine-specific paths)
-6. Merges conflicts with AI assistance and user approval
-7. Scans all staged files for secrets (API keys, tokens, credentials, private keys)
-8. Commits and pushes (pulls first to avoid conflicts)
-9. **Iterates every registered vault project** — runs the full sync engine for each (see Vault Sync below), surfacing conflicts interactively
-10. **Offers registration for the current project** if it has Claude files but isn't tracked yet — `Yes` invokes `/steward:setup-project`, `Not now` defers, `Don't ask again` writes a `.claude/backup-skip` opt-out marker
+1. **Locates the dev clone** through the live install's `origin`. A GitHub URL there (a
+   machine set up before promotion owned the live install), a dev clone off `main`, or
+   uncommitted changes to its `global-config/` payload skip the ccpraxis part with a note
+   saying why and how to fix it; the vault part still runs.
+2. **Promotes** when the dev clone's `main` is ahead of the live install: one
+   `promote_pending` question lists the commits, then the dev clone's own
+   `scripts/promote.pl` runs (its output is kept verbatim). A refusal stops the ccpraxis
+   part. Declined, the export is skipped too if the payload then differs from the live one,
+   because the export would overwrite payload edits that were never promoted.
+3. **Checks the live install**: README path lint and the repo-layout tree (questions on
+   drift), the skills mirror into `~/.claude/skills`, and `~/.claude/CLAUDE.md` against the
+   build of the live payload for this host (`GlobalClaudeMd.pm`).
+4. **Asks per key.** `~/.claude/settings.json` is compared with the payload
+   (`json-diff.pl --host-live`, one-level dotted units, the `${CCPRAXIS_LIVE}` path and other
+   platforms' keys and hooks normalised by `MachineLocalSettings.pm`). Every differing unit
+   without a saved preference (`.backup-preferences.json` in the live install) is one
+   question: into the payload, back into `~/.claude`, skip, or keep different for good. The
+   same per marketplace (`known_marketplaces.json`) and per container-settings key. A
+   `~/.claude/CLAUDE.md` hand edit is never exported: rebuild it or fold the lines into the
+   payload by hand.
+5. **Exports and commits** only what was sent to the payload, into the dev clone's working
+   tree, after a secret scan of the dev clone; the commit (`backup: sync ccpraxis config (N
+   file(s))`) holds those files and nothing else of the developer's. Values sent back into
+   `~/.claude` are written with the token expanded, never the raw `${CCPRAXIS_LIVE}`.
+6. **Promotes again**, without a question, when every commit the live install lacks is a
+   backup export commit, so the run ends with the live install at the dev clone's `main`.
+7. **Iterates every registered vault project** — runs the full sync engine for each (see
+   Vault Sync below), surfacing conflicts interactively.
+8. **Offers registration for the current project** if it has Claude files but isn't tracked
+   yet — `Yes` invokes `/steward:setup-project`, `Not now` defers, `Don't ask again` writes a
+   `.claude/backup-skip` opt-out marker.
+
+## /steward:upstream-sync flow
+
+The GitHub side, for the dev clone only (`plugins/steward/scripts/upstream-sync.pl`,
+stateless: every run recomputes from git):
+
+1. Fetches `origin` (your fork; git's own credential helpers answer, no prompt opens).
+2. Integrates `origin/main` into `main`: a fast-forward, or a merge commit when `main` has
+   commits of its own. A conflict aborts the merge it just started and names the files; a
+   merge git refuses because it would overwrite uncommitted files stops with nothing
+   changed. Never a stash or a reset.
+3. Scans the dev clone for secrets before anything leaves the machine.
+4. Pushes `main` only after a `push_confirmation` that lists the remote and every outgoing
+   commit; the answer names the commit it was shown, so a `main` that moved meanwhile is
+   asked about again. `ls-remote` confirms the remote has it.
+5. Reports how far the dev clone is ahead of the live install; `/steward:backup` (or
+   `scripts/promote.pl`) brings it live.
 
 ## Vault sync
 
@@ -134,7 +179,7 @@ To change what's offered by default, edit `@DEFAULT_TRACKABLE` and `%HARD_EXCLUD
 - Two-level locking (vault `.lock` + per-project `.lock`) with PID+ISO-timestamp and 10-min stale reclaim
 - Atomic `.vault-sync.tmp` staging + batch-rename of staged files
 - Journal at `<vault>/projects/<slug>/.sync-journal.json` with phases (`staging` → `awaiting_resolution` → `renaming` → `sensitive_check` → `committing`); reconciliation on every sync start so an interrupted sync recovers cleanly
-- Secret-scanning is intentionally **not** applied to the private vault — it's a personal backup, so it stores project content (CLAUDE.md, blueprints) verbatim. Secret-scanning is the *public* ccpraxis repo's job only (`sensitive-check.pl`, backup Step 4). The vault scan hooks (`scan_files_for_secrets`, the `sensitive_check` journal phase) remain in code but are disabled by policy — re-enable by restoring `scan_files_for_secrets`
+- Secret-scanning is intentionally **not** applied to the private vault — it's a personal backup, so it stores project content (CLAUDE.md, blueprints) verbatim. Secret-scanning is the *public* ccpraxis repo's job only (`sensitive-check.pl`, run by `/steward:backup` before its export commit and by `/steward:upstream-sync` before a push). The vault scan hooks (`scan_files_for_secrets`, the `sensitive_check` journal phase) remain in code but are disabled by policy — re-enable by restoring `scan_files_for_secrets`
 - File-modified-during-sync rollback (re-hash before final rename)
 - Path safety (no `..`, no absolute paths, no backslashes; symlinks skipped via `File::Find` preprocess)
 
