@@ -720,7 +720,7 @@ ccpraxis/
 │   │   │   ├── b0-tui-probe.pl                                  # B0 TUI viability spike (Decision #18/#19, package B0).
 │   │   │   ├── concurrent-config-safety-spike.md                # Decision doc: keeping config writes safe under concurrent sessions
 │   │   │   ├── migration-record.md                              # Record of the work-copy to standalone-clone migration
-│   │   │   ├── podman-machine.md                                # Operating the podman machine per host: WSL disk and memory limits on Windows; resources, disk, rootless and shares on macOS
+│   │   │   ├── podman-machine.md                                # Operating the podman machine per host: WSL disk and memory limits on Windows; on macOS the rootful machine podman-machine.pl keeps, its shares and their modes
 │   │   │   ├── protected-paths.md                               # The protected-path guard: what a container may never write
 │   │   │   ├── sandbox-checkouts.md                             # How claude-sandbox treats the dev clone and the live install: in-place refusal, which checkout a launch serves, .launcher gotchas
 │   │   │   ├── terminal-minimize-investigation.md               # Investigation into terminal minimize behaviour

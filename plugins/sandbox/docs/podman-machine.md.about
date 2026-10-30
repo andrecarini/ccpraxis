@@ -1,1 +1,1 @@
-Operating the podman machine per host: WSL disk and memory limits on Windows; resources, disk, rootless and shares on macOS
+Operating the podman machine per host: WSL disk and memory limits on Windows; on macOS the rootful machine podman-machine.pl keeps, its shares and their modes

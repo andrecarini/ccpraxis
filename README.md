@@ -273,7 +273,7 @@ the test suite included.
 | Host | Validated with | Notes |
 |---|---|---|
 | Windows 10 | Git for Windows (its bundled Perl and bash 5), Claude Code, Podman with the WSL2 backend | The original development host. The `claude-sandbox` launcher is PowerShell and locates Perl itself. |
-| macOS 27.0.1 on Apple Silicon (M5 Pro) | the system Perl 5.34.1 and `/bin/bash` 3.2.57, Apple Git 2.54.0, Claude Code 2.1.301, Podman 6.1.4 from Homebrew (2026-10-30) | Every host-side shell script must run under that bash 3.2. Nothing from Homebrew except Podman, for the sandbox. |
+| macOS 27.0.1 on Apple Silicon (M5 Pro) | the system Perl 5.34.1 and `/bin/bash` 3.2.57, Apple Git 2.54.0, Claude Code 2.1.301, Podman 6.1.4 from Homebrew (2026-10-30) | Every host-side shell script must run under that bash 3.2. Nothing from Homebrew except Podman, for the sandbox, which runs in a rootful `podman machine` sharing only the folders the sandbox needs (`plugins/sandbox/scripts/podman-machine.pl`). |
 
 The [reference's Platforms section](docs/reference.md#platforms) has the per-OS details: launchers, shells, terminals.
 

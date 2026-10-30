@@ -92,8 +92,9 @@ perl ~/.claude/ccpraxis/plugins/steward/scripts/vault-sync.pl init --url "<vault
 The init is cwd-agnostic — it clones to a fixed location (`~/.claude/claude-code-vault/`) regardless of where you run it from. If the vault is empty, the init scaffolds `README.md`, `.gitignore` (locks, journal, tmps, machine-local registry), `.gitattributes` (`* -text` to defeat CRLF normalization), and `todos/.gitkeep`, then commits and pushes. It does NOT pre-create `projects/<slug>/` — that lands lazily on first use (a `/steward:setup-project` will materialize it). If the vault is already populated (e.g. from another machine), the clone preserves its contents. Tell the user that `/steward:setup-project`, in a session opened in the dev clone, links it to an earlier machine's slug.
 
 **Step 8, container runtime**, only if the user wants the sandbox. Give them the commands for
-their platform and run them only on their explicit go-ahead: `brew install` and
-`podman machine init` install software and download a VM image on the host.
+their platform (`docs/working-on-ccpraxis.md`, step 8) and run them only on their explicit
+go-ahead: `brew install` and creating the podman machine install software and download a VM image
+on the host.
 
 **Step 9, restart.** Tell the user to open a new terminal and start a new Claude Code session.
 On macOS the PATH lines went to `~/.zshrc`, which a running shell does not re-read; on Windows the

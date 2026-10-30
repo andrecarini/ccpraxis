@@ -216,7 +216,7 @@ Container names are deterministic per project path (hash-based), stored in `.ccp
 
 Neither check has an override flag or environment variable. Details: [plugins/sandbox/docs/protected-paths.md](../plugins/sandbox/docs/protected-paths.md), sections 1-2 (protected paths) and 10 (markers).
 
-The container runs `claude --dangerously-skip-permissions` as root — full autonomy inside the sandbox. With rootless Podman, container root is mapped to the unprivileged host user via the kernel's user namespace, so files written to `/project` come out owned by the host user (no chown dance) and a container escape lands as the unprivileged host user, not host root. Docker Desktop uses a similar VM-isolation model on Windows/macOS. The container-specific `CLAUDE.md` tells Claude it can install and run anything, while still enforcing supply chain rules.
+The container runs `claude --dangerously-skip-permissions` as root — full autonomy inside the sandbox. With rootless Podman, container root is mapped to the unprivileged host user via the kernel's user namespace, so files written to `/project` come out owned by the host user (no chown dance) and a container escape lands as the unprivileged host user, not host root. Docker Desktop uses a similar VM-isolation model on Windows/macOS. On macOS the podman machine is rootful instead: container root is root in the VM, the VM is the boundary, and it sees only the folders `plugins/sandbox/scripts/podman-machine.pl` shares with it ([podman-machine.md](../plugins/sandbox/docs/podman-machine.md)). The container-specific `CLAUDE.md` tells Claude it can install and run anything, while still enforcing supply chain rules.
 
 **Mounts:**
 

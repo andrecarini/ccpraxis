@@ -135,8 +135,12 @@ link this one to the same slug: the first sync restores the gitignored `.ccpraxi
 
 - Windows: Podman with the WSL2 backend (`podman machine init`, then `podman machine start`), never
   Hyper-V; the README's Platforms section says why.
-- macOS: `brew install podman`, then `podman machine init --cpus 6 --memory 12288` and
-  `podman machine start`. The machine runs as your user and needs no admin rights.
+- macOS: `brew install podman`, then create the machine with
+  `perl ~/.claude/ccpraxis/plugins/sandbox/scripts/podman-machine.pl apply --confirm` (run it
+  without `--confirm` first to see the plan). It makes a rootful machine with 6 CPUs and 12 GiB that
+  shares only what the sandbox mounts, and no project yet: share one with `add-project <dir>
+  --confirm`. The machine runs as your user and needs no admin rights. Details:
+  `plugins/sandbox/docs/podman-machine.md`.
 
 **9. Restart and verify.** Open a new terminal, which reads the new PATH lines, and start a new
 Claude Code session: its Bash tool runs from a shell snapshot taken at session start, and plugin

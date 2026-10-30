@@ -1,6 +1,6 @@
 ---
 name: setup
-description: Prepare the current project for running Claude Code in an isolated rootless dev container (Docker or Podman — auto-detected). The full setup flow now lives in the `claude-sandbox` launcher's auto-prompt — invoking this command points the user there. Use when the user wants to containerize a project, set up a sandbox, or says "set up a sandbox", "sandbox this project", "containerize this".
+description: Prepare the current project for running Claude Code in an isolated dev container (Docker or Podman — auto-detected). The full setup flow now lives in the `claude-sandbox` launcher's auto-prompt — invoking this command points the user there. Use when the user wants to containerize a project, set up a sandbox, or says "set up a sandbox", "sandbox this project", "containerize this".
 user-invocable: true
 host-only: true
 allowed-tools: Bash

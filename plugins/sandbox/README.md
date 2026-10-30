@@ -74,7 +74,7 @@ order:
 | host | order | notes |
 |---|---|---|
 | Windows (Git-for-Windows perl) | `docker.exe`, `podman.exe` | Docker Desktop or Podman Machine, both on WSL2 |
-| macOS | `podman`, `docker` | a rootless `podman machine` is the supported runtime |
+| macOS | `podman`, `docker` | a rootful `podman machine`, set up by `scripts/podman-machine.pl`, is the supported runtime |
 | Linux | `docker`, `podman` | Docker Engine or native podman |
 
 `CCPRAXIS_CONTAINER_CLI=<name or path>` overrides the order. When set it
@@ -87,17 +87,20 @@ Desktop on Hyper-V isn't auto-detected (it requires manual user effort
 to even configure) but the same fatal 9p bugs apply if you set it up
 that way. Don't.
 
-### macOS: rootless podman machine
+### macOS: rootful podman machine
 
-One-time setup, from any terminal:
+One-time setup, from any terminal. The machine is created by a script, not
+by `podman machine init` (whose defaults share `/Users`, `/private` and
+`/var/folders` read-write):
 
 ```bash
 brew install podman
-podman machine init --cpus 6 --memory 8192   # rootless is the default
-podman machine start
+S=~/.claude/ccpraxis/plugins/sandbox/scripts/podman-machine.pl
+perl $S apply --confirm                       # rootful, 6 CPUs, 12 GiB, no project yet
+perl $S add-project ~/Projects/app --confirm  # share each project you sandbox
 ```
 
-Then, from the project directory (anything under `/Users` works):
+Then, from that project directory:
 
 ```bash
 claude-sandbox            # first run: bootstrap, image build, skills picker, dashboard
@@ -115,13 +118,15 @@ What differs from Windows, and why:
   downloads an artifact for one architecture only
   (`containerfile-portability.t`); the backpack's Node recipe picks its
   tarball from `dpkg --print-architecture` the same way.
-- **Only the machine's shared folders can be mounted.** A macOS podman
-  machine sees `/Users`, `/private` and `/var/folders` by default (see
-  `podman machine init --help`). The launcher reads the machine's share
-  list and refuses a project outside it before asking anything, with the
-  remedy. podman passes paths literally, so `/tmp/x` is not covered by
-  the `/private` share even though `/tmp` links there; the launcher
-  resolves the project path first, which avoids that.
+- **Only the machine's shared folders can be mounted.** The machine
+  shares the live install and ccpraxis's container-files folder read-only,
+  its container-test folder and each project in its list read-write, and
+  nothing else of the Mac
+  (`plugins/sandbox/docs/podman-machine.md` has the table and the reasons).
+  The launcher reads the machine's share list, with each share's mode, and
+  refuses a project outside it before asking anything; the message gives
+  the `add-project <dir>` command. podman passes paths literally, so the
+  launcher resolves the project path first (`/tmp/x` is `/private/tmp/x`).
 - **Bind mounts need no `:Z`.** The machine runs SELinux, but the
   virtiofs shares are usable as they are; files the container's root
   writes appear on the Mac owned by you, and O_APPEND, rename and

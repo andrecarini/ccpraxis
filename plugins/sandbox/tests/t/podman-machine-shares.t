@@ -83,6 +83,15 @@ sub fake_home {
     is_deeply([$st->{projects}, $st->{test_scratch}, $st->{exists}], [['/Users/u/Projects/app'], 0, 1], 'B: ...and reads back');
     ok(!-e "$d/sub/list.json.tmp.$$", 'B: no temp file is left behind');
 
+    PodmanMachine::write_state("$d/ir.json", { projects => [], test_scratch => 1, install_root => '/opt/ccp' });
+    my ($ir) = PodmanMachine::read_state("$d/ir.json");
+    is($ir->{install_root}, '/opt/ccp', 'B: an install_root key round-trips');
+    my $want = PodmanMachine::desired_machine(layout => PodmanMachine::layout(home => '/Users/u'), state => $ir,
+                                              current => { exists => 0 });
+    is_deeply([ map { "$_->{role}:$_->{source}" } grep { $_->{readonly} } @{ $want->{shares} } ],
+        ['install:/opt/ccp', 'container-files:/Users/u/.cache/ccpraxis/container-files'],
+        'B: ...and the desired machine shares that install read-only instead of ~/.claude/ccpraxis');
+
     spew("$d/bad.json", '{ not json');
     ($st, $err) = PodmanMachine::read_state("$d/bad.json");
     ok(!$st && $err =~ /not valid JSON/, 'B: a malformed list is an ERROR (treating it as empty would drop every project share)');
