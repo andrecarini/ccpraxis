@@ -742,6 +742,24 @@ sub pf_item {
 }
 
 {
+    # AC6d -- a refused promotion followed by a decision pause still fails the
+    # run at the end: the failure is durable, not a lexical of the invocation
+    # that saw it.
+    my $r = setup_root(with_origin => 0, clone_ahead => 1);
+    open my $fh, '>>:raw', "$r->{ccpx}/README.md" or die;
+    print {$fh} "edited inside the live install\n";
+    close $fh;
+    my $extra = { STUB_LINT_EXIT => 1, STUB_LINT_STDERR => "README.md:1: missing path scripts/nope.pl\n" };
+    my $resp = run_backup($r, $extra);
+    my $resp2 = run_backup($r, $extra, '--resume', ($resp->{json}{resume_token} // ''), '--answer', 'preflight.promote_pending=promote');
+    is($resp2->{exit}, 10, '(setup) AC6d: after the refused promotion the run pauses for the README drift') or diag($resp2->{out} . $resp2->{err});
+    my $resp3 = run_backup($r, $extra, '--resume', ($resp2->{json}{resume_token} // ''), '--answer', 'preflight.readme_paths=acknowledge');
+    is($resp3->{exit}, 20, 'AC6d: the run still ends complete_with_failures over the refused promotion') or diag($resp3->{out} . $resp3->{err});
+    my $state = read_state($r->{state_path});
+    like(($state->{phases}{preflight}{error} // ''), qr/promotion/, 'AC6d: ...and the phase error names it');
+}
+
+{
     # AC6b -- uncommitted payload edits in the dev clone: no promotion
     # question at all, the ccpraxis part is skipped with the reason.
     my $r = setup_root(with_origin => 0, clone_ahead => 1);

@@ -150,12 +150,24 @@ sub run_phase {
         return { status => 'failed', error => "ccpraxis install not found at $root" };
     }
 
-    my @failed_units;   # [ unit_name, message ]
+    # Failures are kept DURABLY ('unit_failures', as Export.pm does): a unit
+    # that failed (a refused promotion, say) is checkpointed and never re-run,
+    # and the phase can pause for the decision batch after it -- a failure kept
+    # only in this invocation's lexical would vanish on the resume, and the
+    # run would end reporting success.
+    my @failed_units;   # [ unit_name, message ] -- this invocation's order
+    my $load_failures = sub {
+        my $h = $ctx->{get_item}->('unit_failures');
+        return (ref($h) eq 'HASH') ? { %$h } : {};
+    };
     my $record_failure = sub {
         my ($unit, $msg) = @_;
         return unless defined $msg;
         push @failed_units, [ $unit, $msg ];
         $ctx->{note}->('unit_failed', { unit => $unit, message => $msg });
+        my $durable = $load_failures->();
+        $durable->{$unit} = $msg;
+        $ctx->{checkpoint}->('unit_failures', $durable);
     };
 
     my $load_err = _load_shared($root);
@@ -167,6 +179,7 @@ sub run_phase {
     }
     my $target = $ctx->{get_item}->('ccpraxis_target');
     $target = {} unless ref($target) eq 'HASH';
+    $target = { %$target, dev_clone => _item_bytes($target->{dev_clone}) };
     my $clone = $target->{located} ? $target->{dev_clone} : undef;
 
     # ---- U1: promote the dev clone into the live install (Decision 7
@@ -270,9 +283,15 @@ sub run_phase {
 
     $ctx->{note}->('preferences_saved', \@all_prefs_saved) if @all_prefs_saved;
 
-    if (@failed_units) {
-        my @names = map { $_->[0] } @failed_units;
-        my $first = $failed_units[0][1];
+    my $durable = $load_failures->();
+    if (%$durable) {
+        my (%seen, @names);
+        my $first;
+        for my $pair (@failed_units, map { [ $_, $durable->{$_} ] } sort keys %$durable) {
+            next if $seen{ $pair->[0] }++;
+            push @names, $pair->[0];
+            $first //= $pair->[1];
+        }
         return { status => 'failed',
                  error  => 'preflight: ' . join(', ', @names) . " failed \x{2014} $first" };
     }
@@ -295,6 +314,19 @@ sub _load_shared {
         return "cannot load $dir/$m.pm: " . ($@ || 'unknown error') unless $ok;
     }
     return undef;
+}
+
+# A string read back out of the run-state file (a resumed run's checkpoint)
+# as the raw bytes it was checkpointed as: Run.pm's reader can hand it back
+# utf8-FLAGGED without transcoding, which as a path or argv would
+# double-encode a non-ASCII byte. Every character is < 256 there, so the
+# downgrade is lossless (duplicated from Export.pm).
+sub _item_bytes {
+    my ($s) = @_;
+    return $s unless defined $s && !ref $s;
+    my $c = $s;
+    utf8::downgrade($c, 1) or $c = Encode::encode('UTF-8', $c);
+    return $c;
 }
 
 # DevClone's git-runner contract, over this module's own spawner.
