@@ -5266,7 +5266,7 @@ if (! _container_exists($CONTAINER_NAME)) {
             _emit_err("       Found $n stray `;C`-suffixed bind-mount target(s):\n");
             _emit_err("         - $_\n") for @stray;
             _emit_err("\n");
-            _emit_err("       Cause: the MSYS2_ARG_CONV_EXCL=* guard didn't apply when podman.exe was invoked. Likely someone edited launcher.pl or the .sh/.ps1 shim and removed the env-var setup, OR you invoked launcher.pl directly without the shim. See global-config/CLAUDE.md \"MSYS2 path-conversion\" for the full failure mode.\n");
+            _emit_err("       Cause: the MSYS2_ARG_CONV_EXCL=* guard didn't apply when podman.exe was invoked. Likely someone edited launcher.pl or the .sh/.ps1 shim and removed the env-var setup, OR you invoked launcher.pl directly without the shim. See global-config/CLAUDE.windows.md \"MSYS2 path-conversion\" for the full failure mode.\n");
             _emit_err("\n");
             _emit_err("       Auto-recovering: removing the stray dirs and the broken container so the next run can rebuild cleanly.\n");
             _launch_fail('create', 'MSYS2 path corruption detected after podman create', undef);
