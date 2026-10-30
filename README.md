@@ -101,7 +101,7 @@ This is a fixed list of known failures, not a mechanism for enforcing rules you 
 
 ### Your setup, synced across machines
 
-**steward** is the plugin that looks after ccpraxis itself. Its `/steward:backup` carries the settings Claude Code writes into `~/.claude/` (a permission you allowed, a plugin you enabled) back into your dev clone's copy of the config, diffing semantically and scanning for secrets before the dev clone is pushed.
+**steward** is the plugin that looks after ccpraxis itself. Its `/steward:backup` keeps your machine consistent: it promotes what the dev clone has that the live install lacks, and carries the settings Claude Code writes into `~/.claude/` (a permission you allowed, a plugin you enabled) back into your dev clone's copy of the config, one setting at a time, honouring the answers you told it to remember. `/steward:upstream-sync` is the GitHub side: it pulls your fork into the dev clone and pushes it back, listing every commit before it goes out and scanning for secrets first.
 
 Most of what accumulates around a project should not ship with it. Blueprints, todos, session notes and project-specific instructions are yours, not the codebase's, and committing them to a repo other people pull is the wrong answer. They go to a **vault** instead: a private git repository you create and control, synced with three-way merge and a pre-push secret scan, which never deletes a local file it has never held.
 
@@ -231,7 +231,8 @@ The install sets up two checkouts of your fork, described under [On your machine
 | Command | Purpose |
 |---|---|
 | `claude-sandbox` | Launch the container + dashboard (run from a terminal, not inside Claude) |
-| `/steward:backup` | Sync config and every registered vault project |
+| `/steward:backup` | Promote, sync config one setting at a time, and sync every registered vault project (local only) |
+| `/steward:upstream-sync` | Pull your fork into the dev clone and push it back (the only GitHub step) |
 | `/steward:setup-project` | Track this project's Claude files in your vault |
 | `/blueprint:create` | Turn an objective into an audited, on-disk plan |
 | `/butler:dispatch-fleet` | Execute a blueprint with detached sessions per package (sandbox only) |
@@ -322,7 +323,7 @@ perl ~/Projects/ccpraxis/scripts/promote.pl --dry-run
 perl ~/Projects/ccpraxis/scripts/promote.pl
 ```
 
-Push from the dev clone (`git push`, or let `/steward:backup` do it): it is the only checkout that talks to your fork. The live install takes code from the dev clone alone, so a change reaches it by promotion, never by a pull.
+Push from the dev clone (`git push`, or `/steward:upstream-sync`): it is the only checkout that talks to your fork. The live install takes code from the dev clone alone, so a change reaches it by promotion, never by a pull.
 
 **Promotion changes the code underneath a live session.** Start a new Claude Code session afterwards rather than carrying on in the one that was open, which keeps the skill text it read when it started.
 

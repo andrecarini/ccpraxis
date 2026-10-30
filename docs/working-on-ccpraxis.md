@@ -18,11 +18,20 @@ to the dev clone's `main` (cloning it from the dev clone the first time), then s
 way, it never has commits of its own; if it does, it was changed some other way, and promote.pl
 refuses and prints the command that brings those commits into the dev clone.
 
-**`/steward:backup`** carries the other direction: settings that Claude Code wrote into
-`~/.claude` (a permission you allowed, a plugin you enabled) are exported into the dev clone's
-`global-config/`, committed there and pushed with the dev clone. It does this only when the dev
-clone's payload matches what was promoted, so it never overwrites payload changes that are not live
-yet; promote first in that case. It also syncs every registered project with your private vault.
+Two steward commands keep the three places consistent, and only one of them touches GitHub:
+
+- **`/steward:backup`** is local. It promotes the dev clone's unpromoted commits (asking once,
+  since that changes running tooling); then, for every setting Claude Code changed in `~/.claude`
+  (a permission you allowed, a plugin you enabled), it applies your saved preference or asks you,
+  one setting at a time: take your value into the dev clone's `global-config/`, put the payload's
+  value back into `~/.claude`, skip it this time, or remember an answer. What you send to the
+  payload is committed in the dev clone (only those files) and promoted, so the live install and
+  the dev clone end up at the same commit. It also syncs every registered project with your
+  private vault.
+- **`/steward:upstream-sync`** is the GitHub side of the dev clone: it fetches your fork, brings
+  its `main` into the dev clone's (stopping cleanly on a conflict), and pushes the dev clone's
+  `main` after listing every commit that would go out. It never touches the live install; what it
+  pulls in goes live through `/steward:backup` or `scripts/promote.pl`.
 
 ## Setting up a machine
 
@@ -165,8 +174,8 @@ pushed from it. A machine set up that way (the Windows host) moves over once, in
    install fast-forwards, its `origin` is re-pointed from GitHub to the dev clone
    (`origin: set to the dev clone ... (was https://github.com/...)`), and `~/.claude/CLAUDE.md` is
    rebuilt for this operating system.
-4. **Push from the dev clone:** `git push origin main`. From now on GitHub is the dev clone's
-   remote only. The dev clone's old `live` remote is no longer needed
+4. **Push from the dev clone:** `/steward:upstream-sync` (or `git push origin main`). From now on
+   GitHub is the dev clone's remote only. The dev clone's old `live` remote is no longer needed
    (`git remote remove live`).
 
 If step 3 reports `refused-live-only-commits`, step 2's first pull was skipped or the live install
@@ -177,13 +186,13 @@ gained a commit since; run the pull it prints, then promote again.
 From a terminal in the dev clone:
 
 ```bash
-git pull                                    # what other machines pushed
+git pull                                    # what other machines pushed (or /steward:upstream-sync)
 claude-sandbox                              # optional: work inside the project's container
 perl scripts/run-tests.pl --fast plugins/<plugin>
 git commit ...                              # on main, or merge your branch into main
 perl scripts/promote.pl --dry-run
 perl scripts/promote.pl
-git push                                    # or let the next /steward:backup push it
+git push                                    # or /steward:upstream-sync
 ```
 
 Then start a new Claude Code session before relying on the change. A session that was already open

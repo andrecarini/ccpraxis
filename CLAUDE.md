@@ -18,8 +18,9 @@ means editing tooling while it is in use.
 This clone is the only checkout that talks to GitHub: pull and push here. The live install takes
 code from this clone alone: `scripts/promote.pl` creates it on the first run and fast-forwards it
 afterwards (its `origin` is this clone), and refuses a live install that has commits of its own.
-`/steward:backup` exports settings Claude Code wrote into `~/.claude` into this clone's
-`global-config/` and pushes this clone. The model, the fresh-machine procedure and the one-time
+`/steward:backup` is local (promote, settings Claude Code wrote into `~/.claude` exported into this
+clone's `global-config/` one setting at a time, vault); `/steward:upstream-sync` is the only command
+that pulls from or pushes to GitHub, and only for this clone. The model, the fresh-machine procedure and the one-time
 move of a machine set up the old way: `docs/working-on-ccpraxis.md`.
 
 ### ⚠ THE MACHINERY YOU ARE USING IS NOT THE MACHINERY YOU ARE EDITING
