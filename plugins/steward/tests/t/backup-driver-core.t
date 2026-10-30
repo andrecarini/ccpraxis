@@ -93,6 +93,7 @@ my @REQUIRED_KINDS = qw(
     settings_key
     marketplace_key
     file_conflict
+    claude_md_drift
     container_settings_key
     sensitive_finding
     push_confirmation

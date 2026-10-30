@@ -71,6 +71,11 @@ our @EXPORT_OK = qw(
 # by package 06's "every kind has a documented presentation" check, not a
 # copy in prose.
 # ===========================================================================
+# 2026-10-30: claude_md_drift added. ~/.claude/CLAUDE.md is built per host by
+# promote.pl, so a difference from that build cannot be exported back (a line
+# has no record of which part it belongs to); the export phase offers to
+# rebuild it or leave it, where file_conflict offered to copy it into the repo.
+#
 # 2026-10-30: clone_live_divergence retired. The live install is now produced
 # by promote.pl alone, so the dev clone and the live install differing is the
 # normal state between promotions, not a question; what made it dangerous (an
@@ -83,6 +88,7 @@ our @DECISION_KINDS = qw(
     settings_key
     marketplace_key
     file_conflict
+    claude_md_drift
     container_settings_key
     sensitive_finding
     push_confirmation

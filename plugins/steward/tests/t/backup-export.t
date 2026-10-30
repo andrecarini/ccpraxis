@@ -346,6 +346,13 @@ if ($cmd eq 'settings-export-merge') {
     print $json;
     exit $exit;
 }
+elsif ($cmd eq 'install-claude-md') {
+    my $exit = defined $ENV{STUB_INSTALL_MD_EXIT} ? $ENV{STUB_INSTALL_MD_EXIT} : 0;
+    my $json = defined $ENV{STUB_INSTALL_MD_JSON} ? $ENV{STUB_INSTALL_MD_JSON}
+             : '{"status":"rendered","live":"x","previous_status":"differs","backup":"/fake/.promotion-backups/20261030-000000/CLAUDE.md"}';
+    print $json;
+    exit $exit;
+}
 else {
     print '{"status":"error","error":{"code":"usage","message":"unexpected ccpraxis-helpers.pl subcommand in export test stub: ' . $cmd . '"}}';
     exit 3;
@@ -514,21 +521,40 @@ sub write_state_raw {
     write_text($path, $json);
 }
 
-# $data_or_undef: undef -> no phases.preflight key at all (get_phase_item
-# legitimately undef, the "preflight never reached its outcome" case);
-# defined -> phases.preflight.items.settings_outcome.data == $data_or_undef.
+# The preflight's 'export_target' for each scenario's state file (2026-10-30):
+# the export phase runs only for a ready target and writes only into its dev
+# clone. setup_root registers it and seeds it; every later seed keeps it.
+my %EXPORT_TARGET;
+
+# $data_or_undef: undef -> no settings_outcome (get_phase_item legitimately
+# undef, the "preflight never reached its outcome" case); defined ->
+# phases.preflight.items.settings_outcome.data == $data_or_undef. The
+# scenario's export_target is seeded either way.
 sub seed_preflight_outcome {
-    my ($state_path, $data_or_undef) = @_;
+    my ($state_path, $data_or_undef, $extra_items) = @_;
     my $state = fresh_state_shell();
-    if (defined $data_or_undef) {
+    my %items;
+    $items{export_target} = { at => time, data => $EXPORT_TARGET{$state_path} } if $EXPORT_TARGET{$state_path};
+    $items{settings_outcome} = { at => time, data => $data_or_undef } if defined $data_or_undef;
+    $items{$_} = { at => time, data => $extra_items->{$_} } for keys %{ $extra_items // {} };
+    if (%items) {
         $state->{phases}{preflight} = {
             status => 'complete', started_at => time, completed_at => time, error => undef,
-            items  => { settings_outcome => { at => time, data => $data_or_undef } },
-            scratch => {},
+            items  => \%items, scratch => {},
         };
     }
     write_state_raw($state_path, $state);
     return $state;
+}
+
+# A pending change in a file the export WRITES. The export commits only the
+# files it wrote, so an arbitrary new file in the dev clone is never a
+# pending change any more; the dev clone's global-config/settings.json is
+# (settings_merge always lists it as written, and the stubbed merge leaves
+# whatever is there).
+sub pending_export {
+    my ($r, $marker) = @_;
+    write_text("$r->{clone}/global-config/settings.json", qq({"marker":"$marker"}\n));
 }
 
 # ===========================================================================
@@ -542,66 +568,85 @@ sub copy_export_into {
     return 1;
 }
 
-# setup_root(%opts) -- one throwaway "machine": a temp HOME containing
-# <home>/.claude/ccpraxis as a real git repo, all 6 wrapped scripts stubbed
-# and COMMITTED (so the baseline worktree is genuinely clean -- U8's pending
-# set is computed with --untracked-files=all, so an uncommitted stub script
-# would masquerade as a real pending change in every scenario), the git
-# logging stub wired via BACKUP_GIT_BIN, and (opts-controlled) an origin
-# remote / container settings / live settings.
+# setup_root(%opts) -- one throwaway "machine" in the promote.pl topology
+# (2026-10-30): a dev clone with the payload committed (its origin a bare
+# "GitHub" repo when with_origin is set), a live install at
+# <home>/.claude/ccpraxis cloned from it (so its origin is the dev clone),
+# the 6 wrapped scripts stubbed in the live install (scripts run from there),
+# the git logging stub wired via BACKUP_GIT_BIN, the preflight's export_target
+# seeded (ready, naming the dev clone), and (opts-controlled) container
+# settings / live settings.
 sub setup_root {
     my (%opts) = @_;
     my $scratch = temproot();
     my $home    = make_machine($scratch, $opts{machine_name} // 'host');
     my $ccpx    = "$home/.claude/ccpraxis";
-    make_path($ccpx);
+    my $clone   = "$scratch/devclone";
+    make_path($clone, "$home/.claude");
 
-    _git($home, $ccpx, 'init', '-q');
+    _git($home, $clone, 'init', '-q');
+    write_text("$clone/.gitignore", ".backup-preferences.json\n*.pre-merge.*\n");
 
-    write_text("$ccpx/README.md", $opts{readme} // "# ccpraxis\n");
-    write_text("$ccpx/global-config/settings.json", $opts{repo_settings} // "{}\n");
-    write_text("$ccpx/global-config/known_marketplaces.json", "{}\n");
+    write_text("$clone/README.md", $opts{readme} // "# ccpraxis\n");
+    write_text("$clone/global-config/settings.json", $opts{repo_settings} // "{}\n");
+    write_text("$clone/global-config/known_marketplaces.json", "{}\n");
     write_text("$home/.claude/settings.json", $opts{live_settings} // "{}\n");
 
     if (exists $opts{container_settings}) {
         if (defined $opts{container_settings}) {
-            write_text("$ccpx/plugins/sandbox/container/settings.json", $opts{container_settings});
+            write_text("$clone/plugins/sandbox/container/settings.json", $opts{container_settings});
         }
         # else: deliberately absent (AC15).
     } else {
-        write_text("$ccpx/plugins/sandbox/container/settings.json", "{}\n");
+        write_text("$clone/plugins/sandbox/container/settings.json", "{}\n");
     }
 
     for my $extra (@{ $opts{extra_files} // [] }) {
-        write_text("$ccpx/$extra->[0]", $extra->[1]);
+        write_text("$clone/$extra->[0]", $extra->[1]);
     }
 
-    write_stub_scripts($ccpx);
-
-    _git($home, $ccpx, 'add', '-A');
-    _git($home, $ccpx, 'commit', '-q', '-m', 'initial fixture commit');
+    _git($home, $clone, 'add', '-A');
+    _git($home, $clone, 'commit', '-q', '-m', 'initial fixture commit');
 
     my $remote;
     if ($opts{with_origin}) {
         $remote = init_remote($scratch);
-        _git($home, $ccpx, 'remote', 'add', 'origin', $remote);
-        _git($home, $ccpx, 'push', '-q', '-u', 'origin', 'main');
+        _git($home, $clone, 'remote', 'add', 'origin', $remote);
+        _git($home, $clone, 'push', '-q', '-u', 'origin', 'main');
     }
+
+    # The live install, as promote.pl's first run makes it; the stubs go
+    # there because the export runs the live install's scripts.
+    _git_clone($home, $clone, $ccpx);
+    write_stub_scripts($ccpx);
 
     my $phase_dir = "$scratch/phases";
     copy_export_into($phase_dir);
     my $git_stub = write_git_stub($scratch);
 
-    return {
+    my $r = {
         scratch   => $scratch,
         home      => $home,
         ccpx      => $ccpx,
+        clone     => $clone,
         remote    => $remote,
         phase_dir => $phase_dir,
         git_stub  => $git_stub,
         state_path => "$scratch/state/run.json",
         log_path   => "$scratch/log.txt",
     };
+    $EXPORT_TARGET{ $r->{state_path} } = { ready => 1, live_root => $ccpx, dev_clone => $clone };
+    seed_preflight_outcome($r->{state_path}, undef);
+    return $r;
+}
+
+sub _git_clone {
+    my ($home, $src, $dest) = @_;
+    my %genv = _git_env($home);
+    local @ENV{ keys %genv } = values %genv;
+    my $rc = system('git', 'clone', '-q', _native_path($src), _native_path($dest));
+    die "git clone $src -> $dest failed: exit $rc\n" if $rc != 0;
+    return 1;
 }
 
 # ===========================================================================
@@ -792,9 +837,9 @@ sub finish_after_content_change {
 # ===========================================================================
 {
     my $r = setup_root(with_origin => 0);
-    write_text("$r->{ccpx}/greeting.txt", "repo version\n");
-    _git($r->{home}, $r->{ccpx}, 'add', '-A');
-    _git($r->{home}, $r->{ccpx}, 'commit', '-q', '-m', 'add greeting.txt to repo');
+    write_text("$r->{clone}/greeting.txt", "repo version\n");
+    _git($r->{home}, $r->{clone}, 'add', '-A');
+    _git($r->{home}, $r->{clone}, 'commit', '-q', '-m', 'add greeting.txt to repo');
     write_text("$r->{home}/.claude/greeting.txt", "live version\n");
 
     my $sync_json = encode_json([ { file => 'greeting.txt', status => 'not_linked', note => 'copy differs from repo' } ]);
@@ -837,7 +882,7 @@ sub finish_after_content_change {
     $resp2 = finish_after_content_change($r, $extra, $resp2);
     ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), 'AC3: resuming with use_live reaches a terminal status')
         or diag($resp2->{out} . $resp2->{err});
-    is(read_text("$r->{ccpx}/greeting.txt"), "live version\n",
+    is(read_text("$r->{clone}/greeting.txt"), "live version\n",
         'AC3: use_live byte-copies the live content over the repo copy');
     my $state2 = read_state($r->{state_path});
     ok((defined $state2 && length(note_values_json($state2, 'file_conflicts_resolved')) > 0
@@ -847,10 +892,10 @@ sub finish_after_content_change {
 
 {
     my $r = setup_root(with_origin => 0);
-    make_path("$r->{ccpx}/skills-tree");
-    write_text("$r->{ccpx}/skills-tree/a.txt", "repo tree file\n");
-    _git($r->{home}, $r->{ccpx}, 'add', '-A');
-    _git($r->{home}, $r->{ccpx}, 'commit', '-q', '-m', 'add skills-tree to repo');
+    make_path("$r->{clone}/skills-tree");
+    write_text("$r->{clone}/skills-tree/a.txt", "repo tree file\n");
+    _git($r->{home}, $r->{clone}, 'add', '-A');
+    _git($r->{home}, $r->{clone}, 'commit', '-q', '-m', 'add skills-tree to repo');
     make_path("$r->{home}/.claude/skills-tree");
     write_text("$r->{home}/.claude/skills-tree/a.txt", "live tree file\n");
 
@@ -871,9 +916,9 @@ sub finish_after_content_change {
 
 {
     my $r = setup_root(with_origin => 0);
-    write_text("$r->{ccpx}/manual.txt", "repo manual version\n");
-    _git($r->{home}, $r->{ccpx}, 'add', '-A');
-    _git($r->{home}, $r->{ccpx}, 'commit', '-q', '-m', 'add manual.txt to repo');
+    write_text("$r->{clone}/manual.txt", "repo manual version\n");
+    _git($r->{home}, $r->{clone}, 'add', '-A');
+    _git($r->{home}, $r->{clone}, 'commit', '-q', '-m', 'add manual.txt to repo');
     write_text("$r->{home}/.claude/manual.txt", "live manual version\n");
 
     my $sync_json = encode_json([ { file => 'manual.txt', status => 'not_linked', note => 'copy differs from repo' } ]);
@@ -888,7 +933,7 @@ sub finish_after_content_change {
     ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), 'AC5: resuming with merge_manually reaches a terminal status')
         or diag($resp2->{out} . $resp2->{err});
 
-    is(read_text("$r->{ccpx}/manual.txt"), "repo manual version\n", 'AC5: the repo copy is unchanged after merge_manually');
+    is(read_text("$r->{clone}/manual.txt"), "repo manual version\n", 'AC5: the repo copy is unchanged after merge_manually');
     is(read_text("$r->{home}/.claude/manual.txt"), "live manual version\n", 'AC5: the live copy is unchanged after merge_manually');
     my $state2 = read_state($r->{state_path});
     ok((defined $state2 && grep {
@@ -918,8 +963,8 @@ sub run_export_phase_direct {
         or diag($resp->{out} . $resp->{err});
     my @merge_lines = grep { /^ccpraxis-helpers\.pl/ } log_lines($r->{log_path});
     is(scalar(@merge_lines), 1, 'AC6: ccpraxis-helpers.pl (settings-export-merge) is invoked exactly once') or diag(join("\n", @merge_lines));
-    is($merge_lines[0], 'ccpraxis-helpers.pl settings-export-merge --skip-key env.FOO --skip-key model',
-        'AC6: the logged argv is exactly settings-export-merge --skip-key env.FOO --skip-key model');
+    is($merge_lines[0], "ccpraxis-helpers.pl settings-export-merge --live-root $r->{ccpx} --repo-root $r->{clone} --skip-key env.FOO --skip-key model",
+        'AC6: the logged argv is exactly settings-export-merge, the live install as --live-root, the dev clone as --repo-root, then --skip-key env.FOO --skip-key model');
 }
 {
     my $r = setup_root(with_origin => 0);
@@ -929,7 +974,7 @@ sub run_export_phase_direct {
         or diag($resp->{out} . $resp->{err});
     my @merge_lines = grep { /^ccpraxis-helpers\.pl/ } log_lines($r->{log_path});
     is(scalar(@merge_lines), 1, 'AC6: ccpraxis-helpers.pl is still invoked exactly once with an empty skip_keys');
-    is($merge_lines[0], 'ccpraxis-helpers.pl settings-export-merge',
+    is($merge_lines[0], "ccpraxis-helpers.pl settings-export-merge --live-root $r->{ccpx} --repo-root $r->{clone}",
         'AC6: with skip_keys == [], the logged argv carries NO --skip-key flags at all');
 }
 
@@ -940,7 +985,7 @@ sub run_export_phase_direct {
 {
     my $r = setup_root(with_origin => 0);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/untracked-marker-ac789.txt", "pending change so push_confirmation is asked\n");
+    pending_export($r, 'ac789');
     my $merge_json = encode_json({
         status => 'merged', live => 'x', repo => 'y', merge_rule => 'preference-aware-live-wins-preserve-repo-only',
         preferences_applied => [ { name => 'k1', category => 'diverged', action => 'skip-always', effect => 'kept the live value (preference protected it)' } ],
@@ -948,7 +993,7 @@ sub run_export_phase_direct {
         skip_keys_unmatched => ['bogus.key'],
     });
     my $resp = run_backup($r, { STUB_MERGE_JSON => $merge_json });
-    is($resp->{exit}, 10, '(setup) AC7-9: an untracked pending change reaches the push_confirmation pause') or diag($resp->{out} . $resp->{err});
+    is($resp->{exit}, 10, '(setup) AC7-9: a pending exported change reaches the push_confirmation pause') or diag($resp->{out} . $resp->{err});
     my @decs = decisions_of($resp);
     record_decisions(@decs);
 
@@ -1091,7 +1136,7 @@ sub run_export_phase_direct {
 {
     my $r = setup_root(with_origin => 0, container_settings => qq({"k":"v"}\n));
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    my $before = read_text("$r->{ccpx}/plugins/sandbox/container/settings.json");
+    my $before = read_text("$r->{clone}/plugins/sandbox/container/settings.json");
     my $resp = run_backup($r, {});
     ok(($resp->{exit} == 0 || $resp->{exit} == 20 || $resp->{exit} == 10), 'AC13: the identical-container scenario reaches some status')
         or diag($resp->{out} . $resp->{err});
@@ -1099,7 +1144,7 @@ sub run_export_phase_direct {
     record_decisions(@decs);
     ok(!(grep { ($_->{kind} // '') eq 'container_settings_key' } @decs),
         'AC13: no container_settings_key decision when filter-diff reports identical');
-    is(read_text("$r->{ccpx}/plugins/sandbox/container/settings.json"), $before,
+    is(read_text("$r->{clone}/plugins/sandbox/container/settings.json"), $before,
         'AC13: the container settings file bytes are unchanged');
     my $state = read_state($r->{state_path});
     ok((defined $state && exists $state->{phases}{export}{items}{container_diff}),
@@ -1159,7 +1204,7 @@ sub run_export_phase_direct {
     ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), 'AC14/34: answering both container keys reaches a terminal status')
         or diag($resp2->{out} . $resp2->{err});
 
-    my $container_raw = read_text("$r->{ccpx}/plugins/sandbox/container/settings.json");
+    my $container_raw = read_text("$r->{clone}/plugins/sandbox/container/settings.json");
     my $container = defined $container_raw ? eval { decode_json($container_raw) } : undef;
     if (defined $container) {
         is((ref($container->{env}) eq 'HASH' ? $container->{env}{DISABLE_LOGIN_COMMAND} : undef), '1',
@@ -1209,7 +1254,7 @@ sub run_export_phase_direct {
     ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), 'AC17: answering remove_from_container reaches a terminal status')
         or diag($resp2->{out} . $resp2->{err});
 
-    my $container_raw = read_text("$r->{ccpx}/plugins/sandbox/container/settings.json");
+    my $container_raw = read_text("$r->{clone}/plugins/sandbox/container/settings.json");
     my $container = defined $container_raw ? eval { decode_json($container_raw) } : undef;
     if (defined $container) {
         ok((ref($container->{env}) eq 'HASH'), 'AC17: the env object still exists (not removed)');
@@ -1229,14 +1274,14 @@ sub run_export_phase_direct {
 {
     my $r = setup_root(with_origin => 0, container_settings => undef);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    ok(!path_exists("$r->{ccpx}/plugins/sandbox/container/settings.json"), '(setup) AC15: the container settings file is genuinely absent');
+    ok(!path_exists("$r->{clone}/plugins/sandbox/container/settings.json"), '(setup) AC15: the container settings file is genuinely absent');
     my $resp = run_backup($r, { STUB_JSONDIFF_EXIT => 2 });
     ok(($resp->{exit} == 0 || $resp->{exit} == 20), 'AC15: an absent container file does not pause the run')
         or diag($resp->{out} . $resp->{err});
     my @decs = decisions_of($resp);
     record_decisions(@decs);
     ok(!(grep { ($_->{kind} // '') eq 'container_settings_key' } @decs), 'AC15: no container_settings_key decision');
-    ok(!path_exists("$r->{ccpx}/plugins/sandbox/container/settings.json"), 'AC15: the container settings file is still not created');
+    ok(!path_exists("$r->{clone}/plugins/sandbox/container/settings.json"), 'AC15: the container settings file is still not created');
     my @jsondiff_lines = grep { /^json-diff\.pl/ } log_lines($r->{log_path});
     is(scalar(@jsondiff_lines), 0, 'AC15: json-diff.pl is never invoked when the container file is absent');
     my $state = read_state($r->{state_path});
@@ -1275,7 +1320,7 @@ sub run_export_phase_direct {
     ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), 'AC31: answering add_to_container reaches a terminal status')
         or diag($resp2->{out} . $resp2->{err});
 
-    my $new_bytes = read_text("$r->{ccpx}/plugins/sandbox/container/settings.json");
+    my $new_bytes = read_text("$r->{clone}/plugins/sandbox/container/settings.json");
     ok((defined $new_bytes), 'AC31: the container settings file still exists after the write');
     my $decoded_ok = 0;
     if (defined $new_bytes) {
@@ -1310,7 +1355,7 @@ sub run_export_phase_direct {
     my $garbage = qq({"k1": "R",}\n);   # trailing comma -- unparseable
     my $r = setup_root(with_origin => 0, container_settings => qq({"k1":"R"}\n));
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/plugins/sandbox/container/settings.json", $garbage);
+    write_text("$r->{clone}/plugins/sandbox/container/settings.json", $garbage);
     my $extra = { STUB_FILTERDIFF_JSON => $filterdiff_json };
     my $resp = run_backup($r, $extra);
     is($resp->{exit}, 10, '(setup) AC32: a diverged key pauses the run despite a malformed container target') or diag($resp->{out} . $resp->{err});
@@ -1321,7 +1366,7 @@ sub run_export_phase_direct {
     my $resp2 = run_backup($r, $extra, '--resume', ($token // ''),
         '--answer', (defined $d ? "$d->{id}=propagate_to_container" : 'export.container.k1=propagate_to_container'));
     isnt($resp2->{exit}, 1, 'AC32: a malformed container target degrades rather than aborting the run (never phase_died)');
-    is(read_text("$r->{ccpx}/plugins/sandbox/container/settings.json"), $garbage,
+    is(read_text("$r->{clone}/plugins/sandbox/container/settings.json"), $garbage,
         'AC32: the malformed container settings bytes are byte-for-byte UNCHANGED after the run');
     my $state2 = read_state($r->{state_path});
     if (defined $state2) {
@@ -1346,9 +1391,9 @@ sub run_export_phase_direct {
     });
     my $r = setup_root(with_origin => 0, container_settings => qq({"k1":"R"}\n));
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    unlink "$r->{ccpx}/plugins/sandbox/container/settings.json";
-    make_path("$r->{ccpx}/plugins/sandbox/container/settings.json");
-    write_text("$r->{ccpx}/plugins/sandbox/container/settings.json/blocker.txt", "occupying the path\n");
+    unlink "$r->{clone}/plugins/sandbox/container/settings.json";
+    make_path("$r->{clone}/plugins/sandbox/container/settings.json");
+    write_text("$r->{clone}/plugins/sandbox/container/settings.json/blocker.txt", "occupying the path\n");
     my $extra = { STUB_FILTERDIFF_JSON => $filterdiff_json };
     my $resp = run_backup($r, $extra);
     is($resp->{exit}, 10, '(setup) AC33: a diverged key pauses the run despite an unwritable container target') or diag($resp->{out} . $resp->{err});
@@ -1458,7 +1503,7 @@ my $SENSITIVE_HIT_STDOUT =
 {
     my $r = setup_root(with_origin => 0);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    my $before_count = commit_count($r->{home}, $r->{ccpx});
+    my $before_count = commit_count($r->{home}, $r->{clone});
     my $extra = { STUB_SENSITIVE_EXIT => 1, STUB_SENSITIVE_STDOUT => $SENSITIVE_HIT_STDOUT };
     my $resp = run_backup($r, $extra);
     my @sf = decisions_of_kind($resp, 'sensitive_finding');
@@ -1469,7 +1514,7 @@ my $SENSITIVE_HIT_STDOUT =
         '--answer', (defined $d ? "$d->{id}=abort" : 'export.sensitive_finding.1=abort'));
     is($resp2->{exit}, 20, 'AC19: abort yields exit 20 (complete_with_failures)') or diag($resp2->{out} . $resp2->{err});
     is(scalar(git_lines($r->{log_path})), 0, 'AC19: abort -- still zero git invocations');
-    is(commit_count($r->{home}, $r->{ccpx}), $before_count, 'AC19: abort -- the commit count is unchanged (no commit was created)');
+    is(commit_count($r->{home}, $r->{clone}), $before_count, 'AC19: abort -- the commit count is unchanged (no commit was created)');
 }
 {
     my $r = setup_root(with_origin => 0);
@@ -1532,8 +1577,8 @@ my $SENSITIVE_HIT_STDOUT =
 {
     my $r = setup_root(with_origin => 0);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    my $head = head_sha($r->{home}, $r->{ccpx});
-    write_text("$r->{ccpx}/.git/MERGE_HEAD", "$head\n");
+    my $head = head_sha($r->{home}, $r->{clone});
+    write_text("$r->{clone}/.git/MERGE_HEAD", "$head\n");
     my $resp = run_backup($r, {});
     isnt($resp->{exit}, 1, 'AC21: MERGE_HEAD present never aborts the whole run (no phase_died)');
     is($resp->{exit}, 20, 'AC21: MERGE_HEAD present degrades the run to exit 20 (complete_with_failures)')
@@ -1546,7 +1591,7 @@ my $SENSITIVE_HIT_STDOUT =
         ok(0, 'AC21: the phase error names the in-progress merge');
     }
     is(git_verb_count($r->{log_path}, 'add'), 0, 'AC21: git add appears zero times in the git argv log');
-    is(head_sha($r->{home}, $r->{ccpx}), $head, 'AC21: git rev-parse HEAD is unchanged');
+    is(head_sha($r->{home}, $r->{clone}), $head, 'AC21: git rev-parse HEAD is unchanged');
 }
 
 # ===========================================================================
@@ -1554,18 +1599,27 @@ my $SENSITIVE_HIT_STDOUT =
 # files pause at push_confirmation with ZERO add/commit/push spawned; the
 # detail lists them and counts untracked separately; abort leaves git
 # status and the commit count byte-for-byte unchanged.
+#
+# 2026-10-30: the pending set is the files the backup WROTE (here: the merge's
+# global-config/settings.json, and two paths the preflight's W2 recorded as
+# written), never the developer's own changes in the dev clone -- a modified
+# README and an untracked file sit right next to them and must stay out.
 # ===========================================================================
 {
     my $r = setup_root(with_origin => 1);
-    seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    open(my $fh, '>>:raw', "$r->{ccpx}/README.md") or die "cannot modify README.md: $!";
+    seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} },
+        { marketplace_outcome => { wrote => [ 'global-config/known_marketplaces.json', 'global-config/exported-new.json' ] } });
+    pending_export($r, 'ac22');                                                     # modified (settings_merge)
+    unlink "$r->{clone}/global-config/known_marketplaces.json";                    # deleted (recorded as written)
+    write_text("$r->{clone}/global-config/exported-new.json", "{}\n");             # untracked (recorded as written)
+    # The developer's own work in the dev clone, which the backup never wrote.
+    open(my $fh, '>>:raw', "$r->{clone}/README.md") or die "cannot modify README.md: $!";
     print {$fh} "\nan uncommitted modification\n";
     close $fh;
-    unlink "$r->{ccpx}/global-config/known_marketplaces.json";
-    write_text("$r->{ccpx}/never-committed-untracked.txt", "brand new file\n");
+    write_text("$r->{clone}/never-committed-untracked.txt", "brand new file\n");
 
-    my $status_before = status_of($r->{home}, $r->{ccpx});
-    my $commits_before = commit_count($r->{home}, $r->{ccpx});
+    my $status_before = status_of($r->{home}, $r->{clone});
+    my $commits_before = commit_count($r->{home}, $r->{clone});
     my $resp = run_backup($r, {});
     is($resp->{exit}, 10, 'AC22: modified+deleted+untracked changes pause the run (exit 10)') or diag($resp->{out} . $resp->{err});
     my @pc = decisions_of_kind($resp, 'push_confirmation');
@@ -1581,22 +1635,27 @@ my $SENSITIVE_HIT_STDOUT =
         ok((($d->{data}{modified} // 0) + 0 >= 1), 'AC23: data.modified counts at least the one modified file');
         ok((($d->{data}{deleted}  // 0) + 0 >= 1), 'AC23: data.deleted counts at least the one deleted file');
         ok((($d->{data}{untracked} // 0) + 0 >= 1), 'AC23: data.untracked counts the untracked file SEPARATELY');
-        like(encode_json($d->{data}{files} // $d->{detail}), qr/never-committed-untracked\.txt/,
-            'AC23: the untracked file is named in the decision payload');
+        like(encode_json($d->{data}{files} // $d->{detail}), qr/exported-new\.json/,
+            'AC23: the untracked exported file is named in the decision payload');
+        my $payload = encode_json($d->{data}{files} // []) . ($d->{detail} // '');
+        unlike($payload, qr/README\.md/, 'AC23: the developer\'s modified README is NOT part of the pending set');
+        unlike($payload, qr/never-committed-untracked\.txt/, 'AC23: the developer\'s untracked file is NOT part of the pending set');
     } else {
         ok(0, 'AC23: the detail mentions untracked');
         ok(0, 'AC23: data.modified counts at least the one modified file');
         ok(0, 'AC23: data.deleted counts at least the one deleted file');
         ok(0, 'AC23: data.untracked counts the untracked file separately');
-        ok(0, 'AC23: the untracked file is named in the decision payload');
+        ok(0, 'AC23: the untracked exported file is named in the decision payload');
+        ok(0, 'AC23: the developer\'s modified README is NOT part of the pending set');
+        ok(0, 'AC23: the developer\'s untracked file is NOT part of the pending set');
     }
 
     my $token = $resp->{json}{resume_token};
     my $resp2 = run_backup($r, {}, '--resume', ($token // ''), '--answer', (defined $d ? "$d->{id}=abort" : 'export.push_confirmation=abort'));
     ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), 'AC22: answering abort reaches a terminal status')
         or diag($resp2->{out} . $resp2->{err});
-    is(status_of($r->{home}, $r->{ccpx}), $status_before, 'AC22: abort leaves git status --porcelain byte-identical');
-    is(commit_count($r->{home}, $r->{ccpx}), $commits_before, 'AC22: abort leaves the commit count unchanged');
+    is(status_of($r->{home}, $r->{clone}), $status_before, 'AC22: abort leaves git status --porcelain byte-identical');
+    is(commit_count($r->{home}, $r->{clone}), $commits_before, 'AC22: abort leaves the commit count unchanged');
     is(git_verb_count($r->{log_path}, 'commit'), 0, 'AC22: abort -- git commit STILL appears zero times after the resume');
     is(git_verb_count($r->{log_path}, 'push'),   0, 'AC22: abort -- git push STILL appears zero times after the resume');
 }
@@ -1608,8 +1667,8 @@ my $SENSITIVE_HIT_STDOUT =
 {
     my $r = setup_root(with_origin => 0);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/no-remote-marker.txt", "needs a commit, has nowhere to push\n");
-    my $commits_before = commit_count($r->{home}, $r->{ccpx});
+    pending_export($r, q{no-remote});
+    my $commits_before = commit_count($r->{home}, $r->{clone});
     my $resp = run_backup($r, {});
     is($resp->{exit}, 10, 'AC26: a pending change with no remote pauses the run') or diag($resp->{out} . $resp->{err});
     my @pc = decisions_of_kind($resp, 'push_confirmation');
@@ -1629,7 +1688,7 @@ my $SENSITIVE_HIT_STDOUT =
     my $resp2 = run_backup($r, {}, '--resume', ($token // ''), '--answer', (defined $d ? "$d->{id}=commit_only" : 'export.push_confirmation=commit_only'));
     ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), 'AC26: answering commit_only reaches a terminal status')
         or diag($resp2->{out} . $resp2->{err});
-    is(commit_count($r->{home}, $r->{ccpx}), $commits_before + 1, 'AC26: commit_only creates exactly one new commit');
+    is(commit_count($r->{home}, $r->{clone}), $commits_before + 1, 'AC26: commit_only creates exactly one new commit');
     is(git_verb_count($r->{log_path}, 'push'), 0, 'AC26: zero push invocations with no remote configured');
 }
 
@@ -1658,9 +1717,12 @@ for my $variant (
     { label => q{non-ASCII}, machine_name => "host-Andr$AC24_EACUTE", file => "caf${AC24_EACUTE}-notes.txt", content => "Andr$AC24_EACUTE was here\n" },
 ) {
     my $r = setup_root(with_origin => 1, machine_name => $variant->{machine_name});
-    seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/$variant->{file}", $variant->{content});
-    my $commits_before = commit_count($r->{home}, $r->{ccpx});
+    # A newly written export file with this variant's (possibly non-ASCII)
+    # name, recorded as written the way the preflight's W2 records its file.
+    seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} },
+        { marketplace_outcome => { wrote => [ "global-config/$variant->{file}" ] } });
+    write_text("$r->{clone}/global-config/$variant->{file}", $variant->{content});
+    my $commits_before = commit_count($r->{home}, $r->{clone});
     my $remote_before   = remote_head_sha($r->{home}, $r->{remote});
 
     my $resp = run_backup($r, {});
@@ -1672,11 +1734,11 @@ for my $variant (
     my $resp2 = run_backup($r, {}, '--resume', ($token // ''), '--answer', (defined $d ? "$d->{id}=push" : 'export.push_confirmation=push'));
     is($resp2->{exit}, 0, "AC24 ($variant->{label}): answering push completes the run (exit 0)") or diag($resp2->{out} . $resp2->{err});
 
-    is(commit_count($r->{home}, $r->{ccpx}), $commits_before + 1, "AC24 ($variant->{label}): exactly one new commit was created");
-    my $subject = _git_out($r->{home}, $r->{ccpx}, 'log', '-1', '--format=%s');
+    is(commit_count($r->{home}, $r->{clone}), $commits_before + 1, "AC24 ($variant->{label}): exactly one new commit was created");
+    my $subject = _git_out($r->{home}, $r->{clone}, 'log', '-1', '--format=%s');
     $subject =~ s/\s+\z//;
     like($subject, qr/^backup: sync ccpraxis config \(\d+ file\(s\)\)$/, "AC24 ($variant->{label}): the commit subject matches the deterministic grammar");
-    my $new_head = head_sha($r->{home}, $r->{ccpx});
+    my $new_head = head_sha($r->{home}, $r->{clone});
     isnt($new_head, ($remote_before // ''), "AC24 ($variant->{label}): local HEAD advanced");
     is(remote_head_sha($r->{home}, $r->{remote}), $new_head, "AC24 ($variant->{label}): the bare remote main resolves to the new commit");
 
@@ -1703,7 +1765,7 @@ for my $variant (
 {
     my $r = setup_root(with_origin => 1);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/ac25-warn-marker.txt", "triggers a pending change\n");
+    pending_export($r, q{ac25-warn});
     write_text("$r->{remote}/hooks/pre-receive",
         "#!/bin/sh\ncat >/dev/null\necho \"Bypassed rule violations for refs/heads/main\"\n" .
         "echo \"        Cannot update this protected ref / Changes must be made through a pull request\"\nexit 0\n");
@@ -1731,7 +1793,7 @@ for my $variant (
 {
     my $r = setup_root(with_origin => 1);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/ac25-reject-marker.txt", "triggers a pending change\n");
+    pending_export($r, q{ac25-reject});
     write_text("$r->{remote}/hooks/pre-receive",
         "#!/bin/sh\ncat >/dev/null\necho \"TEST-INTENTIONAL-REJECTION-9f3d: hook declined the push\" 1>&2\nexit 1\n");
     chmod 0755, "$r->{remote}/hooks/pre-receive";
@@ -1764,7 +1826,7 @@ for my $variant (
 {
     my $r = setup_root(with_origin => 1);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/ac27-marker.txt", "will be pushed for real\n");
+    pending_export($r, q{ac27});
 
     my $resp = run_backup($r, {});
     my @pc = decisions_of_kind($resp, 'push_confirmation');
@@ -1773,7 +1835,7 @@ for my $variant (
     my $token = $resp->{json}{resume_token};
     my $resp2 = run_backup($r, {}, '--resume', ($token // ''), '--answer', (defined $d ? "$d->{id}=push" : 'export.push_confirmation=push'));
     is($resp2->{exit}, 0, '(setup) AC27: the real push completes normally first') or diag($resp2->{out} . $resp2->{err});
-    my $pushed_head    = head_sha($r->{home}, $r->{ccpx});
+    my $pushed_head    = head_sha($r->{home}, $r->{clone});
     my $push_count_before = git_verb_count($r->{log_path}, 'push');
     ok($push_count_before >= 1, '(setup) AC27: at least one real push was logged');
 
@@ -1796,7 +1858,7 @@ for my $variant (
             or diag($resp3->{out} . $resp3->{err});
         ok(($resp3->{exit} == 0 || $resp3->{exit} == 20), 'AC27: re-entry after the simulated crash reaches a terminal status')
             or diag($resp3->{out} . $resp3->{err});
-        is(head_sha($r->{home}, $r->{ccpx}), $pushed_head, 'AC27: local HEAD is unchanged by the re-entry (no new commit)');
+        is(head_sha($r->{home}, $r->{clone}), $pushed_head, 'AC27: local HEAD is unchanged by the re-entry (no new commit)');
         is(remote_head_sha($r->{home}, $r->{remote}), $pushed_head, 'AC27: the repo IS pushed -- remote main equals the earlier real push');
         is(git_verb_count($r->{log_path}, 'push'), $push_count_before,
             'AC27: the git argv log shows ZERO further push invocations across the re-entry');
@@ -1826,8 +1888,8 @@ for my $variant (
 {
     my $r = setup_root(with_origin => 1);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/ac28-marker.txt", "committed once, pushed on the second attempt\n");
-    my $commits_before = commit_count($r->{home}, $r->{ccpx});
+    pending_export($r, q{ac28});
+    my $commits_before = commit_count($r->{home}, $r->{clone});
 
     my $resp = run_backup($r, {});
     my @pc = decisions_of_kind($resp, 'push_confirmation');
@@ -1838,9 +1900,12 @@ for my $variant (
     my $resp2 = run_backup($r, $fail_push, '--resume', ($token // ''), '--answer', (defined $d ? "$d->{id}=push" : 'export.push_confirmation=push'));
     is($resp2->{exit}, 20, '(setup) AC28: commit succeeds but push is made to fail (simulating a death between the two)')
         or diag($resp2->{out} . $resp2->{err});
-    my $commits_after_first = commit_count($r->{home}, $r->{ccpx});
+    my $commits_after_first = commit_count($r->{home}, $r->{clone});
     is($commits_after_first, $commits_before + 1, '(setup) AC28: the commit was created despite the push failure');
 
+    # A fresh run (the previous one ended complete_with_failures); the preflight
+    # would establish the same export target again.
+    seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
     my $resp3 = run_backup($r, {});
     is($resp3->{exit}, 10, 'AC28: re-entry asks push_confirmation AGAIN (consent is never resurrected)')
         or diag($resp3->{out} . $resp3->{err});
@@ -1852,8 +1917,8 @@ for my $variant (
     my $resp4 = run_backup($r, {}, '--resume', ($token2 // ''), '--answer', (defined $d2 ? "$d2->{id}=push" : 'export.push_confirmation=push'));
     ok(($resp4->{exit} == 0 || $resp4->{exit} == 20), 'AC28: answering push on the retry reaches a terminal status')
         or diag($resp4->{out} . $resp4->{err});
-    is(commit_count($r->{home}, $r->{ccpx}), $commits_after_first, 'AC28: exactly ONE commit exists in total (the retry did not create a second one)');
-    is(remote_head_sha($r->{home}, $r->{remote}), head_sha($r->{home}, $r->{ccpx}), 'AC28: the remote now reflects the single commit');
+    is(commit_count($r->{home}, $r->{clone}), $commits_after_first, 'AC28: exactly ONE commit exists in total (the retry did not create a second one)');
+    is(remote_head_sha($r->{home}, $r->{remote}), head_sha($r->{home}, $r->{clone}), 'AC28: the remote now reflects the single commit');
 }
 
 # ===========================================================================
@@ -1906,12 +1971,12 @@ for my $variant (
     isnt($r->{home}, ($REAL_HOME // ''),        'AC30: the scenario HOME is not literally the operator real HOME');
     isnt($r->{home}, ($REAL_USERPROFILE // ''), 'AC30: the scenario HOME is not literally the operator real USERPROFILE');
     like($r->{state_path}, qr/\Q$r->{scratch}\E/, 'AC30: the run-state file path is rooted under the scratch tree');
-    like($r->{ccpx},       qr/\Q$r->{scratch}\E/, 'AC30: the ccpraxis root is rooted under the scratch tree');
+    like($r->{clone},       qr/\Q$r->{scratch}\E/, 'AC30: the ccpraxis root is rooted under the scratch tree');
     like(($r->{remote} // ''), qr/\Q$r->{scratch}\E/, 'AC30: the git remote path is rooted under the scratch tree');
     unlike(($r->{remote} // ''), qr{^[a-zA-Z][a-zA-Z0-9+.-]*://}, 'AC30: the git remote is a local path, never a URL scheme (no network call is possible)');
 
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/ac30-marker.txt", "isolation sanity content\n");
+    pending_export($r, q{ac30});
     my $resp = run_backup($r, {});
     ok(($resp->{exit} == 10 || $resp->{exit} == 0 || $resp->{exit} == 20), 'AC30: the isolated run reaches a plausible status')
         or diag($resp->{out} . $resp->{err});
@@ -1926,11 +1991,157 @@ for my $variant (
 }
 
 # ===========================================================================
+# 2026-10-30 -- the export target. The phase runs only for the preflight's
+# ready export_target, writes only into that dev clone, and a CLAUDE.md
+# difference is a claude_md_drift question (rebuild / leave), never an export.
+# ===========================================================================
+{
+    # SKIP -- a target that is not ready skips the whole phase, running
+    # nothing at all.
+    my $r = setup_root(with_origin => 1);
+    $EXPORT_TARGET{ $r->{state_path} } = { ready => 0, live_root => $r->{ccpx}, dev_clone => $r->{clone},
+        reason => 'the dev clone has payload changes the live install was not promoted with',
+        fix => 'promote first (perl scripts/promote.pl), then back up' };
+    seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
+    pending_export($r, 'skip');
+    my $resp = run_backup($r, {});
+    is($resp->{exit}, 0, 'TARGET-SKIP: a not-ready export target ends the run cleanly (exit 0)') or diag($resp->{out} . $resp->{err});
+    is(log_line_count($r->{log_path}), 0, 'TARGET-SKIP: no wrapped script and no git verb ran');
+    my $state = read_state($r->{state_path});
+    is(($state // {})->{phases}{export}{status}, 'skipped', 'TARGET-SKIP: the export phase is recorded skipped');
+    my $note = defined $state ? find_note($state, 'ccpraxis_export_skipped') : undef;
+    like((defined $note ? ($note->{value}{fix} // '') : ''), qr/promote first/, 'TARGET-SKIP: the note carries the fix');
+}
+
+{
+    # CLAUDE-MD -- sync-export.pl's claude_md_differs item becomes a
+    # claude_md_drift decision with the differing lines and no way to copy
+    # ~/.claude/CLAUDE.md into the repo.
+    my $r = setup_root(with_origin => 0);
+    seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
+    my $sync_json = encode_json([ {
+        file => 'CLAUDE.md', repo_file => 'global-config/CLAUDE.md', status => 'claude_md_differs',
+        claude_md_status => 'differs', note => 'the file is not what promotion builds from the live install',
+        host_part => 'global-config/CLAUDE.macos.md',
+        extra_lines => [ { n => 7, text => 'a line typed into ~/.claude/CLAUDE.md' } ],
+        missing_lines => [ { n => 9, text => 'a line the build has' } ],
+        resolve => "fold these lines into the dev clone's global-config/CLAUDE.md (every host) or this host's part (global-config/CLAUDE.macos.md) and promote again; rebuilding ~/.claude/CLAUDE.md from the live install discards them.",
+    } ]);
+    my $extra = { STUB_SYNC_JSON => $sync_json };
+    my $resp = run_backup($r, $extra);
+    is($resp->{exit}, 10, 'CLAUDE-MD: a CLAUDE.md difference pauses the run') or diag($resp->{out} . $resp->{err});
+    my @cm = decisions_of_kind($resp, 'claude_md_drift');
+    record_decisions(@cm);
+    is(scalar(@cm), 1, 'CLAUDE-MD: exactly one claude_md_drift decision');
+    ok(!(decisions_of_kind($resp, 'file_conflict')), 'CLAUDE-MD: no file_conflict for CLAUDE.md');
+    my $d = $cm[0] // {};
+    is($d->{id}, 'export.claude_md_drift', 'CLAUDE-MD: the decision id');
+    is(join(',', sort map { $_->{id} } @{ $d->{choices} // [] }), 'leave,rerender', 'CLAUDE-MD: the choices are rerender and leave, no use_live');
+    like(($d->{detail} // ''), qr/L7: a line typed into ~\/\.claude\/CLAUDE\.md/, 'CLAUDE-MD: the detail names the line only in the file');
+    like(($d->{detail} // ''), qr/L9: a line the build has/, 'CLAUDE-MD: ...and the line only in the build');
+    like(($d->{detail} // ''), qr/dev clone's global-config\/CLAUDE\.md/, 'CLAUDE-MD: ...and where a kept line has to go');
+
+    my $resp2 = run_backup($r, $extra, '--resume', ($resp->{json}{resume_token} // ''), '--answer', 'export.claude_md_drift=rerender');
+    ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), 'CLAUDE-MD: rerender reaches a terminal status') or diag($resp2->{out} . $resp2->{err});
+    my ($install) = grep { /^ccpraxis-helpers\.pl install-claude-md/ } log_lines($r->{log_path});
+    is(($install // ''), "ccpraxis-helpers.pl install-claude-md --live-root $r->{ccpx}",
+        'CLAUDE-MD: rerender runs install-claude-md against the LIVE install');
+    my $state = read_state($r->{state_path});
+    my $note = defined $state ? find_note($state, 'claude_md_rerendered') : undef;
+    like((defined $note ? ($note->{value}{backup} // '') : ''), qr/\.promotion-backups/, 'CLAUDE-MD: the note names the backup copy');
+    is(($state // {})->{phases}{export}{items}{file_outcome}{data}{claude_md}{choice}, 'rerender', 'CLAUDE-MD: file_outcome records the choice');
+    is_deeply_wrote($state, [], 'CLAUDE-MD: rebuilding ~/.claude/CLAUDE.md writes nothing into the dev clone');
+
+    my $r2 = setup_root(with_origin => 0);
+    seed_preflight_outcome($r2->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
+    my $resp3 = run_backup($r2, $extra);
+    my $resp4 = run_backup($r2, $extra, '--resume', ($resp3->{json}{resume_token} // ''), '--answer', 'export.claude_md_drift=leave');
+    ok(($resp4->{exit} == 0 || $resp4->{exit} == 20), 'CLAUDE-MD: leave reaches a terminal status') or diag($resp4->{out} . $resp4->{err});
+    ok(!(grep { /install-claude-md/ } log_lines($r2->{log_path})), 'CLAUDE-MD: leave rebuilds nothing');
+    my $state2 = read_state($r2->{state_path});
+    ok((defined $state2 && defined find_note($state2, 'claude_md_left')), 'CLAUDE-MD: leave is noted with where the lines go');
+}
+
+sub is_deeply_wrote {
+    my ($state, $want, $name) = @_;
+    my $got = ($state // {})->{phases}{export}{items}{file_outcome}{data}{wrote};
+    is(join(',', @{ $got // ['(none)'] }), join(',', @$want), $name);
+}
+
+{
+    # E2E-DEVCLONE -- the real settings-export-merge, sync-export.pl and
+    # shared modules. The export lands in the dev clone's working tree, only
+    # the file it wrote is committed (the developer's modified README and
+    # untracked file are not), the push sends the dev clone's main -- the
+    # developer's own unpushed commit included, and listed at consent -- to
+    # its origin, and the live install is untouched: HEAD, status, payload.
+    my $r = setup_root(with_origin => 1, container_settings => undef,
+        repo_settings => qq({"theme":"dark"}\n), live_settings => qq({"theme":"dark","fromLive":"exported"}\n));
+    my $real = "$Bin/../../scripts";
+    for my $name (qw(ccpraxis-helpers.pl sync-export.pl json-diff.pl filter-diff.pl save-preference.pl
+                     DevClone.pm MachineLocalSettings.pm GlobalClaudeMd.pm)) {
+        write_text("$r->{clone}/plugins/steward/scripts/$name", read_text("$real/$name"));
+    }
+    write_text("$r->{clone}/plugins/steward/scripts/sensitive-check.pl", _stub_wrap($STUB_SENSITIVE_BODY));
+    _git($r->{home}, $r->{clone}, 'add', '-A');
+    _git($r->{home}, $r->{clone}, 'commit', '-q', '-m', 'the real backup scripts');
+    _git($r->{home}, $r->{clone}, 'push', '-q', 'origin', 'main');
+    # Promote: the live install takes exactly the dev clone's main (the
+    # untracked stubs setup_root put there make way for the real scripts).
+    unlink "$r->{ccpx}/plugins/steward/scripts/$_"
+        for qw(sync-export.pl ccpraxis-helpers.pl json-diff.pl filter-diff.pl save-preference.pl sensitive-check.pl);
+    _git($r->{home}, $r->{ccpx}, 'pull', '-q', '--ff-only', 'origin', 'main');
+    write_text("$r->{clone}/dev-work.txt", "unpushed development\n");
+    _git($r->{home}, $r->{clone}, 'add', 'dev-work.txt');
+    _git($r->{home}, $r->{clone}, 'commit', '-q', '-m', 'developer work not pushed yet');
+    open(my $fh, '>>:raw', "$r->{clone}/README.md") or die;
+    print {$fh} "a developer edit in progress\n";
+    close $fh;
+    write_text("$r->{clone}/scratch-notes.txt", "untracked developer file\n");
+
+    seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
+    my $live_head    = head_sha($r->{home}, $r->{ccpx});
+    my $live_status  = status_of($r->{home}, $r->{ccpx});
+    my $live_payload = read_text("$r->{ccpx}/global-config/settings.json");
+    is($live_status, '', '(setup) E2E-DEVCLONE: the live install starts clean');
+
+    my $resp = run_backup($r, {});
+    is($resp->{exit}, 10, 'E2E-DEVCLONE: the run pauses for consent') or diag($resp->{out} . $resp->{err});
+    my @pc = decisions_of_kind($resp, 'push_confirmation');
+    record_decisions(@pc);
+    my $d = $pc[0] // {};
+    like(($d->{detail} // ''), qr/developer work not pushed yet/, 'E2E-DEVCLONE: consent lists the developer\'s unpushed commit a push would send');
+    like(($d->{detail} // ''), qr{global-config/settings\.json}, 'E2E-DEVCLONE: ...and the exported file');
+    unlike(($d->{detail} // ''), qr/README\.md|scratch-notes\.txt/, 'E2E-DEVCLONE: ...and nothing the backup did not write');
+    like(($d->{detail} // ''), qr/\Q$r->{remote}\E/, 'E2E-DEVCLONE: ...and the destination remote');
+    like((read_text("$r->{clone}/global-config/settings.json") // ''), qr/"fromLive"\s*:\s*"exported"/,
+        'E2E-DEVCLONE: the merge wrote the live-only key into the dev clone');
+
+    my $resp2 = run_backup($r, {}, '--resume', ($resp->{json}{resume_token} // ''), '--answer', ($d->{id} // 'export.push_confirmation') . '=push');
+    is($resp2->{exit}, 0, 'E2E-DEVCLONE: answering push completes the run') or diag($resp2->{out} . $resp2->{err});
+    my $files = _git_out($r->{home}, $r->{clone}, 'show', '--name-only', '--format=', 'HEAD');
+    is($files, "global-config/settings.json\n", 'E2E-DEVCLONE: the export commit holds exactly the file the backup wrote');
+    is(remote_head_sha($r->{home}, $r->{remote}), head_sha($r->{home}, $r->{clone}), 'E2E-DEVCLONE: the bare remote has the dev clone\'s main');
+    like(_git_out($r->{home}, $r->{remote}, 'log', '--format=%s', 'main'), qr/developer work not pushed yet/,
+        'E2E-DEVCLONE: ...the developer\'s commit went with it');
+    my $st = status_of($r->{home}, $r->{clone});
+    like($st, qr/^ M README\.md$/m, 'E2E-DEVCLONE: the developer\'s README edit is still uncommitted');
+    like($st, qr/^\?\? scratch-notes\.txt$/m, 'E2E-DEVCLONE: the developer\'s untracked file is still untracked');
+    is(head_sha($r->{home}, $r->{ccpx}), $live_head, 'E2E-DEVCLONE: the live install HEAD is unchanged');
+    is(status_of($r->{home}, $r->{ccpx}), '', 'E2E-DEVCLONE: the live install git status is still clean');
+    is(read_text("$r->{ccpx}/global-config/settings.json"), $live_payload, 'E2E-DEVCLONE: the live payload is byte-for-byte unchanged');
+    my $state = read_state($r->{state_path});
+    like((($state // {})->{phases}{export}{items}{committed}{data}{promote_next} // ''), qr{scripts/promote\.pl\z},
+        'E2E-DEVCLONE: the report says to promote next');
+}
+
+# ===========================================================================
 # AC2 -- (aggregate, across the whole suite): every decision observed
 # anywhere in this file has a kind in the closed enum and passes
 # Backup::Run::validate_decision; the set of kinds actually observed is
-# exactly {file_conflict, container_settings_key, sensitive_finding,
-# push_confirmation}; every id matches ^export\.[A-Za-z0-9_.:-]*$.
+# exactly {file_conflict, claude_md_drift, container_settings_key,
+# sensitive_finding, push_confirmation}; every id matches
+# ^export\.[A-Za-z0-9_.:-]*$.
 # ===========================================================================
 {
     my %kinds_seen;
@@ -1953,8 +2164,8 @@ for my $variant (
     ok(scalar(@ALL_DECISIONS_SEEN) > 0, 'AC2: at least one decision was observed across the whole suite');
     ok($all_valid, 'AC2: every decision observed across the suite validates against Backup::Run::validate_decision');
     ok($all_id_ok, 'AC2: every decision id matches ^export\.[A-Za-z0-9_.:-]*$');
-    is(join(',', sort keys %kinds_seen), 'container_settings_key,file_conflict,push_confirmation,sensitive_finding',
-        'AC2: the set of kinds observed across the whole suite is exactly the four this package owns');
+    is(join(',', sort keys %kinds_seen), 'claude_md_drift,container_settings_key,file_conflict,push_confirmation,sensitive_finding',
+        'AC2: the set of kinds observed across the whole suite is exactly the five this package owns');
 }
 
 # ===========================================================================
@@ -2043,7 +2254,7 @@ for my $variant (
 {
     my $r = setup_root(with_origin => 1);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/item1b-marker.txt", "pending change\n");
+    pending_export($r, q{item1b});
     my $remote_before = remote_head_sha($r->{home}, $r->{remote});
     my $resp = run_backup($r, {});
     my @pc = decisions_of_kind($resp, 'push_confirmation');
@@ -2101,7 +2312,7 @@ for my $variant (
     ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), '(setup) HARDEN item2: answering both nested keys reaches a terminal status')
         or diag($resp2->{out} . $resp2->{err});
 
-    my $new_bytes = read_text("$r->{ccpx}/plugins/sandbox/container/settings.json");
+    my $new_bytes = read_text("$r->{clone}/plugins/sandbox/container/settings.json");
     my $decoded_ok = 0;
     if (defined $new_bytes) {
         my $probe = $new_bytes;
@@ -2151,7 +2362,7 @@ for my $variant (
     });
     my $r = setup_root(with_origin => 0, container_settings => qq({}\n));
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/item3-marker.txt", "keeps invocation 1 paused rather than terminal\n");
+    pending_export($r, q{item3});
 
     my $resp1 = run_backup($r, { STUB_JSONDIFF_EXIT => 2 });
     is($resp1->{exit}, 10, '(setup) HARDEN item3: invocation 1 pauses (container_diff failed, but the untracked marker keeps the run alive)')
@@ -2201,28 +2412,30 @@ for my $variant (
 {
     my $scratch = temproot();
     my $home    = make_machine($scratch, 'host');
-    my $claude_dir = "$home/.claude";
-    my $ccpx = "$claude_dir/ccpraxis";
-    make_path($ccpx);
-    write_text("$ccpx/global-config/settings.json", "{}\n");
-    write_text("$ccpx/global-config/known_marketplaces.json", "{}\n");
+    my $ccpx = "$home/.claude/ccpraxis";
+    my $outer = "$scratch/outer";
+    my $clone = "$outer/ccpraxis";
+    make_path($ccpx, $clone);
+    write_text("$clone/global-config/settings.json", "{}\n");
+    write_text("$clone/global-config/known_marketplaces.json", "{}\n");
     write_text("$home/.claude/settings.json", "{}\n");
-    write_text("$ccpx/plugins/sandbox/container/settings.json", "{}\n");
+    write_text("$clone/plugins/sandbox/container/settings.json", "{}\n");
     write_stub_scripts($ccpx);
-    # The git repo is rooted at the PARENT of ccpraxis -- $root
-    # (<home>/.claude/ccpraxis) is a SUBDIRECTORY of the real top level,
-    # never the top level itself.
-    _git($home, $claude_dir, 'init', '-q');
-    _git($home, $claude_dir, 'add', '-A');
-    _git($home, $claude_dir, 'commit', '-q', '-m', 'ancestor-rooted fixture (HARDEN item4a)');
+    # The git repo is rooted at the PARENT of the dev clone directory -- the
+    # export target is a SUBDIRECTORY of the real top level, never the top
+    # level itself.
+    _git($home, $outer, 'init', '-q');
+    _git($home, $outer, 'add', '-A');
+    _git($home, $outer, 'commit', '-q', '-m', 'ancestor-rooted fixture (HARDEN item4a)');
 
     my $phase_dir = "$scratch/phases";
     copy_export_into($phase_dir);
     my $git_stub = write_git_stub($scratch);
     my $r = {
-        scratch => $scratch, home => $home, ccpx => $ccpx, phase_dir => $phase_dir,
+        scratch => $scratch, home => $home, ccpx => $ccpx, clone => $clone, phase_dir => $phase_dir,
         git_stub => $git_stub, state_path => "$scratch/state/run.json", log_path => "$scratch/log.txt",
     };
+    $EXPORT_TARGET{ $r->{state_path} } = { ready => 1, live_root => $ccpx, dev_clone => $clone };
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
 
     my $resp = run_backup($r, {});
@@ -2243,10 +2456,10 @@ for my $variant (
 {
     my $r = setup_root(with_origin => 0);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    my $head = head_sha($r->{home}, $r->{ccpx});
+    my $head = head_sha($r->{home}, $r->{clone});
     my $real_gitdir = "$r->{scratch}/ccpraxis-external-gitdir";
-    rename("$r->{ccpx}/.git", $real_gitdir) or die "HARDEN item4b setup: cannot relocate .git: $!";
-    write_text("$r->{ccpx}/.git", "gitdir: $real_gitdir\n");
+    rename("$r->{clone}/.git", $real_gitdir) or die "HARDEN item4b setup: cannot relocate .git: $!";
+    write_text("$r->{clone}/.git", "gitdir: $real_gitdir\n");
     write_text("$real_gitdir/MERGE_HEAD", "$head\n");
 
     my $resp = run_backup($r, {});
@@ -2271,8 +2484,13 @@ for my $variant (
 # ---------------------------------------------------------------------------
 {
     my $r = setup_root(with_origin => 0);
+    # The dev clone path as the preflight recorded it, with a doubled
+    # separator: the same directory, spelled differently from git's
+    # --show-toplevel answer.
+    (my $clone_equiv = $r->{clone}) =~ s{/([^/]+)\z}{//$1};
+    $EXPORT_TARGET{ $r->{state_path} }{dev_clone} = $clone_equiv;
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/item4a-followup-marker.txt", "pending change under an equivalently spelled root\n");
+    pending_export($r, q{item4a-followup});
 
     # Double the LAST path separator in HOME -- filesystem-equivalent to
     # $r->{home} (the OS and git both collapse a redundant separator
@@ -2305,9 +2523,9 @@ for my $variant (
 {
     my $r = setup_root(with_origin => 0);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/item5a.txt", "repo version\n");
-    _git($r->{home}, $r->{ccpx}, 'add', '-A');
-    _git($r->{home}, $r->{ccpx}, 'commit', '-q', '-m', 'add item5a.txt to repo');
+    write_text("$r->{clone}/item5a.txt", "repo version\n");
+    _git($r->{home}, $r->{clone}, 'add', '-A');
+    _git($r->{home}, $r->{clone}, 'commit', '-q', '-m', 'add item5a.txt to repo');
     write_text("$r->{home}/.claude/item5a.txt", "live version\n");
     my $sync_json = encode_json([ { file => 'item5a.txt', status => 'not_linked', note => 'copy differs from repo' } ]);
     my $extra1 = { STUB_SYNC_JSON => $sync_json };
@@ -2324,9 +2542,12 @@ for my $variant (
     # module's own comment), and produces a genuine pending change (a
     # deleted tracked file + one untracked file) that later reaches
     # push_confirmation.
-    unlink "$r->{ccpx}/item5a.txt";
-    make_path("$r->{ccpx}/item5a.txt");
-    write_text("$r->{ccpx}/item5a.txt/blocker.txt", "occupying the path\n");
+    unlink "$r->{clone}/item5a.txt";
+    make_path("$r->{clone}/item5a.txt");
+    write_text("$r->{clone}/item5a.txt/blocker.txt", "occupying the path\n");
+    # The failed copy wrote nothing; an exported settings change is what
+    # carries the run to consent.
+    pending_export($r, q{item5a});
 
     my $extra2 = { %$extra1, STUB_SENSITIVE_EXIT => 1, STUB_SENSITIVE_STDOUT => $SENSITIVE_HIT_STDOUT };
     my $resp2 = run_backup($r, $extra2, '--resume', ($token1 // ''),
@@ -2359,7 +2580,7 @@ for my $variant (
 {
     my $r = setup_root(with_origin => 1);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/item5b-marker.txt", "pending change\n");
+    pending_export($r, q{item5b});
     my $resp = run_backup($r, {});
     my @pc = decisions_of_kind($resp, 'push_confirmation');
     record_decisions(@pc);
@@ -2388,25 +2609,25 @@ for my $variant (
 # ---------------------------------------------------------------------------
 # Item 6b -- a non-main branch (a remote genuinely exists) must be reported
 # as such, not mislabeled with the "no remote is configured" text that only
-# belongs to the genuinely-no-origin case.
+# belongs to the genuinely-no-origin case. 2026-10-30: the preflight only
+# hands over a dev clone on main; one that left main since is refused at
+# commit_review -- an export commit on a feature branch would be pushed
+# nowhere and land on the wrong history.
 # ---------------------------------------------------------------------------
 {
     my $r = setup_root(with_origin => 1);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    _git($r->{home}, $r->{ccpx}, 'checkout', '-q', '-b', 'not-main');
-    write_text("$r->{ccpx}/item6b-marker.txt", "pending change on a non-main branch\n");
+    _git($r->{home}, $r->{clone}, 'checkout', '-q', '-b', 'not-main');
+    pending_export($r, q{item6b});
+    my $commits_before = commit_count($r->{home}, $r->{clone});
     my $resp = run_backup($r, {});
-    my @pc = decisions_of_kind($resp, 'push_confirmation');
-    record_decisions(@pc);
-    my $d = $pc[0];
-    if (defined $d) {
-        my $blob = ($d->{detail} // '') . ' ' . join(' ', map { $_->{label} // '' } @{ $d->{choices} // [] });
-        unlike($blob, qr/no remote is configured/i,
-            'HARDEN item6b: a non-main branch (origin DOES exist) must not be mislabeled "no remote is configured"');
-    } else {
-        ok(0, 'HARDEN item6b: a non-main branch must not be mislabeled "no remote is configured" (no push_confirmation decision present)')
-            or diag($resp->{out} . $resp->{err});
-    }
+    is($resp->{exit}, 20, 'HARDEN item6b: a dev clone that left main fails the commit review') or diag($resp->{out} . $resp->{err});
+    ok(!(decisions_of_kind($resp, 'push_confirmation')), 'HARDEN item6b: no push is offered from a non-main branch');
+    my $state = read_state($r->{state_path});
+    my $err = defined $state ? ($state->{phases}{export}{error} // '') : '';
+    like($err, qr/on branch 'not-main', not main/, 'HARDEN item6b: the failure names the branch');
+    unlike($err, qr/no remote is configured/i, 'HARDEN item6b: ...and is not mislabeled "no remote is configured"');
+    is(commit_count($r->{home}, $r->{clone}), $commits_before, 'HARDEN item6b: nothing was committed');
 }
 
 # ---------------------------------------------------------------------------
@@ -2418,7 +2639,7 @@ for my $variant (
 {
     my $r = setup_root(with_origin => 0);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/item7-reviewed.txt", "this file WAS part of the reviewed set\n");
+    pending_export($r, q{item7-reviewed});
     my $resp = run_backup($r, {});
     is($resp->{exit}, 10, '(setup) HARDEN item7: the reviewed change pauses at push_confirmation') or diag($resp->{out} . $resp->{err});
     my @pc = decisions_of_kind($resp, 'push_confirmation');
@@ -2427,16 +2648,18 @@ for my $variant (
 
     # During the pause -- unbounded in reality -- a file appears that was
     # NEVER part of what commit_review reviewed or what the operator saw.
-    write_text("$r->{ccpx}/item7-surprise.txt", "this file appeared AFTER the review, during the pause\n");
+    write_text("$r->{clone}/item7-surprise.txt", "this file appeared AFTER the review, during the pause\n");
 
     my $token = $resp->{json}{resume_token};
     my $resp2 = run_backup($r, {}, '--resume', ($token // ''), '--answer', (defined $d ? "$d->{id}=commit_only" : 'export.push_confirmation=commit_only'));
     ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), '(setup) HARDEN item7: answering commit_only reaches a terminal status')
         or diag($resp2->{out} . $resp2->{err});
 
-    my $names = _git_out($r->{home}, $r->{ccpx}, 'show', '--stat', '--format=', 'HEAD');
+    my $names = _git_out($r->{home}, $r->{clone}, 'show', '--stat', '--format=', 'HEAD');
     unlike($names, qr/item7-surprise\.txt/,
         'HARDEN item7: a file that appeared during the consent pause must not be swept into the commit unreviewed');
+    like($names, qr{global-config/settings\.json}, 'HARDEN item7: the reviewed exported file is what was committed');
+    like(status_of($r->{home}, $r->{clone}), qr/item7-surprise\.txt/, 'HARDEN item7: the surprise file is still untracked, untouched');
 }
 
 # ---------------------------------------------------------------------------
@@ -2448,7 +2671,7 @@ for my $variant (
 {
     my $r = setup_root(with_origin => 1);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/item8-marker.txt", "pending change\n");
+    pending_export($r, q{item8});
     my $resp = run_backup($r, {});
     my @pc = decisions_of_kind($resp, 'push_confirmation');
     record_decisions(@pc);
@@ -2483,9 +2706,9 @@ for my $variant (
 
     my $r = setup_root(with_origin => 0);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/item9-content.txt", $repo_nonascii);
-    _git($r->{home}, $r->{ccpx}, 'add', '-A');
-    _git($r->{home}, $r->{ccpx}, 'commit', '-q', '-m', 'add item9-content.txt to repo');
+    write_text("$r->{clone}/item9-content.txt", $repo_nonascii);
+    _git($r->{home}, $r->{clone}, 'add', '-A');
+    _git($r->{home}, $r->{clone}, 'commit', '-q', '-m', 'add item9-content.txt to repo');
     write_text("$r->{home}/.claude/item9-content.txt", $live_nonascii);
     my $sync_json = encode_json([ { file => 'item9-content.txt', status => 'not_linked', note => 'copy differs from repo' } ]);
 
@@ -2570,9 +2793,9 @@ for my $variant (
     my $repo_plain  = "repo-plain-version\n";
     my $r = setup_root(with_origin => 0);
     seed_preflight_outcome($r->{state_path}, { skip_keys => [], preferences_saved => [], answers => {} });
-    write_text("$r->{ccpx}/item9b-content.txt", $repo_plain);
-    _git($r->{home}, $r->{ccpx}, 'add', '-A');
-    _git($r->{home}, $r->{ccpx}, 'commit', '-q', '-m', 'add item9b-content.txt to repo');
+    write_text("$r->{clone}/item9b-content.txt", $repo_plain);
+    _git($r->{home}, $r->{clone}, 'add', '-A');
+    _git($r->{home}, $r->{clone}, 'commit', '-q', '-m', 'add item9b-content.txt to repo');
     write_text("$r->{home}/.claude/item9b-content.txt", $live_latin1);
     my $sync_json = encode_json([ { file => 'item9b-content.txt', status => 'not_linked', note => 'copy differs from repo' } ]);
 

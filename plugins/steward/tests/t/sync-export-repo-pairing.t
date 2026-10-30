@@ -1,40 +1,44 @@
 #!/usr/bin/env perl
 # platform: any
 #
-# Regression for bug report 20260922-211416-1b92: the export phase's
-# file_conflict decision must pair the live copy of a repo-owned file with
-# ITS OWN repo counterpart -- never with an unrelated file that merely
-# shares a basename at a different root.
+# ~/.claude/CLAUDE.md through the export phase, end to end with the REAL
+# sync-export.pl and GlobalClaudeMd.pm (scripts/backup.pl ->
+# Backup::Run::execute -> scripts/backup/Export.pm).
 #
-# CLAUDE.md is the concrete case that exposed this: the live symlinked item
-# is ~/.claude/CLAUDE.md, and its real repo counterpart is
-# global-config/CLAUDE.md -- NOT the repo's own root CLAUDE.md (ccpraxis's
-# project-instructions file, a completely unrelated document). Before the
-# fix, scripts/backup/Export.pm's _do_file_conflicts reconstructed the repo
-# side purely as "$root/$file" using sync-export.pl's live-relative 'file'
-# field, so it silently paired live's CLAUDE.md against the repo ROOT
-# CLAUDE.md instead. This scenario drives the real dispatcher end to end
-# (scripts/backup.pl -> Backup::Run::execute -> the real
-# scripts/backup/Export.pm), stubbing only sync-export.pl's own output (via
-# STUB_SYNC_JSON) so no other wrapped script needs to run before the pause.
+# Regression for bug report 20260922-211416-1b92 (still guarded): the live
+# ~/.claude/CLAUDE.md must be paired with the payload, global-config/
+# CLAUDE.md, never with the repo's own root CLAUDE.md (ccpraxis's project
+# instructions, an unrelated file that shares the basename). The fixture
+# carries both, so a basename-only pairing has something wrong to reach for.
+#
+# 2026-10-30: ~/.claude/CLAUDE.md is BUILT by promote.pl for each host from
+# the live install's payload (the shared file plus CLAUDE.windows.md or
+# CLAUDE.macos.md, GlobalClaudeMd.pm). So:
+#   - a regular file equal to that build is in sync -- no symlink expected,
+#     no question asked, on a host with a part of its own too;
+#   - a hand edit cannot be exported (a line carries no record of which part
+#     it belongs to): it becomes a claude_md_drift question naming the
+#     lines, with no "use the live version" choice at all;
+#   - the comparison is with the LIVE install's payload, never the dev
+#     clone's, which may carry edits that are not promoted yet.
 #
 # This file is a trimmed, self-contained harness (temproot/make_machine/
-# write_text/read_text from StewardTest; the rest copied down from
-# t/backup-export.t's own scaffold) rather than an extension of that file,
-# because that file's own header declares itself deliberately BLIND to
-# Export.pm's implementation -- a constraint this regression test does not
-# want to inherit, since it exists precisely because it read Export.pm.
+# write_text/read_text from StewardTest) rather than an extension of
+# backup-export.t, whose header declares it deliberately BLIND to Export.pm.
 use strict;
 use warnings;
 use FindBin qw($Bin);
 use lib "$Bin/../lib";
+use lib "$Bin/../../scripts";
 use File::Path qw(make_path);
 use File::Temp qw(tempfile);
 use JSON::PP;
 use StewardTest qw(ok is like unlike diag done_testing temproot make_machine write_text read_text);
+use GlobalClaudeMd ();
 
 my $EXPORT_SRC    = "$Bin/../../../../scripts/backup/Export.pm";
 my $BACKUP_SCRIPT = "$Bin/../../../../scripts/backup.pl";
+my $SCRIPTS       = "$Bin/../../scripts";
 
 ok(-f $EXPORT_SRC,    'scripts/backup/Export.pm exists on disk');
 ok(-f $BACKUP_SCRIPT, 'scripts/backup.pl exists on disk');
@@ -76,17 +80,15 @@ sub _git {
     return 1;
 }
 
-# Only sync-export.pl needs stubbing: U1 (file_status) is the only wrapped
-# script Export.pm runs before U2 (file_conflicts) produces the pause this
-# scenario is about.
 sub _stub_wrap {
     my ($body) = @_;
     return "#!/usr/bin/env perl\nuse strict;\nuse warnings;\n" . $body;
 }
 
-my $STUB_SYNC_BODY = <<'PERL';
-my $json = defined $ENV{STUB_SYNC_JSON} ? $ENV{STUB_SYNC_JSON} : '[]';
-print $json;
+# Everything the export runs after U2 is stubbed to a quiet success; the
+# scenario is about U1/U2 (the real sync-export.pl and the decision).
+my $STUB_HELPERS_BODY = <<'PERL';
+print '{"status":"merged","live":"x","repo":"y","merge_rule":"preference-aware-live-wins-preserve-repo-only","preferences_file":null,"preferences_applied":[],"preferences_ignored":[],"skip_keys_unmatched":[]}';
 exit 0;
 PERL
 
@@ -108,9 +110,6 @@ sub write_git_stub {
     my ($scratch) = @_;
     write_text("$scratch/git-stub.pl", $GIT_STUB_PL);
     write_text("$scratch/git-stub.cmd", $GIT_STUB_CMD);
-    # Off Windows a .cmd file is not executable at all (the shell reads
-    # "@echo off" as a command and every git verb fails), so the wrapper is
-    # the perl script itself, run through its shebang.
     unless ($^O eq q{MSWin32} || $^O eq q{cygwin} || $^O eq q{msys}) {
         chmod 0755, "$scratch/git-stub.pl";
         return "$scratch/git-stub.pl";
@@ -118,55 +117,76 @@ sub write_git_stub {
     return "$scratch/git-stub.cmd";
 }
 
-sub copy_export_into {
-    my ($phase_dir) = @_;
-    make_path($phase_dir);
-    write_text("$phase_dir/Export.pm", read_text($EXPORT_SRC));
+sub write_state_raw {
+    my ($path, $data) = @_;
+    write_text($path, JSON::PP->new->canonical->pretty->encode($data));
 }
 
-# setup_root -- one throwaway "machine": a temp HOME containing
-# <home>/.claude/ccpraxis as a real git repo. The fixture deliberately
-# creates BOTH a repo-root CLAUDE.md (ccpraxis's own unrelated
-# project-instructions file) and a global-config/CLAUDE.md (the file that
-# actually pairs with the live copy), so a basename-only pairing bug has
-# something wrong to reach for.
+# setup_root -- the promote.pl topology: a dev clone with the payload
+# committed (shared CLAUDE.md and both platform parts), the live install
+# cloned from it carrying the REAL sync-export.pl and its modules, and the
+# preflight's ready export_target seeded.
 sub setup_root {
     my $scratch = temproot();
     my $home    = make_machine($scratch, 'host');
+    my $clone   = "$scratch/devclone";
     my $ccpx    = "$home/.claude/ccpraxis";
-    make_path($ccpx);
+    make_path($clone, "$home/.claude");
 
-    _git($home, $ccpx, 'init', '-q');
+    _git($home, $clone, 'init', '-q');
+    write_text("$clone/.gitignore", ".backup-preferences.json\n*.pre-merge.*\n");
+    write_text("$clone/CLAUDE.md", "# ccpraxis project instructions\nunrelated to the user's global config\n");
+    write_text("$clone/global-config/CLAUDE.md", "# Global Instructions\nthe real payload counterpart\n");
+    write_text("$clone/global-config/CLAUDE.windows.md", "# Windows\nwindows-only rule\n");
+    write_text("$clone/global-config/CLAUDE.macos.md", "# macOS\nmacos-only rule\n");
+    write_text("$clone/global-config/settings.json", "{}\n");
+    write_text("$clone/global-config/known_marketplaces.json", "{}\n");
+    write_text("$clone/plugins/sandbox/container/settings.json", "{}\n");
+    for my $name (qw(sync-export.pl json-diff.pl DevClone.pm GlobalClaudeMd.pm MachineLocalSettings.pm)) {
+        write_text("$clone/plugins/steward/scripts/$name", read_text("$SCRIPTS/$name"));
+    }
+    write_text("$clone/plugins/steward/scripts/ccpraxis-helpers.pl", _stub_wrap($STUB_HELPERS_BODY));
+    write_text("$clone/plugins/steward/scripts/filter-diff.pl",
+        _stub_wrap("{ local \$/; my \$x = <STDIN>; }\nprint '{\"status\":\"identical\",\"auto_applied\":[],\"needs_decision\":{\"only_left\":{},\"only_right\":{},\"diverged\":{}},\"has_undecided\":false}';\nexit 0;\n"));
+    write_text("$clone/plugins/steward/scripts/sensitive-check.pl", _stub_wrap("print \"No sensitive data found.\\n\"; exit 0;\n"));
+    _git($home, $clone, 'add', '-A');
+    _git($home, $clone, 'commit', '-q', '-m', 'initial fixture commit');
 
-    write_text("$ccpx/CLAUDE.md", "# ccpraxis project instructions\nunrelated to the user's global config\n");
-    write_text("$ccpx/global-config/CLAUDE.md", "# Global Instructions\nthe real repo counterpart\n");
-    write_text("$ccpx/global-config/settings.json", "{}\n");
-    write_text("$ccpx/global-config/known_marketplaces.json", "{}\n");
+    my %genv = _git_env($home);
+    {
+        local @ENV{ keys %genv } = values %genv;
+        system('git', 'clone', '-q', _native_path($clone), _native_path($ccpx)) == 0 or die "clone failed\n";
+    }
     write_text("$home/.claude/settings.json", "{}\n");
-    write_text("$ccpx/plugins/sandbox/container/settings.json", "{}\n");
-    write_text("$home/.claude/CLAUDE.md", "# Global Instructions\nlive copy, edited by the user\n");
-
-    write_text("$ccpx/plugins/steward/scripts/sync-export.pl",      _stub_wrap($STUB_SYNC_BODY));
-    write_text("$ccpx/plugins/steward/scripts/ccpraxis-helpers.pl", _stub_wrap("exit 0;\n"));
-    write_text("$ccpx/plugins/steward/scripts/json-diff.pl",        _stub_wrap("exit 0;\n"));
-    write_text("$ccpx/plugins/steward/scripts/filter-diff.pl",      _stub_wrap("exit 0;\n"));
-    write_text("$ccpx/plugins/steward/scripts/save-preference.pl",  _stub_wrap("exit 0;\n"));
-    write_text("$ccpx/plugins/steward/scripts/sensitive-check.pl",  _stub_wrap("print \"No sensitive data found.\\n\"; exit 0;\n"));
-
-    _git($home, $ccpx, 'add', '-A');
-    _git($home, $ccpx, 'commit', '-q', '-m', 'initial fixture commit');
 
     my $phase_dir = "$scratch/phases";
-    copy_export_into($phase_dir);
+    make_path($phase_dir);
+    write_text("$phase_dir/Export.pm", read_text($EXPORT_SRC));
     my $git_stub = write_git_stub($scratch);
+
+    my $state_path = "$scratch/state/run.json";
+    my $now = time;
+    write_state_raw($state_path, {
+        format => 1, run_id => 'abcdefabcdef0123', started_at => $now, updated_at => $now, status => 'running',
+        phase_order => ['export'], phase_index => 0,
+        phases => {
+            export    => { status => 'pending', started_at => undef, completed_at => undef, error => undef, items => {}, scratch => {} },
+            preflight => { status => 'complete', started_at => $now, completed_at => $now, error => undef, scratch => {}, items => {
+                export_target    => { at => $now, data => { ready => 1, live_root => $ccpx, dev_clone => $clone } },
+                settings_outcome => { at => $now, data => { skip_keys => [], preferences_saved => [], answers => {} } },
+            } },
+        },
+        token_seq => 0, consumed_seq => 0, pending => undef, answers => {}, notes => [],
+    });
 
     return {
         scratch    => $scratch,
         home       => $home,
         ccpx       => $ccpx,
+        clone      => $clone,
         phase_dir  => $phase_dir,
         git_stub   => $git_stub,
-        state_path => "$scratch/state/run.json",
+        state_path => $state_path,
     };
 }
 
@@ -216,39 +236,56 @@ sub run_backup {
 
 sub decisions_of      { my ($resp) = @_; return @{ $resp->{json}{decisions} // [] }; }
 sub decisions_of_kind { my ($resp, $kind) = @_; return grep { ($_->{kind} // '') eq $kind } decisions_of($resp); }
+sub state_of          { my ($r) = @_; my $raw = read_text($r->{state_path}); return defined $raw ? eval { decode_json($raw) } : undef; }
 
 # ---------------------------------------------------------------------------
-# The scenario: sync-export.pl reports CLAUDE.md as not_linked (mirroring
-# its real check_symlink('CLAUDE.md') output), carrying the repo_file field
-# that names the actual repo-relative counterpart -- global-config/CLAUDE.md,
-# never the repo root.
+# A -- in sync: ~/.claude/CLAUDE.md is exactly the build of the live payload
+# for this host (shared file plus this host's part, where it has one).
 # ---------------------------------------------------------------------------
 {
     my $r = setup_root();
-    my $sync_json = encode_json([
-        { file => 'CLAUDE.md', repo_file => 'global-config/CLAUDE.md', status => 'not_linked', note => 'copy differs from repo' },
-    ]);
-    my $resp = run_backup($r, { STUB_SYNC_JSON => $sync_json });
-    is($resp->{exit}, 10, 'a not_linked CLAUDE.md pauses the run for a file_conflict decision')
-        or diag($resp->{out} . $resp->{err});
-
-    my @fc = decisions_of_kind($resp, 'file_conflict');
-    is(scalar(@fc), 1, 'exactly one file_conflict decision is produced') or diag($resp->{out});
-    my $d = $fc[0];
-    if (defined $d) {
-        like(($d->{data}{repo_path} // ''), qr/global-config[\/\\]CLAUDE\.md$/,
-            'the decision pairs live CLAUDE.md with repo global-config/CLAUDE.md, not the repo root');
-        is($d->{data}{repo_text}, "# Global Instructions\nthe real repo counterpart\n",
-            'repo_text is global-config/CLAUDE.md\'s content, not the repo root CLAUDE.md\'s content');
-        is($d->{data}{live_text}, "# Global Instructions\nlive copy, edited by the user\n",
-            'live_text is the live ~/.claude/CLAUDE.md content');
-    } else {
-        ok(0, "$_") for (
-            'the decision pairs live CLAUDE.md with repo global-config/CLAUDE.md, not the repo root',
-            'repo_text is global-config/CLAUDE.md\'s content, not the repo root CLAUDE.md\'s content',
-            'live_text is the live ~/.claude/CLAUDE.md content',
-        );
+    my $build = GlobalClaudeMd::render_from_dir($r->{ccpx});
+    write_text("$r->{home}/.claude/CLAUDE.md", $build);
+    if (defined GlobalClaudeMd::host_part_relpath()) {
+        like($build, qr/-only rule\n\z/, '(setup) A: this host has a part, and the build carries it');
     }
+    my $resp = run_backup($r, {});
+    ok(!(decisions_of_kind($resp, 'claude_md_drift')), 'A: an in-sync CLAUDE.md asks nothing')
+        or diag($resp->{out} . $resp->{err});
+    ok(!(decisions_of_kind($resp, 'file_conflict')), 'A: ...and is not a file conflict either');
+    my $state = state_of($r);
+    my ($item) = grep { ($_->{file} // '') eq 'CLAUDE.md' } @{ ($state // {})->{phases}{export}{items}{file_status}{data} // [] };
+    is(($item // {})->{status}, 'identical', 'A: sync-export reports it identical: a regular file, no symlink expected');
+    is(($item // {})->{repo_file}, 'global-config/CLAUDE.md', 'A: paired with global-config/CLAUDE.md, never the repo-root CLAUDE.md');
+}
+
+# ---------------------------------------------------------------------------
+# B -- a hand edit: reported with its lines, never exportable.
+# ---------------------------------------------------------------------------
+{
+    my $r = setup_root();
+    my $build = GlobalClaudeMd::render_from_dir($r->{ccpx});
+    (my $edited = $build) =~ s/the real payload counterpart\n/the real payload counterpart\na rule typed into the live file\n/;
+    write_text("$r->{home}/.claude/CLAUDE.md", $edited);
+    # A payload edit sitting in the dev clone, not promoted: the comparison
+    # must not use it.
+    write_text("$r->{clone}/global-config/CLAUDE.md", "# Global Instructions\nthe real payload counterpart\na rule typed into the live file\n");
+
+    my $resp = run_backup($r, {});
+    is($resp->{exit}, 10, 'B: a hand-edited CLAUDE.md pauses the run') or diag($resp->{out} . $resp->{err});
+    my @cm = decisions_of_kind($resp, 'claude_md_drift');
+    is(scalar(@cm), 1, 'B: exactly one claude_md_drift decision');
+    ok(!(decisions_of_kind($resp, 'file_conflict')), 'B: no file_conflict (CLAUDE.md is never copied into the repo)');
+    my $d = $cm[0] // {};
+    my %cid = map { $_->{id} => 1 } @{ $d->{choices} // [] };
+    ok(!$cid{use_live}, 'B: there is no use_live choice');
+    ok($cid{rerender} && $cid{leave}, 'B: the choices are rerender and leave');
+    like(($d->{detail} // ''), qr/L3: a rule typed into the live file/, 'B: the detail names the hand-edited line and its number');
+    like(($d->{detail} // ''), qr/dev clone's global-config\/CLAUDE\.md/, 'B: ...and says it must be folded into the dev clone');
+    unlike(($d->{detail} // ''), qr/ccpraxis project instructions/, 'B: the repo-root CLAUDE.md is never what it is compared with');
+    is(read_text("$r->{clone}/global-config/CLAUDE.md"),
+        "# Global Instructions\nthe real payload counterpart\na rule typed into the live file\n",
+        'B: nothing was written into the dev clone\'s CLAUDE.md');
 }
 
 done_testing();
