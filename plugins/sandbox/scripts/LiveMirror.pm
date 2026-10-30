@@ -193,6 +193,7 @@ sub refresh {
         opendir(my $dh, $dst) or die "cannot open $dst: $!\n";
         chdir($dh) or die "cannot enter $dst: $!\n";
         die "$dst was replaced while it was being opened\n" unless _same_inode('.', \@st);
+        _writable_here($dst);
         _sync_dir($ctx, $src, _filter(), $dh, '', 0);
         1;
     };
@@ -248,8 +249,13 @@ sub _sync_dir {
             # wanted (scripts/ for statusline.pl), never as an empty shell.
             next if defined $sub && !grep { -e "$spath/$_" || -l "$spath/$_" } keys %$sub;
             $want{$name} = 1;
-            my $dh = _enter_dir($ctx, $name, $s[2] & 07777, $here, $label, $depth);
+            my $mode = $s[2] & 07777;
+            my $dh = _enter_dir($ctx, $name, $here, $label, $depth);
             _sync_dir($ctx, $spath, $sub, $dh, $label, $depth + 1);
+            # The source's mode last: a read-only directory is still filled.
+            my @now = stat '.';
+            chmod($mode, '.') or die "cannot set the mode of $label: $!\n"
+                if @now && ($now[2] & 07777) != $mode;
             chdir($here) or die "cannot return from $label: $!\n";
             closedir $dh;
         } elsif (-f _) {
@@ -271,9 +277,10 @@ sub _sync_dir {
 
 # _enter_dir(...) -> a handle on the mirror directory $name (created when
 # missing, replacing a non-directory) after making it the working directory
-# and checking it is the directory lstat saw. Its mode is set to $mode.
+# and checking it is the directory lstat saw. Left writable for the refresh;
+# the caller sets the source's mode once the directory is filled.
 sub _enter_dir {
-    my ($ctx, $name, $mode, $here, $label, $depth) = @_;
+    my ($ctx, $name, $here, $label, $depth) = @_;
     my @m = lstat $name;
     if (@m && !-d _) {
         unlink($name) or die "cannot remove $label (not a directory): $!\n";
@@ -290,10 +297,18 @@ sub _enter_dir {
         chdir($here);
         die "$label was replaced while it was being entered\n";
     }
-    my @now = stat '.';
-    chmod($mode, '.') or die "cannot set the mode of $label: $!\n"
-        if @now && ($now[2] & 07777) != $mode;
+    _writable_here($label);
     return $dh;
+}
+
+# _writable_here($label) -- give the owner rwx on the working directory (the
+# one just entered and checked; '.' cannot be redirected by a symlink), so a
+# directory the VM made read-only can still be updated or emptied.
+sub _writable_here {
+    my ($label) = @_;
+    my @now = stat '.';
+    return if @now && ($now[2] & 0700) == 0700;
+    chmod(((@now ? $now[2] & 07777 : 0) | 0700), '.') or die "cannot make $label writable: $!\n";
 }
 
 sub _sync_file {
@@ -403,6 +418,7 @@ sub _remove_entry {
         chdir($here);
         die "$label was replaced while it was being removed\n";
     }
+    _writable_here($label);
     my @kids = grep { $_ ne '.' && $_ ne '..' } readdir $dh;
     for my $k (@kids) {
         _remove_entry($ctx, $k, $dh, "$label/$k", $depth + 1);

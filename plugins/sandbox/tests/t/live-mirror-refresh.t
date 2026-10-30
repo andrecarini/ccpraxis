@@ -212,6 +212,21 @@ sub refresh_ok {
     refresh_ok($src, $dst, 'C (no statusline)');
     ok(!-e "$dst/scripts", 'C: without statusline.pl there is no scripts/ in the mirror');
 
+    # A read-only source directory is still filled, and ends with its mode.
+    make_path("$src/plugins/ro");
+    spew("$src/plugins/ro/f", "in a read-only dir\n");
+    chmod 0555, "$src/plugins/ro";
+    refresh_ok($src, $dst, 'C (read-only dir)');
+    is(slurp("$dst/plugins/ro/f"), "in a read-only dir\n", 'C: a read-only source directory is copied with its files');
+    is(sprintf('%o', (stat "$dst/plugins/ro")[2] & 07777), '555', 'C: ...and its mode');
+    chmod 0755, "$src/plugins/ro";
+    spew("$src/plugins/ro/f", "changed\n");
+    chmod 0555, "$src/plugins/ro";
+    refresh_ok($src, $dst, 'C (read-only dir, changed)');
+    is(slurp("$dst/plugins/ro/f"), "changed\n", 'C: ...and updated inside it later');
+    chmod 0755, "$src/plugins/ro", "$dst/plugins/ro";
+    remove_tree("$src/plugins/ro");
+
     my $missing = new_mirror();
     my $nr = LiveMirror::refresh(source => $src, mirror => $missing);
     ok(!$nr->{ok} && $nr->{error} =~ /does not exist/, 'C: without create, a missing mirror is an error, not created');
@@ -241,6 +256,11 @@ sub refresh_ok {
     spew("$dst/.git/hooks/post-checkout", "#!/bin/sh\n");
     symlink($victim, "$dst/evil/deeper/out") or die;
     symlink("$victim/dir", "$dst/plugins/linkdir") or die;
+    # Directories made read-only: a planted one to remove, a mirrored one to update.
+    make_path("$dst/stuck");
+    spew("$dst/stuck/f", "x\n");
+    chmod 0555, "$dst/stuck";
+    chmod 0555, "$dst/skills";
 
     my $r = refresh_ok($src, $dst, 'D (hostile)');
     is(slurp("$victim/dir/x.pl"), "VICTIM\n", 'D: nothing is written through a planted directory symlink');
@@ -249,6 +269,9 @@ sub refresh_ok {
     ok(!-l "$dst/plugins/a" && -d "$dst/plugins/a", 'D: the planted directory link is replaced by a real directory');
     ok(!-l "$dst/skills/s1/SKILL.md" && -f "$dst/skills/s1/SKILL.md", 'D: the planted file link is replaced by a real file');
     ok(!-e "$dst/evil" && !-e "$dst/.git" && !-e "$dst/plugins/linkdir", 'D: planted extras are removed');
+    ok(!-e "$dst/stuck", 'D: ...a read-only planted directory too');
+    is(sprintf('%o', (stat "$dst/skills")[2] & 07777), sprintf('%o', (stat "$src/skills")[2] & 07777),
+        'D: a mirrored directory made read-only is updated and gets the source\'s mode back');
     is_deeply(tree($dst), tree($src, source => 1), 'D: ...and the mirror equals the source again');
 
     # A FIFO where an empty mirrored file belongs: compared without blocking.
