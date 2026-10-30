@@ -36,7 +36,12 @@ use Digest::SHA qw(sha256_hex);
 use JSON::PP ();
 use POSIX qw(WNOHANG);
 use Cwd ();
-BEGIN { my $d = File::Basename::dirname(Cwd::abs_path(__FILE__) // __FILE__); require "$d/BpJailDevices.pm"; }
+BEGIN {
+    # Beside this file, not FindBin: a test that requires bp-jail.pl has its own $Bin.
+    (my $f = __FILE__) =~ s{\\}{/}g;
+    my $d = File::Basename::dirname(Cwd::abs_path($f) // $f);
+    require "$d/BpJailDevices.pm";
+}
 
 my $META_FILE = '.bp-jail-meta.json';
 my $LOG_FILE  = '.bp-jail-log.jsonl';
