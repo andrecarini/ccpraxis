@@ -23,7 +23,7 @@ as the arm stands:
 
 | where | what is held | what it stops |
 |---|---|---|
-| host (Windows) | the wake-lock (`keep-awake.ps1`) | the machine entering connected standby mid-run |
+| host | the wake-lock (`bp-keepawake.pl`, which picks the mechanism for this operating system) | the machine sleeping mid-run |
 | inside a sandbox | the busy-lease (`/tmp/.butler-busy`) | `heartbeat.sh` reaping the container — and, through the launcher dashboard's probe of that same file, the host sleeping behind it |
 
 `on` starts a detached refresher that re-asserts this every 60s; turning continuity off releases it. **Nothing here

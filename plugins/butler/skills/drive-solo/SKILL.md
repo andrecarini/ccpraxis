@@ -186,7 +186,7 @@ exactly like success.
 
 ## Keep-awake (director-managed)
 
-> The director auto-starts the wake-lock when active work or a pending usage-resume begins, and auto-stops it when the run settles (Windows: `keep-awake.ps1`; macOS: `caffeinate -i`). In sandbox, keep-awake is a no-op. The session does nothing (Decision #7/#19).
+> The director auto-starts the wake-lock when active work or a pending usage-resume begins, and auto-stops it when the run settles; `bp-keepawake.pl` picks the mechanism for the machine it runs on. In sandbox, keep-awake is a no-op. The session does nothing (Decision #7/#19).
 
 ## Host or sandbox
 
