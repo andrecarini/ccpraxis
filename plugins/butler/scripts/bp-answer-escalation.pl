@@ -54,7 +54,11 @@
 #                            [--bp-dir DIR]
 #      exit 0 = unblocked; 2 = usage / bad action for the kind / missing decision /
 #               unknown decision kind / refused write_set narrow-or-replace / blank
-#               --widen-write-set value.
+#               --widen-write-set value; 6 = refused, nothing changed, JSON on
+#               stdout names why (`refused`: coordinator-alive, lock-timeout,
+#               sandbox-pids-unverifiable, sandbox-kill-failed,
+#               live-pid-not-signalled, ...; the last three carry `detail` and
+#               `hint`, see supersede_package_work).
 #
 # b17-answer-decision-completeness fixes four defects (see the spec of that name):
 #   1. `--action reset` now CLEARS the package's registry `session_id` (plan_answer's
@@ -430,7 +434,7 @@ sub update_next_action_with_note {
     return ($rc == 0) ? 1 : 0;
 }
 
-# supersede_package_work($runs, $pkg) -> \@superseded
+# supersede_package_work($runs, $pkg) -> (\@superseded, undef) | (undef, \%refusal)
 # Kill anything still editing the package's write-set so a fresh relaunch can't
 # collide with it on disk: a live coordinator (registry pid) AND any in-flight
 # resolve/harvest judge (runs/<kind>/<pkg>.pid — written by bp-judge.sh). Then
@@ -444,9 +448,16 @@ sub update_next_action_with_note {
 # a number in the CONTAINER's pid namespace. The same blueprint dir is visible
 # from the host through the project mount, and on the host that number names
 # some unrelated process -- which kill_pid would TERM and KILL by process
-# GROUP. So signals are sent only from the namespace that wrote the pids;
-# from the host the recorded pids are reported as not-signalled and left
-# alone (registry pid included), while the judge markers are still cleared.
+# GROUP. So this process signals a recorded pid itself only when it runs in the
+# namespace that wrote it (pids_in_our_namespace). From the host the kill is
+# DELIVERED INTO the project's sandbox container instead (pid_space /
+# sandbox_pid, below), after checking the process there really is this
+# package's coordinator or judge. When that cannot be done -- the container is
+# recorded but cannot be queried, a kill does not take -- the answer is
+# REFUSED with nothing changed (exit 6 at the call site), because flipping the
+# ledger while a coordinator may still be editing the write-set is exactly
+# what this step exists to prevent. Markers are cleared only once every
+# recorded pid has been dealt with.
 sub pids_in_our_namespace {
     return 1 if ($ENV{IS_SANDBOX} // '') eq '1';
     return 1 if ($ENV{BP_ALLOW_HOST} // '') eq '1';
@@ -454,43 +465,252 @@ sub pids_in_our_namespace {
     return 0;
 }
 
+my $SANDBOX_SCRIPTS = "$SELF_DIR/../../sandbox/scripts";
+
+# How long one container CLI call may take. A healthy `exec` answers in well
+# under a second; this only bounds a wedged machine.
+our $SANDBOX_CLI_TIMEOUT = 20;
+
+# The program run INSIDE the container: perl -e PROG <probe|kill> <pid> <bp> <pkg>.
+# It contains no double quote, backslash or newline, so it reaches the
+# container byte-for-byte through a Windows command line too.
+#   * gone when kill(0) fails or /proc/<pid>/stat says zombie (BpOrch::pid_alive);
+#   * a live pid whose environment does not carry BP_BLUEPRINT=<bp> and
+#     BP_PACKAGE=<pkg> (bp-launch.sh and bp-judge.sh export both) is NOT this
+#     package's process -- a recycled pid, a sibling -- and is never signalled;
+#   * kill mirrors BpOrch::kill_pid: TERM then KILL, to the process group,
+#     falling back to the pid; then it waits up to 3 s for the process to go.
+# Exit codes are deliberately not 0/1: a container CLI's own failures (no such
+# container, cannot connect) exit 1 or 125-127 and must read as "unknown".
+# BP_ANSWER_PROC_ROOT is a test seam (a fake /proc); `exec` does not forward
+# the host's environment, so it is never set in a real container.
+our $SANDBOX_PID_PROG = join ' ',
+    'my ($m, $p, $b, $k) = @ARGV;',
+    'exit 45 unless defined $k && $p =~ /^[0-9]+$/ && $p > 1;',
+    'my $proc = $ENV{BP_ANSWER_PROC_ROOT} || q{/proc};',
+    'sub alive { return 0 unless kill(0, $p); if (open(my $s, q{<}, qq{$proc/$p/stat})) {',
+    '  my $l = <$s>; close $s; return 0 if defined $l && $l =~ /.*[)][ ]+Z/ } return 1 }',
+    'alive() or exit 41;',
+    'open(my $e, q{<}, qq{$proc/$p/environ}) or exit 46;',
+    'my %v = map { /^([^=]+)=(.*)$/s ? (lc($1), $2) : () } split(chr(0), join(q{}, <$e>));',
+    'close $e;',
+    'exit 42 unless lc($v{bp_blueprint} // q{}) eq lc($b) && lc($v{bp_package} // q{}) eq lc($k);',
+    'exit 40 if $m eq q{probe};',
+    'kill(q{TERM}, -$p) or kill(q{TERM}, $p);',
+    'kill(q{KILL}, -$p) or kill(q{KILL}, $p);',
+    'for (1 .. 30) { alive() or exit 43; select(undef, undef, undef, 0.1) }',
+    'exit 44;';
+our %SANDBOX_PID_ANSWER = (40 => 'alive', 41 => 'gone', 42 => 'not-ours', 43 => 'killed', 44 => 'survived');
+
+# _capture_bounded(\@cmd, $timeout) -> ($exit_code | -1, $stdout). The child's
+# stdout goes to a temp file (never an in-memory handle: Git-for-Windows perl),
+# its stderr to the null device; -1 means it could not run or timed out.
+# MSYS path conversion is off for the call on Windows: nothing passed here is a
+# host path, and the in-container program must arrive unaltered.
+sub _capture_bounded {
+    my ($cmd, $timeout) = @_;
+    require File::Temp;
+    my ($ofh, $opath) = eval { File::Temp::tempfile('bp-answer-ctr-XXXXXX', TMPDIR => 1, UNLINK => 0) };
+    return (-1, undef) unless $ofh;
+    close $ofh;
+    my ($so, $se, $raw, $timed_out);
+    if (open($so, '>&', \*STDOUT)) {
+        if (open($se, '>&', \*STDERR)) {
+            if (open(STDOUT, '>', $opath) && open(STDERR, '>', File::Spec->devnull)) {
+                local $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/;
+                ($raw, $timed_out) = BpOrch::_run_bounded($cmd, $timeout);
+            }
+            open(STDERR, '>&', $se);
+            close $se;
+        }
+        open(STDOUT, '>&', $so);
+        close $so;
+    }
+    my $out = BpOrch::_read_file($opath);
+    unlink $opath;
+    return (-1, $out) if !defined $raw || $raw < 0 || $timed_out;
+    return ($raw >> 8, $out);
+}
+
+# pid_space($bpdir) -> where the blueprint's recorded pids live, seen from here:
+#   { kind => 'local' }                         this process is in their namespace
+#   { kind => 'container', state => 'running'|'stopped'|'unknown', name, cli, why }
+#   { kind => 'host-only', why }               no sandbox is recorded for this
+#                                               project, so they can only be this
+#                                               host's (a BP_ALLOW_HOST fleet)
+# The container is the one the launcher recorded for the project, in
+# <data>/claude-home/.launcher/container-name (the data dir is the parent of
+# blueprints/), and the CLI is HostPlatform's choice (CCPRAXIS_CONTAINER_CLI
+# honoured), so the host answers with the same container and runtime the
+# launcher uses.
+sub pid_space {
+    my ($bpdir) = @_;
+    return { kind => 'local' } if pids_in_our_namespace();
+    (my $bp = $bpdir // '') =~ s{\\}{/}g;
+    $bp =~ s{/+\z}{};
+    my $parent = dirname($bp);
+    my $file = (basename($parent) eq 'blueprints')
+        ? dirname($parent) . '/claude-home/.launcher/container-name' : undef;
+    return { kind => 'host-only', why => 'the blueprint is not under a <data>/blueprints/ directory' }
+        unless defined $file;
+    return { kind => 'host-only', why => "no sandbox container is recorded for this project ($file)" }
+        unless -e $file;
+    my %c = (kind => 'container', state => 'unknown');
+    my $name = BpOrch::_read_file($file);
+    $name = '' unless defined $name;
+    $name =~ s/\A\s+//;
+    $name =~ s/\s+\z//;
+    my $ident = eval { require "$SANDBOX_SCRIPTS/SandboxIdentity.pm"; 1 };
+    return { %c, why => "cannot load SandboxIdentity.pm from $SANDBOX_SCRIPTS" } unless $ident;
+    return { %c, why => "$file does not hold a sandbox container name" }
+        unless SandboxIdentity::is_sandbox_container_name($name);
+    $c{name} = $name;
+    my $plat = eval { require "$SANDBOX_SCRIPTS/HostPlatform.pm"; 1 };
+    return { %c, why => "cannot load HostPlatform.pm from $SANDBOX_SCRIPTS" } unless $plat;
+    my ($cli, $err) = HostPlatform::detect_container_cli();
+    return { %c, why => ($err // 'no container CLI (podman or docker) answers on PATH') } unless defined $cli;
+    $c{cli} = $cli;
+    my ($rc, $out) = _capture_bounded([$cli, 'container', 'inspect', '--format', '{{.State.Running}}', $name],
+                                      $SANDBOX_CLI_TIMEOUT);
+    $out = '' unless defined $out;
+    $out =~ s/\s+//g;
+    return { %c, state => 'running' } if $rc == 0 && $out eq 'true';
+    return { %c, state => 'stopped' } if $rc == 0 && $out eq 'false';
+    return { %c, why => "`$cli container inspect $name` did not answer (exit $rc)" };
+}
+
+# sandbox_pid($space, $mode, $pid, $bp, $pkg) ->
+#   'alive' | 'gone' | 'not-ours' | 'killed' | 'survived' | 'unknown'
+# $mode is 'probe' or 'kill'. A stopped container has no live processes.
+sub sandbox_pid {
+    my ($space, $mode, $pid, $bp, $pkg) = @_;
+    return 'unknown' unless ref $space eq 'HASH' && ($space->{kind} // '') eq 'container';
+    return 'gone'    if $space->{state} eq 'stopped';
+    return 'unknown' unless $space->{state} eq 'running';
+    my ($rc) = _capture_bounded([$space->{cli}, 'exec', $space->{name}, 'perl', '-e', $SANDBOX_PID_PROG,
+                                 $mode, $pid, $bp, $pkg], $SANDBOX_CLI_TIMEOUT);
+    return $SANDBOX_PID_ANSWER{$rc} // 'unknown';
+}
+
+# What the operator is told when a host answer cannot settle the pids.
+sub _pid_space_hint {
+    return 'Answer from inside the sandbox (claude-sandbox), where the recorded pids can be checked '
+         . 'and signalled; or, for a fleet launched on the host with BP_ALLOW_HOST=1, re-run this '
+         . 'answer with BP_ALLOW_HOST=1.';
+}
+
 sub supersede_package_work {
     my ($runs, $pkg) = @_;
     my @killed;
-    my $ours = pids_in_our_namespace();
-    my $reg = BpOrch::_read_json("$runs/registry.json");
+    my $bpdir = dirname($runs);
+    my $bp    = basename($bpdir);
+    my $reg  = BpOrch::_read_json("$runs/registry.json");
     my $cpid = (ref $reg eq 'HASH') ? ($reg->{packages}{$pkg}{pid}) : undef;
-    if (defined $cpid && $cpid =~ /^\d+$/ && $cpid > 0 && !$ours) {
-        push @killed, "not-signalled:coordinator:$cpid";
-    }
-    elsif (defined $cpid && BpOrch::pid_alive($cpid)) {
-        BpOrch::kill_pid($cpid);
-        push @killed, "coordinator:$cpid";
-        # BLOCKER 2 (fixbatch step7): nothing else in this write set ever clears
-        # registry `pid` for a coordinator that exits non-terminally, so a stale
-        # pid can strand later relaunch/accept/drop refusals (_set_ledger_status's
-        # coordinator-alive gate) once the OS recycles it. This path just killed
-        # the coordinator we know about -- clear the identity so the NEXT gate
-        # check never mistakes a recycled pid for this one.
-        BpOrch::update_registry_pkg($runs, $pkg, { pid => undef });
-    }
+    $cpid = undef unless defined $cpid && $cpid =~ /^\d+$/ && $cpid > 0;
+    my %jpid;
     for my $kind (qw(resolve harvest)) {
         my $pidf = "$runs/$kind/$pkg.pid";
-        if (-f $pidf) {
-            my ($jpid) = (BpOrch::_read_file($pidf) // '') =~ /^(\d+)/;
-            if (defined $jpid && $jpid > 0 && !$ours) {
-                push @killed, "not-signalled:$kind-judge:$jpid";
-            }
-            elsif (defined $jpid && BpOrch::pid_alive($jpid)) {
-                BpOrch::kill_pid($jpid);
-                push @killed, "$kind-judge:$jpid";
-            }
-            unlink $pidf;
+        next unless -f $pidf;
+        my ($j) = (BpOrch::_read_file($pidf) // '') =~ /^(\d+)/;
+        $jpid{$kind} = $j if defined $j && $j > 0;
+    }
+    my @targets = ((defined $cpid ? (['coordinator', $cpid]) : ()),
+                   map { ["$_-judge", $jpid{$_}] } grep { exists $jpid{$_} } qw(resolve harvest));
+
+    my $space = @targets ? pid_space($bpdir) : { kind => 'local' };
+    my $refuse = sub {
+        my ($token, $detail) = @_;
+        return (undef, { refused => $token, detail => $detail, hint => _pid_space_hint(),
+                         superseded => [@killed] });
+    };
+    if ($space->{kind} eq 'local') {
+        for my $t (@targets) {
+            my ($role, $pid) = @$t;
+            next unless BpOrch::pid_alive($pid);
+            BpOrch::kill_pid($pid);
+            push @killed, "$role:$pid";
+            # BLOCKER 2 (fixbatch step7): nothing else in this write set ever clears
+            # registry `pid` for a coordinator that exits non-terminally, so a stale
+            # pid can strand later relaunch/accept/drop refusals (_set_ledger_status's
+            # coordinator-alive gate) once the OS recycles it. This path just killed
+            # the coordinator we know about -- clear the identity so the NEXT gate
+            # check never mistakes a recycled pid for this one.
+            BpOrch::update_registry_pkg($runs, $pkg, { pid => undef }) if $role eq 'coordinator';
         }
+    }
+    elsif ($space->{kind} eq 'host-only') {
+        # No sandbox is recorded for this project, so the pids can only have
+        # been written on this host -- but this process was not told so
+        # (BP_ALLOW_HOST), and a stale or copied record must not get a host
+        # process killed. Read-only: a live one refuses the answer.
+        my @live = grep { BpOrch::pid_alive($_->[1]) } @targets;
+        return $refuse->('live-pid-not-signalled',
+            'recorded ' . join(', ', map { "$_->[0] pid $_->[1]" } @live)
+            . " is alive on this host and this answer does not run in the namespace that recorded it ($space->{why})")
+            if @live;
+    }
+    else {
+        return $refuse->('sandbox-pids-unverifiable',
+            "the recorded pids belong to sandbox container '" . ($space->{name} // '?')
+            . "', which could not be queried: $space->{why}")
+            if $space->{state} eq 'unknown';
+        for my $t (@targets) {
+            my ($role, $pid) = @$t;
+            my $v = sandbox_pid($space, 'kill', $pid, $bp, $pkg);
+            if ($v eq 'killed') {
+                push @killed, "$role:$pid";
+                BpOrch::update_registry_pkg($runs, $pkg, { pid => undef }) if $role eq 'coordinator';
+            }
+            elsif ($v eq 'survived') {
+                return $refuse->('sandbox-kill-failed',
+                    "$role pid $pid in sandbox container '$space->{name}' survived TERM and KILL");
+            }
+            elsif ($v ne 'gone' && $v ne 'not-ours') {
+                return $refuse->('sandbox-pids-unverifiable',
+                    "$role pid $pid could not be checked in sandbox container '$space->{name}' "
+                    . "(`$space->{cli} exec` did not answer)");
+            }
+        }
+    }
+    for my $kind (qw(resolve harvest)) {
+        unlink "$runs/$kind/$pkg.pid";
         BpOrch::clear_judge_inflight($runs, $kind, $pkg);
         BpOrch::clear_judge_verdict($runs, $kind, $pkg);
     }
-    return \@killed;
+    return (\@killed, undef);
+}
+
+# sandbox_alive_fn($runs, $pkg) -> (undef) | ($alive_fn, $unknown_ref)
+# The coordinator-alive gate (BpOrch::_coordinator_alive_refusal, through
+# $BpOrch::PID_ALIVE_FN) asks whether the registry pid is alive. From the
+# host, when the project has a sandbox, that question goes into the container
+# (sandbox_pid probe) instead of to a host kill(0) on a container pid. A
+# container that cannot be queried answers "alive" and sets $$unknown_ref, so
+# the refusal can say why. In this namespace, or with no sandbox recorded
+# (the pids can only be this host's), the gate is left exactly as it was.
+sub sandbox_alive_fn {
+    my ($runs, $pkg) = @_;
+    return () if pids_in_our_namespace();
+    my $bpdir = dirname($runs);
+    my $reg  = BpOrch::_read_json("$runs/registry.json");
+    my $cpid = (ref $reg eq 'HASH') ? ($reg->{packages}{$pkg}{pid}) : undef;
+    return () unless defined $cpid && $cpid =~ /^\d+$/ && $cpid > 0;
+    my $space = pid_space($bpdir);
+    return () unless $space->{kind} eq 'container';
+    my $bp = basename($bpdir);
+    my $unknown;
+    my $fn = sub {
+        my ($pid) = @_;
+        return 0 unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
+        my $v = sandbox_pid($space, 'probe', $pid, $bp, $pkg);
+        return 1 if $v eq 'alive';
+        return 0 if $v eq 'gone' || $v eq 'not-ours';
+        $unknown = ($space->{state} eq 'unknown')
+            ? "sandbox container '" . ($space->{name} // '?') . "' could not be queried: $space->{why}"
+            : "pid $pid could not be checked in sandbox container '$space->{name}'";
+        return 1;
+    };
+    return ($fn, \$unknown);
 }
 
 # clear_pkg_decisions($runs, $pkg) -> count — delete any queued needs-you decisions
@@ -1103,7 +1323,38 @@ unless (caller) {
         # clears registry `pid` when it actually kills something (BLOCKER 2 mitigation
         # in supersede_package_work itself), so a subsequent gate check never mistakes
         # a just-killed coordinator's pid, recycled later, for still being it.
-        $superseded = supersede_package_work($runs, $pkg) if $plan->{supersede};
+        # A supersede that cannot settle the recorded pids (answered from the host,
+        # the sandbox cannot be queried or a kill did not take) refuses the whole
+        # answer here, before any ledger, registry or queue write: exit 6, the
+        # same JSON shape as every other refusal, plus a detail and a hint.
+        if ($plan->{supersede}) {
+            my ($sup, $refusal) = supersede_package_work($runs, $pkg);
+            if ($refusal) {
+                print JSON::PP->new->canonical->pretty->encode({
+                    ok => JSON::PP::false(), package => $pkg, kind => $kind,
+                    family => $plan->{family}, action => $plan->{action}, %$refusal,
+                });
+                exit 6;
+            }
+            $superseded = $sup;
+        }
+        # From the host, the coordinator-alive gate below must ask the sandbox
+        # about a sandbox pid (sandbox_alive_fn); in this namespace, or with no
+        # sandbox recorded for the project, it is left as it was.
+        my ($sandbox_alive, $sandbox_unknown) = $plan->{supersede} ? () : sandbox_alive_fn($runs, $pkg);
+        # `once`: BpOrch is required at run time, so perl would warn "used only
+        # once" at compile time -- onto the stderr callers parse as JSON.
+        no warnings 'once';
+        local $BpOrch::PID_ALIVE_FN = $sandbox_alive if $sandbox_alive;
+        my $gate_refusal = sub {
+            my ($reason) = @_;
+            my %r = (refused => $reason);
+            if ($sandbox_unknown && defined $$sandbox_unknown && $reason eq 'coordinator-alive') {
+                %r = (refused => 'sandbox-pids-unverifiable', detail => $$sandbox_unknown,
+                      hint => _pid_space_hint());
+            }
+            return %r;
+        };
         # fixbatch step7 / BLOCKER 2 aggravating factor: a refused answer (exit 6)
         # used to leave the ledger HALF-applied -- append_human_decision and
         # update_next_action_with_note ran unconditionally BEFORE the coordinator-
@@ -1130,7 +1381,7 @@ unless (caller) {
             if (defined $reason) {
                 print JSON::PP->new->canonical->pretty->encode({
                     ok => JSON::PP::false(), package => $pkg, kind => $kind,
-                    family => $plan->{family}, action => $plan->{action}, refused => $reason,
+                    family => $plan->{family}, action => $plan->{action}, $gate_refusal->($reason),
                 });
                 exit 6;
             }
@@ -1188,7 +1439,7 @@ unless (caller) {
             my $reason = ($BpWrite::LAST_RESULT && $BpWrite::LAST_RESULT->{reason}) || 'write-refused';
             print JSON::PP->new->canonical->pretty->encode({
                 ok => JSON::PP::false(), package => $pkg, kind => $kind,
-                family => $plan->{family}, action => $plan->{action}, refused => $reason,
+                family => $plan->{family}, action => $plan->{action}, $gate_refusal->($reason),
             });
             exit 6;
         }

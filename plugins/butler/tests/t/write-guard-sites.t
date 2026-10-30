@@ -25,6 +25,7 @@ use Test::More;
 use JSON::PP;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
+use POSIX ();
 
 require "$Bin/../../scripts/bp-orchestrator.pl";
 my $ANSWER_SCRIPT = "$Bin/../../scripts/bp-answer-escalation.pl";
@@ -199,10 +200,36 @@ sub run_answer_cli {
     }
 }
 {
-    # --action reset proceeds and exits 0 (behavior 14) even with an alive pid.
+    # --action reset proceeds and exits 0 (behavior 14) even with an alive pid --
+    # in the namespace that recorded it (IS_SANDBOX=1), where the reset kills
+    # it first. The stand-in is a disposable child in its own process group,
+    # never this test's own pid: a reset that may signal must not be pointed
+    # at the process running the assertions.
+    my $child = fork();
+    die "fork: $!" unless defined $child;
+    if ($child == 0) { setpgrp(0, 0); sleep 60; POSIX::_exit(0) }
+    my ($bpdir, $pkg) = mk_answer_bp(status => 'blocked', registry => { status => 'blocked', pid => $child });
+    my ($rc, $out);
+    { local $ENV{IS_SANDBOX} = '1'; ($rc, $out) = run_answer_cli($bpdir, '--package', $pkg, '--action', 'reset'); }
+    is($rc, 0, 'S1/AC9/behavior14: --action reset proceeds and exits 0 despite an alive coordinator pid')
+        or diag($out);
+    kill 'KILL', $child; waitpid($child, 0);
+}
+{
+    # The same answer from the HOST, with no sandbox recorded for the project,
+    # does not signal a pid it did not record -- and therefore does not
+    # proceed while that pid is alive (exit 6, ledger untouched).
     my ($bpdir, $pkg) = mk_answer_bp(status => 'blocked', registry => { status => 'blocked', pid => $$ });
-    my ($rc, $out) = run_answer_cli($bpdir, '--package', $pkg, '--action', 'reset');
-    is($rc, 0, 'S1/AC9/behavior14: --action reset proceeds and exits 0 despite an alive coordinator pid');
+    my $before = slurp("$bpdir/packages/$pkg.md");
+    my ($rc, $out);
+    { local %ENV = %ENV; delete @ENV{qw(IS_SANDBOX BP_ALLOW_HOST)};
+      ($rc, $out) = run_answer_cli($bpdir, '--package', $pkg, '--action', 'reset'); }
+  SKIP: {
+        skip 'running inside a container, which IS the pids\' namespace', 2 if -e '/run/.containerenv' || -e '/.dockerenv';
+        is($rc, 6, 'S1/behavior14 (host): a reset from the host with a live recorded pid is refused, not applied blind')
+            or diag($out);
+        is(slurp("$bpdir/packages/$pkg.md"), $before, 'S1/behavior14 (host): the ledger is byte-unchanged');
+    }
 }
 {
     # behavior16: a refused answer leaves runs/escalations/ entirely unchanged.
