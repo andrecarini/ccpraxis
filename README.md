@@ -264,11 +264,15 @@ Plugins live under `plugins/<name>/` (`sandbox`, `backpack`, `blueprint`, `butle
 
 ## Platforms
 
-| Host | Status | Runs on |
+Validated end to end on the two hosts below. Other platforms, a Linux host for one, should need
+little more than the Perl and bash they already have, but nobody has validated one yet, so expect
+to do some work. Everything inside the sandbox container already runs on Linux (Debian bookworm),
+the test suite included.
+
+| Host | Validated with | Notes |
 |---|---|---|
-| Windows 10 | The original development host. | Git for Windows supplies Perl and bash. The `claude-sandbox` launcher is PowerShell and locates Perl itself; the sandbox runs on Podman with the WSL2 backend. |
-| macOS | Ported in 2026-10; tested on macOS 27 on Apple Silicon. | The Perl that ships with macOS and its `/bin/bash` 3.2, which every host-side shell script must run under. Nothing from Homebrew except Podman for the sandbox, which runs in a rootless `podman machine`. |
-| Linux | Everything inside the sandbox container runs on Linux, the test suite included. A Linux host install has not been confirmed end to end. | The distribution's Perl and bash. |
+| Windows 10 | Git for Windows (its bundled Perl and bash 5), Claude Code, Podman with the WSL2 backend | The original development host. The `claude-sandbox` launcher is PowerShell and locates Perl itself. |
+| macOS 27.0.1 on Apple Silicon (M5 Pro) | the system Perl 5.34.1 and `/bin/bash` 3.2.57, Apple Git 2.54.0, Claude Code 2.1.301, Podman 6.1.4 from Homebrew (2026-10-30) | Every host-side shell script must run under that bash 3.2. Nothing from Homebrew except Podman, for the sandbox. |
 
 The [reference's Platforms section](docs/reference.md#platforms) has the per-OS details: launchers, shells, terminals.
 
