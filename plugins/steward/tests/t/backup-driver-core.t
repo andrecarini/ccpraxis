@@ -30,7 +30,7 @@
 #   AC17 answer_unknown_choice / answer_missing
 #   AC18 --answer without --resume, and an unknown subcommand, are usage errors
 #   AC19 perl -c is clean on all three files
-#   AC20 every one of the 14 kinds is constructible via validate_decision
+#   AC20 every required kind is constructible via validate_decision
 #   AC21 (added by coordinator) invalid decision kind -> decision_invalid, nothing pending
 #   AC22 (added by coordinator) a failed phase does not abort the run -> complete_with_failures
 #   AC23 (added by coordinator) a died phase DOES abort the run -> phase_died (contrast w/ AC22)
@@ -79,15 +79,16 @@ ok(-f $RUNPM, 'scripts/backup/Run.pm exists on disk')
     or diag('scripts/backup/Run.pm is absent -- every Run.pm-contract test below will fail for this reason');
 
 # ---------------------------------------------------------------------------
-# The 14 decision kinds, per spec S2.1. Hard-coded here deliberately: this is
+# The decision kinds, per spec S2.1. Hard-coded here deliberately: this is
 # the ORACLE's own list of what the spec requires to exist, not a copy of the
 # implementation's array. Per the AMENDED AC1 (coordinator ruling), we assert
 # a FLOOR against @Backup::Run::DECISION_KINDS -- never its count or order.
+# clone_live_divergence was retired on 2026-10-30 (the live install follows
+# the dev clone by promotion; see Run.pm), and is asserted ABSENT below.
 # ---------------------------------------------------------------------------
 my @REQUIRED_KINDS = qw(
     dirty_worktree
     remote_merge_conflict
-    clone_live_divergence
     readme_drift
     settings_key
     marketplace_key
@@ -125,6 +126,7 @@ if ($RUNPM_OK) {
         ok(Backup::Run::is_decision_kind($k), "AC1: is_decision_kind('$k') is true");
     }
     ok(!Backup::Run::is_decision_kind('not_a_kind'), "AC1: is_decision_kind('not_a_kind') is false");
+    ok(!Backup::Run::is_decision_kind('clone_live_divergence'), "AC1: the retired kind clone_live_divergence is gone");
     ok(!Backup::Run::is_decision_kind(''),           "AC1: is_decision_kind('') is false");
     ok(!Backup::Run::is_decision_kind(undef),        "AC1: is_decision_kind(undef) is false");
 }
@@ -251,7 +253,7 @@ else {
 }
 
 # =====================================================================
-# AC20 -- every one of the 14 kinds is constructible
+# AC20 -- every required kind is constructible
 # =====================================================================
 if ($RUNPM_OK) {
     for my $k (@REQUIRED_KINDS) {

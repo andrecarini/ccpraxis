@@ -35,7 +35,7 @@ use Exporter 'import';
 
 our @EXPORT_OK = qw(
     PAYLOAD_PATHS default_live_root locate payload_check
-    git_path same_dir promote_hint
+    git_path same_dir promote_hint redact
 );
 
 # What the export writes and the payload check compares: the global-config/
@@ -131,6 +131,10 @@ sub _git_default {
 
 sub _line { my ($s) = @_; $s //= ''; $s =~ s/\s+\z//; return $s; }
 
+# A URL's userinfo (https://user:token@host/...) never reaches a reason, a
+# checkpoint or the driver's stdout.
+sub redact { my ($s) = @_; return $s unless defined $s; $s =~ s{(://)[^/@\s]+@}{$1<redacted>@}g; return $s; }
+
 # A remote that is a URL rather than a local path. file:// is a local path in
 # disguise and is stripped by the caller first; C:/... and C:\... are local.
 sub _is_url {
@@ -180,10 +184,10 @@ sub locate {
         if ($rc != 0 || !length $origin) {
             return $fail->('the live install has no origin remote, so the dev clone it was promoted from is unknown');
         }
-        $r{origin} = $origin;
+        $r{origin} = redact($origin);
         (my $local = $origin) =~ s{^file://}{};
         if (_is_url($local)) {
-            return $fail->("the live install's origin is $origin, not a local dev clone (a live install set up "
+            return $fail->("the live install's origin is $r{origin}, not a local dev clone (a live install set up "
                          . 'before promote.pl owned it)');
         }
         $cand = $local;

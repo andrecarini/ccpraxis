@@ -220,8 +220,8 @@ _compile_check("$Bin/backup-vault.t", 'plugins/steward/tests/t/backup-vault.t (t
 # ===========================================================================
 # AC32 -- static source scan: no require/use of Run.pm, Preflight.pm or
 # Closeout.pm; no literal git invocation of its own; no decision-kind
-# literal other than 'vault_conflict' (the enum is closed, 14 values --
-# scout's "21" was wrong, verified directly against @Backup::Run::DECISION_KINDS).
+# literal other than 'vault_conflict' (the enum is closed -- read from
+# @Backup::Run::DECISION_KINDS directly, never a copied list).
 # Also the AC1 static half: no fork/threads/Parallel::/background spawn.
 # ===========================================================================
 {
@@ -244,7 +244,11 @@ _compile_check("$Bin/backup-vault.t", 'plugins/steward/tests/t/backup-vault.t (t
                 unlike($src, qr/(['"])\Q$kind\E\1/, "AC32: Vault.pm source contains no decision-kind literal '$kind'");
             }
             like($src, qr/vault_conflict/, "AC32: Vault.pm source DOES contain its one permitted kind literal 'vault_conflict'");
-            is(scalar(Backup::Run::DECISION_KINDS()), 14, 'AC32: the decision-kind enum has exactly 14 values (scout correction)');
+            # The count is not pinned here (it moved when clone_live_divergence
+            # was retired and claude_md_drift added, 2026-10-30); the closed
+            # set itself is backup-driver-core.t's to assert.
+            ok((grep { $_ eq 'vault_conflict' } Backup::Run::DECISION_KINDS()),
+                'AC32: vault_conflict is a member of the closed decision-kind enum');
         }
 
         unlike($src, qr/\bfork\s*\(/, 'AC1: Vault.pm source contains no fork()');

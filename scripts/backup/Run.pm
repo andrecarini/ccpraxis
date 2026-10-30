@@ -71,10 +71,14 @@ our @EXPORT_OK = qw(
 # by package 06's "every kind has a documented presentation" check, not a
 # copy in prose.
 # ===========================================================================
+# 2026-10-30: clone_live_divergence retired. The live install is now produced
+# by promote.pl alone, so the dev clone and the live install differing is the
+# normal state between promotions, not a question; what made it dangerous (an
+# export overwriting unpromoted payload edits) is a precondition the
+# preflight phase checks instead, and a "no" skips the export with a note.
 our @DECISION_KINDS = qw(
     dirty_worktree
     remote_merge_conflict
-    clone_live_divergence
     readme_drift
     settings_key
     marketplace_key
