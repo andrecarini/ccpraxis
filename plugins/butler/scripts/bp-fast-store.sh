@@ -294,9 +294,15 @@ fi
 
 # ------------------------------------------------------- 5. pnpm required ----
 # `command -v` only: pnpm itself is NEVER executed (2.9).
+#
+# Still a refusal (exit 3, nothing written) now that a missing pnpm is the
+# NORMAL state of a sandbox: the base image ships no Node or pnpm since
+# 2026-10-30. Writing the config anyway would print a backpack line whose
+# `pnpm install` fails on the next rebuild unless pnpm is declared first, so
+# the message names the one place pnpm now comes from.
 
 if ! require_cmd pnpm; then
-  say 'pnpm is required (it is what reads the .npmrc this script writes); install pnpm, then re-run.'
+  say 'pnpm is required (it reads the pnpm-workspace.yaml this script writes) and is not installed: the sandbox image ships no Node or pnpm. Declare them first with /backpack:add --recipe node-pnpm, run /backpack:install, then re-run this.'
   exit 3
 fi
 

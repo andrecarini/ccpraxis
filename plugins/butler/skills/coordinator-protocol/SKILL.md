@@ -328,12 +328,14 @@ For pnpm, the turnkey path is one command:
 plugins/butler/scripts/bp-fast-store.sh --project /path/to/the/project
 ```
 
-It writes a **gitignored** `<project>/.npmrc` pinning
+**pnpm has to be installed first.** The sandbox image ships no Node or pnpm (since 2026-10-30); the project declares them with `/backpack:add --recipe node-pnpm`, then `/backpack:install`. Without pnpm the script refuses (exit 3) and writes nothing, because the reinstall line it prints runs `pnpm install` and would fail on the next rebuild. Declaring the recipe first also puts it ahead of that line in the backpack, which installs in file order.
 
-- `store-dir` — pnpm's global content-addressed cache, and
-- `virtual-store-dir` — normally `node_modules/.pnpm`, i.e. ~95% of `node_modules` by file count
+It writes a **gitignored** `<project>/pnpm-workspace.yaml` pinning, with the camelCase keys pnpm reads there,
 
-to native `/root/...` paths, ensures the `.gitignore` entries exist, creates the native dirs, and prints **one** `/backpack:add` line on stdout. Run that line. That is the whole procedure.
+- `storeDir` (pnpm's `store-dir`) — the global content-addressed cache, and
+- `virtualStoreDir` (pnpm's `virtual-store-dir`) — normally `node_modules/.pnpm`, i.e. ~95% of `node_modules` by file count
+
+to native `/root/...` paths, ensures the `.gitignore` entries exist, creates the native dirs, and prints **one** `/backpack:add` line on stdout. Run that line. That is the whole procedure. It never writes `.npmrc`: pnpm 10 and later silently ignore `store-dir` / `virtual-store-dir` there, which is how an earlier version of this script reported success and relocated nothing (b38, measured).
 
 What it buys you: `node_modules` stays exactly where node's resolver expects it — a thin symlink tree (~80K) on the bind mount — while every real file lives on the native overlay. Installs write native, reads come from native, and the bind mount carries only symlinks and your source.
 
@@ -350,11 +352,11 @@ Run your build and your tests **from the project directory, as normal**. That is
 | | survives a container rebuild | why it matters |
 |---|---|---|
 | source, ledgers, blueprint dir | **yes** (bind mount) | must stay durable and host-visible — never move these to `/root` |
-| `<project>/.npmrc` | **yes** (bind mount) | it is a project file. It is **gitignored because it hardcodes container-specific `/root/...` paths — never commit it** |
+| `<project>/pnpm-workspace.yaml` | **yes** (bind mount) | it is a project file. It is **gitignored because it hardcodes container-specific `/root/...` paths — never commit it** |
 | the native store + virtual store under `/root` | **no** (wiped) | acceptable: not in the repo, not on the host |
 | the `node_modules` symlink tree | yes — but **dangling** | which is exactly why the backpack item exists |
 
-That last row is the trap. After a rebuild `node_modules/` is still sitting there on the bind mount, so a naive `test -d node_modules` check says "already installed" while every symlink in it points into a store that no longer exists. The `/backpack:add` line `bp-fast-store.sh` prints therefore has a `verify` that checks the **native** virtual store is present *and non-empty*, not just that `node_modules` exists. Skipping that line is how you end up with a tree of dead symlinks and a baffling build failure on your first run after a rebuild.
+That last row is the trap. After a rebuild `node_modules/` is still sitting there on the bind mount, so a naive `test -d node_modules` check says "already installed" while every symlink in it points into a store that no longer exists. The `/backpack:add` line `bp-fast-store.sh` prints therefore has a `verify` that asks pnpm where its store is and checks that `node_modules` entries resolve into the **native** virtual store, not just that `node_modules` exists. Skipping that line is how you end up with a tree of dead symlinks and a baffling build failure on your first run after a rebuild.
 
 ### The non-pnpm equivalent
 
@@ -371,7 +373,7 @@ Same rule for any toolchain: **put the tool's cache/store on native storage usin
 
 Two invariants hold in every case: (1) the **config** lives in the project on the bind mount so it survives a rebuild, and is gitignored because it names container-specific paths; (2) the **artifacts** live on native storage, get wiped on rebuild, and a backpack item re-materializes them. Record which knob you used in `## Decisions & attempt log`.
 
-Run `bp-fast-store.sh` against the **target** project, never against the butler/ccpraxis repo itself — it edits `.npmrc` and `.gitignore` in whatever `--project` names, and it takes that path as an explicit argument precisely so nothing in your environment can redirect it.
+Run `bp-fast-store.sh` against the **target** project, never against the butler/ccpraxis repo itself — it edits `pnpm-workspace.yaml` and `.gitignore` in whatever `--project` names, and it takes that path as an explicit argument precisely so nothing in your environment can redirect it.
 
 ## Dependency & version policy
 
