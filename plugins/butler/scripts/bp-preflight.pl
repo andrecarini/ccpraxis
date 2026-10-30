@@ -502,6 +502,18 @@ for my $a (@{$manifest->{assumptions}}) {
     push @fail, [$id, $detail] if $status eq 'fail';
 }
 
+# ---- claimed but unconfirmed on this platform (assumptions.json unverified_envs).
+# A warning, never a failure: the platform is supported, but these assumptions
+# have not been seen to hold here yet, and the report must not read as if they had.
+{
+    my @unverified = map { $_->{id} }
+        grep { $supported_for{$_->{id}}{$plat}
+               && ref $_->{unverified_envs} eq 'ARRAY'
+               && grep { $_ eq $plat } @{ $_->{unverified_envs} } } @{$manifest->{assumptions}};
+    push @rows, ['warn', 'unverified', "claimed for $plat but never confirmed here: "
+                 . join(', ', @unverified) . ' (assumptions.json unverified_envs)'] if @unverified;
+}
+
 # ---- blueprint DAG integrity (b08). NOT a platform assumption -- see spec 4.2. ----
 {
     my ($st, $detail) = dag_integrity_gate();

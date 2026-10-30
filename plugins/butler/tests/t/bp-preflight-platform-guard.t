@@ -20,7 +20,7 @@ use File::Temp qw(tempdir);
 my $script   = "$Bin/../../scripts/bp-preflight.pl";
 my $manifest = "$Bin/../../docs/assumptions.json";
 
-plan tests => 23;
+plan tests => 28;
 
 ok(-f $script,   'bp-preflight.pl exists');
 ok(-f $manifest, 'assumptions.json exists');
@@ -63,6 +63,32 @@ for my $plat (qw(nixos linux-host)) {
     }
     like($out, qr/^\[ skip \] runtime\.container\s+n\/a on macos/m,
         'macos: the container runtime is not required (drive-solo needs none)');
+    # Claimed for macOS but never seen to hold there: one warning row names
+    # them, so the report does not read as a confirmation (assumptions.json
+    # unverified_envs; docs/design-conventions.md gates claims on confirmation).
+    my ($warn) = $out =~ /^\[ warn \] unverified\s+(.*)$/m;
+    ok(defined $warn, 'macos: a warning row lists the assumptions never confirmed on macOS') or diag($out);
+    like($warn // '', qr/\bhooks\.subagent\b.*\bharness\.wake\b/,
+        'macos: ...including the subagent-hook self-test and the re-invocation probe');
+    unlike($out, qr/^\[ FAIL \] unverified/m, 'macos: ...as a warning, never a failure');
+}
+
+# ---- unverified_envs is well-formed, and only where it is meant -------------
+{
+    my @bad;
+    for my $a (@{$m->{assumptions}}) {
+        next unless exists $a->{unverified_envs};
+        my %sup = map { $_ => 1 } @{ $a->{supported_envs} || [] };
+        push @bad, $a->{id} unless ref $a->{unverified_envs} eq 'ARRAY'
+            && !grep { !$sup{$_} } @{ $a->{unverified_envs} };
+        push @bad, "$a->{id} (no unverified_note)" unless length($a->{unverified_note} // '');
+    }
+    is_deeply(\@bad, [], 'every unverified_envs is a subset of that entry\'s supported_envs, with a note saying what is missing');
+    my $home = tempdir(CLEANUP => 1);
+    local $ENV{HOME} = $home;
+    local $ENV{USERPROFILE} = $home;
+    my $out = `"$^X" "$script" --platform=sandbox-linux 2>&1`;
+    unlike($out, qr/^\[ warn \] unverified/m, 'sandbox-linux: no unverified row where every claim was confirmed');
 }
 
 SKIP: {

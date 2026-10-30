@@ -1,5 +1,5 @@
 {
-  "_about": "Machine-readable assumptions registry seeded by A0 (de-risk spike). A8's preflight asserts env-support (halt loud + specific on unsupported), and the contract-guard validates Anthropic-side responses + creds shape at runtime (alarm + graceful-pause on drift). Decisions #29/#30/#31. Each entry: id, what, expected_contract, check (how to verify), supported_envs, implement_hint (what to build to support a new env), surface (preflight|contract|both).",
+  "_about": "Machine-readable assumptions registry seeded by A0 (de-risk spike). A8's preflight asserts env-support (halt loud + specific on unsupported), and the contract-guard validates Anthropic-side responses + creds shape at runtime (alarm + graceful-pause on drift). Decisions #29/#30/#31. Each entry: id, what, expected_contract, check (how to verify), supported_envs, implement_hint (what to build to support a new env), surface (preflight|contract|both). Optional: unverified_envs, the envs in supported_envs where the assumption is CLAIMED but has never been confirmed working there (with unverified_note saying what is missing). Preflight still runs the check on such an env, and adds one warning row naming every unverified assumption for the platform, so the claim is never mistaken for a confirmed one (docs/design-conventions.md: support claims rest on what has been confirmed).",
   "schema_version": 1,
   "validated_in": {
     "host": { "os": "win32", "perl": "5.42 (cygwin)", "curl": "8.19 (Schannel)", "claude_code": "2.1.170" },
@@ -59,6 +59,8 @@
       "expected_contract": "$BP_CREDS_PATH, else ~/.claude/.credentials.json exists and is readable; mode 0600 (sandbox) / 0644 (cygwin-cosmetic on host). On macOS, with no such file, the login Keychain generic password 'Claude Code-credentials' holds the same JSON (read with `security find-generic-password -s ... -w`; never written, never copied to a file). One lookup for every reader: plugins/butler/scripts/BpCreds.pm.",
       "check": "stat + parse (file), or one bounded `security` read (macOS Keychain).",
       "supported_envs": ["win32", "sandbox-linux", "macos"],
+      "unverified_envs": ["macos"],
+      "unverified_note": "BpCreds reads the Keychain item through /usr/bin/security, but that read has never been run against the real item on a Mac (only against a stub): whether it succeeds without a Keychain access dialog is unconfirmed.",
       "implement_hint": "Teach BpCreds.pm where the new platform keeps Claude Code's grant; every reader (usage gate, preflight, drive-solo token recovery, sitrep/spend) goes through it.",
       "surface": "preflight"
     },
@@ -68,6 +70,8 @@
       "expected_contract": "claudeAiOauth.{accessToken:str, refreshToken:str, expiresAt:int(epoch ms), scopes:[str], subscriptionType:str, rateLimitTier:str}",
       "check": "parse + assert keys/types; expiresAt is epoch-ms (> 1e12).",
       "supported_envs": ["win32", "sandbox-linux", "macos"],
+      "unverified_envs": ["macos"],
+      "unverified_note": "The Keychain item's payload has never been read and validated on a Mac; the shape is assumed to match the file Claude Code writes elsewhere.",
       "implement_hint": "If Anthropic renames fields, update the contract + the write-back mapping; alarm on drift.",
       "surface": "both"
     },
@@ -77,6 +81,8 @@
       "expected_contract": "GET https://api.anthropic.com/api/oauth/usage with Bearer + 'anthropic-beta: oauth-2025-04-20' + 'User-Agent: claude-code/<ver>' returns 200 with five_hour.{utilization:int 0-100, resets_at:ISO-8601} and seven_day.{...}.",
       "check": "one probe GET at launch; validate field presence/types; unauth returns 429 (not an auth signal).",
       "supported_envs": ["win32", "sandbox-linux", "macos"],
+      "unverified_envs": ["macos"],
+      "unverified_note": "No live usage GET has been confirmed from a Mac. The endpoint contract is platform-independent; the macOS path to it (Keychain credentials, system curl) is not.",
       "implement_hint": "If the shape changes (renamed/missing field, non-200), the contract-guard alarms + graceful-pauses; pin the new shape here.",
       "surface": "both"
     },
@@ -105,6 +111,8 @@
       "expected_contract": "A settings/plugin PreToolUse hook fires on a subagent Edit/Write and can deny it; hook input carries agent_id/agent_type.",
       "check": "SELF-TEST at preflight: dispatch a throwaway worker that attempts an out-of-scope edit; assert it is DENIED. Fail loud if containment is silently not firing.",
       "supported_envs": ["win32", "sandbox-linux", "macos"],
+      "unverified_envs": ["macos"],
+      "unverified_note": "The subagent-hook self-test has never been run on a Mac.",
       "implement_hint": "If a Claude Code version stops firing plugin hooks for subagents, containment is broken — halt loud; do not run a fleet.",
       "surface": "preflight",
       "status": "confirmed via docs + structural evidence; runtime self-assert is the durable proof (Decision #31)."
@@ -115,6 +123,8 @@
       "expected_contract": "A detached command, on exit, delivers a notification that re-invokes the session (reporter auto-announce).",
       "check": "PROVEN empirically (Probe 4). Robust fallback: bounded ~9-min long-poll + re-arm regardless.",
       "supported_envs": ["win32", "sandbox-linux", "macos"],
+      "unverified_envs": ["macos"],
+      "unverified_note": "Probe 4 (a background command's completion re-invokes the session) was proven in the A0 environment (Windows host, Linux sandbox); it has never been run on a Mac.",
       "implement_hint": "If re-invocation behavior changes, the bounded long-poll + re-arm still works; surface a warning.",
       "surface": "preflight"
     },

@@ -190,7 +190,7 @@ exactly like success.
 
 ## Host or sandbox
 
-> Runs identically on a Windows or macOS host OR in the sandbox — perl + hooks only, no platform-specific spawns in the prompt (Decision #8).
+> The same steps on a host and in the sandbox — perl + hooks only, no platform-specific spawns in the prompt (Decision #8). Preflight names any assumption not yet confirmed on the platform it runs on.
 
 ## Commit mechanics
 
