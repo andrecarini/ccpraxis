@@ -9,7 +9,11 @@
 #
 # Linux/macOS: chmod +x the .sh launchers in <bindir>, create extensionless
 # symlinks for any *.sh (so `claude-foo` works the same as `claude-foo.sh`),
-# and append `export PATH=...` to the user's shell rc.
+# and append `export PATH=...` to the user's shell rc. Inside a git work tree
+# (the live install, a dev clone) it never chmods or creates a link -- that
+# would dirty tracked content and make the next promote refuse the tree -- and
+# instead lists what the repo itself must track (a 100755 launcher, a tracked
+# extensionless alias).
 #
 # Windows: read/write User-scope PATH and PATHEXT via powershell.exe.
 # Values are passed base64-encoded to avoid any quoting concerns. Only the
@@ -122,18 +126,26 @@ sub run_unix {
         push @symlinks_needed, $link unless -e $link;
     }
 
+    # A bin dir inside a git work tree is tracked content: modes and aliases
+    # belong in the commit, not in an install-time write that leaves the tree
+    # dirty. Report instead of writing.
+    my $in_repo = _inside_git_work_tree($bindir);
+    my @not_exec = $in_repo ? grep { !-x $_ } @launchers : ();
+
     if ($mode eq 'plan') {
         if ($already_path) {
             print "  PATH: $path_expr already present in $shell_rc\n";
         } else {
             print "  PATH: would append `export PATH=\"$path_expr:\$PATH\"` to $shell_rc\n";
         }
-        if (@launchers) {
+        if ($in_repo) {
+            _report_repo_gaps(\@not_exec, \@symlinks_needed);
+        } elsif (@launchers) {
             print "  chmod: would mark "
                 . scalar(@launchers)
                 . " *.sh launchers executable\n";
         }
-        if (@symlinks_needed) {
+        if (!$in_repo && @symlinks_needed) {
             print "  symlinks: would create "
                 . join(', ', map { basename($_) } @symlinks_needed)
                 . " in $bindir\n";
@@ -142,13 +154,17 @@ sub run_unix {
     }
 
     # apply
-    for my $launcher (@launchers) {
-        chmod 0755, $launcher;
-    }
-    for my $link (@symlinks_needed) {
-        my $name = basename($link);
-        symlink "${name}.sh", $link
-            or warn "  symlink $link -> ${name}.sh failed: $!\n";
+    if ($in_repo) {
+        _report_repo_gaps(\@not_exec, \@symlinks_needed);
+    } else {
+        for my $launcher (@launchers) {
+            chmod 0755, $launcher;
+        }
+        for my $link (@symlinks_needed) {
+            my $name = basename($link);
+            symlink "${name}.sh", $link
+                or warn "  symlink $link -> ${name}.sh failed: $!\n";
+        }
     }
 
     if ($already_path) {
@@ -161,6 +177,30 @@ sub run_unix {
         close $fh;
         print "  PATH: appended $path_expr to $shell_rc\n";
     }
+}
+
+# True when $dir sits inside a git work tree: a `.git` (directory, or the file a
+# linked worktree has) in $dir or any ancestor. A walk rather than
+# `git rev-parse`: a spawn is the expensive part of this helper.
+sub _inside_git_work_tree {
+    my ($dir) = @_;
+    my $d = Cwd::abs_path($dir);
+    $d = $dir unless defined $d;
+    while (1) {
+        return 1 if -e "$d/.git";
+        last unless $d =~ s{/[^/]*\z}{};
+        last unless length $d;
+    }
+    return 0;
+}
+
+sub _report_repo_gaps {
+    my ($not_exec, $links) = @_;
+    print "  bin dir is inside a git work tree: not writing there (modes and aliases must be committed)\n";
+    print "  MISSING executable bit (git update-index --chmod=+x): "
+        . join(', ', map { basename($_) } @$not_exec) . "\n" if @$not_exec;
+    print "  MISSING tracked extensionless alias: "
+        . join(', ', map { basename($_) } @$links) . "\n" if @$links;
 }
 
 # ── Windows ─────────────────────────────────────────────────────

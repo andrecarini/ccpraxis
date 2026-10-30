@@ -244,4 +244,32 @@ sub rc_after {
     like($rc->{'.bashrc'} // '', qr{^export PATH=}m, 'B4: Linux bash keeps using .bashrc (unchanged)');
 }
 
+# ===========================================================================
+# B5 -- never write inside a git work tree. A bin dir under a `.git` is
+# tracked content: an install-time chmod or alias symlink there dirties the
+# live install and makes the next promote refuse it. The helper reports what
+# the repo must track instead. run_unix only, $^O forced.
+# ===========================================================================
+{
+    my $home = tempdir(CLEANUP => 1);
+    my $repo = tempdir(CLEANUP => 1);
+    mkdir "$repo/.git" or die $!;
+    File::Path::make_path("$repo/plugins/x/bin");
+    my $bindir = "$repo/plugins/x/bin";
+    my $launcher = "$bindir/bp-example.sh";
+    open my $fh, '>', $launcher or die $!; print {$fh} "#!/bin/bash\nexit 0\n"; close $fh;
+    chmod 0644, $launcher;
+    open my $seed, '>', "$home/.bashrc" or die $!; close $seed;
+
+    local $ENV{SHELL} = "/bin/bash";
+    delete local $ENV{ZSH_VERSION};
+    my ($out, $ok, $err) = run_helper(home => $home, bindir => $bindir, os => 'linux');
+    ok($ok, 'B5 setup: apply inside a work tree completes') or diag("  died: $err");
+    ok(!((stat($launcher))[2] & 0111), 'B5: the launcher was NOT chmod +x inside the work tree');
+    ok(!-e "$bindir/bp-example" && !-l "$bindir/bp-example", 'B5: no alias symlink was created inside the work tree');
+    like($out, qr/MISSING executable bit.*bp-example\.sh/, 'B5: the missing exec bit is reported');
+    like($out, qr/MISSING tracked extensionless alias: bp-example\b/, 'B5: the missing alias is reported');
+    like(slurp("$home/.bashrc") // '', qr/export PATH=/, 'B5: the PATH line is still written (it lives in $HOME, not the repo)');
+}
+
 done_testing();
