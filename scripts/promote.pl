@@ -54,14 +54,15 @@ sub usage_text {
 promote.pl -- fast-forward the live install to this clone's main (creating it on first run), then sync the global-config/ payload into <home>/.claude.
 
 Usage:
-  perl scripts/promote.pl [--dry-run] [--clone DIR] [--live DIR] [--home DIR] [--help]
+  perl scripts/promote.pl [--dry-run] [--clone DIR] [--live DIR] [--home DIR] [--keep-key KEY ...] [--help]
 
 Options:
-  --clone DIR   the dev clone whose main branch is promoted (default: this script's repo)
-  --home DIR    user home; <home>/.claude is the target (default: $HOME or $USERPROFILE)
-  --live DIR    the live install repo, created if missing (default: <home>/.claude/ccpraxis)
-  --dry-run     compute and print everything; write nothing anywhere
-  --help        this text
+  --clone DIR     the dev clone whose main branch is promoted (default: this script's repo)
+  --home DIR      user home; <home>/.claude is the target (default: $HOME or $USERPROFILE)
+  --live DIR      the live install repo, created if missing (default: <home>/.claude/ccpraxis)
+  --keep-key KEY  leave this settings.json unit (a key, or a one-level dotted key such as env.FOO) exactly as <home>/.claude has it, for this run only; repeatable. /steward:backup passes the keys the operator answered "skip"
+  --dry-run       compute and print everything; write nothing anywhere
+  --help          this text
 
 Exit codes: 0 ok, 1 a payload file was refused, 2 precondition/hard failure, 3 usage error.
 EOF
@@ -76,13 +77,16 @@ sub die_usage {
 
 sub parse_args {
     my (@argv) = @_;
-    my %opt = (dry_run => 0, help => 0, clone => undef, live => undef, home => undef);
+    my %opt = (dry_run => 0, help => 0, clone => undef, live => undef, home => undef, keep_keys => {});
     while (@argv) {
         my $a = shift @argv;
         if ($a eq '--help') {
             $opt{help} = 1;
         } elsif ($a eq '--dry-run') {
             $opt{dry_run} = 1;
+        } elsif ($a eq '--keep-key') {
+            die_usage("$a requires a value") unless @argv && length $argv[0];
+            $opt{keep_keys}{ shift @argv } = 1;
         } elsif ($a eq '--clone' || $a eq '--live' || $a eq '--home') {
             my $key = substr($a, 2);
             die_usage("$a requires a value") unless @argv;
@@ -980,9 +984,27 @@ sub main {
             my $result = deep_clone($live_obj);
             my @units = compute_units($live_cmp, $payload_obj);
             my $count = 0;
+            # --keep-key: a unit the caller was asked about and answered
+            # "leave it" (/steward:backup's skip) stays exactly as live has it,
+            # this run only. A key names its unit, a unit under it (env keeps
+            # env.FOO), or the unexpanded unit that holds it (env.FOO keeps
+            # env when env could not be split).
+            my $keep = $opt->{keep_keys};
+            my $kept_by_request = sub {
+                my ($name) = @_;
+                return 1 if $keep->{$name};
+                for my $k (keys %$keep) {
+                    return 1 if index($name, "$k.") == 0 || index($k, "$name.") == 0;
+                }
+                return 0;
+            };
             for my $u (@units) {
                 my $rel = $u->{relation};
                 next if $rel eq 'identical';
+                if (%$keep && $kept_by_request->($u->{name})) {
+                    push @settings_lines, "  kept-local $u->{name} (asked)";
+                    next;
+                }
 
                 # Decision 26 / spec 09: the three permission-rule arrays
                 # are merged element by element against payload history,
