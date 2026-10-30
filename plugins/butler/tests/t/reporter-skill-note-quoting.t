@@ -33,6 +33,12 @@ ok(scalar(@heredoc_feeds) >= 1,
     'AC-10: at least one `--note - <<\'EOF\'` single-quoted heredoc feed is present')
     or diag('found none; scanned ' . length($text) . ' bytes of SKILL.md');
 unlike($text, qr/\$\(cat\s*<</, 'AC-10: no heredoc inside a command substitution anywhere (bash 3.2 mis-parses it)');
+# ...but the skill's REASON must not blame bash 3.2 or name a host: the shell
+# that runs the reporter's command is the Bash tool's (zsh on macOS, bash 5 on
+# Windows and in the container), and each of those parses that form fine. The
+# reasons that hold everywhere are that stdin needs no substitution and that
+# a substitution strips trailing newlines.
+unlike($text, qr/bash 3\.2|macOS|\/bin\/bash/, 'AC-10: the stated reason names no shell version or host');
 
 # Every `--note` use in the doc must read stdin (`-`) or a file, never an
 # inline literal string.

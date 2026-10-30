@@ -123,9 +123,9 @@ never an inline double-quoted literal: an inline guidance string containing back
 gets command-substituted by the shell **before the script ever sees the argument**, so a mandate
 can reach the ledger with a silent hole in it. A single-quoted heredoc delimiter (`<<` followed by
 `'EOF'`) closes that hole; an unquoted delimiter reopens it, so always quote it. Do not wrap the
-heredoc in a command substitution either: bash 3.2 (macOS `/bin/bash`) mis-parses a heredoc
-inside `$(...)` when the note holds parentheses or quotes. `--note-file <path>` is the
-alternative when the note is already in a file.
+heredoc in a command substitution and a variable either: the script already reads the note on
+stdin, the substitution would strip the note's trailing newlines, and it adds a second shell parse
+of the note for nothing. `--note-file <path>` is the alternative when the note is already in a file.
 
 ```
 perl "${CLAUDE_PLUGIN_ROOT}/scripts/bp-answer-escalation.pl" $0 --bp-dir "<bpdir>" \
