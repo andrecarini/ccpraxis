@@ -48,7 +48,7 @@ If `decisions[]` shows a version previously `declined`, look at why. If the issu
 
 A table, one row per version, newest first: version, released, age, risk, and a compact summary of the changes. Use `bullet_count` to say how large each entry is; reproduce `bullets` in full only for versions the user is actually weighing, or when asked. A 100-bullet changelog pasted into chat helps nobody.
 
-**Filter crash reports by platform.** Each issue carries `platforms[]`. A Linux-only glibc segfault cluster is not a reason for a Windows user to stay put, and presenting it as one is the single most misleading thing the old flow did. Say which platform each cluster affects.
+**Filter crash reports by platform.** Each issue carries `platforms[]`. A crash cluster confined to another platform is not a reason for this user to stay put, and presenting it as one is the single most misleading thing the old flow did. Say which platform each cluster affects.
 
 State the recommendation and its `why`. If `recommendation.version` is null, say that staying put is the sound choice and why.
 

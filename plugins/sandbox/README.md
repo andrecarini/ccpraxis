@@ -380,7 +380,8 @@ it stays alive + processing throughout.
 │   └── claude-sandbox.sh              # Bash shim → launcher.pl
 ├── container/
 │   ├── Containerfile                  # debian:bookworm-slim + claude install
-│   ├── CLAUDE.md                      # blueprint copied into each container
+│   ├── CLAUDE.md                      # container instructions shared by every launch
+│   ├── CLAUDE.<part>.md               # per runtime/host parts the launcher appends (ContainerClaudeMd.pm)
 │   └── settings.json                  # blueprint copied into each container
 ├── scripts/
 │   ├── launcher.pl                    # main entrypoint (manager + connector modes)
