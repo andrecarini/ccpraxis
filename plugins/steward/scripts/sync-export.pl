@@ -1,14 +1,21 @@
 #!/usr/bin/env perl
 # sync-export.pl — detect sync status between the live ~/.claude/ config and the
 # export repo. Outputs a JSON array describing each file's state; merge decisions
-# are left to the AI (backup Step 2/3).
+# are left to the backup driver (scripts/backup/Export.pm).
 #
 # Perl port of the former sync-export.sh (internal helpers are Perl per the
-# shell-script policy in references/extending-ccpraxis.md). Behaviour preserved:
-# same statuses, same item order, same JSON shape.
+# shell-script policy in references/extending-ccpraxis.md).
 #
-# Most files are symlinked by install; only repo-owned files are tracked here.
-# settings.json is the one file that needs merging (permissions stay machine-local).
+# Two checkouts, two roles (DevClone.pm):
+#   --live-root DIR  the live install, what runs: skills are mirrored from it,
+#                    ~/.claude/CLAUDE.md is built from its payload, and it is
+#                    the directory ${CCPRAXIS_LIVE} stands for. Default
+#                    <home>/.claude/ccpraxis.
+#   --repo-root DIR  the dev clone, the export target: repo-owned files,
+#                    global-config/settings.json, the container settings and
+#                    known_marketplaces.json are compared there. Default
+#                    $CLAUDE_EXPORT_DIR, else the live install's origin.
+# This script only reads.
 use strict;
 use warnings;
 use JSON::PP;
@@ -16,11 +23,36 @@ use File::Spec;
 use File::Basename qw(dirname basename);
 use File::Compare qw(compare);
 use File::Find;
+use Encode ();
+use B ();
+use FindBin ();
+use lib $FindBin::Bin;
+use DevClone ();
+use GlobalClaudeMd ();
 
 my $home       = $ENV{HOME} // $ENV{USERPROFILE};
-my $export_dir = $ENV{CLAUDE_EXPORT_DIR} // "$home/.claude/ccpraxis";
 my $claude_dir = "$home/.claude";
 my $script_dir = dirname(File::Spec->rel2abs(__FILE__));
+
+my ($live_dir, $export_dir);
+while (@ARGV) {
+    my $a = shift @ARGV;
+    if    ($a eq '--live-root') { $live_dir   = shift @ARGV; }
+    elsif ($a eq '--repo-root') { $export_dir = shift @ARGV; }
+    else { print STDERR "sync-export.pl: unknown argument: $a\n"; exit 2; }
+}
+$live_dir //= DevClone::default_live_root($home);
+unless (defined $export_dir && length $export_dir) {
+    $export_dir = $ENV{CLAUDE_EXPORT_DIR};
+}
+unless (defined $export_dir && length $export_dir) {
+    my $loc = DevClone::locate(live_root => $live_dir, override => $ENV{BACKUP_CLONE_DIR});
+    unless (defined $loc->{dev_clone}) {
+        print STDERR "sync-export.pl: no dev clone: $loc->{reason}; $loc->{fix}\n";
+        exit 2;
+    }
+    $export_dir = $loc->{dev_clone};
+}
 
 # Treat MSWin32/cygwin/msys as Windows (no real symlinks — config is copied).
 sub is_windows { return $^O =~ /^(?:MSWin32|cygwin|msys)$/; }
@@ -75,31 +107,55 @@ sub _dirs_equal {
     return 1;
 }
 
+# A skill directory in ~/.claude/skills should be a link to (Unix) or a copy
+# of (Windows) the live install's skill: the skills that run.
 sub check_symlink {
     my $name = shift;
-    # repo_file is the path *relative to the repo root* that this live item
-    # is actually paired with. It usually equals $name, but CLAUDE.md is the
-    # one exception: the live symlink target is global-config/CLAUDE.md, NOT
-    # a repo-root CLAUDE.md (that's ccpraxis's own project-instructions file,
-    # a completely unrelated document that happens to share the basename).
-    # Callers MUST use repo_file -- never reconstruct the repo path from
-    # $name/basename alone -- or they'll pair live's CLAUDE.md against the
-    # wrong repo file. See bug report 20260922-211416-1b92.
-    my $repo_file = $name eq 'CLAUDE.md' ? 'global-config/CLAUDE.md' : $name;
-    my $link      = "$claude_dir/$name";
-    my $target    = "$export_dir/$repo_file";
+    my $link   = "$claude_dir/$name";
+    my $target = "$live_dir/$name";
 
     if (-l $link) {
-        return { file => $name, repo_file => $repo_file, status => 'linked' };
+        return { file => $name, repo_file => $name, status => 'linked' };
     } elsif (-e $link) {
         if (is_windows()) {
             return content_matches($link, $target)
-                ? { file => $name, repo_file => $repo_file, status => 'linked',     note => 'copy matches repo' }
-                : { file => $name, repo_file => $repo_file, status => 'not_linked', note => 'copy differs from repo' };
+                ? { file => $name, repo_file => $name, status => 'linked',     note => 'copy matches the live install' }
+                : { file => $name, repo_file => $name, status => 'not_linked', note => 'copy differs from the live install' };
         }
-        return { file => $name, repo_file => $repo_file, status => 'not_linked', note => 'exists but should be symlink' };
+        return { file => $name, repo_file => $name, status => 'not_linked', note => 'exists but should be symlink' };
     }
-    return { file => $name, repo_file => $repo_file, status => 'missing', note => 'missing from ~/.claude/' };
+    return { file => $name, repo_file => $name, status => 'missing', note => 'missing from ~/.claude/' };
+}
+
+# ~/.claude/CLAUDE.md is BUILT by promote.pl from the live install's payload
+# (global-config/CLAUDE.md plus this host's part), so it is compared with that
+# build (GlobalClaudeMd::compare_installed, shared with check-claude-md). A
+# regular file equal to the build is in sync; a link is no longer expected.
+# repo_file names the shared payload file -- never the repo-root CLAUDE.md,
+# which is ccpraxis's own project-instructions file (bug 20260922-211416-1b92).
+sub check_claude_md {
+    my $c = GlobalClaudeMd::compare_installed(installed => "$claude_dir/CLAUDE.md", live_root => $live_dir);
+    my %r = (file => 'CLAUDE.md', repo_file => GlobalClaudeMd::SHARED_RELPATH, claude_md_status => $c->{status});
+    my $st = $c->{status};
+    if ($st eq 'in_sync' || $st eq 'linked') {
+        $r{status} = 'identical';
+        $r{note}   = "matches what promotion builds from the live install's payload";
+    } elsif ($st eq 'missing_live') {
+        $r{status} = 'missing';
+        $r{note}   = 'missing from ~/.claude/';
+    } elsif ($st eq 'missing_payload') {
+        $r{status} = 'missing';
+        $r{note}   = "the live install has no " . GlobalClaudeMd::SHARED_RELPATH;
+    } else {
+        $r{status}        = 'claude_md_differs';
+        $r{note}          = $c->{reason} // ($st eq 'symlinked_elsewhere' ? "a link to $c->{target}" : 'differs');
+        $r{host_part}     = $c->{host_part};
+        $r{target}        = $c->{target} if defined $c->{target};
+        $r{extra_lines}   = $c->{extra_lines};
+        $r{missing_lines} = $c->{missing_lines};
+        $r{resolve}       = GlobalClaudeMd::fold_hint();
+    }
+    return \%r;
 }
 
 sub check_repo_file {
@@ -109,10 +165,10 @@ sub check_repo_file {
         : { file => $name, status => 'missing', note => 'missing from repo' };
 }
 
-# Discover skills dynamically.
+# Discover skills dynamically, from the live install (the skills that run).
 sub skill_names {
     my @names;
-    for my $dir (glob("'$export_dir'/skills/*/")) {
+    for my $dir (glob("'$live_dir'/skills/*/")) {
         next unless -d $dir;
         $dir =~ s{/$}{};
         push @names, basename($dir);
@@ -151,8 +207,8 @@ my @skill_files = map { "skills/$_/SKILL.md" } @skills;
 
 my @results;
 
-# 1. Symlinked items: CLAUDE.md + each skill dir.
-push @results, check_symlink('CLAUDE.md');
+# 1. Built and mirrored items: CLAUDE.md + each skill dir.
+push @results, check_claude_md();
 push @results, check_symlink("skills/$_") for @skills;
 
 # 2. Repo-owned files exist?
@@ -165,7 +221,7 @@ my $settings_export = "$export_dir/global-config/settings.json";
 if (-f $settings_live && -f $settings_export) {
     push @results, {
         file   => 'settings.json',
-        status => json_diff_changed('--host-live', $export_dir, $settings_live, $settings_export) ? 'settings_changed' : 'identical',
+        status => json_diff_changed('--host-live', $live_dir, $settings_live, $settings_export) ? 'settings_changed' : 'identical',
         note   => 'full semantic comparison',
     };
 } elsif (-f $settings_live) {
@@ -207,4 +263,20 @@ if (-f $mp_live && -f $mp_export) {
     push @results, { file => 'known_marketplaces.json', status => 'missing',     note => 'no marketplace data' };
 }
 
-print JSON::PP->new->utf8->canonical->pretty->encode(\@results);
+# Paths (from HOME) and CLAUDE.md lines (read from disk) are raw UTF-8 bytes;
+# the ->utf8 encoder below wants characters, or "André" comes out double
+# encoded. Numbers keep their type. Same fallback as ccpraxis-helpers.pl's
+# _decode_strings_recursive: UTF-8 first, CP1252 for a Windows byte path.
+sub _chars {
+    my ($x) = @_;
+    if (ref $x eq 'HASH')  { return { map { $_ => _chars($x->{$_}) } keys %$x }; }
+    if (ref $x eq 'ARRAY') { return [ map { _chars($_) } @$x ]; }
+    return $x if ref $x || !defined $x || utf8::is_utf8($x);
+    my $fl = B::svref_2object(\$x)->FLAGS;
+    return $x if ($fl & (B::SVf_IOK | B::SVf_NOK)) && !($fl & B::SVf_POK);
+    my $copy = $x;
+    my $d = eval { Encode::decode('UTF-8', $copy, Encode::FB_CROAK) };
+    return defined $d ? $d : Encode::decode('cp1252', $x, Encode::FB_DEFAULT);
+}
+
+print JSON::PP->new->utf8->canonical->pretty->encode(_chars(\@results));

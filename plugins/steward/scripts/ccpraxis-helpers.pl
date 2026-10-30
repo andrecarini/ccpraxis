@@ -5,17 +5,41 @@
 # subcommand emits a JSON report; the LLM consumes the JSON and only
 # needs to drive AskUserQuestion / commit-message generation.
 #
+# Two checkouts are involved (DevClone.pm has the whole model):
+#   the live install  <home>/.claude/ccpraxis, what Claude Code runs. Read
+#                     only: its skills are mirrored, its payload is what
+#                     ~/.claude/CLAUDE.md is built from, its
+#                     .backup-preferences.json holds this machine's answers.
+#                     Nothing here ever writes into it.
+#   the dev clone     the export target. Only settings-export-merge writes,
+#                     and only into the dev clone's working tree.
+#
+# Every subcommand except claude-internals takes:
+#   --live-root DIR   the live install (default <home>/.claude/ccpraxis, the
+#                     same default promote.pl's --live has). The backup driver
+#                     always passes it, so ${CCPRAXIS_LIVE} is collapsed against
+#                     the same directory promote expanded it to.
+#   --repo-root DIR   the dev clone (default: the live install's origin, which
+#                     promote.pl points at the dev clone).
+#
 # Subcommands:
-#   sync-skills           — Ensure each ccpraxis skill is mirrored to live.
-#                           Symlink on Unix, copy on Windows. Emits per-skill
-#                           result (linked/copied/unchanged/error).
-#   check-claude-md       — Compare live CLAUDE.md with repo's
-#                           global-config/CLAUDE.md. Reports linked/equal/
-#                           differs/missing.
+#   sync-skills           — Ensure each live-install skill is mirrored into
+#                           ~/.claude/skills. Symlink on Unix, copy on
+#                           Windows. Emits per-skill result
+#                           (linked/copied/unchanged/error).
+#   check-claude-md       — Compare ~/.claude/CLAUDE.md with what promote.pl
+#                           builds for this host from the live install's
+#                           payload (GlobalClaudeMd.pm). Reports in_sync/
+#                           linked/differs/symlinked_elsewhere/missing_live/
+#                           missing_payload, and for differs the lines on
+#                           each side.
+#   install-claude-md     — Rebuild ~/.claude/CLAUDE.md from the live
+#                           install's payload, the existing file first backed
+#                           up to ~/.claude/.promotion-backups/<ts>/.
 #   marketplace-diff      — Detect discrepancies between live and repo
 #                           known_marketplaces.json. Emits the discrepancies
 #                           the LLM needs to resolve.
-#   settings-export-merge — Merge live settings.json into the repo's
+#   settings-export-merge — Merge live settings.json into the dev clone's
 #                           global-config/settings.json: live wins on shared
 #                           keys; keys only in repo are preserved — EXCEPT
 #                           where the user's saved backup preferences, or a
@@ -33,7 +57,7 @@
 #   2 = hard fail (write error, integrity issue)
 #   3 = usage error
 #
-# Self-contained: core Perl modules only.
+# Core Perl modules only, plus the sibling modules in this directory.
 
 use strict;
 use warnings;
@@ -43,6 +67,11 @@ use File::Spec;
 use File::Basename qw(basename dirname);
 use JSON::PP;
 use Encode qw(decode);
+use FindBin ();
+use lib $FindBin::Bin;
+use DevClone ();
+use GlobalClaudeMd ();
+use MachineLocalSettings ();
 
 # Output structures mix char strings (decode_json) with raw UTF-8 byte strings
 # (paths from %ENV / catfile). Normalize byte strings up to chars before the
@@ -79,7 +108,48 @@ sub home_dir {
 sub is_windows { return $^O eq 'MSWin32' || $^O eq 'cygwin' || $^O eq 'msys'; }
 
 sub claude_dir   { return File::Spec->catdir(home_dir(), '.claude'); }
-sub ccpraxis_dir { return File::Spec->catdir(home_dir(), '.claude', 'ccpraxis'); }
+
+# --live-root / --repo-root, taken out of @ARGV before a subcommand parses
+# the rest (take_root_opts, called by the dispatcher).
+my %ROOT_OPT;
+sub take_root_opts {
+    my @rest;
+    while (@ARGV) {
+        my $a = shift @ARGV;
+        if ($a eq '--live-root' || $a eq '--repo-root') {
+            my $v = shift @ARGV;
+            die_json(3, "$a requires a directory") unless defined $v && length $v;
+            $ROOT_OPT{ $a eq '--live-root' ? 'live' : 'repo' } = $v;
+        } elsif ($a =~ /^--(live|repo)-root=(.+)\z/) {
+            $ROOT_OPT{$1} = $2;
+        } else {
+            push @rest, $a;
+        }
+    }
+    @ARGV = @rest;
+    return;
+}
+
+# The live install: read from, never written to.
+sub live_root {
+    return $ROOT_OPT{live} if defined $ROOT_OPT{live};
+    return DevClone::default_live_root(home_dir());
+}
+
+# The dev clone, the only checkout an export writes into. Never the live
+# install, whichever way it was named.
+sub repo_root {
+    my $repo = $ROOT_OPT{repo};
+    unless (defined $repo) {
+        my $loc = DevClone::locate(live_root => live_root(), override => $ENV{BACKUP_CLONE_DIR});
+        die_json(1, "no dev clone to export into: $loc->{reason}", fix => $loc->{fix})
+            unless defined $loc->{dev_clone};
+        $repo = $loc->{dev_clone};
+    }
+    die_json(2, "refusing to export into the live install ($repo): the export target is the dev clone")
+        if DevClone::same_dir($repo, live_root());
+    return $repo;
+}
 
 sub emit_json {
     my ($obj) = @_;
@@ -180,7 +250,8 @@ sub trees_equal {
 # ─── Subcommand: sync-skills ──────────────────────────────────────────────
 
 sub cmd_sync_skills {
-    my $ccpraxis = ccpraxis_dir();
+    # The skills that run are the live install's, so those are what is mirrored.
+    my $ccpraxis = live_root();
     my $skills_src = File::Spec->catdir($ccpraxis, 'skills');
     my $skills_dst = File::Spec->catdir(claude_dir(), 'skills');
 
@@ -293,44 +364,99 @@ sub recursive_copy_dir {
 
 sub cmd_check_claude_md {
     my $live = File::Spec->catfile(claude_dir(), 'CLAUDE.md');
-    my $repo = File::Spec->catfile(ccpraxis_dir(), 'global-config', 'CLAUDE.md');
+    my $root = live_root();
+    # ~/.claude/CLAUDE.md is built by promote.pl from the live install's
+    # payload (the shared file plus this host's part), so that build is what
+    # it is compared with -- never a single repo file, and never the dev
+    # clone, which may hold payload edits that are not live yet.
+    my $c = GlobalClaudeMd::compare_installed(installed => $live, live_root => $root);
 
-    my %r = (live => $live, repo => $repo);
-
-    if (!-e $repo) {
-        $r{status} = 'missing_repo';
-        emit_json(\%r);
-        exit 1;
+    my %r = (
+        live      => $live,
+        repo      => "$root/" . GlobalClaudeMd::SHARED_RELPATH,
+        payload   => $root,
+        status    => $c->{status},
+        host_part => $c->{host_part},
+    );
+    $r{target} = $c->{target} if defined $c->{target};
+    $r{reason} = $c->{reason} if defined $c->{reason};
+    if ($c->{status} eq 'differs' || $c->{status} eq 'symlinked_elsewhere') {
+        $r{extra_lines}   = $c->{extra_lines};
+        $r{missing_lines} = $c->{missing_lines};
+        $r{resolve}       = GlobalClaudeMd::fold_hint() if @{ $c->{extra_lines} };
     }
-
-    if (!-e $live) {
-        $r{status} = 'missing_live';
-        emit_json(\%r);
-        exit 1;
-    }
-
-    if (-l $live) {
-        my $target = readlink($live) // '';
-        my $target_abs = File::Spec->rel2abs($target, dirname($live));
-        if ($target_abs eq $repo) {
-            $r{status} = 'linked';
-        } else {
-            $r{status} = 'symlinked_elsewhere';
-            $r{target} = $target_abs;
-        }
-        emit_json(\%r);
-        exit 0;
-    }
-
-    if (trees_equal($live, $repo)) {
-        $r{status} = 'equal_content';
-        emit_json(\%r);
-        exit 0;
-    }
-
-    $r{status} = 'differs';
-    $r{platform} = is_windows() ? 'windows' : 'unix';
     emit_json(\%r);
+    exit($c->{status} =~ /^missing_/ ? 1 : 0);
+}
+
+# ─── Subcommand: install-claude-md ────────────────────────────────────────
+# What promote.pl does to ~/.claude/CLAUDE.md, alone: rebuild it from the live
+# install's payload, after a verified backup copy of the file it replaces in
+# ~/.claude/.promotion-backups/<UTC timestamp>/ (promote.pl's own backup
+# directory, same naming). A link to the shared file holds no content, so it is
+# replaced without a copy; a link anywhere else is refused, as promote refuses
+# it, because replacing it would silently cut whatever it points at loose.
+
+sub promotion_backup_dir {
+    my $base = File::Spec->catdir(claude_dir(), '.promotion-backups');
+    make_path($base) unless -d $base;
+    my @t = gmtime(time());
+    my $dir = File::Spec->catdir($base, sprintf('%04d%02d%02d-%02d%02d%02d',
+        $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]));
+    if (-e $dir) {
+        my $n = 2;
+        $n++ while -e "$dir-$n";
+        $dir = "$dir-$n";
+    }
+    make_path($dir) or return (undef, "cannot create $dir: $!");
+    return ($dir, undef);
+}
+
+sub write_bytes_atomic {
+    my ($path, $bytes) = @_;
+    my $tmp = "$path.tmp.$$";
+    open my $fh, '>:raw', $tmp or return "cannot open $tmp for write: $!";
+    unless (print {$fh} $bytes) { my $e = $!; close $fh; unlink $tmp; return "write $tmp failed: $e"; }
+    unless (close $fh)          { my $e = $!; unlink $tmp; return "close $tmp failed: $e"; }
+    unless (rename($tmp, $path)) { my $e = $!; unlink $tmp; return "rename $tmp -> $path failed: $e"; }
+    return undef;
+}
+
+sub cmd_install_claude_md {
+    my $dest = File::Spec->catfile(claude_dir(), 'CLAUDE.md');
+    my $c = GlobalClaudeMd::compare_installed(installed => $dest, live_root => live_root());
+    my $status = $c->{status};
+
+    die_json(1, 'the live install has no ' . GlobalClaudeMd::SHARED_RELPATH . ' to build from', live => $dest)
+        if $status eq 'missing_payload';
+    die_json(1, "$dest is a link to $c->{target}; not replacing a link to another file", live => $dest)
+        if $status eq 'symlinked_elsewhere';
+    if ($status eq 'in_sync' || $status eq 'linked') {
+        emit_json({ status => 'unchanged', live => $dest, previous_status => $status, backup => undef });
+        exit 0;
+    }
+
+    my $backup;
+    if (-l $dest) {
+        unlink $dest or die_json(2, "cannot remove the link $dest: $!");
+    } elsif (-f $dest) {
+        my ($dir, $derr) = promotion_backup_dir();
+        die_json(2, "cannot back up $dest: $derr") unless defined $dir;
+        $backup = File::Spec->catfile($dir, 'CLAUDE.md');
+        open my $in, '<:raw', $dest or die_json(2, "cannot read $dest: $!");
+        local $/;
+        my $orig = <$in> // '';
+        close $in;
+        my $err = write_bytes_atomic($backup, $orig);
+        die_json(2, "cannot back up $dest: $err") if defined $err;
+        open my $chk, '<:raw', $backup or die_json(2, "cannot verify the backup $backup: $!");
+        my $again = <$chk> // '';
+        close $chk;
+        die_json(2, "backup verification failed for $backup") unless $again eq $orig;
+    }
+    my $err = write_bytes_atomic($dest, $c->{rendered});
+    die_json(2, "cannot write $dest: $err") if defined $err;
+    emit_json({ status => 'rendered', live => $dest, previous_status => $status, backup => $backup });
     exit 0;
 }
 
@@ -353,7 +479,9 @@ sub cmd_marketplace_diff {
         }
     }
     $live //= File::Spec->catfile(claude_dir(), 'plugins', 'known_marketplaces.json');
-    $repo //= File::Spec->catfile(ccpraxis_dir(), 'global-config', 'known_marketplaces.json');
+    # Read-only, so the default is the payload that was promoted: the live
+    # install's. The backup driver passes --repo with the dev clone's file.
+    $repo //= File::Spec->catfile(live_root(), 'global-config', 'known_marketplaces.json');
 
     my ($live_obj, $live_err) = -f $live ? read_json_file($live) : (undef, "missing: $live");
     my ($repo_obj, $repo_err) = -f $repo ? read_json_file($repo) : (undef, "missing: $repo");
@@ -451,7 +579,7 @@ sub cmd_marketplace_diff {
                         diverged  => 'skip-always');
     my $prefs = {};
     {
-        my $pf = File::Spec->catfile(ccpraxis_dir(), '.backup-preferences.json');
+        my $pf = prefs_path();
         if (-f $pf) {
             my ($obj) = read_json_file($pf);
             $prefs = (ref $obj eq 'HASH' && ref $obj->{marketplaces} eq 'HASH')
@@ -519,7 +647,8 @@ my %VALID_ACTION = (
 my $VALUE_CMP = JSON::PP->new->canonical->allow_nonref;
 sub same_value { return $VALUE_CMP->encode($_[0]) eq $VALUE_CMP->encode($_[1]); }
 
-sub prefs_path { return File::Spec->catfile(ccpraxis_dir(), '.backup-preferences.json'); }
+# Machine-local answers live in the live install, where promote.pl reads them.
+sub prefs_path { return File::Spec->catfile(live_root(), '.backup-preferences.json'); }
 
 # Load the live_vs_repo preference scope. Returns ($scope_hashref, $error).
 # A missing file is fine (no preferences recorded yet); an unparseable one is
@@ -666,7 +795,9 @@ sub cmd_settings_export_merge {
     }
 
     my $live = File::Spec->catfile(claude_dir(), 'settings.json');
-    my $repo = File::Spec->catfile(ccpraxis_dir(), 'global-config', 'settings.json');
+    # Written into the dev clone's working tree, never the live install: the
+    # live install changes only by promotion (DevClone.pm).
+    my $repo = File::Spec->catfile(repo_root(), 'global-config', 'settings.json');
 
     die_json(1, "Live settings missing: $live") unless -f $live;
 
@@ -689,17 +820,12 @@ sub cmd_settings_export_merge {
     # ${CCPRAXIS_LIVE}, never as the literal path, and the platform-only keys
     # that do not apply on this host are taken out of the merge on both sides
     # and put back exactly as the repo had them -- a Mac backup never adds,
-    # changes or deletes the Windows-only PowerShell switch. Required lazily:
-    # only this subcommand needs it.
-    my $repo_foreign;
-    {
-        (my $self = __FILE__) =~ s{\\}{/}g;
-        local @INC = (dirname($self), @INC);
-        require MachineLocalSettings;
-        MachineLocalSettings::collapse_live_root($live_obj, ccpraxis_dir());
-        MachineLocalSettings::strip_foreign_platform_keys($live_obj);
-        $repo_foreign = MachineLocalSettings::strip_foreign_platform_keys($repo_obj);
-    }
+    # changes or deletes the Windows-only PowerShell switch. The path is
+    # collapsed against the LIVE install (live_root), the directory promote.pl
+    # expanded the token to -- never against the dev clone being written.
+    MachineLocalSettings::collapse_live_root($live_obj, live_root());
+    MachineLocalSettings::strip_foreign_platform_keys($live_obj);
+    my $repo_foreign = MachineLocalSettings::strip_foreign_platform_keys($repo_obj);
 
     # Pre-flight: backup the repo file before writing (in case caller hasn't).
     # Keep only the 2 most recent pre-merge backups; prune older ones so the
@@ -790,17 +916,21 @@ sub cmd_help {
 ccpraxis-helpers.pl
 
 Subcommands:
-  sync-skills            Mirror ccpraxis/skills/ to ~/.claude/skills/. Symlinks on Unix, copies on Windows. Idempotent.
+  sync-skills            Mirror the live install's skills/ to ~/.claude/skills/. Symlinks on Unix, copies on Windows. Idempotent.
 
-  check-claude-md        Report status of live CLAUDE.md vs the repo version. Possible statuses: linked, equal_content, differs, symlinked_elsewhere, missing_live, missing_repo.
+  check-claude-md        Compare ~/.claude/CLAUDE.md with what promote.pl builds for this host from the live install's payload (global-config/CLAUDE.md plus this host's part). Statuses: in_sync, linked, differs, symlinked_elsewhere, missing_live, missing_payload; differs also lists the lines only on each side.
 
-  marketplace-diff       Diff live known_marketplaces.json vs repo's global-config/known_marketplaces.json. Strips installLocation from each entry before comparing.
+  install-claude-md      Rebuild ~/.claude/CLAUDE.md from the live install's payload, as promote.pl does, after a verified copy of the old file to ~/.claude/.promotion-backups/<timestamp>/. Refuses a link to another file.
 
-  settings-export-merge  Merge live settings.json into repo's global-config/settings.json. Live wins on shared keys; keys only in repo are preserved. Saved backup preferences (.backup-preferences.json, live_vs_repo scope) override that: "keep different" (skip-always) and "keep repo-only" (right-only) keep the repo's value; "keep live-only" (left-only) stays out of the repo entirely.
+  marketplace-diff       Diff live known_marketplaces.json vs a payload copy (--repo FILE; default: the live install's global-config/known_marketplaces.json). Strips installLocation and lastUpdated from each entry before comparing.
+
+  settings-export-merge  Merge live settings.json into the dev clone's global-config/settings.json. Live wins on shared keys; keys only in repo are preserved. Saved backup preferences (.backup-preferences.json, live_vs_repo scope) override that: "keep different" (skip-always) and "keep repo-only" (right-only) keep the repo's value; "keep live-only" (left-only) stays out of the repo entirely. Never writes into the live install.
                          Options:
                            --skip-key KEY  Leave the repo side of KEY alone for this run only (repeatable). Use for the user's per-run "Skip" answers. Dotted names (env.FOO) address one sub-key, matching json-diff.pl.
 
   claude-internals  Read-only check that the installed claude binary still contains the undocumented internals our settings rely on. Options: --binary PATH, --data PATH. Exit 0 all present, 1 changed, 2 could not check.
+
+Every subcommand but claude-internals takes --live-root DIR (the live install; default ~/.claude/ccpraxis) and --repo-root DIR (the dev clone; default the live install's origin).
 
 All output is JSON on stdout. Exit codes: 0=ok, 1=soft fail, 2=hard fail, 3=usage error.
 EOF
@@ -811,9 +941,13 @@ EOF
 
 my $sub = shift @ARGV;
 $sub //= 'help';
+# claude-internals passes its arguments through untouched; every other
+# subcommand accepts --live-root / --repo-root.
+take_root_opts() unless $sub eq 'claude-internals';
 
 if    ($sub eq 'sync-skills')           { cmd_sync_skills(); }
 elsif ($sub eq 'check-claude-md')       { cmd_check_claude_md(); }
+elsif ($sub eq 'install-claude-md')     { cmd_install_claude_md(); }
 elsif ($sub eq 'marketplace-diff')      { cmd_marketplace_diff(); }
 elsif ($sub eq 'settings-export-merge') { cmd_settings_export_merge(); }
 elsif ($sub eq 'claude-internals')      { cmd_claude_internals(); }

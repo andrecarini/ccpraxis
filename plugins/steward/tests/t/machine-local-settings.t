@@ -340,33 +340,63 @@ SKIP: {
 
 # ---------------------------------------------------------------------------
 # 5. settings-export-merge on THIS host: this machine's path goes back as the
-#    token; a foreign platform-only key in the payload is kept exactly.
+#    token; a foreign platform-only key in the payload is kept exactly. The
+#    merge writes into the DEV CLONE (--repo-root), never the live install, and
+#    collapses the path against the LIVE install (--live-root): the directory
+#    promote.pl expanded the token to, not the checkout being written.
 # ---------------------------------------------------------------------------
 {
     my $home = tempdir(CLEANUP => 1);
     my $live_root = "$home/.claude/ccpraxis";
-    make_path("$live_root/global-config");
+    my $clone     = "$home/Projects/ccpraxis";
+    make_path("$live_root/global-config", "$clone/global-config");
     my ($root_spelling) = MachineLocalSettings::live_root_spellings($live_root);
     write_json_file("$home/.claude/settings.json",
         mp_settings("$root_spelling/plugins", env => { KEEP => '2', ($IS_WIN ? ($PS => '1') : ($PS => '0')) }));
     write_json_file("$live_root/global-config/settings.json", $PAYLOAD_V2);
-    my ($rc, $out, $err) = run_cmd({ HOME => $home, USERPROFILE => $home }, $^X, $HELPERS, 'settings-export-merge');
+    write_json_file("$clone/global-config/settings.json", $PAYLOAD_V2);
+    my $live_payload_before = read_file("$live_root/global-config/settings.json");
+    my @roots = ('--live-root', $live_root, '--repo-root', $clone);
+    my ($rc, $out, $err) = run_cmd({ HOME => $home, USERPROFILE => $home }, $^X, $HELPERS, 'settings-export-merge', @roots);
     is($rc, 0, 'export-merge: exits 0') or diag("$out\n$err");
-    my $repo = read_json_file("$live_root/global-config/settings.json");
+    my $repo = read_json_file("$clone/global-config/settings.json");
     is(mp_path($repo), "$TOKEN/plugins", 'export-merge: this machine\'s live path is exported as the token, never literally');
     is($repo->{env}{KEEP}, '2', 'export-merge: an ordinary live value still wins');
     is($repo->{env}{$PS}, '1', $IS_WIN
         ? 'export-merge (windows host): the PowerShell switch syncs normally'
         : 'export-merge (non-windows host): a live "0" does not overwrite the Windows-only "1"');
+    is(read_file("$live_root/global-config/settings.json"), $live_payload_before,
+        'export-merge: the live install\'s payload is byte-for-byte untouched (the dev clone is the target)');
 
     # live WITHOUT the foreign key must not delete it from the payload either.
     unless ($IS_WIN) {
         write_json_file("$home/.claude/settings.json", mp_settings("$root_spelling/plugins", env => { KEEP => '2' }));
-        ($rc, $out, $err) = run_cmd({ HOME => $home, USERPROFILE => $home }, $^X, $HELPERS, 'settings-export-merge');
+        ($rc, $out, $err) = run_cmd({ HOME => $home, USERPROFILE => $home }, $^X, $HELPERS, 'settings-export-merge', @roots);
         is($rc, 0, 'export-merge: second run exits 0') or diag("$out\n$err");
-        is(read_json_file("$live_root/global-config/settings.json")->{env}{$PS}, '1',
+        is(read_json_file("$clone/global-config/settings.json")->{env}{$PS}, '1',
             'export-merge (non-windows host): a live file without the key never deletes it from the payload');
     }
+
+    # The token stands for the live install, not for the checkout being
+    # written: a marketplace path under the DEV CLONE is a real, different
+    # directory and is exported literally.
+    my ($clone_spelling) = MachineLocalSettings::live_root_spellings($clone);
+    write_json_file("$home/.claude/settings.json", mp_settings("$clone_spelling/plugins", env => { KEEP => '2' }));
+    ($rc, $out, $err) = run_cmd({ HOME => $home, USERPROFILE => $home }, $^X, $HELPERS, 'settings-export-merge', @roots);
+    is($rc, 0, 'export-merge: a dev-clone path run exits 0') or diag("$out\n$err");
+    is(mp_path(read_json_file("$clone/global-config/settings.json")), "$clone_spelling/plugins",
+        'export-merge: only the live install collapses to the token, never the dev clone');
+
+    # Naming the live install as the export target is refused, and nothing in
+    # it changes.
+    ($rc, $out, $err) = run_cmd({ HOME => $home, USERPROFILE => $home }, $^X, $HELPERS, 'settings-export-merge',
+        '--live-root', $live_root, '--repo-root', $live_root);
+    is($rc, 2, 'export-merge: --repo-root naming the live install is refused (exit 2)') or diag("$out\n$err");
+    like($out, qr/refusing to export into the live install/, 'export-merge: ...and says why');
+    is(read_file("$live_root/global-config/settings.json"), $live_payload_before,
+        'export-merge: ...and the live payload is still untouched');
+    my @strays = grep { /pre-merge/ } glob("'$live_root/global-config/'*");
+    is(scalar(@strays), 0, 'export-merge: no pre-merge copy was written into the live install');
 }
 
 # ---------------------------------------------------------------------------
