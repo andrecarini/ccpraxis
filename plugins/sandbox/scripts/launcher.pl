@@ -50,6 +50,7 @@ use ProtectedPaths qw(path_relation protected_roots target_self_codes normalize_
 use RefusalMarker ();  # .claude-sandbox-refuse markers: refuse before anything is written
 use SandboxIdentity ();  # launcher identity + this checkout's own install root
 use HostPlatform ();     # container CLI choice, machine shares, darwin path case
+use ContainerClaudeMd ();  # the container CLAUDE.md, built for this host and runtime
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
 use WtProfile ();   # sandbox-wt-profile/02: [c]-press profile fragment ensure + name
@@ -3277,7 +3278,18 @@ sub _enumerate_inuse_host_ports {
 }
 
 # Container-config blueprint drift (CLAUDE.md + settings.json).
-my $CURRENT_CLAUDE_MD_HASH = md5_of_file("$CONTAINER_CONFIG/CLAUDE.md");
+#
+# The container's CLAUDE.md is not a copy of container/CLAUDE.md: it is that
+# shared file plus the parts for this host and this container runtime
+# (ContainerClaudeMd), so a container started from a Mac is never told about
+# WSL. The drift hash is taken over that rendered text, so editing a part that
+# applies to this launch is noticed exactly as an edit to the shared file is,
+# and so is a launch under a different runtime than the copy was made for.
+my $CONTAINER_CLAUDE_MD_TEXT = ContainerClaudeMd::render_dir($CONTAINER_CONFIG,
+    HostPlatform::os_family(), HostPlatform::runtime_family($PODMAN));
+die "ERROR: container CLAUDE.md template missing: $CONTAINER_CONFIG/CLAUDE.md\n"
+    unless defined $CONTAINER_CLAUDE_MD_TEXT;
+my $CURRENT_CLAUDE_MD_HASH = md5_of_string($CONTAINER_CLAUDE_MD_TEXT);
 my $CURRENT_SETTINGS_HASH  = md5_of_file("$CONTAINER_CONFIG/settings.json");
 if (-f $CLAUDE_MD_HASH_FILE) {
     my $saved = _read_file($CLAUDE_MD_HASH_FILE);
@@ -3441,7 +3453,7 @@ if ($do_rebuild) {
     # Refresh per-project container blueprint copies from upstream
     # (plugins/sandbox/container/). Any in-container modifications get
     # overwritten — that's the explicit opt-in semantic of Rebuild.
-    _copy_file("$CONTAINER_CONFIG/CLAUDE.md",    $CONTAINER_CLAUDE_MD);
+    _write_file($CONTAINER_CLAUDE_MD, $CONTAINER_CLAUDE_MD_TEXT);
     _copy_file("$CONTAINER_CONFIG/settings.json", $CONTAINER_SETTINGS_JSON);
     _write_file($CLAUDE_MD_HASH_FILE, $CURRENT_CLAUDE_MD_HASH);
     _write_file($SETTINGS_HASH_FILE,  $CURRENT_SETTINGS_HASH);
@@ -4232,8 +4244,9 @@ if (-f "$CLAUDE_DATA/git-ssh-command.sh") {
 # this because Docker Desktop ships its own user-mode proxy. The WSL
 # distro's external IPv4 is always reachable from the host, so we capture
 # it here and expose it in the container as $SANDBOX_HOST_IP; the
-# container's CLAUDE.md tells agents to prefer that URL when emitting
-# user-facing links. Captured at create-time; goes stale only if WSL
+# container's CLAUDE.md part for this combination
+# (container/CLAUDE.windows-podman.md) tells agents to use that address
+# in user-facing links. Captured at create-time; goes stale only if WSL
 # restarts before the user re-launches.
 if ($WINDOWS_FAMILY && $PODMAN =~ /podman/i) {
     my $machine = `$PODMAN machine inspect --format "{{.Name}}" 2>/dev/null`;
@@ -5085,8 +5098,8 @@ if (! _container_exists($CONTAINER_NAME)) {
 
     # Materialize blueprint copies on first create.
     if (! -f $CONTAINER_CLAUDE_MD) {
-        _copy_file("$CONTAINER_CONFIG/CLAUDE.md", $CONTAINER_CLAUDE_MD);
-        _write_file($CLAUDE_MD_HASH_FILE, md5_of_file("$CONTAINER_CONFIG/CLAUDE.md"));
+        _write_file($CONTAINER_CLAUDE_MD, $CONTAINER_CLAUDE_MD_TEXT);
+        _write_file($CLAUDE_MD_HASH_FILE, $CURRENT_CLAUDE_MD_HASH);
     }
     if (! -f $CONTAINER_SETTINGS_JSON) {
         _copy_file("$CONTAINER_CONFIG/settings.json", $CONTAINER_SETTINGS_JSON);
@@ -5125,6 +5138,10 @@ if (! _container_exists($CONTAINER_NAME)) {
             # Hosts this launcher's identity must not reach (empty for
             # ccpraxis); pinned to 0.0.0.0 in the container's /etc/hosts.
             SandboxIdentity::blocked_host_args(),
+            # A name for the host (host.docker.internal) where the runtime
+            # does not provide one itself: Docker Engine on Linux only, empty
+            # everywhere else. The container's CLAUDE.md names it.
+            HostPlatform::host_gateway_args($PODMAN),
             # Sandbox-marker env var that skill guards inside the container
             # key off (instead of fragile $HOME-path sniffing). Stable across
             # any future image-internal user/path changes.

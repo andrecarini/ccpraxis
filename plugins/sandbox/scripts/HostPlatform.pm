@@ -51,6 +51,42 @@ sub cli_candidates {
     return ('docker', 'podman');
 }
 
+# os_family($os) -> 'windows' | 'macos' | 'linux'. The one spelling of "which
+# kind of host is this" for anything chosen per host by file name (the
+# container CLAUDE.md parts, ContainerClaudeMd). The Windows family is the same
+# set every $WINDOWS_FAMILY test in this plugin uses.
+sub os_family {
+    my ($os) = @_;
+    $os = $^O unless defined $os;
+    return 'windows' if $os =~ /^(MSWin32|cygwin|msys)$/;
+    return 'macos'   if $os eq 'darwin';
+    return 'linux';
+}
+
+# runtime_family($cli) -> 'podman' | 'docker'. The launcher's own rule, which
+# it spells inline as `$PODMAN =~ /podman/i` wherever behaviour differs: a CLI
+# whose name says podman is podman, and anything else speaks docker's CLI.
+sub runtime_family {
+    my ($cli) = @_;
+    return (defined $cli && !ref $cli && $cli =~ /podman/i) ? 'podman' : 'docker';
+}
+
+# host_gateway_args($cli, $os) -> extra `create` arguments that give the
+# container a name for the host.
+#
+# Podman adds host.containers.internal to every container's /etc/hosts, and
+# Docker Desktop (Windows, macOS) resolves host.docker.internal by itself.
+# Docker Engine on Linux does neither: it defines host.docker.internal only for
+# a container created with `--add-host host.docker.internal:host-gateway`.
+# Passing that there is what lets the container's CLAUDE.md name one host name
+# per runtime and have it be true on every host. Everywhere else this is empty,
+# so a Windows or macOS launch is unchanged.
+sub host_gateway_args {
+    my ($cli, $os) = @_;
+    return () unless runtime_family($cli) eq 'docker' && os_family($os) eq 'linux';
+    return ('--add-host', 'host.docker.internal:host-gateway');
+}
+
 # _cli_responds($cli) -> 1 if `$cli --version` exits 0. The only reliable
 # check on Windows (see cli_candidates); harmless everywhere else.
 sub _cli_responds {

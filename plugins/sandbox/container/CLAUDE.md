@@ -27,7 +27,7 @@ Specifically for the backpack system (if the `backpack` plugin is mounted into t
 
 ## ✅ YOU ARE INSIDE A SANDBOXED CONTAINER — FULL AUTONOMY
 
-You are running inside an isolated dev container (Docker or Podman — auto-detected), as root. The project folder is at `/project`.
+You are running inside an isolated dev container, as root. The project folder is at `/project`. Which container runtime this is, and what that means for networking, is in the last section of this file.
 You have full autonomy. No permission prompts. Go fast.
 
 **You CAN and SHOULD install and run dev tooling directly:**
@@ -38,7 +38,7 @@ You have full autonomy. No permission prompts. Go fast.
 - ✅ `firebase`, `gcloud`, `terraform`
 - ✅ ANY build tool, linter, formatter, or compiler
 
-There is no host machine to protect — this container IS the sandbox. Under rootless Podman, container root is mapped via Podman's user namespace to the unprivileged host user; under Docker Desktop, a similar isolation boundary applies. Either way, a compromise stays contained even with full in-container root.
+There is no host machine to protect — this container IS the sandbox, and a compromise stays contained in it even with full in-container root.
 Worst case, the container gets recreated. Project files are bind-mounted and git-recoverable.
 
 ## ⚠️ SUPPLY CHAIN SECURITY (still applies inside the container)
@@ -80,17 +80,12 @@ Nothing listens on these ports at container startup, so a server can bind `0.0.0
 
 ### Sharing the URL with the user
 
-When you print the URL for the user to open, prefer `$SANDBOX_HOST_IP` if it's set. Pick any port from the published range:
+When you print a URL for the user to open, use `localhost` and any port from the published range:
 
 ```bash
-HOST=${SANDBOX_HOST_IP:-localhost}
 PORT=$(echo "$SANDBOX_OPEN_PORTS" | cut -d- -f1)
-echo "Open http://${HOST}:${PORT}"
+echo "Open http://localhost:${PORT}"
 ```
-
-The launcher auto-injects `SANDBOX_HOST_IP` on Windows+Podman, where the host's `localhost:<port>` mirror via WSL2's `wslrelay.exe` is unreliable — it sometimes registers only an IPv6 listener, so IPv4 connects from Firefox/Chrome silently fail even though the container is healthy. The injected value is the WSL distro's directly-reachable IPv4 address and always reaches the published port. On Linux/macOS hosts, or under Docker on any host, the env var is unset and the fallback to `localhost` works as normal.
-
-The env var is captured at container-create time, so if the user runs `wsl --shutdown` or reboots and then re-attaches to an existing sandbox, the value may be stale — a fresh `claude-sandbox` launch (which re-creates if needed) refreshes it.
 
 Example: serve a Flutter web build on the first port of the range:
 ```bash
@@ -121,18 +116,7 @@ The rest of `<project>/.ccpraxis-local-data/claude-home/.launcher/` (hashes, sna
 
 ### Accessing Host Services
 
-Services running on the user's host machine (databases, Chrome DevTools, APIs, etc.) are reachable from inside this container via a special hostname. The exact name depends on which container runtime is hosting you:
-
-- **Docker** (Docker Desktop on Windows/macOS, Docker Engine on Linux): `host.docker.internal`
-- **Podman** (Podman Desktop / Podman Machine): `host.containers.internal`
-
-For example, a Postgres instance on the host on port 5432:
-- Under docker: `host.docker.internal:5432`
-- Under podman: `host.containers.internal:5432`
-
-Both names should work transparently on most modern setups (Podman often aliases `host.docker.internal` for compatibility, and Docker sometimes provides `host.containers.internal`), but the canonical name for each runtime is the safer choice. If unsure which runtime is hosting you, try `getent hosts host.docker.internal host.containers.internal` to see which resolves.
-
-Use one of these names instead of `localhost` or `127.0.0.1` when connecting to host services. `localhost` inside the container refers to the container itself, not the host.
+Services running on the user's host machine (databases, Chrome DevTools, APIs, etc.) are reachable from inside this container through a host name the container runtime provides. That name is in the last section of this file. Use it instead of `localhost` or `127.0.0.1` when connecting to host services: `localhost` inside the container refers to the container itself, not the host.
 
 ## Persistence
 
@@ -155,3 +139,7 @@ ls -t ~/.claude/sandbox-logs/ | head        # newest launch first
 ```
 
 This is worth knowing because `~/.claude/.launcher/` **is a read-only overlay in here**, and its emptiness reads as "nothing was recorded". It isn't — the logs are in `sandbox-logs/`, which is a different directory and writable on the host side. A report filed from a live container (`20260813-011838-82bf`) reached a speculative "the install was probably interrupted" conclusion for exactly this reason, when the transcript would have named the three unprocessed items outright.
+
+## This sandbox's runtime and host
+
+The launcher writes this section for the container runtime and the host this sandbox was started from, when it creates or rebuilds the sandbox. What follows holds for this sandbox.

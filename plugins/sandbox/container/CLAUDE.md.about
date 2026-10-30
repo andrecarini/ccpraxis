@@ -1,1 +1,1 @@
-Container-specific instructions (full autonomy)
+Container-specific instructions (full autonomy): the shared part every launch gets, followed by the runtime/host parts that apply (ContainerClaudeMd.pm)
