@@ -11,7 +11,8 @@
 #     under noclobber. BpHook::_segments now maps each to the bash operator
 #     it means inside its own quote-aware walk, and normalize_redirects does
 #     the same for already-stripped text;
-#   * a command word "=name", which zsh replaces with the path of name, and
+#   * a command word "=name", which zsh replaces with the path of name, the
+#     precommand modifiers noglob / nocorrect / "-" (which run the next word),
 #     its cousins a command word that is a path to git ("/usr/bin/git") and,
 #     on case-insensitive macOS and Windows, "GIT".
 #
@@ -107,6 +108,11 @@ sub targets_of {
         '=env =rm /p/a.md'      => 'delete:/p/a.md',
         'sudo =rm /p/a.md'      => 'delete:/p/a.md',
         '/bin/rm /p/a.md'       => 'delete:/p/a.md',
+        # zsh precommand modifiers run the next word as the command.
+        'noglob rm /p/a.md'     => 'delete:/p/a.md',
+        'nocorrect rm /p/a.md'  => 'delete:/p/a.md',
+        '- rm /p/a.md'          => 'delete:/p/a.md',
+        'noglob =tee /p/a.md'   => 'write:/p/a.md',
     );
     for my $cmd (sort keys %WORD) {
         my @t = targets_of($cmd);
@@ -212,6 +218,7 @@ sub ggm { return GuardHarness::run_module('Guards::GuardGitMutations', payload(@
     is($run->("=sed -i s/a/b/ $BSD/continuity/armed/$SID")->{rc}, 2, 'Z6: "=sed -i" on it is refused like sed -i');
     is($run->("cat $BSD/continuity/armed/$SID &>! /dev/null")->{rc}, 0, 'Z6: a read with "&>! /dev/null" is still only a read');
     is($run->("echo x >! $BSD/continuity/armed/$SID")->{rc}, 2, 'Z6: "echo x >! <armed record>" is refused');
+    is($run->("noglob rm $BSD/continuity/armed/$SID")->{rc}, 2, 'Z6: "noglob rm <armed record>" is refused like rm');
 }
 
 done_testing();

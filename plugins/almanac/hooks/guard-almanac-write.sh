@@ -530,7 +530,8 @@ OUT=$(printf "%s" "$P" | perl -MJSON::PP -MTime::HiRes -e '
             }
             my $vi = $seg->{s};
             while ($vi <= $seg->{e} && $toks->[$vi] =~ /^[A-Za-z_][A-Za-z0-9_]*=/) { $vi++; }
-            while ($vi <= $seg->{e} && $toks->[$vi] =~ /^(?:\{|then|else|do|builtin|command|time|!|if|elif|while|until)\z/i) { $vi++; }
+            # noglob / nocorrect / a lone "-": zsh precommand modifiers.
+            while ($vi <= $seg->{e} && $toks->[$vi] =~ /^(?:\{|then|else|do|builtin|command|time|!|if|elif|while|until|noglob|nocorrect|-)\z/i) { $vi++; }
             next if $vi > $seg->{e};
             (my $cbase = $toks->[$vi]) =~ s{.*[/\\]}{};
             $cbase =~ s/\.exe\z//i;

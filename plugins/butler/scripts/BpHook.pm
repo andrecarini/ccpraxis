@@ -2087,7 +2087,8 @@ sub _reduce_and_match {
             $progress = 1;
             if ($i < $n && defined $words->[$i]{literal} && $words->[$i]{literal} eq '-n') { $i += 2 }
         }
-        elsif ($lit eq 'nohup' || $lit eq 'command' || $lit eq 'exec') {
+        elsif ($lit eq 'nohup' || $lit eq 'command' || $lit eq 'exec'
+            || $lit eq 'noglob' || $lit eq 'nocorrect') {   # the last two: zsh precommand modifiers
             $i++;
             $progress = 1;
         }

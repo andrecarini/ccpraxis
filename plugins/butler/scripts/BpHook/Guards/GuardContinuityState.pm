@@ -150,7 +150,7 @@ sub _edit_rule {
 # ---------------------------------------------------------------------------
 # A mutating verb may be spelled with a path (/bin/rm) or, under zsh -- the
 # macOS Bash tool's shell -- as "=rm", which zsh expands to the path of rm.
-my $VERB_RE = qr{(?:\A|[;&|(`\x7b\n]|\$\()\s*(?:(?:sudo|exec|command|nohup|xargs(?:\s+-\S+)*)\s+)*(?:=|/\S*/)?(?:rm|mv|cp|tee|touch|truncate|ln|dd|install|chmod|unlink|rmdir)(?=\s|\z)};
+my $VERB_RE = qr{(?:\A|[;&|(`\x7b\n]|\$\()\s*(?:(?:sudo|exec|command|nohup|noglob|nocorrect|xargs(?:\s+-\S+)*)\s+)*(?:=|/\S*/)?(?:rm|mv|cp|tee|touch|truncate|ln|dd|install|chmod|unlink|rmdir)(?=\s|\z)};
 my $INPLACE_RE = qr{(?:\A|[\s;&|(`])(?:=|[^\s;&|(`]*/)?(?:sed\s+(?:[^\s;&|]+\s+)*?-(?:-in-place|[a-zA-Z]*i)|perl\s+(?:[^\s;&|]+\s+)*?-(?![IMmeE])[a-zA-Z]*i)};
 
 sub _mutates {

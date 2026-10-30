@@ -3150,7 +3150,10 @@ sub _hyg_reduce {
         # same way _hyg_command_name does, so "/usr/bin/env" and "env.exe"
         # are recognised as "env" too, not just a bare "env" word.
         my $lit_fold = _hyg_cmd_basename($lit);
-        if ($lit_fold =~ /^(?:builtin|exec|nohup|then|do|else|elif|if|while|until)$/) {
+        # noglob, nocorrect and a lone "-" are zsh precommand modifiers (the
+        # macOS Bash tool runs zsh): "noglob rm f" runs rm. Under bash they
+        # are merely commands not found, so unwrapping them only adds targets.
+        if ($lit_fold =~ /^(?:builtin|exec|nohup|then|do|else|elif|if|while|until|noglob|nocorrect|-)$/) {
             $i++;
             $progress = 1;
             next;

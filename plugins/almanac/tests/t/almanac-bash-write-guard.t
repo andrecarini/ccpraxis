@@ -855,6 +855,11 @@ my $G = q{unset BASH_ENV ; f="${CLAUDE_PLUGIN_ROOT}/hooks/guard-almanac-write.sh
     assert_deny_bash("=rm $R", 'Z-ALM: =rm R');
     assert_deny_bash("=tee $T < /dev/null", 'Z-ALM: =tee T');
     assert_deny_bash("=sed -i s/a/b/ $R", 'Z-ALM: =sed -i on R');
+    assert_deny_bash("noglob rm $R", 'Z-ALM: noglob rm R (a zsh precommand modifier)');
+    assert_deny_bash("nocorrect rm $R", 'Z-ALM: nocorrect rm R');
+    assert_deny_bash("- rm $R", 'Z-ALM: "- rm R" (zsh runs rm with a dash argv[0])');
+    assert_deny_bash("noglob cd /c/P/.ccpraxis-local-data/bug-reports && rm a.md",
+        'Z-ALM: noglob cd <store> && rm a.md (the cd behind the modifier still counts)');
     assert_deny_bash(q{=python3 -c "import os; os.remove('/c/P/.ccpraxis-local-data/bug-reports/a.md')"},
         'Z-ALM: =python3 -c one-liner (rule I reads the =word as python3)');
 
