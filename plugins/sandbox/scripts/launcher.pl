@@ -1846,7 +1846,11 @@ sub _backpack_triage_via_screen {
 # teardown can release the wake-lock — a leaked PowerShell helper would keep the
 # machine awake forever. Release is idempotent + tolerant of an unset holder.
 my $KEEPAWAKE;
-sub _keepawake_release_global { eval { $KEEPAWAKE->release if $KEEPAWAKE }; }
+sub _keepawake_release_global {
+    my $was_held = eval { $KEEPAWAKE && $KEEPAWAKE->running };
+    eval { $KEEPAWAKE->release if $KEEPAWAKE };
+    eval { _power_plan_hold(0, 'sandbox-exit') } if $was_held;
+}
 
 # 03-resources-reader-model: cygwin pid of our sampler child, or undef. Same
 # file-scope-for-signal-teardown rationale as $KEEPAWAKE above -- a leaked
@@ -6803,6 +6807,9 @@ sub enter_dashboard {
                 log_ev('keepawake', { want => ($st->{stay_awake} ? 1 : 0), action => $act,
                                       busy_age => $st->{busy_age} }) if $act ne 'noop';
             }
+            # The power plan follows the lock (Decision 14, bug 6764).
+            if ($act eq 'start' || $rv eq 'restart') { _power_plan_hold(1, 'sandbox-hold') }
+            elsif ($act eq 'stop')                   { _power_plan_hold(0, 'sandbox-release') }
             # AND THE STEADY STATE GETS WRITTEN DOWN. Logging only transitions
             # meant the state that actually matters -- held, hour after hour --
             # wrote nothing at all: `busy_age` appeared zero times across every
@@ -6813,6 +6820,10 @@ sub enter_dashboard {
             my $now_ka = time;
             if ($now_ka - $last_keepawake_log >= $KEEPAWAKE_LOG_SECONDS) {
                 $last_keepawake_log = $now_ka;
+                # Keep the plan's sandbox hold fresh while the lock is held: it
+                # stops counting after ten minutes, so a dead launcher cannot
+                # pin Continuous work.
+                _power_plan_hold(1, 'sandbox-refresh') if $KEEPAWAKE->running;
                 log_ev('keepawake_decision', {
                     want       => ($st->{stay_awake} ? 1 : 0),
                     held       => ($KEEPAWAKE->running ? 1 : 0),
@@ -7416,6 +7427,36 @@ sub _keepawake_alive {
     return 1 if $w == 0;
     return 0 if $w == $pid;
     return kill(0, $pid) ? 1 : 0;
+}
+
+# _power_plan_hold($on, $why) -- tell the host power plan that this launcher
+# holds (1) or released (0) the wake-lock for its container. Decision 14: the
+# plan is Continuous work while anything the wake-lock counts as active is
+# running; a sandboxed run arms only inside its container, which the host
+# reconciler never reads (bug 20261031-225231-6764). `bp-power-plan reconcile
+# --hold|--release <container>` records the hold where the reconciler counts it,
+# then reconciles. Called on every hold transition and on each two-minute
+# keep-awake tick while held (the hold goes stale after ten minutes, so a dead
+# launcher cannot pin the plan). Windows only; fire and forget, double-forked so
+# no zombie is left per tick; a failure costs the plan switch, never the launch.
+sub _power_plan_hold {
+    my ($on, $why) = @_;
+    return unless $WINDOWS_FAMILY && defined $CONTAINER_NAME && length $CONTAINER_NAME;
+    my $cli = "$INSTALL_ROOT/plugins/butler/scripts/bp-power-plan.pl";
+    return unless -f $cli;
+    my $pid = fork();
+    return unless defined $pid;
+    if ($pid == 0) {
+        my $gc = fork();
+        POSIX::_exit(0) if !defined $gc || $gc;
+        open(STDIN,  '<', '/dev/null');
+        open(STDOUT, '>', '/dev/null');
+        open(STDERR, '>', '/dev/null');
+        exec($^X, $cli, 'reconcile', '--why', $why, ($on ? '--hold' : '--release'), $CONTAINER_NAME)
+            or POSIX::_exit(127);
+    }
+    waitpid($pid, 0);
+    log_ev('power_plan_hold', { on => ($on ? 1 : 0), why => $why });
 }
 
 # _keepawake_log_tail($logfile) -> the helper log's last line (<= 200 chars), or undef.

@@ -426,6 +426,11 @@ sub reconcile {
     }
     my $arms = BpContinuityLease::live_arms($root);
     $arms = [] unless ref $arms eq 'ARRAY';
+    # A sandboxed run arms INSIDE its container, which this host never reads; what
+    # reaches the host is the launcher holding the wake-lock for it. Decision 14
+    # counts "whatever the wake-lock lease counts as active", so a fresh sandbox
+    # hold counts as an arm (bug 20261031-225231-6764).
+    push @$arms, map { { sid => "sandbox:$_" } } @{ sandbox_holds($root) };
     my $armed = scalar @$arms;
     my $arm_ids = [ map { $_->{sid} } @$arms ];
 
@@ -561,7 +566,51 @@ sub reconcile {
 # CLI (spec 2.1)
 # ---------------------------------------------------------------------------
 
-my $USAGE = "usage: bp-power-plan reconcile [--why WORD] [--json]\n";
+my $USAGE = "usage: bp-power-plan reconcile [--why WORD] [--json] [--hold NAME | --release NAME]\n";
+
+# ---------------------------------------------------------------------------
+# sandbox holds (bug 20261031-225231-6764)
+# ---------------------------------------------------------------------------
+# <root>/sandbox-holds/<name>: one file per sandbox launcher currently holding
+# the wake-lock for its container, kept fresh by `reconcile --hold <name>` on
+# every launcher keep-awake tick (two minutes) and removed by `--release`. A
+# launcher that dies without releasing leaves a file that stops counting after
+# $SANDBOX_HOLD_FRESH_SECONDS, so a crash cannot pin Continuous work forever.
+our $SANDBOX_HOLD_FRESH_SECONDS = 600;
+my $HOLD_NAME_RE = qr/\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\z/;
+
+sub sandbox_hold_dir { my ($root) = @_; return "$root/sandbox-holds" }
+
+# sandbox_holds($root) -> [names of fresh holds], sorted. Never dies.
+sub sandbox_holds {
+    my ($root) = @_;
+    my @out;
+    return \@out unless defined $root && length $root;
+    my $d = sandbox_hold_dir($root);
+    opendir(my $dh, $d) or return \@out;
+    my $cutoff = time() - $SANDBOX_HOLD_FRESH_SECONDS;
+    for my $e (sort readdir $dh) {
+        next unless $e =~ $HOLD_NAME_RE;
+        my $m = (stat("$d/$e"))[9];
+        push @out, $e if defined $m && $m >= $cutoff;
+    }
+    closedir $dh;
+    return \@out;
+}
+
+# set_sandbox_hold($root, $name, $on) -> 1 | 0. On: create or touch. Off: remove.
+sub set_sandbox_hold {
+    my ($root, $name, $on) = @_;
+    return 0 unless defined $root && length $root && defined $name && $name =~ $HOLD_NAME_RE;
+    my $d = sandbox_hold_dir($root);
+    my $f = "$d/$name";
+    unless ($on) { unlink $f; return -e $f ? 0 : 1 }
+    eval { require File::Path; File::Path::make_path($d) } unless -d $d;
+    open(my $fh, '>', $f) or return 0;
+    print {$fh} time(), "\n";
+    close $fh or return 0;
+    return 1;
+}
 
 sub _prune_plan_checked {
     my ($dir) = @_;
@@ -598,6 +647,10 @@ sub cli_main {
             $opt{why} = shift @argv;
         } elsif ($a eq '--json') {
             $opt{json} = 1;
+        } elsif ($a eq '--hold' || $a eq '--release') {
+            unless (@argv && !defined $opt{hold_name} && $argv[0] =~ $HOLD_NAME_RE) { print STDERR $USAGE; return 2 }
+            $opt{hold_name} = shift @argv;
+            $opt{hold_on}   = ($a eq '--hold') ? 1 : 0;
         } else {
             print STDERR $USAGE;
             return 2;
@@ -611,6 +664,15 @@ sub cli_main {
         print "wanted: none (none, none)\n";
         print "result: error: arm-state-unresolvable\n";
         return 1;
+    }
+
+    if (defined $opt{hold_name}) {
+        my $root = BpContinuityLease::store_root_for($dir);
+        unless (defined $root && length $root && set_sandbox_hold($root, $opt{hold_name}, $opt{hold_on})) {
+            print STDERR "bp-power-plan: could not " . ($opt{hold_on} ? 'record' : 'remove')
+                . " sandbox hold '$opt{hold_name}'\n";
+            return 1;
+        }
     }
 
     my %rc_opts;
