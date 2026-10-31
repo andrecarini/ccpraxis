@@ -432,8 +432,14 @@ sub _section_bugs {
         my $closed;
         if    ($st eq 'fixed')   { $closed = $rep->{fields}{fixed_at} }
         elsif ($st eq 'dropped') { $closed = $rep->{fields}{updated_at} }
+        # AlmanacBug::load hands back raw UTF-8 bytes, while every other
+        # section's titles are already-decoded characters. Mixed in one report
+        # and encoded once at output, a non-ASCII bug title was encoded twice
+        # ("--" em dash E2 80 94 -> "a-circumflex" + two C1 controls) as soon
+        # as any other line carried a non-ASCII character. Decode here so the
+        # bug section is characters like the rest.
         push @{ $by_state{$st} }, {
-            id => $rep->{fields}{id}, title => $rep->{fields}{title},
+            id => $rep->{fields}{id}, title => _decode_if_bytes($rep->{fields}{title}),
             filed => $rep->{fields}{created_at}, closed => $closed,
             severity => $rep->{fields}{severity},
         };
