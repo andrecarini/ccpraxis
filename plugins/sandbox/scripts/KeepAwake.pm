@@ -90,13 +90,19 @@ sub classify_lease_stat_failure {
 #     problem s17 fixes elsewhere). Defaults to a no-op so existing callers that
 #     don't pass it are unaffected. Never dies: a broken on_event coderef must
 #     not take down the keep-awake lifecycle it's merely observing.
-# All three default to no-ops so a holder is always safe to construct/sync.
+#   alive->($handle) — optional: 1 while the helper behind $handle still runs, 0
+#     once it has gone. Without it revive() can tell nothing and does nothing.
+#   now->()          — optional clock seam for revive()'s restart gap (default time).
+# All default to no-ops so a holder is always safe to construct/sync.
 sub new {
     my ($class, %a) = @_;
     return bless {
         start    => $a{start}    || sub { undef },
         stop     => $a{stop}     || sub { },
         on_event => $a{on_event} || sub { },
+        alive    => $a{alive},
+        now      => $a{now}      || sub { time },
+        last_revive => undef,
         running  => 0,
         handle   => undef,
         # s21: consecutive 'probe-failed' streak seen by on_probe. Reset by
@@ -107,6 +113,42 @@ sub new {
 
 sub running { return $_[0]{running} ? 1 : 0 }
 sub handle  { return $_[0]{handle} }
+
+# revive() -> 'restart' | 'died' | 'noop'
+#
+# A HELD LOCK IS ONLY AS GOOD AS THE HELPER BEHIND IT. `running` records that a
+# helper was started, nothing more, and nothing re-checked it: on 2026-10-31 a
+# fleet's helper vanished (its pid file gone, no stop logged) twenty minutes
+# into the run, and the launcher went on logging held=1 every two minutes for a
+# machine with no wake-lock at all (bug 20261031-225228-4eca).
+#
+# Call it on every tick. While running, it asks the alive seam; a dead helper is
+# reported (on_event kind => 'died', with the old handle) and a new one started
+# in its place, since `running` means the lock is still wanted. At most one
+# restart per $REVIVE_GAP_SECONDS: a pid file that keeps vanishing must not turn
+# into a powershell.exe spawn on every tick. Inside the gap the holder stays
+# `running` on the dead handle (so a sync(1) does not spawn either), the death
+# is reported once, and the first revive() after the gap restarts.
+our $REVIVE_GAP_SECONDS = 60;
+sub revive {
+    my ($self) = @_;
+    return 'noop' unless $self->{running} && ref $self->{alive} eq 'CODE';
+    my $alive = eval { $self->{alive}->($self->{handle}) };
+    return 'noop' if !defined $alive || $alive;     # a failed probe proves nothing
+    my $old = $self->{handle};
+    my $key = defined $old ? "$old" : '';
+    my $now = $self->{now}->();
+    my $gap_ok = !defined $self->{last_revive} || $now - $self->{last_revive} >= $REVIVE_GAP_SECONDS;
+    unless (defined $self->{dead_reported} && $self->{dead_reported} eq $key) {
+        $self->{dead_reported} = $key;
+        eval { $self->{on_event}->(kind => 'died', handle => $old, restarting => ($gap_ok ? 1 : 0)); 1 };
+    }
+    return 'died' unless $gap_ok;
+    $self->{last_revive}   = $now;
+    $self->{dead_reported} = undef;
+    $self->{handle} = $self->{start}->();
+    return 'restart';
+}
 
 # sync($want, %extra) — converge the helper to the desired state. Idempotent:
 # starts when wanted and not running, stops when running and not wanted, else

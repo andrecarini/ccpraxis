@@ -6228,10 +6228,21 @@ sub enter_dashboard {
                        ? $ENV{BUSY_STALE_SECS} : 600;
     my $ka_helper    = "$SANDBOX_PLUGIN/scripts/keep-awake.ps1";
     my $ka_pidfile   = "$SAMPLER_TMPDIR/keepawake.pid";
+    my $ka_logfile   = "$SAMPLER_TMPDIR/keepawake.log";
     _keepawake_reap_orphan($ka_pidfile);
     $KEEPAWAKE = KeepAwake->new(
-        start => sub { _keepawake_start($ka_helper, $ka_pidfile) },
-        stop  => sub { _keepawake_stop($_[0], $ka_pidfile) },
+        start    => sub { _keepawake_start($ka_helper, $ka_pidfile, $ka_logfile) },
+        stop     => sub { _keepawake_stop($_[0], $ka_pidfile) },
+        alive    => \&_keepawake_alive,
+        on_event => sub {
+            my (%e) = @_;
+            return unless ($e{kind} // '') eq 'died';
+            # The helper's own last line says why it went (RELEASE reason=...),
+            # which is exactly what was missing when bug 4eca was found.
+            log_ev('keepawake_died', { pid => $e{handle}, restarting => $e{restarting},
+                                       pidfile_present => (-e $ka_pidfile ? 1 : 0),
+                                       helper_last => _keepawake_log_tail($ka_logfile) });
+        },
     );
 
     # 03-resources-reader-model: detached resources sampler. Reap any helper
@@ -6780,6 +6791,12 @@ sub enter_dashboard {
             # exactly as on_probe left it.
             my $probe_state = ref $st->{lease_probe} eq 'HASH'
                             ? ($st->{lease_probe}{state} // '') : '';
+            # A held lock must have a live helper behind it, whatever the probe
+            # says (bug 20261031-225228-4eca). Runs during a probe failure too:
+            # that is when the lock is being held on purpose.
+            my $rv = $KEEPAWAKE->revive;
+            log_ev('keepawake', { want => 1, action => $rv, busy_age => $st->{busy_age} })
+                if $rv eq 'restart';
             my $act = 'noop';
             if ($probe_state ne 'probe-failed') {
                 $act = $KEEPAWAKE->sync($st->{stay_awake} ? 1 : 0);
@@ -7324,13 +7341,23 @@ sub _trim_err {
 # Returns the cygwin child pid (the holder's handle, used by _keepawake_stop).
 # The helper self-reports its WINDOWS pid into $pidfile for cross-crash reaping.
 sub _keepawake_start {
-    my ($ps1, $pidfile) = @_;
+    my ($ps1, $pidfile, $logfile) = @_;
     unless (-f $ps1) {
         log_ev('keepawake_start_failed', { reason => "helper missing: $ps1" });
         return undef;
     }
     my $win_ps1 = winify_path($ps1);
     my $win_pid = winify_path($pidfile);
+    # The helper logs every state change and a HOLD line a minute. Without a log
+    # its RELEASE reason was lost, and a helper that vanished mid-run could not
+    # be explained (bug 20261031-225228-4eca). Rotated here, at start, past 1 MB
+    # (a HOLD line a minute is ~115 KB/day), keeping one previous file.
+    my @log_args;
+    if (defined $logfile && length $logfile) {
+        my $sz = -s $logfile;
+        rename($logfile, "$logfile.1") if defined $sz && $sz > 1024 * 1024;
+        @log_args = ('-LogFile', winify_path($logfile));
+    }
     # The helper's owner is THIS launcher, named by its WINDOWS pid so the helper
     # can tell a quiet owner from a gone one (keep-awake.ps1 -OwnerWinPid,
     # Decision 16). Read in the parent, before fork: $$ is an MSYS pid, a
@@ -7362,7 +7389,7 @@ sub _keepawake_start {
         local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
         exec('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
              '-WindowStyle', 'Hidden', '-File', $win_ps1, '-PidFile', $win_pid,
-             @owner_args)
+             @owner_args, @log_args)
             or do { POSIX::_exit(127); };
     }
     log_ev('keepawake_started', { pid => $pid,
@@ -7376,6 +7403,35 @@ sub _keepawake_start {
 # Cygwin/MSYS exposes the native pid at /proc/<msys-pid>/winpid (measured on
 # this host: MSYS 1183523 -> WINPID 99496). Anything that is not a positive
 # integer -- no /proc, unreadable, garbage -- is undef, never a guess.
+# _keepawake_alive($pid) -> 1 | 0 | undef. The helper is this launcher's own
+# forked child (MSYS pid; the exec'd powershell.exe keeps it), so a non-blocking
+# waitpid answers exactly: 0 still running, the pid once it has exited (which
+# also reaps it). -1 means it is not ours to wait for (already reaped
+# elsewhere); then a signal-0 probe in the same namespace decides. undef for no
+# handle at all: nothing to judge.
+sub _keepawake_alive {
+    my ($pid) = @_;
+    return undef unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
+    my $w = waitpid($pid, POSIX::WNOHANG());
+    return 1 if $w == 0;
+    return 0 if $w == $pid;
+    return kill(0, $pid) ? 1 : 0;
+}
+
+# _keepawake_log_tail($logfile) -> the helper log's last line (<= 200 chars), or undef.
+sub _keepawake_log_tail {
+    my ($f) = @_;
+    return undef unless defined $f && -s $f;
+    open(my $fh, '<:raw', $f) or return undef;
+    my $size = -s $fh;
+    seek($fh, $size > 4096 ? $size - 4096 : 0, 0);
+    my @l = grep { /\S/ } <$fh>;
+    close $fh;
+    return undef unless @l;
+    (my $last = $l[-1]) =~ s/[\r\n]+\z//;
+    return substr($last, 0, 200);
+}
+
 sub _keepawake_owner_winpid {
     my $f = "/proc/$$/winpid";
     return undef unless -r $f;
