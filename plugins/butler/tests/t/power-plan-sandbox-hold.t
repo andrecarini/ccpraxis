@@ -141,9 +141,13 @@ sub setactive_to { my ($calls) = @_; my @s = grep { $_->[0] eq '/setactive' } @$
     like($sub // '', qr/'reconcile', '--why', \$why, \(\$on \? '--hold' : '--release'\), \$CONTAINER_NAME/,
          'with --hold / --release and its container name');
     like($sub // '', qr/return unless \$WINDOWS_FAMILY/, 'on Windows only');
-    like($src, qr/if \(\$act eq 'start' \|\| \$rv eq 'restart'\) \{ _power_plan_hold\(1, 'sandbox-hold'\) \}/,
-         'on taking (or re-taking) the lock');
-    like($src, qr/elsif \(\$act eq 'stop'\)\s+\{ _power_plan_hold\(0, 'sandbox-release'\) \}/, 'on releasing it');
+    # By LEVEL, from $KEEPAWAKE->running, not from one path's transitions: a
+    # start or stop decided by on_probe never reached the plan when it followed
+    # the keepawake callback's own sync action (architecture review 2026-11-01).
+    like($src, qr/my \$plan_want = \$KEEPAWAKE->running \? 1 : 0;\s*if \(!defined \$plan_told \|\| \$plan_told != \$plan_want\) \{\s*_power_plan_hold\(\$plan_want, \$plan_want \? 'sandbox-hold' : 'sandbox-release'\);\s*\$plan_told = \$plan_want;/,
+         'on taking and releasing the lock, judged from the lock state itself every tick');
+    unlike($src, qr/if \(\$act eq 'start' \|\| \$rv eq 'restart'\) \{ _power_plan_hold/,
+         'no longer from one code path\'s transitions only');
     like($src, qr/_power_plan_hold\(1, 'sandbox-refresh'\) if \$KEEPAWAKE->running;/, 'refreshed on the two-minute tick while held');
     like($src, qr/sub _keepawake_release_global \{.*?_power_plan_hold\(0, 'sandbox-exit'\) \} if \$was_held;/s,
          'and released when the launcher exits holding it');

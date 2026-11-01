@@ -6207,6 +6207,7 @@ sub enter_dashboard {
     my $cached_busy_stamp       = 0;       # host time() when $cached_busy_age was measured
     my $cached_probe_result     = { state => 'lease-absent' };   # s21: KeepAwake's pinned probe struct
     my $last_keepawake_log      = 0;       # when the periodic keep-awake decision was last written
+    my $plan_told;                         # 1|0 last sent to the power plan (_power_plan_hold); undef = never
     my $cached_needs_you        = 0;       # B3: escalations only the OPERATOR can clear
     my $cached_triage_queued    = 0;       # ...and those queued for the escalation resolver
     my $cached_backpack         = undef;   # B4: backpack items + per-item approval
@@ -6807,9 +6808,19 @@ sub enter_dashboard {
                 log_ev('keepawake', { want => ($st->{stay_awake} ? 1 : 0), action => $act,
                                       busy_age => $st->{busy_age} }) if $act ne 'noop';
             }
-            # The power plan follows the lock (Decision 14, bug 6764).
-            if ($act eq 'start' || $rv eq 'restart') { _power_plan_hold(1, 'sandbox-hold') }
-            elsif ($act eq 'stop')                   { _power_plan_hold(0, 'sandbox-release') }
+            # The power plan follows the lock (Decision 14, bug 6764), by LEVEL:
+            # whatever $KEEPAWAKE->running says on this tick, compared with what
+            # the plan was last told. It used to follow this callback's own sync
+            # transitions only, so a start or stop decided by on_probe (the
+            # probe path, :6554) never reached the plan, and a run that settled
+            # left the machine on Continuous work (architecture review,
+            # 2026-11-01). undef at first, so the first tick also clears a hold
+            # a crashed launcher left behind.
+            my $plan_want = $KEEPAWAKE->running ? 1 : 0;
+            if (!defined $plan_told || $plan_told != $plan_want) {
+                _power_plan_hold($plan_want, $plan_want ? 'sandbox-hold' : 'sandbox-release');
+                $plan_told = $plan_want;
+            }
             # AND THE STEADY STATE GETS WRITTEN DOWN. Logging only transitions
             # meant the state that actually matters -- held, hour after hour --
             # wrote nothing at all: `busy_age` appeared zero times across every
