@@ -13,7 +13,7 @@ package Almanac::SessionLive;
 #
 # Armed = 46800s (13h): F5 requires the armed threshold to "cover a usage
 # pause". The longest pause an armed session holds through is
-# bp-drive-next.pl::$LONG_PAUSE_HANDOFF_SECONDS = 12h. The extra hour is the
+# bp-drive-next.pl::$PAUSE_HORIZON_SECONDS = 12h. The extra hour is the
 # idle window again: the time between the pause lifting and the session's
 # first transcript write.
 use strict;

@@ -1169,10 +1169,12 @@ sub capture_run {
 # Spec: .ccpraxis-local-data/blueprints/never-halt/specs/10-long-usage-pause-ends-session-spec.md
 # =============================================================================
 
-# ── AC-1/AC-2: pause_is_long (pure) and $LONG_PAUSE_HANDOFF_SECONDS ─────────
+# ── AC-1/AC-2: pause_is_long (pure) and $PAUSE_HORIZON_SECONDS ──────────────
+# (the long-pause threshold and the keep-awake horizon are one value since
+#  2026-11-01; pause-horizon-releases-wakelock.t pins the keep-awake half)
 {
-    is($BpDrive::LONG_PAUSE_HANDOFF_SECONDS, 43200,
-        'AC-1(pkg10): $LONG_PAUSE_HANDOFF_SECONDS is 43200 (12h)');
+    is($BpDrive::PAUSE_HORIZON_SECONDS, 43200,
+        'AC-1(pkg10): $PAUSE_HORIZON_SECONDS is 43200 (12h)');
 
     is(BpDrive::pause_is_long('usage', $NOW + 43200 + 1, $NOW), 1,
         'AC-2(pkg10): just over 12h away -> long (1)');

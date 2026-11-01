@@ -115,12 +115,17 @@ BEGIN { $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/; }
 # How many verdict attempts before degrading (spec §2.5, Decision #14).
 our $VERDICT_RETRY_MAX = 3;
 
-# How far ahead a usage pause may resume and still justify holding the machine
-# awake for it. Six hours: the FIVE-HOUR usage window can never reopen more than
-# five hours out, so this covers it with an hour of slack, while excluding the
-# seven-day window entirely. See the pause branch in run_next() for why that
-# distinction is the whole point.
-our $KEEPAWAKE_PAUSE_HORIZON_SECONDS = 6 * 3600;
+# THE ONE PAUSE HORIZON. How far ahead a usage pause may resume and still be
+# waited out: within it, the machine is held awake AND the session waits;
+# beyond it, the wake-lock is released AND the session hands off (pause-long).
+#
+# Until 2026-11-01 these were two numbers set by two packages and never
+# reconciled: a 6 h keep-awake horizon and a 12 h handoff threshold. Between 6
+# and 12 hours the session went on waiting while the machine was free to sleep,
+# which made no sense, and the operator asked for one threshold: 12 hours. It
+# still covers the five-hour window with room to spare, and still never waits
+# out a seven-day reset that is days away.
+our $PAUSE_HORIZON_SECONDS = 12 * 3600;   # 43200, package-global, test-readable
 
 # Absolute script dir: lets tests `require` from any working dir.
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
@@ -1091,18 +1096,18 @@ sub pause_keepawake_phase {
     my ($reason, $until, $now) = @_;
     return 'settled' unless defined $reason && $reason eq 'usage';
     return 'pause-pending' unless defined $until;
-    return (($until - $now) > $KEEPAWAKE_PAUSE_HORIZON_SECONDS) ? 'settled' : 'pause-pending';
+    return (($until - $now) > $PAUSE_HORIZON_SECONDS) ? 'settled' : 'pause-pending';
 }
 
-# never-halt package 10: a usage pause that reopens more than 12h out hands the
-# session off instead of waiting it out (Decision 41, narrowed by Decision 42 —
-# butler-hold.pl's 50-minute clamp is explicitly NOT the mechanism here).
-our $LONG_PAUSE_HANDOFF_SECONDS = 12 * 3600;   # 43200, package-global, test-readable
+# never-halt package 10: a usage pause that reopens beyond $PAUSE_HORIZON_SECONDS hands
+# the session off instead of waiting it out (Decision 41, narrowed by Decision 42 —
+# butler-hold.pl's 50-minute clamp is explicitly NOT the mechanism here). The same
+# horizon releases the wake-lock (pause_keepawake_phase), so the two never disagree.
 
 # pause_is_long($reason, $until_epoch, $now) -> 1 | 0   (pure; no I/O)
 #   1 iff  defined $reason && $reason eq 'usage'
 #      &&  defined $until_epoch && $until_epoch =~ /\A-?\d+(?:\.\d+)?\z/
-#      &&  ($until_epoch - $now) > $LONG_PAUSE_HANDOFF_SECONDS
+#      &&  ($until_epoch - $now) > $PAUSE_HORIZON_SECONDS
 #   else 0
 sub pause_is_long {
     my ($reason, $until, $now) = @_;
@@ -1112,7 +1117,7 @@ sub pause_is_long {
     # strftime() downstream ("Usage: POSIX::strftime") -- fail safe to "not
     # long" here, before any caller reaches that strftime call.
     return 0 unless gmtime(int $until);
-    return (($until - $now) > $LONG_PAUSE_HANDOFF_SECONDS) ? 1 : 0;
+    return (($until - $now) > $PAUSE_HORIZON_SECONDS) ? 1 : 0;
 }
 
 sub keepawake_apply {
@@ -1688,7 +1693,7 @@ sub _cmd_next {
                 _append_run_log($dsdir, sprintf(
                     'PAUSE-LONG (%.1fh away, threshold %.1fh) -- the session hands off and ends; '
                   . 're-invoke drive-solo after %s',
-                    ($until - $now) / 3600, $LONG_PAUSE_HANDOFF_SECONDS / 3600, $iso));
+                    ($until - $now) / 3600, $PAUSE_HORIZON_SECONDS / 3600, $iso));
                 my $action = { action => 'pause-long', reason => $reason,
                                until_epoch => $until, until_iso => $iso };
                 print _encode_action($action), "\n";
@@ -1696,13 +1701,11 @@ sub _cmd_next {
                 return 0;
             }
 
+            # A usage pause past the horizon already handed off above (pause-long),
+            # so here the phase holds for any usage pause; it still settles a
+            # non-usage one. The old PAUSE-BEYOND-HORIZON branch (lock released,
+            # session still waiting) cannot happen with one shared horizon.
             my $phase = pause_keepawake_phase($reason, $until, $now);
-            if ($phase eq 'settled' && $reason eq 'usage' && defined $until) {
-                _append_run_log($dsdir, sprintf(
-                    'PAUSE-BEYOND-HORIZON (%.1fh away, horizon %.1fh) -- releasing the wake-lock; '
-                  . 'the run still resumes at %d, but the machine is free to sleep until then',
-                    ($until - $now) / 3600, $KEEPAWAKE_PAUSE_HORIZON_SECONDS / 3600, $until));
-            }
             my $action = { action => 'pause', reason => $reason, until_epoch => $until };
             print _encode_action($action), "\n";
             keepawake_apply($phase, $dsdir, $opts);
