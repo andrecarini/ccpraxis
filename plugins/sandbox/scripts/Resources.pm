@@ -21,7 +21,10 @@ use JSON::PP ();   # core; the only dependency (precedent: SessionFilter.pm)
 # The probe keys, in the order gather invokes them. Ordered by value-per-cost:
 # the container stats first (cheapest podman call, most-wanted fact), the
 # image-store walk last (most expensive, first thing the budget drops).
-my @PROBE_ORDER = qw(stats machine cim_mem cim_cpu cim_disk df);
+# ctr_pss is LAST: it is the costliest per-round probe that can run (a podman
+# exec), it only runs where `podman stats` cannot count memory, and last means
+# it only ever spends what the round budget has left over.
+my @PROBE_ORDER = qw(stats machine cim_mem cim_cpu cim_disk df ctr_pss);
 
 # The 15 closed keys of the Resources::build / snapshot "resources" struct,
 # in no particular order (unlike @PROBE_ORDER this list has no cadence
@@ -189,6 +192,32 @@ sub parse_stats {
     return undef;
 }
 
+# parse_pss_kib($raw) -> bytes | undef. The ctr_pss probe prints one
+# "Pss:   <N> kB" line per process in the container (grep of each
+# /proc/<pid>/smaps_rollup); the sum is the container's footprint. No such line
+# is undef, and so is a sum of 0: a running container never uses zero memory,
+# so 0 means nothing was read.
+sub parse_pss_kib {
+    my ($raw) = @_;
+    return undef unless defined $raw && !ref $raw;
+    my ($sum, $n) = (0, 0);
+    while ($raw =~ /^Pss:\s+(\d{1,12})\s*kB\s*$/mg) { $sum += $1; $n++ }
+    return ($n && $sum > 0) ? $sum * 1024 : undef;
+}
+
+# _ctr_mem($stats_used, $pss_bytes) -> bytes | undef. `podman stats` first; its
+# 0 is NOT a measurement. Without the cgroup memory controller (the WSL podman
+# machine) it reports MemUsage 0B for every container, and the panel showed
+# "ctr mem 0 B used" for a container using about a gigabyte (2026-11-01). A
+# running container never uses zero memory, so a 0 falls through to the PSS
+# fallback, and with no fallback either, to undef: n/a, never a false zero.
+sub _ctr_mem {
+    my ($used, $pss) = @_;
+    my $u = _num($used);
+    return $u if defined $u && $u > 0;
+    return $pss;
+}
+
 # parse_system_df($raw) -> { images, containers, volumes } | undef, each value
 # either undef (no such row) or { size, reclaimable }. The Type match is
 # case-sensitive; unknown types are ignored; the first matching row wins.
@@ -328,7 +357,7 @@ sub build {
     return {
         machine_name    => _sub($machine, 'name'),
         machine_state   => $state,
-        ctr_mem_used    => _sub($stats, 'mem_used'),
+        ctr_mem_used    => _ctr_mem(_sub($stats, 'mem_used'), parse_pss_kib($raw->{ctr_pss})),
         vm_mem_total    => _sub($stats, 'mem_limit'),
         ctr_cpu_pct     => _sub($stats, 'cpu_pct'),
         pod_images      => _dfsize($df, 'images'),

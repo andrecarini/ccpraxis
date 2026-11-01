@@ -2457,25 +2457,25 @@ FAKE_MODULE
 
 # --- AC-22 -> DC-3/DC-4: Resources::probe_availability. -------------------
 {
-    my %full = map { $_ => sub {1} } qw(stats machine cim_mem cim_cpu cim_disk df);
+    my %full = map { $_ => sub {1} } qw(stats machine cim_mem cim_cpu cim_disk df ctr_pss);
     is_deeply(R('probe_availability', \%full),
-        { present => [ qw(stats machine cim_mem cim_cpu cim_disk df) ], absent => [] },
-        'AC-22: probe_availability with the full six-key probe hash -> present = full PROBE_ORDER, absent = []');
+        { present => [ qw(stats machine cim_mem cim_cpu cim_disk df ctr_pss) ], absent => [] },
+        'AC-22: probe_availability with the full seven-key probe hash -> present = full PROBE_ORDER, absent = []');
 
     my %partial = ( stats => sub {1}, df => sub {1} );
     is_deeply(R('probe_availability', \%partial),
-        { present => [ 'stats', 'df' ], absent => [ qw(machine cim_mem cim_cpu cim_disk) ] },
-        'AC-22: probe_availability with only stats+df -> present in PROBE_ORDER order, absent the remaining four in order');
+        { present => [ 'stats', 'df' ], absent => [ qw(machine cim_mem cim_cpu cim_disk ctr_pss) ] },
+        'AC-22: probe_availability with only stats+df -> present in PROBE_ORDER order, absent the remaining five in order');
 
     my %mixed = ( stats => sub {1}, machine => 'not a coderef', bogus_key => sub {1} );
     is_deeply(R('probe_availability', \%mixed),
-        { present => [ 'stats' ], absent => [ qw(machine cim_mem cim_cpu cim_disk df) ] },
+        { present => [ 'stats' ], absent => [ qw(machine cim_mem cim_cpu cim_disk df ctr_pss) ] },
         'AC-22: probe_availability ignores a non-CODE value and an unrecognized key');
 
     for my $bad ( [ 'undef', undef ], [ "'x'", 'x' ], [ '[]', [] ] ) {
         my ($label, $val) = @$bad;
         is_deeply(R('probe_availability', $val),
-            { present => [], absent => [ qw(stats machine cim_mem cim_cpu cim_disk df) ] },
+            { present => [], absent => [ qw(stats machine cim_mem cim_cpu cim_disk df ctr_pss) ] },
             "AC-22: probe_availability($label) -> present=>[], absent=>full PROBE_ORDER");
     }
 }

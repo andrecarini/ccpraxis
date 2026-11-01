@@ -7876,6 +7876,14 @@ use constant DF_MAX_AGE_SECS  => 1800;
 # rebuilds its closures every round; the cache must outlive them.
 my ($DF_TEXT, $DF_OK_AT, $DF_TRY_AT);
 
+# The container-memory fallback's cadence (ctr_pss probe below). Once a minute,
+# not every 23 s round: it is a `podman exec` (~650 ms measured), and it only
+# runs at all on a podman host without the cgroup memory controller. Believed
+# for three missed minutes, then n/a, the same bounded carry-forward as df.
+use constant PSS_INTERVAL_SECS => 60;
+use constant PSS_MAX_AGE_SECS  => 180;
+my ($PSS_TEXT, $PSS_OK_AT, $PSS_TRY_AT);
+
 # _df_should_probe($now, $last_attempt_at) -> 0|1. Throttles ATTEMPTS, so a
 # probe that keeps timing out is not retried every sampler round.
 sub _df_should_probe {
@@ -7894,6 +7902,7 @@ sub _df_believe_cached {
 }
 
 sub _resources_probes {
+    my ($container) = @_;   # for ctr_pss; undef skips that probe
     # STDERR IS CAPTURED, NOT DISCARDED.
     #
     # Every one of these used to end in `2>/dev/null`. When all six probes
@@ -7961,7 +7970,37 @@ sub _resources_probes {
             }
             return _df_believe_cached($now, $DF_OK_AT) ? $DF_TEXT : undef;
         },
+        # CONTAINER MEMORY WHERE PODMAN CANNOT COUNT IT. Without the cgroup
+        # memory controller (the WSL podman machine: `controllers=[]`, measured
+        # 2026-10-28), `podman stats` reports MemUsage 0B for every container,
+        # and the panel rendered "ctr mem 0 B used" for a container using about
+        # a gigabyte (operator, 2026-11-01). Sum the container's processes' PSS
+        # instead: each process's proportional share of shared pages, so shared
+        # memory is not counted twice (measured 933 MB PSS vs 1.22 GB summed
+        # RSS). Outputs one "Pss: N kB" line per process; Resources::parse_pss_kib
+        # sums them. Skipped where the controller exists,
+        # since `podman stats` is then the authoritative figure.
+        ctr_pss => sub {
+            my $now = time;
+            if (!defined $PSS_TRY_AT || $now - $PSS_TRY_AT >= PSS_INTERVAL_SECS) {
+                $PSS_TRY_AT = $now;
+                my $e = _probe_err_path('pss'); my $t = _timeout_prefix(10);
+                # Plain grep, summed on THIS side: no `$`, backslash or double
+                # quote may cross MSYS -> podman.exe -> sh -c, which mangled an
+                # awk "{s+=\$2}" into a stray backslash (measured).
+                my $out = scalar `${t}$PODMAN exec $container sh -c 'grep -h ^Pss: /proc/[0-9]*/smaps_rollup' 2>"$e"`;
+                if (defined $out && $out =~ /^Pss:/m) {
+                    ($PSS_TEXT, $PSS_OK_AT) = ($out, $now);
+                    return $out;
+                }
+            }
+            return (defined $PSS_OK_AT && $now - $PSS_OK_AT < PSS_MAX_AGE_SECS) ? $PSS_TEXT : undef;
+        },
     );
+    # Where `podman stats` can count memory, the fallback is not a probe at all
+    # (absent, not failing), so its silence never reads as a fault on the panel.
+    delete $p{ctr_pss} if !defined $container
+        || eval { _podman_host_mem_bytes(); $PODMAN_MEM_CONTROLLER };
     return \%p unless $WINDOWS_FAMILY;
     my %cmd = _ps_commands();
     $p{machine}  = sub { my $e = _probe_err_path('machine'); my $t = _timeout_prefix(5);
@@ -8313,7 +8352,7 @@ sub _resources_sampler_reap_orphan {
 sub _resources_sampler_round {
     my ($container, $device, $snapshot_path) = @_;
     my $t0     = time;   # measurement time, captured before any probe runs
-    my $probes = _resources_probes();
+    my $probes = _resources_probes($container);
     my $avail  = Resources::probe_availability($probes);
     my %probe_err;
     my $popts  = Resources::sampler_probe_opts($container, $device);
