@@ -1253,7 +1253,21 @@ unless (caller) {
         else { $o{_pos} ||= []; push @{$o{_pos}}, $a }
     }
     my @pos  = @{ $o{_pos} // [] };
-    my $root = $o{project} // $ENV{CLAUDE_PROJECT_DIR} // Cwd::abs_path('.') // '.';
+    # Without --project, the PROJECT root, resolved the way every other almanac
+    # writer resolves it (Almanac::Store::resolve_project_root: a pin, then the
+    # nearest ancestor holding .ccpraxis-local-data or .git, then
+    # CLAUDE_PROJECT_DIR, then cwd). This used to be CLAUDE_PROJECT_DIR, else
+    # cwd, and Claude Code sets CLAUDE_PROJECT_DIR for hooks but not for Bash
+    # tool commands, so in practice it was cwd: an agent that had cd'd into a
+    # subfolder filed there, in a fresh .ccpraxis-local-data no collect ever
+    # walked. Two DAME reports sat unseen in functions/ for two months
+    # (bug 20261031-232358-0381).
+    my $root = $o{project};
+    unless (defined $root && length $root) {
+        require Almanac::Store;
+        $root = eval { Almanac::Store::resolve_project_root() };
+        $root = $ENV{CLAUDE_PROJECT_DIR} // Cwd::abs_path('.') // '.' unless defined $root && length $root;
+    }
     $root =~ s{\\}{/}g; $root =~ s{/+$}{};
     # The sixth vector: $root becomes `project:` in frontmatter, and it is
     # checked once here, uniformly, for every command -- not per-command.
