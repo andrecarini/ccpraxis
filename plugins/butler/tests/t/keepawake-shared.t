@@ -120,8 +120,12 @@ is(BpKeepAwake::should_be_on('nonsense'),      0, 'unknown phase -> released (fa
         'the fleet releases the lock on exit — including the error path');
 
     # A manual pause is waiting on an absent human; holding the machine awake
-    # for them is cost without benefit.
-    like($fleet, qr/\$paused->\{manual\}\s*\?\s*'settled'/,
+    # for them is cost without benefit. Since 2026-11-01 the phase goes through
+    # pause_holds_awake, which also releases a timed pause past the 32 h horizon
+    # (fleet-pause-horizon.t pins that half).
+    like($fleet, qr/pause_holds_awake\(\$paused, \$now, \$t->\{pause_horizon\}\) \? 'pause-pending'\s*:\s*'settled'/,
+        'the fleet pause phase is decided by pause_holds_awake');
+    like($fleet, qr/sub pause_holds_awake \{.*?return 0 if \$paused->\{manual\};/s,
         'a MANUAL fleet pause releases the lock; a timed one keeps it');
 }
 

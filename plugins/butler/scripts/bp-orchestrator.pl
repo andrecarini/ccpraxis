@@ -2483,6 +2483,32 @@ sub resume_ready {
     return $now >= $paused->{relaunch_at} ? 1 : 0;
 }
 
+# --- pause_holds_awake($paused, $now, $horizon) -> 1 | 0. PURE.
+# Whether a pause should keep the machine awake: the wake-lock phase, and the
+# busy lease that keeps the sandbox launcher's Windows wake-lock held.
+#
+# A timed pause is held awake so the machine is still up when the window
+# reopens, but not without limit. 2026-11-01: a seven_day pause 31 h out held a
+# laptop awake for the whole wait, and the operator asked whether a horizon
+# existed. It did, only on the drive-solo path (bp-drive-next.pl
+# pause_keepawake_phase, 6 h). For the sandboxed fleet the operator set 32 h:
+# a relaunch further out than that releases the machine, which may then sleep
+# and resumes the run when woken. Bug 20261101-171529-1dd7.
+#
+#   no pause / manual pause          -> 0 (manual waits on a human)
+#   timed pause, no relaunch_at      -> 1 (telemetry: cleared on recovery, short)
+#   timed pause, relaunch_at <= now + horizon -> 1
+#   timed pause, relaunch_at beyond the horizon -> 0
+sub pause_holds_awake {
+    my ($paused, $now, $horizon) = @_;
+    return 0 unless ref $paused eq 'HASH';
+    return 0 if $paused->{manual};
+    my $at = $paused->{relaunch_at};
+    return 1 unless defined $at && !ref $at && $at =~ /^\d+(?:\.\d+)?$/;
+    $horizon = 32 * 3600 unless defined $horizon && !ref $horizon && $horizon =~ /^\d+$/;
+    return ($at - $now <= $horizon) ? 1 : 0;
+}
+
 # --- busy-lease (Decision #16): touch while work is active OR an auto-resume is
 # pending; never while shut down or only parked-for-human.
 sub should_touch_busy {
@@ -4029,6 +4055,9 @@ sub _tunables_base {
     return {
         ceil5      => $ENV{BP_CEIL_5H}            // 85,
         ceil7      => $ENV{BP_CEIL_7D}            // 90,
+        # How far ahead a timed pause's relaunch may be and still hold the
+        # machine awake (pause_holds_awake). Operator, 2026-11-01: 32 hours.
+        pause_horizon => $ENV{BP_PAUSE_HORIZON_SECS} // 32 * 3600,
         drain      => $ENV{BP_DRAIN_SECS}         // 600,
         max_par    => $ENV{BP_MAX_PARALLEL}       // 2,
         cap        => $ENV{BP_ATTEMPT_CAP}        // 5,
@@ -4663,9 +4692,10 @@ sub run {
             # human, and holding the machine awake for an absent person is the
             # cost without the benefit. A timed pause keeps it — the entire
             # point is to still be awake when the window reopens.
-            my $ka_phase = !$paused              ? 'active'
-                         : $paused->{manual}     ? 'settled'
-                         :                         'pause-pending';
+            # A timed pause beyond the horizon settles too (pause_holds_awake).
+            my $ka_phase = !$paused                                          ? 'active'
+                         : pause_holds_awake($paused, $now, $t->{pause_horizon}) ? 'pause-pending'
+                         :                                                     'settled';
             BpKeepAwake::apply($ka_phase, $runs,
                 { log => sub { _log($log, 'keepawake', { detail => $_[0] }) } });
 
@@ -4851,7 +4881,11 @@ sub run {
                     # fall through into the watch/launch section: a cleared pause
                     # lets dead non-terminal packages be relaunched immediately.
                 } else {
-                    touch_busy($t->{busy_path}) if should_touch_busy({ resume_pending => $resume_pending, shutdown => $shutdown });
+                    # Only within the horizon: beyond it the lease goes stale and
+                    # the host launcher releases its wake-lock.
+                    touch_busy($t->{busy_path}) if should_touch_busy({
+                        resume_pending => pause_holds_awake($paused, $now, $t->{pause_horizon}),
+                        shutdown => $shutdown });
                     last if $opt->{once};
                     $sleep_fn->($t->{watch_tick});
                     next;
