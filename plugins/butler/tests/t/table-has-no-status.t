@@ -439,4 +439,14 @@ sub assert_ledger_pointer {
     unlike($src, qr/\bop_ready\b/, 'extra: op_ready is deleted outright (not retired-with-message)');
 }
 
+# The /blueprint:create skill's own worked example must not teach --status to
+# add-package: the verb refuses it, so a session following the skill verbatim
+# failed every add-package call (2026-11-01, wake-and-pause-consolidation).
+{
+    my $skill = read_file("$FindBin::Bin/../../../blueprint/skills/create/SKILL.md");
+    ok(defined $skill && length $skill, 'extra: the create skill is readable');
+    unlike($skill // '', qr/add-package[^\n]*\n?[^\n]*--status/,
+        'extra: the create skill\'s add-package example passes no --status');
+}
+
 done_testing();

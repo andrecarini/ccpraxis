@@ -25,7 +25,7 @@ Steps:
    # decisions and package rows — typed verbs, validated against the real parser:
    perl plugins/butler/scripts/bp-blueprint.pl add-decision --file "$BP" --id 1 --text "..."
    perl plugins/butler/scripts/bp-blueprint.pl add-package  --file "$BP" --pkg 01-slug \
-        --deliverable "..." --model sonnet --status pending
+        --deliverable "..." --model sonnet [--deps 01-slug,02-slug]
    ```
 
    `init` refuses to overwrite an existing blueprint, requires a kebab-case name, and strips the template's illustrative rows (left in, `parse_dag` reads `01-<slug>` as a real package). `set-section` refuses the structured sections — `Package status`, `Decisions`, `Harvest log` have their own verbs.
