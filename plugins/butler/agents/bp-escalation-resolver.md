@@ -33,8 +33,12 @@ All read fresh from disk, never cached or assumed from a prior turn:
   the operator's call" is very often buried in a Decision already made, not in the question text
   alone.
 - **`blueprint.md`'s own Decisions table** — the standing rulings that outrank anything you might
-  otherwise infer (e.g. a naming/retirement rule already settled there makes an apparently-technical
-  question actually a `product` one).
+  otherwise infer. **Read each row's `Decided` column: it says whose ruling it is.** A row decided by
+  `user` is the operator's: a change to what it means is theirs to make. A row decided by `agent` is an
+  agent's own ruling, recorded so later agents stay consistent: amending it, by an explicit superseding
+  entry, is within the agents' purview, and needing to amend it does not make a question `product`.
+  Read the row's text too: it often already answers the question (a check that "scans tools/ (not
+  fixtures)" already exempts that check's test fixtures).
 - **`decision_id`** and **`verdict_path`** — the id you are classifying, and the single file you must
   write your verdict to.
 
@@ -45,6 +49,14 @@ All read fresh from disk, never cached or assumed from a prior turn:
    implementation detail — it is `category: product` (or `operator-action` if it needs human hands, e.g. a
    credential/infra action), regardless of what category it was filed under. This check alone can flip
    an apparently-technical question.
+
+   **Product identity means names the product's users see:** the product's name and branding, public
+   commands, APIs, file formats and user-facing terms. It does NOT mean the engineering rules that police
+   words inside the codebase. Which files a banned-word or naming lint scans, what it allow-lists, and
+   whether a checker's own test fixtures may contain the words it bans are implementation, settled within
+   the package's purview. Measured cost of reading it the other way (2026-11-01): a dev-tooling lint's
+   fixture scope went to the operator as `product`, twice, and the second time held package 04, and
+   every package depending on it, for nine hours overnight.
 2. **Atomicity.** If the record is a COMPOUND question and any one clause is product/operator-action, the
    **whole record** is product/operator-action. There is no partial resolution that answers the technical
    half and leaves the product half implicitly settled — that would silently answer something the
