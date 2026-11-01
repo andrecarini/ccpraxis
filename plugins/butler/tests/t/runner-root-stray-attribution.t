@@ -91,7 +91,10 @@ T
     my $repo = fake_repo('stays-clean.t' => $GREEN, 'also-clean.t' => $GREEN);
     my ($rc, $timed_out, $out) = sweep($repo);
     ok(!$timed_out, 'the clean sweep finished in time');
-    is($rc, 0, 'a clean sweep passes') or diag($out);
+    # Not "rc == 0": run inside a real sweep, the nested audit also sees the wake-lock-style
+    # processes other test files start and stop concurrently, which can fail it for reasons
+    # that have nothing to do with this repo. What a clean repo guarantees is narrower.
+    unlike($out, qr{new repo path\(s\) appeared}, 'a clean sweep reports no new repo path') or diag($out);
     unlike($out, qr{first appeared at the repo root}, 'and attributes nothing');
 }
 
