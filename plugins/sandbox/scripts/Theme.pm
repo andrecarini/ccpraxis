@@ -517,7 +517,7 @@ sub _glyphs_data {
         'icon.threads'    => { cp => 0x23E3, desc => 'benzene ring with circle, open-thread count and thread lead' },
         'thread.full'     => { cp => 0x25B0, desc => 'black parallelogram, a done task in the thread bar' },
         'thread.empty'    => { cp => 0x25B1, desc => 'white parallelogram, an open task in the thread bar' },
-        'thread.idle'     => { cp => 0x23F8, desc => 'double vertical bar, the attached thread has nothing doing' },
+        'thread.idle'     => { cp => 0x23F8, pad => 1, desc => 'double vertical bar, the attached thread has nothing doing' },
         # Decision 54: Decision 12 / design 9 named U+26D4 (NO ENTRY) for the
         # blocked glyph, but U+26D4 is Emoji_Presentation=Yes and fails the
         # no-colour-emoji guards (statusline-rebuild.t AC-E1/AC-G1,
@@ -594,7 +594,7 @@ sub _glyphs_data {
         # not getting through.
         'title.needs'   => { cp => 0x203C, desc => 'double exclamation -- a decision is waiting on the operator' },
         'title.exited'  => { cp => 0x2716, desc => 'heavy multiplication x -- container exited or dead' },
-        'title.paused'  => { cp => 0x23F8, desc => 'double vertical bar -- stopped, paused, created, restarting' },
+        'title.paused'  => { cp => 0x23F8, pad => 1, desc => 'double vertical bar -- stopped, paused, created, restarting' },
         'title.gone'    => { cp => 0x26A0, desc => 'warning sign -- the container could not be reached' },
 
         'scroll.up'   => { cp => 0x25B2, desc => 'black up-pointing triangle, scroll indicator' },
@@ -681,11 +681,22 @@ sub _glyphs_data {
         my $char  = chr($item->{cp});
 
         my $width = defined($item->{width}) ? $item->{width} : 1;
+        # PAD: trailing spaces that travel WITH the glyph, for a glyph the
+        # operator has seen render badly against the text after it (U+23F8,
+        # 2026-11-01). Declared per glyph here and nowhere else. The record
+        # itself stays the BARE glyph (char, bytes and width describe the one
+        # character: the width tables in tui::Layout and the legacy dashboard module measure text
+        # by it, and the statusline drift guards compare it); glyph() emits the
+        # pad and glyph_width() counts it, so every renderer gets the same
+        # spacing and alignment stays right. generated_block() carries the pad
+        # to the statusline as %THEME_GLYPH_PAD.
+        my $pad   = defined($item->{pad}) ? $item->{pad} : 0;
         $built{$name} = {
             cp    => $item->{cp},
             char  => $char,
             bytes => Encode::encode('UTF-8', $char),
             width => $width,
+            pad   => $pad,
             desc  => $item->{desc},
         };
     }
@@ -719,15 +730,17 @@ sub glyph {
     return undef unless defined $name;
     my $rec = _glyphs_data()->{$name};
     return undef unless $rec;
-    return $rec->{bytes};
+    return $rec->{bytes} . (' ' x ($rec->{pad} || 0));
 }
 
+# glyph_width($name) -> the columns glyph($name) occupies: the glyph's own
+# width plus its declared pad.
 sub glyph_width {
     my ($name) = @_;
     return undef unless defined $name;
     my $rec = _glyphs_data()->{$name};
     return undef unless $rec;
-    return $rec->{width};
+    return $rec->{width} + ($rec->{pad} || 0);
 }
 
 # display_width($str) DELETED (package 06, unified-tui-design-system, driver
@@ -1175,6 +1188,16 @@ sub generated_block {
         my ($r, $g, $b) = @{ $roles_data->{$role}{bg} };
         $s .= "  '$role' => [$r,$g,$b],\n";
     }
+    $s .= ");\n";
+
+    # %THEME_GLYPH_PAD: codepoint => trailing spaces, for every glyph declared
+    # with a pad (see _glyphs_data). Appended after %THEME_BG so the earlier
+    # hashes keep their bytes. The statusline emits glyphs as literals, so it
+    # applies the pad through this table rather than through glyph().
+    my $gd = _glyphs_data();
+    my %pad_by_cp = map { ($gd->{$_}{cp} => $gd->{$_}{pad}) } grep { $gd->{$_}{pad} } keys %$gd;
+    $s .= "my \%THEME_GLYPH_PAD = (\n";
+    $s .= sprintf("  0x%04X => %d,\n", $_, $pad_by_cp{$_}) for sort { $a <=> $b } keys %pad_by_cp;
     $s .= ");\n";
 
     return $s;

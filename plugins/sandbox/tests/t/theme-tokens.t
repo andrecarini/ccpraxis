@@ -2205,8 +2205,11 @@ my $theme_generated_block;   # captured here, reused by the read-only surface re
         unlike($block, qr/[^\x20-\x7E\n]/,
             'generated_block() is pure printable ASCII + LF -- no ESC, no C0, no non-ASCII (B-G2 extension, M4, AC-15)');
 
+        # 2026-11-01: %THEME_GLYPH_PAD (per-glyph trailing spaces, Theme.pm
+        # _glyphs_data) adds one opener and entries shaped exactly 'NNNN-hex => digit',
+        # inert data that cannot carry code.
         my @bad = grep { length }
-                  grep { !/\A(?:\#\ .*|my\ \%THEME_(?:RGB|X256|ATTR|BG)\ =\ \(|\);|\ \ '[a-z.]+'\ =>\ (?:\[\d{1,3},\d{1,3},\d{1,3}\]|\d{1,3}|'(?:|1|2|7)'),)\z/ }
+                  grep { !/\A(?:\#\ .*|my\ \%THEME_(?:RGB|X256|ATTR|BG|GLYPH_PAD)\ =\ \(|\);|\ \ '[a-z.]+'\ =>\ (?:\[\d{1,3},\d{1,3},\d{1,3}\]|\d{1,3}|'(?:|1|2|7)'),|\ \ 0x[0-9A-F]{4,5}\ =>\ \d,)\z/ }
                   split /\n/, $block, -1;
         ok(!@bad,
             'generated_block(): EVERY line matches one of the four permitted shapes -- nothing unvalidated reaches an installed executable file (M4, AC-15)')
@@ -2218,8 +2221,11 @@ my $theme_generated_block;   # captured here, reused by the read-only surface re
         ok(index($block, "\nmy %THEME_BG = (\n") >= 0,
             'generated_block(): the %THEME_BG opener is present as its own line, so M4\'s permitted-shape check covers it (M4, AC-15)');
         my @hash_openers = ($block =~ /^my \%(THEME_\w+) = \($/mg);
-        is_deeply(\@hash_openers, [qw(THEME_RGB THEME_X256 THEME_ATTR THEME_BG)],
-            'generated_block(): the hash openers are exactly RGB, X256, ATTR, BG, in that order -- no fifth, unvalidated hash (M4, AC-15)');
+        # THEME_GLYPH_PAD (2026-11-01) is the fifth, and it is validated: its
+        # entries have their own shape in the permitted-line check above
+        # ('  0xHHHH => d,'). Any sixth hash still fails here.
+        is_deeply(\@hash_openers, [qw(THEME_RGB THEME_X256 THEME_ATTR THEME_BG THEME_GLYPH_PAD)],
+            'generated_block(): the hash openers are exactly RGB, X256, ATTR, BG, GLYPH_PAD, in that order -- no unvalidated hash (M4, AC-15)');
     }
 }
 

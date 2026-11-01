@@ -332,7 +332,7 @@ my $E  = encode('UTF-8', chr(0x25B1));   # thread.empty
 my $DG = encode('UTF-8', chr(0x25B6));   # cursor (doing)
 my $AR = encode('UTF-8', chr(0x2192));   # arrow.right
 my $BR = encode('UTF-8', chr(0x2502));   # rule.v
-my $ID = encode('UTF-8', chr(0x23F8));   # thread.idle
+my $ID = encode('UTF-8', chr(0x23F8)) . ' ';   # thread.idle, with the one-space pad Theme.pm declares for U+23F8 (2026-11-01)
 my $DOT = encode('UTF-8', chr(0x00B7));
 my $FLAG = encode('UTF-8', chr(0x2691));
 
@@ -578,11 +578,11 @@ SKIP: {
         ['row14 F1 sandbox 80',  $P1, 1, [80],
             "$T drive-tooling $F$F$F$F$E$E$E$E$E 4/9  $DG tooling-fixes/12 scout +1", 80],
         ['row15 F3 host 140/100', $P3, 0, [140, 100],
-            "$T notes-cleanup $F$E$E 1/3  $ID idle $AR Write the summary section  $BR $PATH_FULL", 98],
+            "$T notes-cleanup $F$E$E 1/3  $ID idle $AR Write the summary section  $BR $PATH_FULL", 99],
         ['row16 F3 host 80',     $P3, 0, [80],
-            "$T notes-cleanup $F$E$E 1/3  $ID idle $AR Write the summary...  $BR $PATH_SHORT", 79],
+            "$T notes-cleanup $F$E$E 1/3  $ID idle $AR Write the summary...  $BR $PATH_SHORT", 80],
         ['row17 F3 sandbox all', $P3, 1, [140, 100, 80],
-            "$T notes-cleanup $F$E$E 1/3  $ID idle $AR Write the summary section", 71],
+            "$T notes-cleanup $F$E$E 1/3  $ID idle $AR Write the summary section", 72],
         ['row18 F4 host 140',    $P4, 0, [140],
             "$T release-prep $F$E$E 1/3  $BK Publish the package: waiting on 20261002-120000-abcd $AR Announce it  $BR $PATH_FULL", 131],
         ['row19 F4 host 100',    $P4, 0, [100],

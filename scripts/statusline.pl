@@ -95,7 +95,17 @@ my %THEME_ATTR = (
 my %THEME_BG = (
   'overlay.warn' => [59,10,10],
 );
+my %THEME_GLYPH_PAD = (
+  0x23F8 => 1,
+);
 # <<< END GENERATED FROM Theme.pm <<<
+
+# _g($codepoint) -> the glyph plus any trailing pad Theme.pm declares for it
+# (%THEME_GLYPH_PAD, generated above). Every theme glyph this script draws goes
+# through here, so a glyph the operator flags for extra spacing gets it in the
+# statusline exactly as in the dashboard (2026-11-01, U+23F8). An unpadded glyph
+# is byte-for-byte the bare character.
+sub _g { my ($cp) = @_; return chr($cp) . (q{ } x ($THEME_GLYPH_PAD{$cp} // 0)) }
 
 # rgb($role) -> the truecolor SGR string for a semantic role, or '' for an
 # unknown role. The only place an escape is composed from channel values,
@@ -136,7 +146,7 @@ my $SEP     = " ${RULE}\x{FF5C}${R} ";
 # here so a future swap touches exactly the three places that need the
 # literal: this constant, %GLYPH_COLS below and the render site in
 # thread_row -- never a fourth hard-coded literal (review N5).
-my $G_BLOCKED = "\x{2715}";
+my $G_BLOCKED = "${\ _g(0x2715)}";
 
 # ── Display width ────────────────────────────────────────────
 # %GLYPH_COLS declares the display width of every non-single-column glyph
@@ -1257,8 +1267,8 @@ my %MARKER = (
 # takes text.primary and SANDBOX stays text.muted: a brightness step rather
 # than a hue, present when you look at it and silent when you do not. The
 # sandbox is the safe default and gets the quieter treatment.
-my $GLYPH_WATCHED   = "\x{25CF}";   # filled  -- a Stop gate is armed for this session
-my $GLYPH_UNWATCHED = "\x{25CB}";   # hollow  -- nothing is watching
+my $GLYPH_WATCHED   = "${\ _g(0x25CF)}";   # filled  -- a Stop gate is armed for this session
+my $GLYPH_UNWATCHED = "${\ _g(0x25CB)}";   # hollow  -- nothing is watching
 my %WORD_COLOR = ( sandbox => $MUTED, host => $PRIMARY );
 
 my $env  = $SANDBOX_ON ? 'sandbox' : 'host';
@@ -1374,7 +1384,7 @@ if (length $sid) {
         my $off = _badge_record("$state/off/$sid");
         my $actor = $off ? $off->{actor} : undef;
         if (defined $actor && !ref($actor) && $actor eq 'agent') {
-            $badge_glyph = "\x{2205}";
+            $badge_glyph = "${\ _g(0x2205)}";
         }
     }
 }
@@ -1448,7 +1458,7 @@ my $inbox_unanswered = $alm_project->{inbox} // 0;
 # never take the flag down with it. It leads the counters field (Decision 1)
 # rather than riding in the marker.
 my $inbox_str = '';
-$inbox_str = bgrgb('overlay.warn') . rgb('overlay.warn') . "\x{2691} ${inbox_unanswered}${R}"
+$inbox_str = bgrgb('overlay.warn') . rgb('overlay.warn') . "${\ _g(0x2691)} ${inbox_unanswered}${R}"
     if $inbox_unanswered > 0;
 
 # ── ...and where it goes ─────────────────────────────────────
@@ -1511,9 +1521,9 @@ eval {
 
         # The counts are VALUES, not health states -- text.primary, never a
         # green/amber state role. "A value is present" is not "healthy".
-        $git_str = "${MUTED}\x{2325}\x{200A}${branch}${R}";
-        $git_str .= " ${PRIMARY}\x{2191}${ahead}${R}"  if $ahead  > 0;
-        $git_str .= " ${PRIMARY}\x{2193}${behind}${R}" if $behind > 0;
+        $git_str = "${MUTED}${\ _g(0x2325)}\x{200A}${branch}${R}";
+        $git_str .= " ${PRIMARY}${\ _g(0x2191)}${ahead}${R}"  if $ahead  > 0;
+        $git_str .= " ${PRIMARY}${\ _g(0x2193)}${behind}${R}" if $behind > 0;
     }
 };
 
@@ -1540,7 +1550,7 @@ eval {
         # above rather than left to the fallback. One space after the glyph,
         # like the tasklist and todos counters (operator, 2026-09-27: the
         # two-space form tried in package 01 was one too many).
-        push @parts, "${MUTED}\x{29C9} ${R}${PRIMARY}${n}${R}" if $n > 0;
+        push @parts, "${MUTED}${\ _g(0x29C9)} ${R}${PRIMARY}${n}${R}" if $n > 0;
     }
 
     # The almanac counters, from the one accessor call above. Each reads
@@ -1567,7 +1577,7 @@ eval {
     # clamp-to-P (spec 2.3) on 2026-10-23. An absent/invalid global thread
     # count is 0, same as every other counter here (behaviour 2: no
     # snapshot renders "P", not "P.P").
-    for my $c (['thread', "\x{23E3}", 1, ' ', 1], ['todo', "\x{274F}", 1, ' ', 0], ['note', "\x{2630}", 1, '', 0]) {
+    for my $c (['thread', "${\ _g(0x23E3)}", 1, ' ', 1], ['todo', "${\ _g(0x274F)}", 1, ' ', 0], ['note', "${\ _g(0x2630)}", 1, '', 0]) {
         my ($kind, $glyph, $has_global, $gap, $clamp) = @$c;
         my $p     = $alm_project->{$kind} // 0;
         my $g_raw = $has_global ? $alm_global->{$kind} : undef;
@@ -1829,7 +1839,7 @@ sub thread_row {
     my $current = (ref($thread->{current}) eq 'HASH') ? $thread->{current} : undef;
     my $next    = (ref($thread->{next})    eq 'HASH') ? $thread->{next}    : undef;
 
-    my $LEAD = "${MUTED}\x{23E3}${R} ${PRIMARY}${name}${R}";
+    my $LEAD = "${MUTED}${\ _g(0x23E3)}${R} ${PRIMARY}${name}${R}";
 
     # ACT state: doing (one or more doing tasks), blocked (no doing task but
     # the first not-done task is blocked-class), else idle. A blocked TEXT
@@ -1857,30 +1867,30 @@ sub thread_row {
         return '' unless $w > 0;
         $f = 0 if $f < 0;
         $f = $w if $f > $w;
-        my $filled = "${ACCENT}" . ("\x{25B0}" x $f) . "${R}";
-        my $empty  = "${FAINT}"  . ("\x{25B1}" x ($w - $f)) . "${R}";
+        my $filled = "${ACCENT}" . ("${\ _g(0x25B0)}" x $f) . "${R}";
+        my $empty  = "${FAINT}"  . ("${\ _g(0x25B1)}" x ($w - $f)) . "${R}";
         return " $filled$empty";
     };
     my $act_part = sub {
         my ($text) = @_;
         if ($state eq 'doing') {
-            my $seg = "  ${OK}\x{25B6}${R} ${PRIMARY}${text}${R}";
+            my $seg = "  ${OK}${\ _g(0x25B6)}${R} ${PRIMARY}${text}${R}";
             $seg .= " ${MUTED}+${extra}${R}" if $extra > 0;
             return $seg;
         }
         if ($state eq 'blocked') {
             return "  ${CRIT}${G_BLOCKED}${R} ${PRIMARY}${text}${R}";
         }
-        return "  ${FAINT}\x{23F8} idle${R}";
+        return "  ${FAINT}${\ _g(0x23F8)} idle${R}";
     };
     my $next_part = sub {
         my ($text) = @_;
-        return " ${FAINT}\x{2192}${R} ${MUTED}${text}${R}";
+        return " ${FAINT}${\ _g(0x2192)}${R} ${MUTED}${text}${R}";
     };
     my $path_part = sub {
         my ($text) = @_;
         return '' unless length $text;
-        return "  ${RULE}\x{2502}${R} ${FAINT}${text}${R}";
+        return "  ${RULE}${\ _g(0x2502)}${R} ${FAINT}${text}${R}";
     };
     my $count_part = " ${PRIMARY}${n}/${N}${R}";
 
