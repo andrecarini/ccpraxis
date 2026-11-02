@@ -211,8 +211,13 @@ my @WINDOWS_ONLY = (qr/\bWSL/i, qr/wslrelay/i, qr/wsl --shutdown/, qr/\b9p\b/,
         'F: nothing hashes the raw shared file any more');
     unlike($code, qr/_copy_file\(\s*"\$CONTAINER_CONFIG\/CLAUDE\.md"/,
         'F: nothing copies the raw shared file into the container any more');
-    my @writes = ($code =~ /_write_file\(\s*\$CONTAINER_CLAUDE_MD\s*,\s*\$CONTAINER_CLAUDE_MD_TEXT\s*\)/g);
-    is(scalar @writes, 2, 'F: both the rebuild refresh and the first create write the rendered text');
+    # Since 2026-11-02 the rendered text reaches the sandbox in ONE place, on
+    # every create (Rebuild or not): SandboxSettings::refresh_claude_md, which
+    # backs up a copy the sandbox edited and records the render as given.
+    my @gives = ($code =~ /SandboxSettings::refresh_claude_md\((.*?)\);/sg);
+    is(scalar @gives, 1, 'F: one call gives the sandbox its CLAUDE.md');
+    like($gives[0] // '', qr/render\s*=>\s*\$CONTAINER_CLAUDE_MD_TEXT/, 'F: ... the rendered text');
+    like($gives[0] // '', qr/last_render\s*=>\s*\$CONTAINER_CLAUDE_MD\b/, 'F: ... recorded as the last render given');
     like($code, qr/_write_file\(\s*\$CLAUDE_MD_HASH_FILE\s*,\s*\$CURRENT_CLAUDE_MD_HASH\s*\)/,
         'F: the first create records the rendered hash');
     like($code, qr/Container CLAUDE\.md upstream changed/,

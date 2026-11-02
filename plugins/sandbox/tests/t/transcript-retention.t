@@ -964,13 +964,18 @@ like($launcher_src, qr{\$CONTAINER_CONFIG\s*=\s*"\$SANDBOX_PLUGIN/container"},
 like($launcher_src, qr{\$CONTAINER_SETTINGS_JSON\s*=\s*"\$LAUNCHER_DIR},
     'A6: $CONTAINER_SETTINGS_JSON is assigned a path under $LAUNCHER_DIR');
 
-like($launcher_src,
-    qr{_copy_file\(\s*"\$CONTAINER_CONFIG/settings\.json"\s*,\s*\$CONTAINER_SETTINGS_JSON\s*\)},
-    'A6: $CONTAINER_CONFIG/settings.json is copied to $CONTAINER_SETTINGS_JSON');
-
-like($launcher_src,
-    qr{_copy_file\(\s*\$CONTAINER_SETTINGS_JSON\s*,\s*"\$host_data/settings\.json"\s*\)},
-    'A6: $CONTAINER_SETTINGS_JSON is copied to a settings.json under the host-data (claude-home) dir');
+# Since 2026-11-02 the preset is MERGED into the sandbox's own settings.json
+# at create (SandboxSettings::merge_settings, base = the preset it was last
+# given), not copied over it, so the wiring asserted is that one call: the
+# preset file is the merge's source and claude-home/settings.json its target.
+my ($merge_call) = $launcher_src =~ m{(SandboxSettings::merge_settings\(.*?\);)}s;
+ok(defined $merge_call, 'A6: the launcher calls SandboxSettings::merge_settings');
+like($merge_call // '', qr{preset\s*=>\s*"\$CONTAINER_CONFIG/settings\.json"},
+    'A6: $CONTAINER_CONFIG/settings.json is the preset merged into the sandbox settings');
+like($merge_call // '', qr{target\s*=>\s*"\$host_data/settings\.json"},
+    'A6: the merge target is settings.json under the host-data (claude-home) dir');
+like($merge_call // '', qr{base\s*=>\s*\$CONTAINER_SETTINGS_JSON},
+    'A6: $CONTAINER_SETTINGS_JSON (the preset the sandbox was last given) is the merge base');
 
 # =====================================================================
 # A7 — struck by the operator's six-month ruling (spec §4/A7). No

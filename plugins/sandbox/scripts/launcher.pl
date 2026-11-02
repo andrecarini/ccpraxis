@@ -167,6 +167,7 @@ use ClaudeConfig ();      # self-heal .claude.json onboarding-bypass (0-byte / l
 use PluginSync ();  # Fix 2: copy-model plugin-store reconcile (copy/prune/reconcile)
 use PortAlloc ();         # fix-multiple-running-sandboxes: per-container port-block allocation
 use SandboxLock ();       # 04-build-race-lock: generalised mkdir lock + global build-race guard
+use SandboxSettings ();   # the sandbox's settings.json merge / CLAUDE.md refresh at create, with backups
 use JSON::PP ();          # parse backpack.json + write the approved install-set
 use Errno ();              # 04-run-panel-ledger-truth: %! (EPERM) for _pid_alive's kill(0,...) probe
 use File::Path qw(make_path);
@@ -1120,14 +1121,21 @@ my $HOST_ONLY_MASKS_SIGNATURE_FILE = "$LAUNCHER_DIR/.host-only-masks-signature";
 my $EMPTY_SKILL_DIR            = "$LAUNCHER_DIR/empty-skill";
 my $MARKETPLACES_COPY_MANIFEST = "$LAUNCHER_DIR/.host-tier-marketplaces.json";
 my $SKILLS_COPY_MANIFEST       = "$LAUNCHER_DIR/.host-tier-skills.json";
-# Container CLAUDE.md and settings.json: per-project copies (blueprint
-# model). Container can modify these freely; changes never propagate
-# back to ccpraxis. Drift from upstream is detected via stored hash;
-# user picks rebuild to refresh.
+# Container CLAUDE.md and settings.json: what this sandbox was last given.
+# container-CLAUDE.md is the last render it got; container-settings.json is
+# the preset it was last merged with (the BASE of the next merge). The
+# sandbox's own claude-home/settings.json is its own: a container create
+# merges the current preset into it (SandboxSettings::merge_settings) instead
+# of overwriting it, and /steward:backup can carry its changes back into the
+# preset. Drift from upstream is detected via stored hash; a preset version
+# the operator answered "Continue" to is remembered in the *-declined-hash
+# files, so the prompt does not ask about it again until it changes.
 my $CONTAINER_CLAUDE_MD       = "$LAUNCHER_DIR/container-CLAUDE.md";
 my $CONTAINER_SETTINGS_JSON   = "$LAUNCHER_DIR/container-settings.json";
 my $CLAUDE_MD_HASH_FILE       = "$LAUNCHER_DIR/.container-CLAUDE-md-hash";
 my $SETTINGS_HASH_FILE        = "$LAUNCHER_DIR/.container-settings-json-hash";
+my $CLAUDE_MD_DECLINED_FILE   = "$LAUNCHER_DIR/.container-CLAUDE-md-declined-hash";
+my $SETTINGS_DECLINED_FILE    = "$LAUNCHER_DIR/.container-settings-json-declined-hash";
 my $LOCK_DIR                  = "$LAUNCHER_DIR/.launcher.lock";
 
 # B1: per-launch diagnostic log. Opened just after the lock is acquired (below);
@@ -3387,20 +3395,21 @@ die "ERROR: container CLAUDE.md template missing: $CONTAINER_CONFIG/CLAUDE.md\n"
     unless defined $CONTAINER_CLAUDE_MD_TEXT;
 my $CURRENT_CLAUDE_MD_HASH = md5_of_string($CONTAINER_CLAUDE_MD_TEXT);
 my $CURRENT_SETTINGS_HASH  = md5_of_file("$CONTAINER_CONFIG/settings.json");
-if (-f $CLAUDE_MD_HASH_FILE) {
-    my $saved = _read_file($CLAUDE_MD_HASH_FILE);
-    chomp $saved if defined $saved;
-    if (defined $saved && $saved ne $CURRENT_CLAUDE_MD_HASH) {
-        push @STALE_REASONS, "  - Container CLAUDE.md upstream changed since last sandbox refresh";
-    }
-}
-if (-f $SETTINGS_HASH_FILE) {
-    my $saved = _read_file($SETTINGS_HASH_FILE);
-    chomp $saved if defined $saved;
-    if (defined $saved && $saved ne $CURRENT_SETTINGS_HASH) {
-        push @STALE_REASONS, "  - Container settings.json upstream changed since last sandbox refresh";
-    }
-}
+# 'changed' asks; 'declined' is a version the operator already answered
+# "Continue" to (remembered below, after the answer), so it does not ask again
+# until the upstream file changes once more; 'none' is no drift or no record.
+my $CLAUDE_MD_DRIFT = SandboxSettings::drift_state(
+    saved    => _read_file($CLAUDE_MD_HASH_FILE),
+    current  => $CURRENT_CLAUDE_MD_HASH,
+    declined => _read_file($CLAUDE_MD_DECLINED_FILE));
+my $SETTINGS_DRIFT = SandboxSettings::drift_state(
+    saved    => _read_file($SETTINGS_HASH_FILE),
+    current  => $CURRENT_SETTINGS_HASH,
+    declined => _read_file($SETTINGS_DECLINED_FILE));
+push @STALE_REASONS, "  - Container CLAUDE.md upstream changed since last sandbox refresh"
+    if $CLAUDE_MD_DRIFT eq 'changed';
+push @STALE_REASONS, "  - Container settings.json upstream changed since last sandbox refresh"
+    if $SETTINGS_DRIFT eq 'changed';
 
 sub _skill_divergence_msg {
     return '' unless -f $SELECTION_FILE;
@@ -3492,6 +3501,15 @@ elsif (plan_wants_prompt(%plan_state)) {
 
 my $PLAN = decide_launch_plan(%plan_state, operator => $answer);
 
+# "Continue" over an upstream CLAUDE.md or preset change is an answer about
+# THAT version: remember it, so the next launch does not ask again until the
+# file changes once more. A container created by this launch merges the
+# current preset anyway and records it as given, which makes the memory moot.
+if (defined $answer && $answer eq 'continue') {
+    _write_file($SETTINGS_DECLINED_FILE,  "$CURRENT_SETTINGS_HASH\n")  if $SETTINGS_DRIFT eq 'changed';
+    _write_file($CLAUDE_MD_DECLINED_FILE, "$CURRENT_CLAUDE_MD_HASH\n") if $CLAUDE_MD_DRIFT eq 'changed';
+}
+
 if ($PLAN->{cancel}) {
     tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
     _emit_out("Cancelled.\n");
@@ -3546,13 +3564,13 @@ if ($do_rebuild) {
     _tee_system($PODMAN, 'rm', '-f', $CONTAINER_NAME) if $PLAN->{remove_container};
     $CONTAINER_EXISTS_NOW = 0;
 
-    # Refresh per-project container blueprint copies from upstream
-    # (plugins/sandbox/container/). Any in-container modifications get
-    # overwritten — that's the explicit opt-in semantic of Rebuild.
-    _write_file($CONTAINER_CLAUDE_MD, $CONTAINER_CLAUDE_MD_TEXT);
-    _copy_file("$CONTAINER_CONFIG/settings.json", $CONTAINER_SETTINGS_JSON);
-    _write_file($CLAUDE_MD_HASH_FILE, $CURRENT_CLAUDE_MD_HASH);
-    _write_file($SETTINGS_HASH_FILE,  $CURRENT_SETTINGS_HASH);
+    # The per-project copies (container-CLAUDE.md, container-settings.json)
+    # are NOT refreshed here any more. They record what the sandbox was last
+    # given, and the create below needs exactly that: it merges the current
+    # preset into the sandbox's settings.json against it, backs up a CLAUDE.md
+    # the sandbox edited, and only then records the new versions
+    # (apply_blueprints_to_host_data). Refreshing them here used to make the
+    # create overwrite every in-sandbox change with no merge and no backup.
     # Regenerate container name.
     unlink "$LAUNCHER_DIR/container-name";
     my $path_hash = substr(md5_of_string($PROJECT_PATH), 0, 8);
@@ -3703,9 +3721,27 @@ sub plan_wants_prompt {
     return (($s{stale_count} // 0) > 0) ? 1 : 0;
 }
 
+# sandbox_settings_create_note() -> lines for the stale prompt: what creating a
+# container (every Rebuild does) does to the sandbox's settings.json and
+# CLAUDE.md. Kept short enough for an 80-column frame.
+sub sandbox_settings_create_note {
+    return (
+        "  A new container (every Rebuild makes one) keeps this sandbox's",
+        "  own settings: settings.json is merged with the preset key by key,",
+        "  and a key changed on both sides is asked about (default: keep",
+        "  the sandbox's). The old file is backed up first, to",
+        "  .ccpraxis-local-data/claude-home/.launcher/backups/. CLAUDE.md is",
+        "  regenerated; a copy edited in the sandbox is backed up there too.",
+    );
+}
+
 sub prompt_stale_action {
     my ($reasons_ref, $host_version, $state) = @_;
     my @reasons = @$reasons_ref;
+    # SAY WHAT A NEW CONTAINER DOES TO THE SANDBOX'S OWN SETTINGS. A Rebuild (and
+    # any create) used to overwrite them silently; it merges now, and the
+    # operator choosing between these options should know that before choosing.
+    push @reasons, '', sandbox_settings_create_note();
     $state = {} unless ref $state eq 'HASH';
     my $have_image     = $state->{image_exists}     ? 1 : 0;
     my $have_container = $state->{container_exists} ? 1 : 0;
@@ -4199,9 +4235,12 @@ if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
 # non-zero exit here is warned and the launch proceeds with no masks -- a
 # host-only skill left visible, no worse than before this package existed.
 if (@PLUGIN_MOUNTS) {
-    my $seed_settings = -f $CONTAINER_SETTINGS_JSON
-        ? $CONTAINER_SETTINGS_JSON
-        : "$CONTAINER_CONFIG/settings.json";
+    # These masks only ever reach `podman create`, and that create merges the
+    # CURRENT preset into the sandbox's settings.json (apply_blueprints_to_
+    # host_data), so a plugin the preset newly enables must be masked by it.
+    # $CONTAINER_SETTINGS_JSON is the preset the sandbox was last GIVEN -- the
+    # drift signature's seed (_host_only_mask_signature), not this one's.
+    my $seed_settings = "$CONTAINER_CONFIG/settings.json";
     my ($mask_rc, $mask_out, $mask_err) = _capture_out_err($^X, $SANDBOX_SKILLS_PL,
         'host-only-masks',
         '--selection-file', $SELECTION_FILE,
@@ -4503,15 +4542,68 @@ sub pick_session_action {
 # Reintroduce ONLY if a future backend's host-bind fails the t/01
 # (O_APPEND, utimensat UTIME_NOW, utimensat explicit-timestamp) probes.
 
+# apply_blueprints_to_host_data() -- give a container being created the
+# current CLAUDE.md render and the current preset.
+#
+# CLAUDE.md is generated, so it is replaced -- but a copy the sandbox edited
+# (it differs from the render it was last given) is backed up first and the
+# operator is told where. settings.json is the sandbox's own: the current
+# preset is MERGED into it key by key against the preset it was last given
+# (SandboxSettings::merge_settings), a key both changed is asked about
+# (_ask_settings_conflict), the old file is backed up first, and the preset
+# becomes the new base. This runs for EVERY create, Rebuild or not, so a
+# recreate never brings back an old preset; the hash records written here are
+# what the drift check compares against, so they move only when the sandbox
+# was actually given the new version.
 sub apply_blueprints_to_host_data {
     my $host_data = "$CLAUDE_DATA";
     make_path($host_data) unless -d $host_data;
-    if (-f $CONTAINER_CLAUDE_MD) {
-        _copy_file($CONTAINER_CLAUDE_MD, "$host_data/CLAUDE.md");
+    my $backup_dir = SandboxSettings::backup_dir_maker($LAUNCHER_DIR, time);
+
+    my $md = SandboxSettings::refresh_claude_md(
+        target      => "$host_data/CLAUDE.md",
+        last_render => $CONTAINER_CLAUDE_MD,
+        render      => $CONTAINER_CLAUDE_MD_TEXT,
+        backup_dir  => $backup_dir,
+    );
+    _write_file($CLAUDE_MD_HASH_FILE, $CURRENT_CLAUDE_MD_HASH);
+    unlink $CLAUDE_MD_DECLINED_FILE;
+    if (defined $md->{backup}) {
+        _emit_step(_c_step("This sandbox's CLAUDE.md had edits of its own; backed up to $md->{backup} before regenerating it"), "\n");
     }
-    if (-f $CONTAINER_SETTINGS_JSON) {
-        _copy_file($CONTAINER_SETTINGS_JSON, "$host_data/settings.json");
+
+    my $st = SandboxSettings::merge_settings(
+        target     => "$host_data/settings.json",
+        base       => $CONTAINER_SETTINGS_JSON,
+        preset     => "$CONTAINER_CONFIG/settings.json",
+        backup_dir => $backup_dir,
+        resolve    => \&_ask_settings_conflict,
+    );
+    if ($st->{base_recorded}) {
+        _write_file($SETTINGS_HASH_FILE, md5_of_file($CONTAINER_SETTINGS_JSON));
+        unlink $SETTINGS_DECLINED_FILE;
     }
+    my @c = @{ $st->{conflicts} };
+    my $took_preset = grep { $_->{choice} eq 'take' } @c;
+    if ($st->{status} eq 'merged') {
+        _emit_step(_c_step(sprintf(
+            "Sandbox settings merged with the preset: kept %d of the sandbox's own change(s), took %d preset change(s)%s; the old file is backed up to %s",
+            scalar(@{ $st->{kept} }) + (@c - $took_preset), scalar(@{ $st->{taken} }) + $took_preset,
+            (@c ? sprintf(', %d key(s) changed on both sides', scalar @c) : ''), $st->{backup})), "\n");
+    }
+    elsif ($st->{status} eq 'unchanged' && @{ $st->{kept} }) {
+        _emit_ok(_c_ok(sprintf("Sandbox settings kept: %d change(s) of its own, nothing new in the preset",
+                               scalar @{ $st->{kept} })), "\n");
+    }
+    _emit_err(_c_warn("WARNING:"), " $st->{warning}" . (defined $st->{backup} ? " (backup: $st->{backup})" : '') . "\n")
+        if defined $st->{warning};
+    _emit_err(_c_warn("NOTE:"), " no record of the preset this sandbox was last given, so every key it and the preset both have with different values was treated as changed on both sides\n")
+        if $st->{base_missing} && @c;
+    log_ev('sandbox_settings_merge', {
+        status => $st->{status}, backup => $st->{backup}, taken => $st->{taken}, kept => $st->{kept},
+        agreed => $st->{agreed}, conflicts => [ map { { name => $_->{name}, choice => $_->{choice} } } @c ],
+        claude_md_backup => $md->{backup},
+    });
     # .credentials.json is NOT copied here — materialize-credentials
     # writes it directly at claude-home/.credentials.json (a real file in
     # the RW dir bind), so writes from inside the container (an OAuth token
@@ -4519,6 +4611,58 @@ sub apply_blueprints_to_host_data {
     # canonical host file and persist across container rebuild with no sync
     # step. See the $SANDBOX_CREDENTIALS_FILE definition for why this is a
     # real file and not a single-file mount.
+}
+
+# _ask_settings_conflict(\%conflict) -> 'keep' | 'take'
+#
+# One settings.json key the sandbox and the preset BOTH changed since the
+# sandbox was last given the preset (a SettingsUnits::merge3 conflict record).
+# The same three paths as the stale prompt: a screen when the launch frame is
+# up, a line prompt on a bare terminal, and with nobody to ask (no TTY) the
+# sandbox's value is kept. Keeping is also what q/ESC and an empty answer do:
+# the sandbox's value is the one somebody chose on purpose.
+#
+# The values came out of a file the container can write, so they are shown as
+# ASCII-escaped JSON (no raw control byte or escape sequence reaches the
+# terminal) and clipped.
+sub _ask_settings_conflict {
+    my ($c) = @_;
+    my $json = JSON::PP->new->canonical->allow_nonref->ascii;
+    my $show = sub {
+        my ($found, $v) = @_;
+        return '(not set)' unless $found;
+        my $s = $json->encode($v);
+        $s = substr($s, 0, 160) . ' ...' if length($s) > 160;
+        return $s;
+    };
+    (my $name = $json->encode("$c->{name}")) =~ s/\A"|"\z//g;
+    my @detail = (
+        "  This sandbox and the sandbox preset both changed this key since the",
+        "  sandbox was last given the preset.",
+        '',
+        "  this sandbox:   " . $show->($c->{local_found},  $c->{local_val}),
+        "  the preset now: " . $show->($c->{remote_found}, $c->{remote_val}),
+        "  both had:       " . $show->($c->{base_found},   $c->{base_val}),
+    );
+
+    if ($LAUNCH_MODE ne 'plain' && $LAUNCH_HOST && $LAUNCH_HOST->{active}) {
+        my $model = tui::LaunchScreens::menu_model(
+            label   => "Sandbox setting changed on both sides: $name",
+            detail  => \@detail,
+            options => [
+                { id => 'keep', key => 'k', display => "[k] Keep this sandbox's value" },
+                { id => 'take', key => 'p', display => "[p] Take the preset's value" },
+            ],
+        );
+        return tui::LaunchScreens::menu_choice(_launch_run_list($model), 'keep');
+    }
+    return 'keep' unless -t STDIN && -t STDOUT;
+    print "\nSandbox setting changed on both sides: $name\n";
+    print "$_\n" for @detail;
+    print "\n[k] Keep this sandbox's value   [p] Take the preset's value\nChoice [k/p] (default k): ";
+    my $line = <STDIN>;
+    $line //= '';
+    return lc(substr($line, 0, 1) // '') eq 'p' ? 'take' : 'keep';
 }
 
 # Single-file bind mounts require the host path to exist before podman
@@ -5192,20 +5336,12 @@ if (! _container_exists($CONTAINER_NAME)) {
 if (! _container_exists($CONTAINER_NAME)) {
     _launch_stage_begin('create');
 
-    # Materialize blueprint copies on first create.
-    if (! -f $CONTAINER_CLAUDE_MD) {
-        _write_file($CONTAINER_CLAUDE_MD, $CONTAINER_CLAUDE_MD_TEXT);
-        _write_file($CLAUDE_MD_HASH_FILE, $CURRENT_CLAUDE_MD_HASH);
-    }
-    if (! -f $CONTAINER_SETTINGS_JSON) {
-        _copy_file("$CONTAINER_CONFIG/settings.json", $CONTAINER_SETTINGS_JSON);
-        _write_file($SETTINGS_HASH_FILE, md5_of_file("$CONTAINER_CONFIG/settings.json"));
-    }
-
-    # Materialize blueprint files + single-file-bind placeholders on host
-    # BEFORE the bind mounts go live, so /root/.claude/ inside the
-    # container sees everything at the canonical paths from the first
-    # moment.
+    # Give the sandbox the CURRENT CLAUDE.md render and preset -- merged into
+    # its own settings.json, never copied over it -- on EVERY create, Rebuild
+    # or not (a recreate used to copy back the stale per-project copy), plus
+    # the single-file-bind placeholders, BEFORE the bind mounts go live, so
+    # /root/.claude/ inside the container sees everything at the canonical
+    # paths from the first moment.
     apply_blueprints_to_host_data();
     # Decision #10 / Ruling B: migrate the global config off the pre-fix
     # location before anything reads or heals it. In THIS layout both
@@ -5428,6 +5564,7 @@ else {
     _launch_stage_end('create', 'skipped');
 }
 # <<< launch-emit:create:END
+
 
 # =====================================================================
 # Backpack approval (host-side, BEFORE podman start)
