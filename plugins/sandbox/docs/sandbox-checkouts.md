@@ -57,7 +57,14 @@ plain DNS names are dropped. It is a guardrail, not a wall: root in the containe
 - **Never copy `.ccpraxis-local-data/claude-home/.launcher/` between project locations.** It holds
   machine- and container-specific identity (`container-name`, `port-base`, `containerfile-hash`).
   A copied `container-name` makes the launcher attach to *another project's* container and mount the
-  wrong directory at `/project`. It is derived state: delete it and it regenerates.
+  wrong directory at `/project`. It is derived state: delete it and it regenerates. Three things in
+  it are not purely derived, though. `sandbox-id` is the project's id in this machine's sandbox list
+  (`/steward:backup` remembers answers per id); a copied one is detected and replaced, and a deleted
+  one is given back from the list. `container-settings.json` is the preset the sandbox's
+  `settings.json` was last merged with: deleting it makes the next create treat every key the
+  sandbox and the preset both have with different values as changed on both sides, and ask.
+  `backups/` holds the copies of `settings.json` and `CLAUDE.md` taken before a create replaced
+  them; deleting `.launcher` deletes those too.
 - **`.launcher/last-transcript.txt`** is a one-line, best-effort pointer `launcher.pl` writes on every
   launch (immediately after opening the launch transcript), holding the in-container path to that
   launch's raw console transcript (`/root/.claude/sandbox-logs/launch-<id>.transcript.log`).

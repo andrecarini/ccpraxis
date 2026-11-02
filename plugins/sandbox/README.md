@@ -208,10 +208,10 @@ name from every process. With no Node installed those cost nothing.
 The launcher applies these in order during `podman create`:
 
 1. **`.ccpraxis-local-data/claude-home` → `/root/.claude` (RW)** — the bulk bind. Sessions,
-   tasks, lockfiles, blueprint copies (`CLAUDE.md`, `settings.json`) all
-   land here. `apply_blueprints_to_host_data` writes the canonicals
-   from `.launcher/` to `.ccpraxis-local-data/claude-home/` on container create so they
-   appear at the standard paths inside.
+   tasks, lockfiles, `CLAUDE.md` and `settings.json` all land here. On container create
+   `apply_blueprints_to_host_data` writes the current `CLAUDE.md` render and merges the
+   current preset into the sandbox's own `settings.json` (see "The sandbox's own
+   settings" below), so they appear at the standard paths inside.
 
 2. **`.launcher` → `/root/.claude/.launcher:ro` (RO overlay)** — defends
    the launcher's metadata. The container can READ launcher state
@@ -242,6 +242,45 @@ The launcher applies these in order during `podman create`:
    `ensure_claude_json_host_file` touches it if missing).
 
 ---
+
+### The sandbox's own settings
+
+A sandbox's user settings are `claude-home/settings.json` (`/root/.claude/settings.json`
+inside). They start as the preset, `container/settings.json`, and from then on they are the
+sandbox's: Claude Code writes permissions, plugin choices and the like into them.
+
+**Every container create merges, never overwrites** (`plugins/sandbox/scripts/SandboxSettings.pm`). Rebuild
+or not, the current preset is merged into the sandbox's file key by key, against the preset
+the sandbox was last given (`.launcher/container-settings.json`). A key only the sandbox
+changed is kept; a key only the preset changed is taken; a key both changed is asked about at
+the launch (keep the sandbox's value, or take the preset's), and with nobody to ask, or on
+q/ESC, the sandbox's value is kept. Keys are the one-level dotted units every settings sync in
+ccpraxis uses (`plugins/steward/scripts/SettingsUnits.pm`): `env.FOO` is its own key. The old
+file is backed up first, to `.launcher/backups/<UTC time>/settings.json`, and the preset is
+then recorded as the one the sandbox was given.
+
+`CLAUDE.md` stays generated: each create writes the current render. A copy the sandbox edited
+(it differs from the last render it was given) is backed up to the same directory first, and
+the launch says where.
+
+The backups are read-only inside the container (`.launcher` is overlaid read-only at
+`/root/.claude/.launcher`), the same protection every launcher record has. A process in the
+container can still reach them through `/project/.ccpraxis-local-data`, as it can reach
+anything else in the project.
+
+**The stale prompt.** A changed preset or `CLAUDE.md` makes the launch ask whether to rebuild,
+and the prompt says what a new container does to these files. Choosing "Continue" records
+that preset (or `CLAUDE.md`) version for this project (`.launcher/*-declined-hash`), and the
+prompt does not ask about it again until the file changes once more.
+
+**Carrying a sandbox's changes back.** Each launch records the project in this machine's
+sandbox list, `~/.claude/ccpraxis-sandbox-projects.json` (`plugins/sandbox/scripts/SandboxRegistry.pm`), under
+an id kept in `.launcher/sandbox-id` that survives moving or renaming the project.
+`/steward:backup` reads that list and, for every key a sandbox changed on its own, asks
+whether to put it into the dev clone's preset (every sandbox takes it on its next merge), keep
+it in that sandbox (once, or remembered for that project), or revert that sandbox to the
+preset's value (after a backup). A key the preset changed and the sandbox did not is not
+asked: the next merge takes it.
 
 ## Plugin store (Fix 2 — copy model, two tiers)
 
@@ -289,7 +328,7 @@ launch.
 
 | Event | Host's `.ccpraxis-local-data/claude-home/` state |
 |-------|--------------------------------------------------|
-| Container freshly created | Blueprint files written to host before mount; .claude.json placeholder ensured |
+| Container freshly created | `CLAUDE.md` rendered and the preset merged into `settings.json` before mount (old copies backed up to `.launcher/backups/`); .claude.json placeholder ensured |
 | claude session writes a turn | Host sees it immediately (bind mount) |
 | claude exits cleanly | Host already has everything — no final sync needed |
 | Container crashes | Host already has everything — no rescue needed |
@@ -414,10 +453,12 @@ it stays alive + processing throughout.
 │   ├── Containerfile                  # debian:bookworm-slim + claude install
 │   ├── CLAUDE.md                      # container instructions shared by every launch
 │   ├── CLAUDE.<part>.md               # per runtime/host parts the launcher appends (ContainerClaudeMd.pm)
-│   └── settings.json                  # blueprint copied into each container
+│   └── settings.json                  # the sandbox preset, merged into each sandbox's settings.json
 ├── scripts/
 │   ├── launcher.pl                    # main entrypoint (manager + connector modes)
 │   ├── MountSpec.pm                   # mount-spec parsing (bind vs volume)
+│   ├── SandboxSettings.pm             # settings.json merge + CLAUDE.md refresh at create, backups
+│   ├── SandboxRegistry.pm             # this machine's list of sandboxed projects
 │   ├── select-session.pl              # picker TUI (used in connector mode)
 │   ├── bootstrap.pl                   # first-time .ccpraxis-local-data/claude-home setup
 │   └── skills.pl                      # discovery + selection state

@@ -109,7 +109,10 @@ are involved ([Working on ccpraxis](working-on-ccpraxis.md)): the live install
    platforms' keys and hooks normalised by `MachineLocalSettings.pm`). Every differing unit
    without a saved preference (`.backup-preferences.json` in the live install) is one
    question: into the payload, back into `~/.claude`, skip, or keep different for good. The
-   same per marketplace (`known_marketplaces.json`) and per container-settings key. A
+   same per marketplace (`known_marketplaces.json`) and per container-settings key, and for
+   each sandbox in this machine's sandbox list, per key that sandbox changed on its own: into
+   the dev clone's sandbox preset, keep it in that sandbox (once, or remembered for that
+   project), or revert that sandbox to the preset's value after a backup. A
    `~/.claude/CLAUDE.md` hand edit is never exported: rebuild it or fold the lines into the
    payload by hand.
 5. **Exports and commits** only what was sent to the payload, into the dev clone's working
