@@ -654,6 +654,12 @@ sub _assemble_report {
             },
             files     => $ex_present ? _shape_hash(_gpi($ctx, 'export', 'file_outcome'),      'export.file_outcome',      \@shape_failures) : undef,
             container => $ex_present ? _shape_hash(_gpi($ctx, 'export', 'container_outcome'), 'export.container_outcome', \@shape_failures) : undef,
+            # The sandbox preset vs each registered sandbox (2026-11-02):
+            # per project what was compared, skipped or left to its next
+            # merge, and what the answers did.
+            sandboxes => $ex_present ? _sandboxes_summary(
+                _shape_hash(_gpi($ctx, 'export', 'sandbox_diff'),    'export.sandbox_diff',    \@shape_failures),
+                _shape_hash(_gpi($ctx, 'export', 'sandbox_outcome'), 'export.sandbox_outcome', \@shape_failures)) : undef,
             sensitive => $ex_present ? _shape_hash(_gpi($ctx, 'export', 'sensitive_scan'),     'export.sensitive_scan',    \@shape_failures) : undef,
             committed => $ex_present ? _shape_hash(_gpi($ctx, 'export', 'committed'),          'export.committed',         \@shape_failures) : undef,
             promote_after_commit => $ex_present ? _shape_hash(_gpi($ctx, 'export', 'promote_after_commit'), 'export.promote_after_commit', \@shape_failures) : undef,
@@ -846,6 +852,29 @@ my %CLASS_BY_STATUS = (
 sub _class_for_status {
     my ($status) = @_;
     return $CLASS_BY_STATUS{ $status // '' } // 'errored';
+}
+
+# _sandboxes_summary($diff, $outcome) -> the report's view of the sandbox
+# pair, or undef when it never ran: the diff's status and, per project, its
+# path, any skip reason and the counts (asked, answered by a preference, left
+# to the sandbox's next merge); plus the outcome checkpoint as it is. The
+# values themselves stay out of the report.
+sub _sandboxes_summary {
+    my ($diff, $outcome) = @_;
+    return undef unless $diff || $outcome;
+    my @projects;
+    for my $p (@{ ($diff && ref($diff->{projects}) eq 'ARRAY') ? $diff->{projects} : [] }) {
+        next unless ref($p) eq 'HASH';
+        push @projects, {
+            id            => $p->{id},
+            path          => $p->{path},
+            skipped       => $p->{skipped},
+            asked         => scalar(@{ ref($p->{units}) eq 'ARRAY' ? $p->{units} : [] }),
+            auto_applied  => scalar(@{ ref($p->{auto_applied}) eq 'ARRAY' ? $p->{auto_applied} : [] }),
+            pending_merge => scalar(@{ ref($p->{pending_merge}) eq 'ARRAY' ? $p->{pending_merge} : [] }),
+        };
+    }
+    return { status => ($diff ? $diff->{status} : undef), projects => \@projects, outcome => $outcome };
 }
 
 sub _shape_hash {

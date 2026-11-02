@@ -89,6 +89,11 @@ our @EXPORT_OK = qw(
 # normal state between promotions, not a question; what made it dangerous (an
 # export overwriting unpromoted payload edits) is a precondition the
 # preflight phase checks instead, and a "no" skips the export with a note.
+#
+# 2026-11-02: sandbox_settings_key added, the third preference pair (the
+# sandbox preset vs each sandbox's own settings.json). Its choices are not
+# container_settings_key's: a unit can go into the preset, stay in that one
+# sandbox (once or remembered per project), or be reverted in that sandbox.
 our @DECISION_KINDS = qw(
     promote_pending
     readme_drift
@@ -97,6 +102,7 @@ our @DECISION_KINDS = qw(
     file_conflict
     claude_md_drift
     container_settings_key
+    sandbox_settings_key
     sensitive_finding
     vault_conflict
     project_registration

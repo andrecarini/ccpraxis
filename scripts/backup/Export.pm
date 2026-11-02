@@ -68,15 +68,25 @@
 # both paths for a human to reconcile. See reports/parity/03-export-and-push.md.
 #
 # Decision 10: the decision-kind enum is CLOSED. This module emits exactly
-# four kinds: file_conflict, claude_md_drift, container_settings_key,
-# sensitive_finding. The commit and the promotion after it are deterministic
-# and ask nothing.
+# five kinds: file_conflict, claude_md_drift, container_settings_key,
+# sandbox_settings_key, sensitive_finding. The commit and the promotion after
+# it are deterministic and ask nothing.
+#
+# THE SANDBOX PAIR (U5b/U6b, 2026-11-02): the sandbox preset vs each
+# registered sandbox's own settings.json. It reads three modules from the live
+# install rather than wrapping a script -- SandboxRegistry.pm (where the
+# sandboxes are), SandboxSettings.pm (reading them, and reverting a unit with
+# a backup) and SettingsUnits.pm (the unit model every settings sync shares)
+# -- and still leaves preference matching to filter-diff.pl and preference
+# writes to save-preference.pl.
 #
 # Decision 7 barriers, enforced in code (not prose):
 #   B1 -- the container diff (U5/U6) does not run unless settings_merge
 #         (U4) checkpointed (on either its success path or its
 #         nothing-to-merge path). A failed U4 leaves the key unset, so U5/U6
-#         are skipped this pass.
+#         are skipped this pass. The sandbox pair (U5b/U6b) runs only once
+#         the container diff checkpointed, after U6, so it compares each
+#         sandbox with the preset as this run left it.
 #   B2 -- no git verb of any kind is spawned until sensitive_scan (U7)
 #         checkpoints clean. U8/U9 are both gated on is_done('sensitive_scan').
 #   B3 -- sensitive_finding is never batched with anything else (returned
@@ -133,7 +143,7 @@ sub phase_spec {
         name      => 'export',
         order     => 200,   # spec S8 P2: preflight=100, export=200, vault=300, closeout=400
         resumable => 1,
-        title     => 'Export: into the dev clone -- file differences, settings merge, container settings, sensitive scan, commit, promote',
+        title     => 'Export: into the dev clone -- file differences, settings merge, container settings, sandbox settings, sensitive scan, commit, promote',
     };
 }
 
@@ -300,6 +310,27 @@ sub run_phase {
                 my $res = _do_container_outcome($ctx, $root, $repo);
                 if ($res->{failed}) { $record_failure->('container_outcome', $res->{failed}); }
                 else                 { $record_success->('container_outcome'); }
+            }
+
+            # ---- U5b/U6b: the sandbox preset vs each registered sandbox's
+            #      own settings.json (2026-11-02). After U6, so the preset
+            #      they are compared with already holds this run's
+            #      global->container writes. ----
+            unless ($ctx->{is_done}->('sandbox_diff')) {
+                my $res = _do_sandbox_diff($ctx, $root, $repo, $home_n);
+                if ($res->{decisions}) {
+                    $record_success->('sandbox_diff');   # see file_conflicts' identical comment above
+                    return { status => 'needs_decision', decisions => $res->{decisions} };
+                }
+                if ($res->{failed}) { $record_failure->('sandbox_diff', $res->{failed}); }
+                else                 { $record_success->('sandbox_diff'); }
+            }
+            if ($ctx->{is_done}->('sandbox_diff')) {
+                unless ($ctx->{is_done}->('sandbox_outcome')) {
+                    my $res = _do_sandbox_outcome($ctx, $root, $repo, $home_n);
+                    if ($res->{failed}) { $record_failure->('sandbox_outcome', $res->{failed}); }
+                    else                 { $record_success->('sandbox_outcome'); }
+                }
             }
         }
     }
@@ -1109,6 +1140,363 @@ sub _container_decisions {
 }
 
 # ===========================================================================
+# U5b -- sandbox_diff: the sandbox preset (the dev clone's
+# plugins/sandbox/container/settings.json) against each sandbox's own
+# settings.json, for every project in this machine's sandbox list
+# (plugins/sandbox/scripts/SandboxRegistry.pm, written by the launcher).
+#
+# The third preference pair, beside live_vs_repo and global_vs_container. A
+# sandbox's settings start as the preset and are merged with it on every
+# container create (SandboxSettings.pm); what the sandbox changed since stays
+# in that sandbox unless it is carried back here. A unit is a decision only
+# when it is the SANDBOX's change: when the sandbox still holds the value the
+# preset gave it last time (its BASE, .launcher/container-settings.json),
+# the difference is the preset moving on, which the sandbox's next merge
+# takes by itself -- asking "put the sandbox's value into the preset" there
+# would offer to undo the preset's change. Those units are only counted
+# (pending_merge). With no base on record every difference is asked about.
+#
+# A saved preference answers a unit without a decision: scope
+# container_vs_sandbox:<project id> in .backup-preferences.json, so a
+# "keep it in this sandbox" remembered for one project never applies to
+# another, and survives renaming the project (the id is SandboxRegistry's).
+# Matching is filter-diff.pl's, fed a json-diff-shaped report (left = the
+# sandbox, right = the preset). The unit model is SettingsUnits.pm's.
+#
+# Only projects registered by a launcher with the live install's identity
+# (SandboxIdentity $ID) are compared: a fork's sandboxes follow its own
+# preset. A project that cannot be reached (directory gone, no or unreadable
+# settings.json) is skipped with a note. Checkpoints 'sandbox_diff':
+#   { status, preset, projects => [ { id, path, name, skipped?, pending_merge,
+#     auto_applied, units => [ { key, path, relation, sandbox_found,
+#     sandbox_value, preset_found, preset_value } ] } ] }
+# ===========================================================================
+sub _do_sandbox_diff {
+    my ($ctx, $root, $repo, $home_n) = @_;
+    my $done = sub {
+        my ($data) = @_;
+        $ctx->{checkpoint}->('sandbox_diff', _sanitize_utf8($data));
+        return {};
+    };
+
+    my $load_err = _load_sandbox_shared($root);
+    if (defined $load_err) {
+        $ctx->{note}->('sandbox_settings_skipped', { reason => $load_err });
+        return $done->({ status => 'unavailable', reason => $load_err, projects => [] });
+    }
+    my $registry = SandboxRegistry::registry_path("$home_n/.claude");
+    my $ours = do { no warnings q{once}; $SandboxIdentity::ID };
+    my ($entries, $reg_err) = SandboxRegistry::entries(registry => $registry, launcher => $ours);
+    if (defined $reg_err) {
+        return { failed => "sandbox_diff: the machine's sandbox list is unreadable: $reg_err" };
+    }
+    return $done->({ status => 'no_sandboxes', projects => [] }) unless @$entries;
+
+    my $preset_rel  = 'plugins/sandbox/container/settings.json';
+    my $preset_path = "$repo/$preset_rel";
+    my ($preset, $preset_err, $preset_exists) = SandboxSettings::read_json($preset_path);
+    unless ($preset_exists) {
+        $ctx->{note}->('sandbox_settings_skipped', { reason => "no sandbox preset at $preset_path" });
+        return $done->({ status => 'preset_absent', projects => [] });
+    }
+    return { failed => "sandbox_diff: $preset_err" } if defined $preset_err;
+
+    my $prefs_path = "$root/.backup-preferences.json";
+    my (@projects, @skipped);
+    for my $e (@$entries) {
+        my $path = $e->{path};
+        my $name = $path;
+        $name =~ s{.*[/\\]}{};
+        my %p = (id => $e->{id}, path => $path, name => $name, units => [], auto_applied => [],
+                 pending_merge => []);
+        my $home = SandboxRegistry::claude_home_for($path);
+        my $why;
+        if (!-d $path) {
+            $why = 'the project directory is not reachable';
+        }
+        else {
+            my ($sandbox, $err, $exists) = SandboxSettings::read_json("$home/settings.json");
+            if (!$exists) {
+                $why = 'it has no settings.json yet (no container has been created)';
+            }
+            elsif (defined $err) {
+                $why = $err;
+            }
+            else {
+                my ($base, $base_err, $base_exists) = SandboxSettings::read_json("$home/.launcher/container-settings.json");
+                $base = undef if defined $base_err || !$base_exists;
+                my @cand;
+                for my $u (SettingsUnits::compute_units($sandbox, $preset)) {
+                    next if $u->{relation} eq 'identical';
+                    if ($base) {
+                        my ($sf, $sv) = SettingsUnits::value_at_path($sandbox, $u->{path});
+                        my ($bf, $bv) = SettingsUnits::value_at_path($base, $u->{path});
+                        if ($sf == $bf && (!$sf || SettingsUnits::same_value($sv, $bv))) {
+                            push @{ $p{pending_merge} }, $u->{name};
+                            next;
+                        }
+                    }
+                    push @cand, $u;
+                }
+                $p{base_missing} = $base ? 0 : 1;
+                if (@cand) {
+                    my $f = _sandbox_filter_prefs($root, $prefs_path, $e->{id}, \@cand);
+                    return { failed => "sandbox_diff ($path): $f->{failed}" } if $f->{failed};
+                    $p{auto_applied} = $f->{auto_applied};
+                    for my $u (@{ $f->{needs} }) {
+                        push @{ $p{units} }, {
+                            key => $u->{name}, path => $u->{path}, relation => $u->{relation},
+                            sandbox_found => ($u->{relation} eq 'only_right' ? 0 : 1), sandbox_value => $u->{live_val},
+                            preset_found  => ($u->{relation} eq 'only_left'  ? 0 : 1), preset_value  => $u->{payload_val},
+                        };
+                    }
+                }
+            }
+        }
+        if (defined $why) {
+            $p{skipped} = $why;
+            push @skipped, { project => $path, id => $e->{id}, reason => $why };
+        }
+        push @projects, \%p;
+    }
+    $ctx->{note}->('sandbox_settings_skipped_projects', \@skipped) if @skipped;
+    my @auto = map { my $p = $_; map { { %$_, project => $p->{path} } } @{ $p->{auto_applied} } } @projects;
+    $ctx->{note}->('sandbox_settings_auto_applied', \@auto) if @auto;
+
+    my $data = _sanitize_utf8({ status => 'compared', preset => $preset_rel, projects => \@projects });
+    $ctx->{checkpoint}->('sandbox_diff', $data);
+    my @decisions = _sandbox_decisions($ctx, $data);
+    return @decisions ? { decisions => \@decisions } : {};
+}
+
+# filter-diff.pl over one project's candidate units, scope
+# container_vs_sandbox:<id>. Returns { auto_applied => [..], needs => [units] }.
+sub _sandbox_filter_prefs {
+    my ($root, $prefs_path, $id, $units) = @_;
+    my (%only_left, %only_right, %diverged);
+    for my $u (@$units) {
+        if    ($u->{relation} eq 'only_left')  { $only_left{ $u->{name} }  = $u->{live_val}; }
+        elsif ($u->{relation} eq 'only_right') { $only_right{ $u->{name} } = $u->{payload_val}; }
+        else  { $diverged{ $u->{name} } = { left => $u->{live_val}, right => $u->{payload_val} }; }
+    }
+    my $report = JSON::PP->new->utf8->canonical->allow_nonref->encode({
+        status => 'different', identical => [],
+        only_left => \%only_left, only_right => \%only_right, diverged => \%diverged });
+    my $fd = _run_with_stdin($report, $^X, "$root/plugins/steward/scripts/filter-diff.pl",
+        '--prefs', $prefs_path, '--scope', "container_vs_sandbox:$id");
+    return { failed => 'filter-diff.pl failed to spawn' } unless $fd->{spawned};
+    return { failed => "filter-diff.pl exited $fd->{exit}" } unless $fd->{exit} == 0;
+    my $j = eval { decode_json($fd->{out}) };
+    return { failed => 'filter-diff.pl produced unparseable output' } unless ref($j) eq 'HASH';
+    my %auto = map { (ref($_) eq 'HASH' && defined $_->{key}) ? ($_->{key} => $_) : () } @{ $j->{auto_applied} // [] };
+    return {
+        auto_applied => [ map { { key => $_->{key}, category => $_->{category}, action => $_->{action} } }
+                          sort { $a->{key} cmp $b->{key} } values %auto ],
+        needs        => [ grep { !$auto{ $_->{name} } } @$units ],
+    };
+}
+
+# Pure function of a sandbox_diff checkpoint: one decision per unit, in
+# project order then unit order, with ids U6b can regenerate exactly.
+sub _sandbox_decisions {
+    my ($ctx, $diff) = @_;
+    return () unless ref($diff) eq 'HASH' && ref($diff->{projects}) eq 'ARRAY';
+    my @decisions;
+    my $jv = JSON::PP->new->canonical->allow_nonref;
+    for my $p (@{ $diff->{projects} }) {
+        next unless ref($p) eq 'HASH' && ref($p->{units}) eq 'ARRAY' && @{ $p->{units} };
+        my @pairs = _mint_ids("export.sandbox.$p->{id}", map { $_->{key} } @{ $p->{units} });
+        (my $pname = $p->{name} // q{}) =~ s/[\x00-\x1f\x7f]+/ /g;
+        $pname = _clip_utf8_bytes($pname, 40);
+        for my $i (0 .. $#{ $p->{units} }) {
+            my ($key, $id) = @{ $pairs[$i] };
+            my $u   = $p->{units}[$i];
+            my $rel = $u->{relation};
+            my $kd  = _title_key($key);
+            my $show = sub { my ($f, $v) = @_; return $f ? _clip_utf8_bytes($jv->encode($v), 1000) : '(not set)' };
+            push @decisions, $ctx->{decision}->(
+                kind    => 'sandbox_settings_key',
+                id      => $id,
+                title   => _clip_utf8_bytes($rel eq 'only_left'  ? "sandbox '$pname': settings key '$kd' exists only in this sandbox, not in the sandbox preset"
+                         : $rel eq 'only_right' ? "sandbox '$pname': settings key '$kd' was removed in this sandbox but is in the sandbox preset"
+                         :                        "sandbox '$pname': settings key '$kd' differs from the sandbox preset", 200),
+                subject => $key,
+                detail  => join("\n",
+                    "project: $p->{path}",
+                    'this sandbox:       ' . $show->($u->{sandbox_found}, $u->{sandbox_value}),
+                    'the sandbox preset: ' . $show->($u->{preset_found},  $u->{preset_value}),
+                    'Every sandbox takes the preset\'s value on its next merge unless it changed the key itself.'),
+                data    => { project_id => $p->{id}, project_path => $p->{path}, project_name => $p->{name},
+                             key => $key, path => $u->{path}, relation => $rel,
+                             sandbox_found => $u->{sandbox_found}, sandbox_value => $u->{sandbox_value},
+                             preset_found => $u->{preset_found}, preset_value => $u->{preset_value} },
+                choices => _sandbox_choices($rel),
+            );
+        }
+    }
+    return @decisions;
+}
+
+sub _sandbox_choices {
+    my ($rel) = @_;
+    my $to_preset = $rel eq 'only_left'  ? "Add it to the dev clone's sandbox preset (every sandbox gets it on its next merge)"
+                  : $rel eq 'only_right' ? "Remove it from the dev clone's sandbox preset (every sandbox loses it on its next merge)"
+                  :                        "Put this sandbox's value into the dev clone's sandbox preset (every sandbox gets it on its next merge)";
+    my $revert    = $rel eq 'only_left'  ? "Remove it from this sandbox's settings.json (the file is backed up first)"
+                  :                        "Put the preset's value back into this sandbox's settings.json (the file is backed up first)";
+    return [
+        { id => 'to_preset',                label => $to_preset },
+        { id => 'keep_in_sandbox',          label => 'Keep it in this sandbox only, this time (asked again next backup)' },
+        { id => 'keep_in_sandbox_remember', label => 'Keep it in this sandbox only, always (remembered for this project)' },
+        { id => 'revert_sandbox',           label => $revert },
+    ];
+}
+
+# ===========================================================================
+# U6b -- sandbox_outcome: apply answered sandbox_settings_key choices.
+#   to_preset                 the sandbox's value (or its absence) goes into
+#                             the dev clone's preset; committed with the
+#                             other export files. Two sandboxes sending one
+#                             unit different values is refused for that unit.
+#   keep_in_sandbox           nothing.
+#   keep_in_sandbox_remember  a container_vs_sandbox:<id> preference.
+#   revert_sandbox            the preset's value into that sandbox's
+#                             settings.json, after a backup to its
+#                             .launcher/backups/ (SandboxSettings::apply_units);
+#                             nothing else is written.
+# Checkpoints 'sandbox_outcome': { to_preset, reverted, kept, preferences_saved,
+# refused, wrote }.
+# ===========================================================================
+sub _do_sandbox_outcome {
+    my ($ctx, $root, $repo, $home_n) = @_;
+    my $diff = $ctx->{get_item}->('sandbox_diff');
+    my @decisions = _sandbox_decisions($ctx, $diff);
+    return {} unless @decisions;
+
+    my $load_err = _load_sandbox_shared($root);
+    return { failed => "sandbox_outcome: $load_err" } if defined $load_err;
+
+    my $preset_rel  = 'plugins/sandbox/container/settings.json';
+    my $preset_path = "$repo/$preset_rel";
+    my $prefs_path  = "$root/.backup-preferences.json";
+    my (@to_preset, @reverted, @kept, @prefs_saved, @refused, @failed_msgs, @wrote);
+    my (%preset_units, %revert_by_project);
+
+    my %remember = (diverged => 'skip-always', only_left => 'left-only', only_right => 'right-only');
+    for my $d (@decisions) {
+        my $choice = $ctx->{answers}{ $d->{id} };
+        next unless defined $choice;
+        my $dd  = $d->{data};
+        my $rel = $dd->{relation};
+        if ($choice eq 'to_preset') {
+            push @{ $preset_units{ $dd->{key} } }, $dd;
+        }
+        elsif ($choice eq 'revert_sandbox') {
+            push @{ $revert_by_project{ $dd->{project_id} } }, $dd;
+        }
+        elsif ($choice eq 'keep_in_sandbox') {
+            push @kept, { project => $dd->{project_path}, key => $dd->{key} };
+        }
+        elsif ($choice eq 'keep_in_sandbox_remember') {
+            my $scope = "container_vs_sandbox:$dd->{project_id}";
+            my $sp = _run_capture($^X, "$root/plugins/steward/scripts/save-preference.pl",
+                '--prefs', $prefs_path, '--scope', $scope, '--key', $dd->{key},
+                '--category', $rel, '--action', $remember{$rel});
+            if ($sp->{spawned} && $sp->{exit} == 0) {
+                push @prefs_saved, { scope => $scope, project => $dd->{project_path}, key => $dd->{key},
+                                     category => $rel, action => $remember{$rel} };
+            }
+            else {
+                push @failed_msgs, "save-preference.pl for '$dd->{key}' ($dd->{project_path})";
+            }
+        }
+    }
+
+    # to_preset: one value per unit, or nothing for that unit.
+    my @writes;
+    for my $key (sort keys %preset_units) {
+        my @from = @{ $preset_units{$key} };
+        my %distinct = map { (($_->{sandbox_found} ? 'v:' . JSON::PP->new->canonical->allow_nonref->encode($_->{sandbox_value}) : 'absent') => 1) } @from;
+        if (keys(%distinct) > 1) {
+            push @refused, { key => $key, projects => [ map { $_->{project_path} } @from ] };
+            push @failed_msgs, "sandbox_outcome: '$key' was sent to the preset from "
+                             . scalar(@from) . ' sandboxes with different values; nothing was written for it';
+            next;
+        }
+        push @writes, $from[0];
+    }
+    if (@writes) {
+        my ($data, $read_err) = _read_or_init_json_file($preset_path);
+        if (defined $read_err) {
+            push @failed_msgs, "sandbox_outcome: $read_err";
+        }
+        else {
+            for my $w (@writes) {
+                my $from = {};
+                my $path = _widen_utf8($w->{path});
+                SettingsUnits::set_at_path($from, $path, _widen_utf8($w->{sandbox_value})) if $w->{sandbox_found};
+                SettingsUnits::take_at_path($data, $path, $from);
+            }
+            my $ok = eval { _write_json_file($preset_path, $data); 1 };
+            if ($ok) {
+                push @wrote, $preset_rel;
+                push @to_preset, map { { key => $_->{key}, from => $_->{project_path},
+                                         removed => $_->{sandbox_found} ? 0 : 1 } } @writes;
+            }
+            else {
+                push @failed_msgs, "sandbox_outcome: cannot write $preset_path: $@";
+            }
+        }
+    }
+
+    # revert_sandbox: per project, one backup, one write.
+    for my $pid (sort keys %revert_by_project) {
+        my @units = @{ $revert_by_project{$pid} };
+        my $project = _item_bytes($units[0]{project_path});
+        my $home = SandboxRegistry::claude_home_for($project);
+        my $r = SandboxSettings::apply_units(
+            target     => "$home/settings.json",
+            backup_dir => SandboxSettings::backup_dir_maker("$home/.launcher", time),
+            units      => [ map { { name => _widen_utf8($_->{key}), path => _widen_utf8($_->{path}),
+                                    found => $_->{preset_found}, value => _widen_utf8($_->{preset_value}) } } @units ],
+        );
+        if (defined $r->{error}) {
+            push @failed_msgs, "sandbox_outcome: revert in $project: $r->{error}";
+            next;
+        }
+        push @reverted, { project => $project, keys => [ map { $_->{key} } @units ], backup => $r->{backup} };
+    }
+
+    my $out = _sanitize_utf8({ to_preset => \@to_preset, reverted => \@reverted, kept => \@kept,
+                               preferences_saved => \@prefs_saved, refused => \@refused, wrote => \@wrote });
+    $ctx->{checkpoint}->('sandbox_outcome', $out);
+    $ctx->{note}->('sandbox_settings_to_preset', $out->{to_preset}) if @to_preset;
+    $ctx->{note}->('sandbox_settings_reverted', $out->{reverted}) if @reverted;
+    $ctx->{note}->('sandbox_preferences_saved', $out->{preferences_saved}) if @prefs_saved;
+    my $ret = {};
+    $ret->{failed} = join('; ', @failed_msgs) if @failed_msgs;
+    return $ret;
+}
+
+# The sandbox modules, from the live install (the tree every wrapped script
+# runs from): SandboxIdentity (which launcher's sandboxes are ours),
+# SandboxRegistry (where they are), SandboxSettings (reading, and reverting a
+# unit with a backup) -- which loads SettingsUnits from the steward scripts.
+# Returns undef on success, else why not.
+sub _load_sandbox_shared {
+    my ($root) = @_;
+    my $dir = "$root/plugins/sandbox/scripts";
+    local @INC = ($dir, @INC);
+    for my $m (qw(SandboxIdentity SandboxRegistry SandboxSettings)) {
+        next if $INC{"$m.pm"};
+        return "$dir/$m.pm is missing" unless -f "$dir/$m.pm";
+        my $ok = eval { require "$m.pm"; 1 };
+        return "cannot load $dir/$m.pm: " . ($@ || 'unknown error') unless $ok;
+    }
+    return undef;
+}
+
+# ===========================================================================
 # U7 -- sensitive_scan (Step 4). BARRIER B2/B3: gates every git operation;
 # always returned alone. <attempt> is derived from the contiguous run of
 # 'rescan' answers (spec S2.5), so a still-dirty rescan mints a fresh id.
@@ -1222,7 +1610,7 @@ sub _written_paths {
     my ($ctx) = @_;
     my %w;
     my @sources = ( $ctx->{get_phase_item}->('preflight', 'marketplace_outcome'),
-                    map { $ctx->{get_item}->($_) } qw(file_outcome settings_merge container_outcome) );
+                    map { $ctx->{get_item}->($_) } qw(file_outcome settings_merge container_outcome sandbox_outcome) );
     for my $it (@sources) {
         next unless ref($it) eq 'HASH' && ref($it->{wrote}) eq 'ARRAY';
         for my $p (@{ $it->{wrote} }) {
@@ -1704,6 +2092,18 @@ sub _clamp {
     my $t = substr($s, 0, $max);
     $t =~ s/[\x80-\xBF]+\z//;
     return $t;
+}
+
+# _clip_utf8_bytes($s, $max) -> $s, or at most $max bytes of it ending in an
+# ellipsis, cut on a CHARACTER boundary (a decision title is limited in bytes,
+# and a cut through a multi-byte sequence would leave invalid UTF-8 for
+# backup.pl's stdout encoder).
+sub _clip_utf8_bytes {
+    my ($s, $max) = @_;
+    return $s unless defined $s && length($s) > $max;
+    my $head = substr($s, 0, $max - 3);
+    my $chars = Encode::decode('UTF-8', $head, Encode::FB_QUIET());   # stops before a cut sequence
+    return Encode::encode('UTF-8', $chars) . "\xE2\x80\xA6";
 }
 
 # Text clamp for a file_conflict decision's live_text/repo_text -- returns
