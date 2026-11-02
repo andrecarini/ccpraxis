@@ -108,6 +108,21 @@ is_deeply([ map { $_->{path} } @{ list(launcher => 'claude-sandbox') } ], [ sort
     is(SandboxRegistry::_path_key('C:\\Users\\Me', 1), 'c:/users/me', 'backslashes are slashes');
 }
 
+# ---- two spellings of ONE directory are not a copy ----
+# (On Windows and macOS that is a non-ASCII letter in another case, which a
+# byte-wise lc does not fold; a symbolic link alias is the portable stand-in.)
+SKIP: {
+    skip 'no symbolic links on this host', 2 if $^O =~ /^(MSWin32|cygwin|msys)$/;
+    my $real  = project('one-dir');
+    my $alias = "$root/one-dir-alias";
+    symlink($real, $alias) or skip "symlink failed: $!", 2;
+    my $first  = reg(project_path => $real,  now => 830);
+    my $second = reg(project_path => $alias, now => 840);
+    is($second->{id}, $first->{id}, 'same directory, another spelling: same id');
+    ok(!$second->{reminted}, '... not mistaken for a copy');
+    unlink $alias;
+}
+
 # ---- a non-ASCII path (the Windows host's home is C:/Users/André) ----
 {
     my $nb = project("Andr\xc3\xa9-proj");          # UTF-8 bytes, as the launcher has them

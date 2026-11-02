@@ -1137,7 +1137,7 @@ my $CLAUDE_MD_HASH_FILE       = "$LAUNCHER_DIR/.container-CLAUDE-md-hash";
 my $SETTINGS_HASH_FILE        = "$LAUNCHER_DIR/.container-settings-json-hash";
 my $CLAUDE_MD_DECLINED_FILE   = "$LAUNCHER_DIR/.container-CLAUDE-md-declined-hash";
 my $SETTINGS_DECLINED_FILE    = "$LAUNCHER_DIR/.container-settings-json-declined-hash";
-my $LOCK_DIR                  = "$LAUNCHER_DIR/.launcher.lock";
+my $LOCK_DIR                  = SandboxSettings::launch_lock_dir($LAUNCHER_DIR);  # /steward:backup checks it before reverting a setting
 
 # B1: per-launch diagnostic log. Opened just after the lock is acquired (below);
 # declared here so the signal handlers / END block can close it. log_ev() is a
@@ -3506,7 +3506,11 @@ my $PLAN = decide_launch_plan(%plan_state, operator => $answer);
 # THAT version: remember it, so the next launch does not ask again until the
 # file changes once more. A container created by this launch merges the
 # current preset anyway and records it as given, which makes the memory moot.
-if (defined $answer && $answer eq 'continue') {
+# Only an answer somebody gave counts: with no terminal the prompt's line
+# path reads EOF and returns 'continue' by default, and remembering that
+# would silence the notice for good without anyone having seen it.
+my $ANSWER_WAS_INTERACTIVE = (($LAUNCH_MODE ne 'plain' && $LAUNCH_HOST && $LAUNCH_HOST->{active}) || -t STDIN) ? 1 : 0;
+if (defined $answer && $answer eq 'continue' && $ANSWER_WAS_INTERACTIVE) {
     _write_file($SETTINGS_DECLINED_FILE,  "$CURRENT_SETTINGS_HASH\n")  if $SETTINGS_DRIFT eq 'changed';
     _write_file($CLAUDE_MD_DECLINED_FILE, "$CURRENT_CLAUDE_MD_HASH\n") if $CLAUDE_MD_DRIFT eq 'changed';
 }
@@ -4600,9 +4604,15 @@ sub apply_blueprints_to_host_data {
         if defined $st->{warning};
     _emit_err(_c_warn("NOTE:"), " no record of the preset this sandbox was last given, so every key it and the preset both have with different values was treated as changed on both sides\n")
         if $st->{base_missing} && @c;
+    # Key names come out of decoded JSON as text; the launch log's encoder
+    # takes bytes.
+    my $bytes = sub { my ($s) = @_; utf8::encode($s) if utf8::is_utf8($s); return $s };
     log_ev('sandbox_settings_merge', {
-        status => $st->{status}, backup => $st->{backup}, taken => $st->{taken}, kept => $st->{kept},
-        agreed => $st->{agreed}, conflicts => [ map { { name => $_->{name}, choice => $_->{choice} } } @c ],
+        status => $st->{status}, backup => $st->{backup},
+        taken  => [ map { $bytes->($_) } @{ $st->{taken} } ],
+        kept   => [ map { $bytes->($_) } @{ $st->{kept} } ],
+        agreed => [ map { $bytes->($_) } @{ $st->{agreed} } ],
+        conflicts => [ map { { name => $bytes->($_->{name}), choice => $_->{choice} } } @c ],
         claude_md_backup => $md->{backup},
     });
     # .credentials.json is NOT copied here — materialize-credentials

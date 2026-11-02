@@ -54,6 +54,7 @@ use warnings;
 use File::Basename qw(dirname basename);
 use File::Path qw(make_path);
 use File::Temp ();
+use Fcntl qw(O_RDONLY O_NOFOLLOW);
 use JSON::PP ();
 use POSIX qw(strftime);
 
@@ -100,12 +101,21 @@ sub backup_dir_maker {
     };
 }
 
-# backup_file($src, $dir_maker) -> the backup's path. Bytes, unchanged.
+# backup_file($src, $dir_maker) -> the backup's path. A plain file is copied
+# byte for byte. Anything else the container may have put there -- a
+# symbolic link above all -- is MOVED into the backup directory as it is,
+# never read: a link is resolved on the host, so following it would copy a
+# host file of the sandbox's choosing (~/.ssh/id_ed25519) into a backup the
+# sandbox can read through /project.
 sub backup_file {
     my ($src, $dir_maker) = @_;
+    my $dst = $dir_maker->() . '/' . basename($src);
+    unless (_plain_file($src)) {
+        rename $src, $dst or die "SandboxSettings: cannot move $src aside to $dst: $!\n";
+        return $dst;
+    }
     my $bytes = _read_bytes($src);
     die "SandboxSettings: cannot read $src to back it up\n" unless defined $bytes;
-    my $dst = $dir_maker->() . '/' . basename($src);
     _write_bytes_atomic($dst, $bytes);
     return $dst;
 }
@@ -114,7 +124,9 @@ sub backup_file {
 # Absent: (undef, undef, 0). Unreadable or not a JSON object: (undef, $why, 1).
 sub read_json {
     my ($path) = @_;
-    return (undef, undef, 0) unless -e $path;
+    return (undef, undef, 0) unless -l $path || -e $path;
+    return (undef, "$path is a symbolic link (not followed)", 1) if -l $path;
+    return (undef, "$path is not a regular file", 1) unless -f $path;
     my $bytes = _read_bytes($path);
     return (undef, "cannot read $path", 1) unless defined $bytes;
     my $data = eval { JSON::PP->new->utf8->decode($bytes) };
@@ -178,7 +190,7 @@ sub merge_settings {
         $r{backup}  = backup_file($o{target}, $o{backup_dir});
         _write_bytes_atomic($o{target}, $preset_bytes);
         $r{status}  = 'replaced_unreadable';
-        $r{warning} = "the sandbox's settings.json did not parse ($local_err); it was backed up and replaced with the preset";
+        $r{warning} = "the sandbox's settings.json could not be used ($local_err); it was backed up and replaced with the preset";
     }
     else {
         my ($base, $base_err, $base_exists) = read_json($o{base});
@@ -211,6 +223,10 @@ sub merge_settings {
 sub refresh_claude_md {
     my (%o) = @_;
     my %r = (status => 'unchanged', backup => undef);
+    if ((-l $o{target} || -e $o{target}) && !_plain_file($o{target})) {
+        # A link or other non-file in place of CLAUDE.md: moved aside, never read.
+        $r{backup} = backup_file($o{target}, $o{backup_dir});
+    }
     my $current = _read_bytes($o{target});
     if (defined $current) {
         my $last = _read_bytes($o{last_render});
@@ -239,15 +255,31 @@ sub drift_state {
     return 'changed';
 }
 
+# launch_lock_dir($launcher_dir) -> the directory launcher.pl holds (mkdir
+# lock, SandboxLock) while it sets a sandbox up -- including while it waits at
+# a settings conflict question, after which it writes the merge result.
+sub launch_lock_dir {
+    my ($launcher_dir) = @_;
+    return "$launcher_dir/.launcher.lock";
+}
+
 # apply_units(%o) -> { backup => path|undef, error => text|undef, applied => [names] }
-#   target      a sandbox's settings.json
-#   backup_dir  a backup_dir_maker() sub
-#   units       [ { name, path => [k] | [k, sk], found => 0|1, value => V }, ... ]
+#   target        a sandbox's settings.json
+#   backup_dir    a backup_dir_maker() sub
+#   units         [ { name, path => [k] | [k, sk], found => 0|1, value => V }, ... ]
+#   launcher_dir  that sandbox's .launcher (optional): while a launcher holds
+#                 its setup lock, nothing is written -- its merge would land
+#                 on top of this write and silently undo it.
 # Sets each unit to value (found) or removes it (not found), after backing the
 # file up. Nothing else in the file changes. Used by /steward:backup's
-# "revert this sandbox to the preset's value".
+# "revert this sandbox to the preset's value". A session running in the
+# sandbox's container sees the change (Claude Code reloads settings.json),
+# and can still write the file itself afterwards.
 sub apply_units {
     my (%o) = @_;
+    return { error => 'a launch of this sandbox is setting it up right now (' . launch_lock_dir($o{launcher_dir})
+                    . ' exists); nothing was written -- answer again on the next backup' }
+        if defined $o{launcher_dir} && -d launch_lock_dir($o{launcher_dir});
     my ($data, $err, $exists) = read_json($o{target});
     return { error => "cannot revert: $o{target} does not exist" } unless $exists;
     return { error => "cannot revert: $err" } if defined $err;
@@ -267,10 +299,21 @@ sub apply_units {
     return { backup => $backup, applied => \@applied };
 }
 
+# A plain regular file, not reached through a symbolic link.
+sub _plain_file {
+    my ($path) = @_;
+    return 0 unless defined $path;
+    return 0 if -l $path;
+    return -f _ ? 1 : 0;
+}
+
+# The bytes of a plain file, or undef. Never follows a symbolic link, not even
+# one swapped in between the check and the open (O_NOFOLLOW).
 sub _read_bytes {
     my ($path) = @_;
-    return undef unless defined $path && -f $path;
-    open my $fh, '<:raw', $path or return undef;
+    return undef unless _plain_file($path);
+    sysopen(my $fh, $path, O_RDONLY | O_NOFOLLOW) or return undef;
+    binmode $fh;
     local $/;
     my $c = <$fh>;
     close $fh;
@@ -284,8 +327,8 @@ sub _write_bytes_atomic {
     my ($path, $bytes) = @_;
     my $dir = dirname($path);
     make_path($dir) unless -d $dir;
-    my $mode = (stat $path)[2];
-    $mode = defined $mode ? ($mode & 07777) : (0666 & ~umask);
+    my @st = lstat $path;
+    my $mode = (@st && -f _) ? ($st[2] & 07777) : (0666 & ~umask);
     my ($fh, $tmp) = File::Temp::tempfile('.sandbox-settings-XXXXXXXX', DIR => $dir, UNLINK => 0);
     binmode $fh;
     print {$fh} $bytes;

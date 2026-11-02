@@ -189,7 +189,10 @@ sub register {
         }
         elsif ($projects->{$id} && $key->($projects->{$id}{path}) ne $pk) {
             my $other = $projects->{$id}{path};
-            if (-d $other && (_read_id(id_file(launcher_dir_for($other))) // '') eq $id) {
+            # Two spellings of ONE directory (a non-ASCII letter in another
+            # case, which lc on bytes does not fold) are not a copy.
+            if (-d $other && !_same_dir($other, $project)
+                && (_read_id(id_file(launcher_dir_for($other))) // '') eq $id) {
                 # A copy: the registered directory still carries this id.
                 $id = (defined $by_path && $by_path ne $id) ? $by_path : _mint_id($project, $now);
                 $write_id = 1;
@@ -237,6 +240,16 @@ sub _path_key {
     (my $k = defined $p ? $p : '') =~ s{\\}{/}g;
     $k =~ s{(?<=.)/+\z}{};
     return $fold ? lc $k : $k;
+}
+
+# Same directory by device and inode (a zero inode, which some filesystems
+# report, proves nothing).
+sub _same_dir {
+    my ($a, $b) = @_;
+    my @sa = stat $a;
+    my @sb = stat $b;
+    return 0 unless @sa && @sb && $sa[1];
+    return ($sa[0] == $sb[0] && $sa[1] == $sb[1]) ? 1 : 0;
 }
 
 sub _read_id {

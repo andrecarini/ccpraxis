@@ -92,8 +92,10 @@ sub code_of { my ($s) = @_; return join "\n", grep { !/^\s*#/ } split /\n/, ($s 
         'W3 the preset drift check reads the declined version');
     like($code, qr/push \@STALE_REASONS, "  - Container settings\.json upstream changed since last sandbox refresh"\s*\n\s*if \$SETTINGS_DRIFT eq 'changed';/,
         'W3 a declined preset version is not a stale reason');
-    like($code, qr/if \(defined \$answer && \$answer eq 'continue'\) \{\s*_write_file\(\$SETTINGS_DECLINED_FILE,\s*"\$CURRENT_SETTINGS_HASH\\n"\)\s*if \$SETTINGS_DRIFT eq 'changed';/,
+    like($code, qr/if \(defined \$answer && \$answer eq 'continue' && \$ANSWER_WAS_INTERACTIVE\) \{\s*_write_file\(\$SETTINGS_DECLINED_FILE,\s*"\$CURRENT_SETTINGS_HASH\\n"\)\s*if \$SETTINGS_DRIFT eq 'changed';/,
         'W3 "Continue" over a preset change remembers that version');
+    like($code, qr/my \$ANSWER_WAS_INTERACTIVE = \(\(\$LAUNCH_MODE ne 'plain' && \$LAUNCH_HOST && \$LAUNCH_HOST->\{active\}\) \|\| -t STDIN\) \? 1 : 0;/,
+        'W3 ... only when somebody answered (a screen or a terminal), never a headless EOF default');
     my $plan_at     = index($SRC, 'my $PLAN = decide_launch_plan(');
     my $declined_at = index($SRC, "_write_file(\$SETTINGS_DECLINED_FILE");
     ok($plan_at > 0 && $declined_at > $plan_at, 'W3 ... after the answer is in');

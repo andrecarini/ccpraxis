@@ -152,7 +152,7 @@ sub run_merge {
     is($r->{status}, 'replaced_unreadable', 'unparseable sandbox file: replaced');
     is(raw($r->{backup}), "{ not json\n", '... after a backup of exactly what was there');
     is_deeply(json($s->{target}), { a => 1 }, '... with the preset');
-    like($r->{warning}, qr/did not parse/, '... and a warning to show');
+    like($r->{warning}, qr/could not be used/, '... and a warning to show');
 }
 {
     my $s = sandbox();
@@ -164,6 +164,39 @@ sub run_merge {
     is_deeply(json($s->{target}), { a => 5 }, '... the sandbox file is left alone');
     is_deeply(json($s->{base}), { a => 0 }, '... and the base does not move, so the next create tries again');
     ok(!$r->{base_recorded}, '... base_recorded is 0');
+}
+
+# ---------------------------------------------------------------------------
+# a symbolic link the container put in place of a file is never followed: it
+# is resolved on the HOST, so reading it would copy a host file of the
+# sandbox's choosing into a backup the sandbox can read
+# ---------------------------------------------------------------------------
+SKIP: {
+    skip 'symbolic links are not available on this host', 9
+        unless eval { symlink('', ''); 1 } && $^O !~ /^(MSWin32|cygwin|msys)$/;
+    my $s = sandbox();
+    my $secret = "$s->{root}/host-secret";
+    put($secret, "PRIVATE KEY\n");
+    put($s->{preset}, { a => 1 });
+    put($s->{last_render}, "render\n");
+    symlink($secret, $s->{target}) or die "symlink: $!";
+    symlink($secret, $s->{md}) or die "symlink: $!";
+    my $mk = SandboxSettings::backup_dir_maker($s->{launcher}, 1_800_000_000);
+    my $md = SandboxSettings::refresh_claude_md(target => $s->{md}, last_render => $s->{last_render},
+                                                render => "render2\n", backup_dir => $mk);
+    my $st = SandboxSettings::merge_settings(target => $s->{target}, base => $s->{base},
+                                             preset => $s->{preset}, backup_dir => $mk);
+    ok(-l $md->{backup}, 'symlinked CLAUDE.md: the link itself is moved into the backup');
+    is(readlink($md->{backup}), $secret, '... still pointing where it pointed');
+    ok(!-l $s->{md} && raw($s->{md}) eq "render2\n", '... and CLAUDE.md is a plain file with the render');
+    is($st->{status}, 'replaced_unreadable', 'symlinked settings.json: treated as unusable');
+    ok(-l $st->{backup}, '... the link moved into the backup, not its target copied');
+    ok(!-l $s->{target} && json($s->{target})->{a} == 1, '... settings.json is a plain file with the preset');
+    is(raw($secret), "PRIVATE KEY\n", 'the host file was neither read into a backup nor written through');
+    my @copies = grep { -f $_ && !-l $_ } glob(SandboxSettings::backups_root($s->{launcher}) . '/*/*');
+    is(scalar(@copies), 0, 'no backup holds a copy of the host file');
+    my ($d, $err) = SandboxSettings::read_json($st->{backup});
+    like($err // '', qr/symbolic link/, 'read_json refuses a symbolic link');
 }
 
 # ---------------------------------------------------------------------------
