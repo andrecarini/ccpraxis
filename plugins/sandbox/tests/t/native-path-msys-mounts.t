@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# platform: any
 # native_path: a real host path handed to a native Windows program must arrive
 # in a form Windows resolves to the same file.
 #

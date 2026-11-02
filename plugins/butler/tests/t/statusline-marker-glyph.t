@@ -468,9 +468,16 @@ for my $sb (0, 1) {
 # AC12 -- %GLYPH_COLS does NOT gain an entry for 0x25CF or 0x25CB.
 # ===========================================================================
 {
+    # Scoped to the %GLYPH_COLS literal (2026-11-02). It used to forbid the two
+    # codepoints anywhere in the file, which was a fair proxy while the glyphs
+    # were "\x{25CF}" literals; since e6095b5 every glyph is emitted through
+    # _g(0xHHHH) so Theme.pm's per-glyph pad applies, and the codepoint now
+    # appears at its render site as data. The width table is what AC12 guards.
     my $src = slurp_raw($STATUSLINE_SRC);
-    unlike($src, qr/0x25CF/i, 'AC12: scripts/statusline.pl does not add 0x25CF to %GLYPH_COLS (or anywhere else)');
-    unlike($src, qr/0x25CB/i, 'AC12: scripts/statusline.pl does not add 0x25CB to %GLYPH_COLS (or anywhere else)');
+    my ($cols) = $src =~ /(my %GLYPH_COLS = \(.*?\n\);)/s;
+    ok(defined $cols, 'AC12: the %GLYPH_COLS literal is found');
+    unlike($cols // '', qr/0x25CF/i, 'AC12: scripts/statusline.pl does not add 0x25CF to %GLYPH_COLS');
+    unlike($cols // '', qr/0x25CB/i, 'AC12: scripts/statusline.pl does not add 0x25CB to %GLYPH_COLS');
 }
 
 # ===========================================================================
