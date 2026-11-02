@@ -295,21 +295,21 @@ sub probe_source {
     return (defined $ps && ($ps eq 'ac' || $ps eq 'dc')) ? $ps : 'unknown';
 }
 
-# _probe_darwin() -> 'ac' | 'dc' | 'unknown' -- one bounded `pmset -g ps`.
+# _probe_darwin() -> 'ac' | 'dc' | 'unknown' -- the sandbox plugin's
+# KeepAwake::power_source: one bounded `pmset -g ps`, the same read the macOS
+# wake-lock holder makes every two seconds to drop caffeinate on battery, so
+# the AC-loss watch and the holder can never disagree about the power source.
 # Refused under a .t and under CCPRAXIS_NO_WAKELOCK, the same rule (and the
 # same reason) as BpPowerJournal::probe_argv on Windows: a test must read the
 # probe-file seam, never the real machine's power source.
 sub _probe_darwin {
     return 'unknown' if defined $0 && $0 =~ /\.t\z/;
     return 'unknown' if $ENV{CCPRAXIS_NO_WAKELOCK};
-    my $ok = eval {
-        require "$DIR/BpPowerJournal.pm" unless defined &BpPowerJournal::run_bounded;
-        1;
-    };
-    return 'unknown' unless $ok;
-    my $r = eval { BpPowerJournal::run_bounded(['pmset', '-g', 'ps'], 10) };
-    return 'unknown' unless ref $r eq 'HASH' && ($r->{status} // '') eq 'ok' && ($r->{rc} // 1) == 0;
-    return parse_pmset_ps($r->{out});
+    unless (defined &KeepAwake::power_source) {
+        my $p = "$DIR/../../sandbox/scripts/KeepAwake.pm";
+        return 'unknown' unless -f $p && eval { require $p; 1 } && defined &KeepAwake::power_source;
+    }
+    return KeepAwake::power_source();
 }
 
 # parse_pmset_ps($text) -> 'ac' | 'dc' | 'unknown'. PURE. The parser is the
