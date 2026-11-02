@@ -156,6 +156,15 @@
       "supported_envs": ["sandbox-linux"],
       "implement_hint": "Build the sandbox image rootful (device nodes need mknod outside a user namespace); until then jailed workers get empty-file stand-ins, and bp-jail.pl warns when it creates a jail.",
       "surface": "preflight"
+    },
+    {
+      "id": "power.sleep_intact",
+      "what": "The Mac's sleep rule holds: no caffeinate takes effect off AC power, and closing the lid always sleeps the Mac (operator rule, 2026-10-30).",
+      "expected_contract": "`pmset -g` does not show SleepDisabled 1, and no caffeinate holding -s, -d or -u runs under a ccpraxis process or a Claude Code session. ccpraxis's own holder (KeepAwake::hold_main) takes only `caffeinate -i -w <holder>`, and only on AC; Claude Code's own `caffeinate -i -t 300` holds only -i.",
+      "check": "Read `pmset -g` and `ps -axo pid=,ppid=,command=` (BpKeepAwake::sleep_override_findings). A finding is a WARNING, never a failure: the settings are the operator's.",
+      "supported_envs": ["macos"],
+      "implement_hint": "Undo `pmset disablesleep 1` with `sudo pmset -a disablesleep 0`; stop the reported caffeinate. On another OS there is no lid rule to check.",
+      "surface": "preflight"
     }
   ]
 }

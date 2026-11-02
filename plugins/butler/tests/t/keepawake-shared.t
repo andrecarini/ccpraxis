@@ -33,6 +33,7 @@ use FindBin qw($Bin);
 use Test::More;
 use File::Temp qw(tempdir);
 use Time::HiRes ();
+use JSON::PP ();
 
 # Canonical, so BpContinuityLease's own require of bp-keepawake.pl (by its
 # abs_path) finds this one already loaded instead of compiling it twice.
@@ -284,6 +285,7 @@ SKIP: {
     ok($wait_for->(sub { $slurp->($log_f) =~ /pid=$h ASSERTED/ }, 5),
         'holder: logs ASSERTED once caffeinate is up on AC (what replace() waits for)');
     is($slurp->($pid_f), "$h\n", 'holder: writes ITS OWN pid into the pid file, as keep-awake.ps1 does');
+    $wait_for->(sub { $slurp->($args) =~ /\n\d+\n\z/ }, 5);   # the fake writes its argv a moment after exec
     is($slurp->($args), "-i\n-w\n$h\n",
         'holder: runs caffeinate -i -w <holder pid> and nothing more: no -s/-d/-u/-m, so a closed lid still sleeps the Mac');
     is(join("\n", (KeepAwake::caffeinate_argv($fake, $h))[1 .. 3]) . "\n", $slurp->($args),
@@ -379,6 +381,49 @@ SKIP: {
     open my $p, '>', "$d/ps" or die $!; print {$p} "AC\n"; close $p;
     local $ENV{CCPRAXIS_AC_PROBE_FILE} = "$d/ps";
     is(KeepAwake::power_source(), 'ac', 'power_source: the seam file is read, case-insensitively');
+}
+
+# ---- the macOS doctor (bp-preflight.pl power.sleep_intact) ---------------------
+# What could still break the operator's sleep rule behind ccpraxis's back:
+# SleepDisabled, or a caffeinate holding -s/-d/-u under ccpraxis or a Claude
+# Code session. Pure parsers, both reads seamed.
+{
+    my $pm_ok = "System-wide power settings:\nCurrently in use:\n standby              1\n sleep                1 (sleep prevented by caffeinate, powerd)\n";
+    my $pm_bad = "System-wide power settings:\n SleepDisabled\t\t1\nCurrently in use:\n sleep 1\n";
+    is(BpKeepAwake::pmset_sleep_disabled($pm_ok), 0, 'doctor: an ordinary pmset -g has no SleepDisabled');
+    is(BpKeepAwake::pmset_sleep_disabled($pm_bad), 1, 'doctor: pmset disablesleep 1 is seen');
+    is(BpKeepAwake::pmset_sleep_disabled(" SleepDisabled 0\n"), 0, 'doctor: SleepDisabled 0 is fine');
+    is(BpKeepAwake::caffeinate_flags('caffeinate -i -s -m -t 50400'), 'ism', 'doctor: flags of the incident caffeinate');
+    is(BpKeepAwake::caffeinate_flags('/usr/bin/caffeinate -dims make'), 'dims', 'doctor: a clustered flag word, then the utility');
+    is(BpKeepAwake::caffeinate_flags('caffeinate -i -w 4242'), 'i', 'doctor: -w takes a value');
+    my $ps = join("\n",
+        '    1     0 /sbin/launchd',
+        ' 5448     1 claude',
+        ' 6000  5448 /bin/zsh -c caffeinate -i -s -m -t 50400',
+        ' 6001  6000 caffeinate -i -s -m -t 50400',          # an agent's hand-run one: reported
+        '88224  5448 caffeinate -i -t 300',                 # Claude Code's own: -i only, never reported
+        ' 7000     1 /usr/bin/perl /Users/x/.claude/ccpraxis/plugins/butler/scripts/bp-keepawake.pl hold --pid-file k.pid',
+        ' 7001  7000 /usr/bin/caffeinate -i -w 7000',       # ccpraxis's own, by the rule: not reported
+        ' 7100     1 /usr/bin/perl /Users/x/.claude/ccpraxis/plugins/sandbox/scripts/launcher.pl',
+        ' 7101  7100 /usr/bin/caffeinate -i -s -w 7100',    # an old launcher lock from before the rule: reported
+        ' 8000     1 /bin/zsh',
+        ' 8001  8000 caffeinate -d',                        # the operator's own, outside ccpraxis: not ours to report
+        '');
+    my @o = BpKeepAwake::caffeinate_overrides($ps);
+    is_deeply([map { $_->{pid} } @o], [6001, 7101], 'doctor: reports only -s/-d/-u under ccpraxis or a Claude Code session');
+    is($o[0]{flags}, 's', 'doctor: the hand-run one holds -s');
+    like($o[0]{owner}, qr/^a Claude Code session \(pid 5448\)$/, 'doctor: ...under the claude process');
+    like($o[1]{owner}, qr/^ccpraxis \(pid 7100\)$/, 'doctor: the old launcher lock is ccpraxis\'s');
+    my @f = BpKeepAwake::sleep_override_findings(pmset_g => sub { $pm_bad }, ps => sub { $ps });
+    is(scalar(@f), 3, 'doctor: SleepDisabled plus two overriding caffeinates make three findings');
+    like($f[0], qr/^pmset reports SleepDisabled 1: /, 'doctor: SleepDisabled first, with how to undo it');
+    like($f[1], qr/^caffeinate pid 6001 holds -s under a Claude Code session/, 'doctor: names pid, flags and owner');
+    is_deeply([BpKeepAwake::sleep_override_findings(pmset_g => sub { $pm_ok }, ps => sub { "88224  5448 caffeinate -i -t 300\n 5448 1 claude\n" })],
+        [], 'doctor: a clean Mac with Claude Code\'s own caffeinate has no findings');
+    my $aj = do { open my $h, '<:raw', "$S/../docs/assumptions.json" or die $!; local $/; JSON::PP->new->decode(<$h>) };
+    my ($a) = grep { $_->{id} eq 'power.sleep_intact' } @{ $aj->{assumptions} };
+    ok($a, 'doctor: assumptions.json registers power.sleep_intact for bp-preflight.pl');
+    is_deeply($a && $a->{supported_envs}, ['macos'], 'doctor: macOS only (no lid rule to check elsewhere)');
 }
 
 done_testing();

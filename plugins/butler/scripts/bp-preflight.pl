@@ -218,6 +218,18 @@ my %CHECK = (
         ('warn', BpJailDevices::warning_text($st->{stand_ins}, $st->{reason}));
     } },
 
+    'power.sleep_intact' => { run => sub {
+        # The operator's sleep rule on a Mac: no caffeinate off AC power, and a
+        # closed lid always sleeps it. ccpraxis's own holder obeys it by
+        # construction; this reports what could still break it
+        # (BpKeepAwake::sleep_override_findings). A warning, never a failure:
+        # it is the operator's machine to set, and nothing here changes it.
+        require "$Bin/bp-keepawake.pl";
+        my @f = BpKeepAwake::sleep_override_findings();
+        return ('warn', join(' | ', @f)) if @f;
+        ('ok', 'sleep rule intact: SleepDisabled is not set, and no caffeinate holds -s/-d/-u under ccpraxis or a Claude Code session');
+    } },
+
     'harness.wake' => { run => sub {
         ('skip', 'harness property (proven in A0); bounded long-poll + re-arm is the robust fallback');
     } },

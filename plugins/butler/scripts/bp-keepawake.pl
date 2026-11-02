@@ -901,6 +901,110 @@ sub apply {
     }
 }
 
+# ---------------------------------------------------------------------------
+# DOCTOR (macOS): is anything overriding the operator's sleep rule?
+#
+# The rule (2026-10-30): no caffeinate may take effect off AC power, and
+# closing the lid must always sleep the Mac. ccpraxis's own holder obeys it by
+# construction (KeepAwake: `caffeinate -i -w`, AC only), and the Bash-tool
+# guard stops a session reaching around it. Two things can still break it
+# without either noticing, so bp-preflight.pl reports them as a warning:
+#
+#   - `pmset -g` shows SleepDisabled 1 (`pmset disablesleep 1`, from anyone):
+#     the Mac then sleeps neither on lid close nor on battery;
+#   - a caffeinate holding -s (system sleep: a closed lid on AC), -d
+#     (display) or -u (user activity) runs under a ccpraxis process or a
+#     Claude Code session -- an old holder from before the rule, or one an
+#     agent started by hand. Claude Code's own `caffeinate -i -t 300`, a
+#     child of the claude process, holds only -i and is not reported.
+#
+# Pure parsers below, with the two reads behind seams; nothing here changes
+# any setting or signals any process.
+# ---------------------------------------------------------------------------
+
+# pmset_sleep_disabled($pmset_g_text) -> 0|1
+sub pmset_sleep_disabled {
+    my ($t) = @_;
+    return 0 unless defined $t && !ref $t;
+    return $t =~ /^[ \t]*SleepDisabled[ \t]+1\b/m ? 1 : 0;
+}
+
+my $CCPRAXIS_PROC = qr{bp-keepawake\.pl|KeepAwake\.pm|launcher\.pl|BpContinuityLease\.pm|claude-sandbox|/\.claude/ccpraxis/|/plugins/(?:butler|sandbox)/};
+my $CLAUDE_PROC   = qr{(?:\A|/)claude(?:\s|\z)|\@anthropic-ai/claude-code};
+
+# caffeinate_flags($command_line) -> the assertion letters it holds (e.g.
+# 'dims'), from its options up to the first operand; -t and -w take a value.
+sub caffeinate_flags {
+    my ($cmd) = @_;
+    return '' unless defined $cmd;
+    my @w = split ' ', $cmd;
+    shift @w;
+    my $letters = '';
+    while (@w && $w[0] =~ /\A-([A-Za-z]+)\z/) {
+        my $cl = $1;
+        shift @w;
+        $letters .= $cl;
+        shift @w if $cl =~ /[tw]\z/ && @w;   # -t <secs>, -w <pid>
+    }
+    $letters =~ s/[tw]//g;
+    return $letters;
+}
+
+# caffeinate_overrides($ps_text) -> list of { pid, flags, owner } for every
+# caffeinate holding -s, -d or -u whose ancestry includes a ccpraxis process
+# or a Claude Code session. $ps_text is `ps -axo pid=,ppid=,command=`.
+sub caffeinate_overrides {
+    my ($ps) = @_;
+    return () unless defined $ps && !ref $ps;
+    my (%cmd, %ppid);
+    for my $line (split /\r?\n/, $ps) {
+        next unless $line =~ /\A\s*(\d+)\s+(\d+)\s+(.*?)\s*\z/;
+        ($ppid{$1}, $cmd{$1}) = ($2, $3);
+    }
+    my @out;
+    for my $pid (sort { $a <=> $b } keys %cmd) {
+        my ($word) = split ' ', $cmd{$pid};
+        next unless defined $word && $word =~ m{(?:\A|/)caffeinate\z};
+        (my $bad = caffeinate_flags($cmd{$pid})) =~ s/[^sdu]//g;
+        next unless length $bad;
+        my ($owner, $p, %seen) = (undef, $ppid{$pid});
+        while (defined $p && $p > 1 && !$seen{$p}++ && defined $cmd{$p}) {
+            if    ($cmd{$p} =~ $CCPRAXIS_PROC) { $owner = "ccpraxis (pid $p)";             last }
+            elsif ($cmd{$p} =~ $CLAUDE_PROC)   { $owner = "a Claude Code session (pid $p)"; last }
+            $p = $ppid{$p};
+        }
+        next unless defined $owner;
+        my %u; my $flags = join '', grep { !$u{$_}++ } split //, $bad;
+        push @out, { pid => $pid, flags => $flags, owner => $owner };
+    }
+    return @out;
+}
+
+sub _doctor_read {
+    my ($argv) = @_;
+    my $ok = eval { require "$DIR/BpPowerJournal.pm" unless defined &BpPowerJournal::run_bounded; 1 };
+    return '' unless $ok;
+    my $r = eval { BpPowerJournal::run_bounded($argv, 5) };
+    return '' unless ref $r eq 'HASH' && ($r->{status} // '') eq 'ok';
+    return $r->{out} // '';
+}
+
+# sleep_override_findings(%seams) -> list of one-line findings; empty when the
+# rule holds. %seams: pmset_g => sub { text }, ps => sub { text }.
+sub sleep_override_findings {
+    my (%o) = @_;
+    my $pm = $o{pmset_g} ? $o{pmset_g}->() : _doctor_read([-x '/usr/bin/pmset' ? '/usr/bin/pmset' : 'pmset', '-g']);
+    my $ps = $o{ps}      ? $o{ps}->()      : _doctor_read([-x '/bin/ps' ? '/bin/ps' : 'ps', '-axo', 'pid=,ppid=,command=']);
+    my @f;
+    push @f, 'pmset reports SleepDisabled 1: this Mac sleeps neither with the lid closed nor on battery '
+           . '(sudo pmset -a disablesleep 0 restores it)' if pmset_sleep_disabled($pm);
+    for my $c (caffeinate_overrides($ps)) {
+        push @f, sprintf('caffeinate pid %d holds -%s under %s: -s keeps a lid-closed Mac awake on AC, '
+                       . '-d/-u keep the display awake; ccpraxis takes only -i, on AC', $c->{pid}, $c->{flags}, $c->{owner});
+    }
+    return @f;
+}
+
 # _note_unavailable($dir, $log) -- a host that should hold a wake-lock and
 # cannot says so ONCE, not on every director tick. The marker beside the pid
 # file is the "already said" flag; a later successful spawn clears it, so a
