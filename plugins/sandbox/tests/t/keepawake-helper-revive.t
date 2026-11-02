@@ -135,7 +135,7 @@ ok(defined $tick, 'before the probe-failed gate, so a held-through probe failure
 like($SRC, qr/log_ev\('keepawake_died', .{0,300}?helper_last => _keepawake_log_tail/s,
      'a death is logged with the helper\'s own last line');
 my ($start) = $SRC =~ /(sub _keepawake_start \{.*?\n\})/s;
-like($start // '', qr/\@log_args = \('-LogFile', winify_path\(\$logfile\)\)/, 'the helper always gets -LogFile');
+like($start // '', qr/\@log_args = \('-LogFile', native_path\(\$logfile\)\)/, 'the helper always gets -LogFile');
 like($start // '', qr/rename\(\$logfile, "\$logfile\.1"\) if defined \$sz && \$sz > 1024 \* 1024/, 'rotated past 1 MB');
 like($start // '', qr/\@owner_args, \@log_args\)/, 'and the log args reach the exec');
 

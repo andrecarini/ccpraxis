@@ -16,7 +16,7 @@ use Exporter qw(import);
 use Fcntl qw(O_WRONLY O_CREAT O_EXCL);
 use JSON::PP ();
 
-our @EXPORT_OK = qw(winify_path v_to_mount convert_v_to_mount
+our @EXPORT_OK = qw(winify_path native_path v_to_mount convert_v_to_mount
     claude_home_create_args parse_create_args parse_inspect_lines
     audit_claude_home ensure_global_counts_file);
 
@@ -31,6 +31,27 @@ sub winify_path {
     return $p unless $WINDOWS_FAMILY;
     $p =~ s|^/([a-zA-Z])/|$1:/|;
     return $p;
+}
+
+# native_path($p) -> the Windows form of a REAL host path, for a native
+# program (powershell.exe) that must open it. winify_path only rewrites the
+# /<drive>/ prefix and passes every other POSIX path through, by design (a
+# mount spec's /host is not a host file). A path under an MSYS mount such as
+# /tmp then reaches the native side bare, Windows resolves the leading / to
+# C:\tmp\..., and the file is never written: the keep-awake helper could not
+# write its pidfile there, exited, and was respawned once a minute, each spawn
+# a hidden powershell.exe that could minimize the operator's terminal (bug
+# 20261102). Ask the MSYS runtime for the real location instead; forward
+# slashes, which every native caller here accepts. No-op off Windows.
+sub native_path {
+    my $p = shift;
+    return $p unless defined $p && length $p;
+    return $p unless $WINDOWS_FAMILY;
+    return winify_path($p) if $p !~ m{^/} || $p =~ m{^/[a-zA-Z]/};
+    my $w = defined &Cygwin::posix_to_win_path ? Cygwin::posix_to_win_path($p, 1) : undef;
+    return winify_path($p) unless defined $w && length $w;
+    $w =~ s{\\}{/}g;
+    return $w;
 }
 
 # Rewrite one `SOURCE:TARGET[:OPTS]` spec into the comma-separated

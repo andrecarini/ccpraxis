@@ -44,7 +44,7 @@ BEGIN {
     my $dir = dirname($here);
     unshift @INC, $dir;
 }
-use MountSpec qw(winify_path v_to_mount convert_v_to_mount);
+use MountSpec qw(winify_path native_path v_to_mount convert_v_to_mount);
 use CcpraxisWorkCopy qw(workcopy_route workcopy_refusal_outcome);
 use ProtectedPaths qw(path_relation protected_roots target_self_codes normalize_path);
 use RefusalMarker ();  # .claude-sandbox-refuse markers: refuse before anything is written
@@ -7368,8 +7368,8 @@ sub _keepawake_start {
         log_ev('keepawake_start_failed', { reason => "helper missing: $ps1" });
         return undef;
     }
-    my $win_ps1 = winify_path($ps1);
-    my $win_pid = winify_path($pidfile);
+    my $win_ps1 = native_path($ps1);
+    my $win_pid = native_path($pidfile);
     # The helper logs every state change and a HOLD line a minute. Without a log
     # its RELEASE reason was lost, and a helper that vanished mid-run could not
     # be explained (bug 20261031-225228-4eca). Rotated here, at start, past 1 MB
@@ -7378,7 +7378,7 @@ sub _keepawake_start {
     if (defined $logfile && length $logfile) {
         my $sz = -s $logfile;
         rename($logfile, "$logfile.1") if defined $sz && $sz > 1024 * 1024;
-        @log_args = ('-LogFile', winify_path($logfile));
+        @log_args = ('-LogFile', native_path($logfile));
     }
     # The helper's owner is THIS launcher, named by its WINDOWS pid so the helper
     # can tell a quiet owner from a gone one (keep-awake.ps1 -OwnerWinPid,
