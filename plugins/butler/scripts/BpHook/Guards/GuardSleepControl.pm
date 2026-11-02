@@ -37,10 +37,12 @@
 # timeout, time, command, exec, builtin, stdbuf, noglob, nocorrect), and each
 # command word is reduced the way the shell resolves it: a path, zsh's
 # `=name`, `\name`, a `.exe` suffix, any letter case (macOS and Windows find
-# commands case-insensitively). On top of that walk: xargs and doas as
-# wrappers, PowerShell's -Command text, a text scan where a shell reads a
-# heredoc or a pipe, interpreter one-liners that exec something, and a
-# command word nobody can resolve ($c) in a command that names a target.
+# commands case-insensitively). On top of that walk: xargs, doas and the
+# %WRAPPER commands (screen, tmux, launchctl, find -exec, su -c, cmd /c, ...),
+# `env -S` and `exec -a`, PowerShell's -Command text, a heredoc or pipe into a
+# shell (read as commands), interpreter one-liners that exec a target, and a
+# command word nobody can resolve ($c) in a command that names a target. The
+# hook's text prefilter sees only literal names: `caf""feinate` never reaches perl.
 #
 # A GUIDANCE GUARD, NOT A SANDBOX. A cooperating agent's every ordinary
 # spelling is denied; an adversary with a shell can always reach a binary
@@ -80,11 +82,26 @@ my %POWERCFG_READ = map { $_ => 1 } qw(
 
 my %SHELL = map { $_ => 1 } qw(sh bash zsh ksh dash);
 
-# Interpreter one-liners: the code argument is only scanned when the code
-# also execs something, so `perl -ne 'print if /caffeinate/'` stays allowed.
+# Commands that run another command given in their arguments, beyond the
+# wrappers GuardBash's walker already unwraps (env, sudo, nohup, nice,
+# timeout, time, command, exec, builtin, stdbuf, noglob, nocorrect) and xargs
+# and doas below. Their arguments are searched for a target command word, and
+# an argument with spaces in it is read as a command line of its own.
+my %WRAPPER = map { $_ => 1 } qw(
+    screen tmux launchctl script find arch xcrun watch taskpolicy coproc repeat
+    su chroot unbuffer parallel cmd runas
+);
+
+# The command words _classify knows, for the wrapper search.
+my %TARGET = map { $_ => 1 } qw(caffeinate pmset powercfg systemd-inhibit systemsetup pkill killall perl bp-keepawake.pl keepawake.pm);
+
+# Interpreter one-liners: the code argument is only searched when the code
+# also execs something, and then only for a target that STARTS a string or a
+# quoted command (system("caffeinate ..."), ["caffeinate", ...], `caffeinate`,
+# qx{caffeinate}), so `perl -ne 'print if /caffeinate/'` stays allowed.
 my %ONE_LINER = (perl => qr/^-[A-Za-z]*[eE]$/, ruby => qr/^-[A-Za-z]*e$/, node => qr/^-(?:e|-eval|p|-print)$/,
                  python => qr/^-[A-Za-z]*c$/, python3 => qr/^-[A-Za-z]*c$/, osascript => qr/^-e$/);
-my $EXEC_PRIMITIVE = qr/\b(?:system|exec|qx|popen|spawn|subprocess|child_process|execSync|spawnSync|Start-Process)\b|do shell script|\x60|%x[\[({]/i;
+my $EXEC_PRIMITIVE = qr/\b(?:system|exec\w*|qx|popen\w*|spawn\w*|subprocess|child_process|Start-Process)\b|do shell script|\x60|%x[\[({]/i;
 
 # _cmd_name($word) -> the command a shell runs for this word, folded to lower
 # case (an over-fold on a case-sensitive host only ever over-denies a command
@@ -144,6 +161,12 @@ sub _classify {
         }
         return { what => 'powercfg ' . (defined $v ? $v : '(an unresolvable argument)'), hint => 'powercfg' };
     }
+    # macOS's other way to the same settings: -set<...>sleep writes them.
+    if ($name eq 'systemsetup') {
+        my ($set) = grep { defined $_ && /\A-set\w*sleep/i } @lit;
+        return { what => "systemsetup $set", hint => 'systemsetup' } if defined $set;
+        return undef;
+    }
     # Killing caffeinate is toggling it off by hand: it takes down the managed
     # lock and Claude Code's own assertion along with any hand-run one.
     if (($name eq 'pkill' || $name eq 'killall') && grep { defined $_ && /caffeinate/i } @lit) {
@@ -155,31 +178,47 @@ sub _classify {
     }
     # A ccpraxis keep-awake holder started by hand, run directly or through
     # perl: the managed lock is the lease's to take and release.
-    my @script = ($name, map { defined $_ ? _basename($_) : '' } @lit);
-    if ($name =~ /\Aperl/) { shift @script; shift @script while @script && $script[0] =~ /\A-/ }
+    my @rest = @lit;
+    if ($name =~ /\Aperl/) {
+        while (@rest && defined $rest[0] && $rest[0] =~ /\A-/) {
+            my $opt = shift @rest;
+            shift @rest if $opt =~ /\A-[IMmx]\z/ && @rest;   # an option with a separate value
+        }
+    } else {
+        unshift @rest, $name;
+    }
+    my @script = map { defined $_ ? _basename($_) : '' } @rest;
     if (@script >= 2 && ($script[0] eq 'bp-keepawake.pl' || $script[0] eq 'keepawake.pm') && $script[1] eq 'hold') {
         return { what => 'a hand-started keep-awake holder (' . $script[0] . ' hold)' };
     }
     return undef;
 }
 
-# _scan_text($text) -> { what, hint } | undef. For text a shell will read that
-# the walker cannot see as commands (a heredoc or pipe into a shell, an
-# interpreter one-liner, an unresolvable command word): any mention, in a
-# command-ish position, of a target that is not one of the read forms.
+# _scan_text($text, $mode) -> { what, hint } | undef. For text the walker
+# cannot see as commands. $mode:
+#   'shell' (default)  a target at a word start (after a separator, a space,
+#                      a quote, '=' or a path) -- PowerShell -Command text and
+#                      a comment-free command with an unresolvable command word;
+#   'code'             a target that starts a string or a quoted command in an
+#                      interpreter one-liner that execs something.
+# keep-awake.ps1 counts only where it is run (-File, &, Start-Process, a
+# powershell argument), SetThreadExecutionState only where it is called or
+# declared (`SetThreadExecutionState(`): a mention reads as a mention.
 sub _scan_text {
-    my ($t) = @_;
+    my ($t, $mode) = @_;
     return undef unless defined $t && length $t;
-    my $A = '(?:^|[;&|\s\'"\x60({=/\\\\])';
-    return { what => 'caffeinate' } if $t =~ /${A}caffeinate(?:\.exe)?(?![\w.-])/i;
+    my $A = ($mode // 'shell') eq 'code'
+        ? '(?:["\'\x60(\[{,]\s*|\bq[qwx]?\s*[{(\[\/|!<]\s*)(?:[^\s"\'\x60]*\/)?'
+        : '(?:^|[;&|\s\'"\x60({=\/\\\\])';
+    return { what => 'caffeinate' } if $t =~ /${A}caffeinate(?:\.exe)?(?![\w.-])/im;
     return { what => 'systemd-inhibit', hint => 'systemd-inhibit' }
-        if $t =~ /${A}systemd-inhibit(?![\w.-])(?![ \t]+(?:--list|-h|--help|--version)\s*(?:$|[;&|)'"]))/im;
-    while ($t =~ /${A}pmset(?![\w.-])[ \t]*([^\s;&|)'"]*)/gi) {
+        if $t =~ /${A}systemd-inhibit(?![\w.-])(?![\s"',]+(?:--list|-h|--help|--version)\s*(?:$|[;&|)'"\]]))/im;
+    while ($t =~ /${A}pmset(?![\w.-])[ \t"',]*([^\s;&|)'",\]]*)/gim) {
         my $arg = $1;
         next if $arg =~ /\A-g/ || $arg eq '';
         return { what => "pmset $arg", hint => 'pmset' };
     }
-    while ($t =~ /${A}powercfg(?:\.exe)?(?![\w.-])[ \t]*([^\s;&|)'"]*)([ \t]+[^\s;&|)'"])?/gi) {
+    while ($t =~ /${A}powercfg(?:\.exe)?(?![\w.-])[ \t"',]*([^\s;&|)'",\]]*)([ \t"',]+[^\s;&|)'",\]])?/gim) {
         my ($arg, $more) = ($1, $2);
         next if $arg eq '';
         (my $k = lc $arg) =~ s{\A[/-]+}{};
@@ -187,8 +226,9 @@ sub _scan_text {
         next if $k eq 'requestsoverride' && !defined $more;
         return { what => "powercfg $arg", hint => 'powercfg' };
     }
-    return { what => 'SetThreadExecutionState' } if $t =~ /SetThreadExecutionState/i;
-    return { what => 'a hand-started keep-awake helper (keep-awake.ps1)' } if $t =~ /keep-awake\.ps1/i;
+    return { what => 'SetThreadExecutionState' } if $t =~ /SetThreadExecutionState\s*\(/i;
+    return { what => 'a hand-started keep-awake helper (keep-awake.ps1)' }
+        if $t =~ /(?:-File\s+|&\s*|Start-Process\b[^;|\n]*?|\b(?:powershell|pwsh)(?:\.exe)?\s+)['"]?[^\s'";|]*keep-awake\.ps1/i;
     return { what => 'a hand-started keep-awake holder (bp-keepawake.pl hold)' } if $t =~ /bp-keepawake\.pl\W+hold\b/i;
     return { what => 'a hand-started keep-awake holder (KeepAwake.pm hold)' } if $t =~ /KeepAwake\.pm\W+hold\b/i;
     return undef;
@@ -200,6 +240,67 @@ sub _scan_text {
 our $WALK_SECONDS = 2;
 our $DEADLINE_AT;
 
+# _heredoc_bodies($cmd) -> the text of each heredoc in $cmd (what a shell
+# reading it would run).
+sub _heredoc_bodies {
+    my ($cmd) = @_;
+    my @b;
+    while ($cmd =~ /<<-?[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_.-]*)\1[^\n]*\n(.*?)(?:\n[ \t]*\2[ \t]*(?:\n|\z)|\z)/gs) {
+        push @b, $3;
+    }
+    return @b;
+}
+
+# _on_path($word) -> 1 when $word names an executable (a path, or a name
+# found on PATH): the command a wrapper runs, after which the remaining words
+# are that command's own arguments.
+sub _on_path {
+    my ($w) = @_;
+    return 0 unless defined $w && length $w && $w !~ /\A-/;
+    return (-f $w && -x _) ? 1 : 0 if $w =~ m{[/\\]};
+    for my $d (split /:/, ($ENV{PATH} // '')) {
+        next unless length $d;
+        return 1 if -f "$d/$w" && -x _;
+    }
+    return 0;
+}
+
+# _search_args(\@words, $depth, $wrapper) -> hit | undef: a wrapper's
+# arguments, searched up to the command it runs. A target command word is
+# classified with the words after it; an argument holding a command line of
+# its own (`tmux new -d 'caffeinate -i'`) is read as one; the first other
+# executable ends the search, since what follows is its own arguments
+# (`watch grep caffeinate log` greps). find runs only what follows -exec,
+# -execdir, -ok and -okdir (`find . -exec grep caffeinate {} +` greps too).
+sub _search_args {
+    my ($words, $depth, $wrapper) = @_;
+    $wrapper //= '';
+    my $after_exec = 0;
+    for my $i (0 .. $#$words) {
+        my $l = _lit($words->[$i]);
+        next unless defined $l;
+        if ($wrapper eq 'find') {
+            if ($l =~ /\A-(?:exec|execdir|ok|okdir)\z/) { $after_exec = 1; next }
+            next unless $after_exec;
+            $after_exec = 0;
+        }
+        if ($l =~ /\s/) {
+            my $h = _verdict($l, $depth + 1);
+            return $h if $h;
+            next;
+        }
+        my $n = _cmd_name($words->[$i]);
+        if (defined $n && $TARGET{$n}) {
+            return _classify($n, [ @{$words}[$i + 1 .. $#$words] ]) unless $n eq 'perl';
+            my $h = _classify($n, [ @{$words}[$i + 1 .. $#$words] ]);
+            return $h if $h;
+            last;
+        }
+        last if $wrapper ne 'find' && _on_path($l);
+    }
+    return undef;
+}
+
 # _verdict($cmd, $depth) -> { what, hint } | undef for a whole command.
 sub _verdict {
     my ($cmd, $depth) = @_;
@@ -207,12 +308,26 @@ sub _verdict {
     return undef if $depth > 3 || !defined $cmd || !length $cmd;
     my @commands = BpHook::Guards::GuardBash::_hyg_commands($cmd, 0, $DEADLINE_AT);
     my $unresolved = 0;
+    my $stdin_shell = 0;
     for my $e (@commands) {
         next unless ref $e eq 'HASH';
         my $name = _cmd_name($e->{name});
         my @argv = @{ $e->{argv} || [] };
         if (!defined $name) {
             $unresolved = 1 if defined $e->{name};
+            next;
+        }
+        # A command word with spaces is a command line re-read by its wrapper
+        # (`env -S "caffeinate -i"`); an option where the command should be
+        # (`exec -a name caffeinate`) leaves the command among the arguments.
+        if ($name =~ /\s/) {
+            my $h = _verdict(_lit($e->{name}) // $name, $depth + 1);
+            return $h if $h;
+            next;
+        }
+        if ($name =~ /\A-/) {
+            my $h = _search_args(\@argv, $depth, 'exec');
+            return $h if $h;
             next;
         }
         # xargs and doas run the rest of their arguments as a command.
@@ -234,23 +349,21 @@ sub _verdict {
         my $hit = _classify($name, \@argv);
         return $hit if $hit;
 
+        if ($WRAPPER{$name}) {
+            my $h = _search_args(\@argv, $depth, $name);
+            return $h if $h;
+        }
         # PowerShell: its -Command text is commands too, and
         # SetThreadExecutionState / keep-awake.ps1 are what caffeinate is on a
         # Mac.
         if ($name =~ /\A(?:powershell|pwsh)\z/) {
-            my $text = join(' ', map { _raw_text($_) } @argv);
-            my $h = _scan_text($text);
+            my $h = _scan_text(join(' ', map { _raw_text($_) } @argv), 'shell');
             return $h if $h;
         }
-        # A shell reading a heredoc or a pipe: its commands are text the walker
-        # does not split, so scan that text (the whole command: a heredoc body
-        # is not in this segment).
+        # A shell reading its commands from stdin (no -c, no script operand).
         if ($SHELL{$name} && !defined BpHook::Guards::GuardBash::_hyg_find_shellc_script(\@argv)) {
             my $first_operand = (grep { my $l = _lit($_); !defined $l || $l !~ /\A[-+]/ } @argv)[0];
-            unless (defined $first_operand) {
-                my $h = _scan_text($cmd);
-                return $h if $h;
-            }
+            $stdin_shell = 1 unless defined $first_operand;
         }
         # Interpreter one-liners that exec something.
         if (my $flag_re = $ONE_LINER{$name}) {
@@ -259,15 +372,33 @@ sub _verdict {
                 next unless defined $l && $l =~ $flag_re;
                 my $code = defined $argv[$i + 1] ? _raw_text($argv[$i + 1]) : '';
                 next unless $code =~ $EXEC_PRIMITIVE;
-                my $h = _scan_text($code);
+                my $h = _scan_text($code, 'code');
                 return $h if $h;
             }
         }
     }
+    # A shell reading stdin runs a heredoc's body, or what a pipe feeds it:
+    # read the bodies as commands, else every argument of the other commands
+    # (`echo 'caffeinate -i' | sh`).
+    if ($stdin_shell) {
+        my @bodies = _heredoc_bodies($cmd);
+        unless (@bodies) {
+            for my $e (@commands) {
+                next unless ref $e eq 'HASH';
+                push @bodies, grep { defined && length } map { _lit($_) } @{ $e->{argv} || [] };
+            }
+            splice(@bodies, 50) if @bodies > 50;
+        }
+        for my $b (@bodies) {
+            my $h = _verdict($b, $depth + 1);
+            return $h if $h;
+        }
+    }
     # A command word nobody can resolve (`c=caffeinate; $c -i`) in a command
-    # that names a target: the target may be what runs.
+    # that names a target: the target may be what runs. Searched without its
+    # comments and heredoc bodies (BpHook::_segments drops both).
     if ($unresolved) {
-        my $h = _scan_text($cmd);
+        my $h = _scan_text(join("\n", grep { defined } eval { BpHook::_segments($cmd) }), 'shell');
         return $h if $h;
     }
     return undef;
@@ -295,6 +426,7 @@ my %HINT = (
     pmset             => 'Read-only pmset -g (pmset -g, -g ps, -g assertions, -g log) is allowed.',
     powercfg          => 'Read-only queries (powercfg /requests, /list, /query, /a, /lastwake) are allowed.',
     'systemd-inhibit' => 'systemd-inhibit --list is allowed.',
+    systemsetup       => 'Read-only systemsetup -get... (-getcomputersleep, -getdisplaysleep) is allowed.',
 );
 
 # ---------------------------------------------------------------------------

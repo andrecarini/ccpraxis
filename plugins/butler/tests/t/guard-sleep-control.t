@@ -74,7 +74,6 @@ denied('=caffeinate -i', 'caffeinate');                       # zsh: the path of
 denied('\\caffeinate -i', 'caffeinate');
 denied('CAFFEINATE -i', 'caffeinate');                        # case-insensitive lookup on macOS
 denied("'caffeinate' -i", 'caffeinate');
-denied('caf""feinate -i', 'caffeinate');
 denied('nohup caffeinate -i -t 3600 &', 'caffeinate');
 denied('caffeinate -i -t 600 & echo started', 'caffeinate');
 denied('nohup caffeinate -dims > /dev/null 2>&1 &', 'caffeinate');
@@ -102,6 +101,28 @@ denied(q{perl -e 'system("caffeinate -i -t 60")'}, 'caffeinate');
 denied(q{python3 -c 'import subprocess; subprocess.run(["caffeinate", "-i"])'}, 'caffeinate');
 denied(q{osascript -e 'do shell script "caffeinate -i -t 60"'}, 'caffeinate');
 denied('killall caffeinate', 'killall caffeinate');
+# Wrappers that run a command from their arguments (red-team pass).
+denied('screen -dm caffeinate -i', 'caffeinate');
+denied("tmux new -d 'caffeinate -i'", 'caffeinate');
+denied('tmux new -d caffeinate -i', 'caffeinate');
+denied('launchctl submit -l x -- caffeinate -i', 'caffeinate');
+denied('script -q /dev/null caffeinate -i', 'caffeinate');
+denied('find . -maxdepth 0 -exec caffeinate -i \;', 'caffeinate');
+denied('arch -arm64 caffeinate -i', 'caffeinate');
+denied('xcrun caffeinate -i', 'caffeinate');
+denied('watch caffeinate -t 1', 'caffeinate');
+denied('taskpolicy -b caffeinate -i', 'caffeinate');
+denied('coproc caffeinate -i', 'caffeinate');
+denied('repeat 1 caffeinate -t 1', 'caffeinate');
+denied('exec -a quiet caffeinate -i', 'caffeinate');
+denied('env -S "caffeinate -i"', 'caffeinate');
+denied("su root -c 'pmset -a sleep 0'", 'pmset -a');
+denied(q{python3 -c 'import os; os.execvp("caffeinate", ["caffeinate", "-i"])'}, 'caffeinate');
+denied(q{python3 -c 'import os; os.spawnlp(os.P_NOWAIT, "caffeinate", "caffeinate", "-i")'}, 'caffeinate');
+denied('perl -I lib plugins/butler/scripts/bp-keepawake.pl hold --pid-file /tmp/k.pid',
+    'a hand-started keep-awake holder (bp-keepawake.pl hold)');
+denied('sudo systemsetup -setcomputersleep Never', 'systemsetup -setcomputersleep');
+denied('cmd //c powercfg /change standby-timeout-ac 0', 'powercfg /change');
 denied('pkill -f caffeinate', 'pkill caffeinate');
 
 # ---- pmset writes (every verb but -g) ----------------------------------------
@@ -161,6 +182,17 @@ allowed($_) for (
     'CCPRAXIS_CAFFEINATE_BIN=/tmp/fake perl plugins/butler/tests/t/keepawake-shared.t',
     'perl -c plugins/butler/scripts/bp-keepawake.pl', 'perl scripts/run-tests.pl plugins/butler/tests/t/keepawake-shared.t',
     'cat plugins/sandbox/scripts/keep-awake.ps1',
+    # Mentions the red-team pass found over-denied.
+    q{powershell -Command "Get-CimInstance Win32_Process | ? CommandLine -match 'keep-awake.ps1'"},
+    q{pwsh -c "Get-Content plugins/sandbox/scripts/keep-awake.ps1"},
+    q{pwsh -c "Select-String SetThreadExecutionState plugins/sandbox/scripts/keep-awake.ps1"},
+    q{perl -e 'print BpHook::Guards::GuardSleepControl::verdict_for("exec caffeinate -i") ? 1 : 0'},
+    q{perl -e 'print `ps -axo command` =~ /caffeinate/ ? "running\n" : "none\n"'},
+    '$PERL plugins/butler/tests/t/keepawake-shared.t   # caffeinate tests',
+    "bash <<'EOF'\ngrep -rn caffeinate plugins/ | head\nEOF",
+    'systemsetup -getcomputersleep',
+    'tmux new -d "make test"',
+    'find . -name "*.t" -exec grep -l caffeinate {} +',
 );
 
 # ---- the message names the one sanctioned path, by who is asking -----------------

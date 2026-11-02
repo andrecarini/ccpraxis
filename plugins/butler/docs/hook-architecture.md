@@ -1437,16 +1437,19 @@ with slashes normalised. Source: `plugins/butler/tests/t/guard-continuity-state.
 guard-sleep-control.sh (added 2026-10-30, after an unattended session's hand-run
 `caffeinate -i -s -m -t 50400` kept a lid-closed Mac on AC awake from 23:01, when its work ended, to
 08:52) denies a Bash command that changes the machine's sleep behaviour by hand: `caffeinate` in any
-spelling (a path, zsh `=caffeinate`, `\caffeinate`, any letter case, behind `nohup`, `env`, `sudo`,
-`time`, `timeout`, `exec`, `command`, `xargs` or `doas`, backgrounded with `&`, inside `$(...)`,
-backticks, `sh -c`, `eval`, a heredoc or pipe into a shell, or an interpreter one-liner that execs
-it), `pkill`/`killall caffeinate`, every `pmset` verb but `-g` (writes, `disablesleep`, `noidle`, and
-`sleepnow`, which would suspend the machine running the work), `systemd-inhibit` but `--list`, every
-`powercfg` verb but the queries (`/requests`, `/list`, `/query`, `/a`, `/lastwake`, ...;
-`/requestsoverride` is a query only with no arguments), `SetThreadExecutionState` through PowerShell,
-and a hand-started `keep-awake.ps1`, `bp-keepawake.pl hold` or `KeepAwake.pm hold`. The commands are
-walked with GuardBash's command walker (`_hyg_commands`), so a mention (`grep caffeinate`, a commit
-message, a heredoc written to a file) passes. The denial names the one sanctioned path, arming
+spelling (a path, zsh `=caffeinate`, `\caffeinate`, any letter case, behind `nohup`, `env`, `env -S`,
+`sudo`, `time`, `timeout`, `exec`, `command`, `xargs`, `doas`, `screen`, `tmux`, `launchctl`, `script`,
+`find -exec`, `arch`, `xcrun`, `watch`, `taskpolicy`, `coproc`, `repeat`, `su -c` or `cmd /c`,
+backgrounded with `&`, inside `$(...)`, backticks, `sh -c`, `eval`, a heredoc or pipe into a shell, or
+an interpreter one-liner that execs it), `pkill`/`killall caffeinate`, every `pmset` verb but `-g`
+(writes, `disablesleep`, `noidle`, and `sleepnow`, which would suspend the machine running the work),
+`systemsetup -set...sleep`, `systemd-inhibit` but `--list`, every `powercfg` verb but the queries
+(`/requests`, `/list`, `/query`, `/a`, `/lastwake`, ...; `/requestsoverride` is a query only with no
+arguments), `SetThreadExecutionState` called or declared through PowerShell, and a `keep-awake.ps1`,
+`bp-keepawake.pl hold` or `KeepAwake.pm hold` started by hand. The commands are walked with GuardBash's
+command walker (`_hyg_commands`), so a mention (`grep caffeinate`, a commit message, a heredoc written
+to a file, a PowerShell query naming keep-awake.ps1, a one-liner matching /caffeinate/) passes. The
+prefilter sees only literal names, so a name split by quotes (`caf""feinate`) is out of its reach. The denial names the one sanctioned path, arming
 continuity, whose lease holds the managed wake-lock only while work is in flight (on a Mac: `caffeinate
 -i`, AC power only, never against a closed lid), and adjusts for an armed session and for a subagent.
 ccpraxis's own holders and Claude Code's own `caffeinate -i -t 300` are started by fork+exec, never
