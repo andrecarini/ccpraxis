@@ -1303,8 +1303,12 @@ sub live_mirror_line {
     return undef unless $r;
     return "mirror: warning $dir was not refreshed ($r->{error}); running sandboxes keep the previous copy"
         unless $r->{ok};
-    return "mirror: up-to-date $dir" unless $r->{updated} || $r->{removed};
-    return "mirror: refreshed $dir ($r->{updated} written, $r->{removed} removed)";
+    # Entries the refresh had to leave were planted from inside the VM.
+    my @w = @{ $r->{warnings} || [] };
+    my $left = @w ? '; warning ' . scalar(@w) . ' planted entr' . (@w == 1 ? 'y' : 'ies')
+                  . " could not be removed ($w[0])" : '';
+    return "mirror: up-to-date $dir$left" unless $r->{updated} || $r->{removed};
+    return "mirror: refreshed $dir ($r->{updated} written, $r->{removed} removed)$left";
 }
 
 # rel2abs without pulling in File::Spec's own path-separator assumptions,

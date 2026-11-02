@@ -33,18 +33,29 @@ package LiveMirror;
 #     old one, so no reader ever sees a truncated file. While a refresh runs, a
 #     reader can see some files new and some old -- exactly what the git
 #     checkout that updates the live install itself has always shown them.
-#     New and changed entries are written before stale ones are removed.
+#     New and changed entries are written before stale ones are removed. A
+#     single-file bind (statusline.pl, backpack.pl, auto-declare.pl) holds the
+#     inode it was started with, so a changed file reaches it at the next
+#     container start -- as it did when git replaced the live install's file.
 #   * The mirror is treated as hostile, because the VM can write it. Nothing
-#     inside it is followed: each directory is entered with fchdir on a handle
-#     whose device and inode match an lstat of the name, and every write is a
-#     relative name in that directory -- a temp file opened O_CREAT|O_EXCL|
-#     O_NOFOLLOW, then rename(), which replaces a planted symlink rather than
-#     writing through it. A mirror file is read for comparison only through
-#     O_NOFOLLOW|O_NONBLOCK and an fstat check, so a planted FIFO cannot hang a
-#     launch. Without this, a symlink planted in the mirror would turn the
-#     Mac's own refresh into the write path the copy exists to remove.
+#     inside it is followed: each directory is opened O_DIRECTORY|O_NOFOLLOW,
+#     entered with fchdir and checked against an lstat of the name, and every
+#     write is a relative name in that directory -- a temp file (random name)
+#     opened O_CREAT|O_EXCL|O_NOFOLLOW, then rename(), which replaces a
+#     planted symlink rather than writing through it. A mirror file is read
+#     for comparison only through O_NOFOLLOW|O_NONBLOCK and an fstat check, so
+#     a planted FIFO cannot hang a launch. Without this, a symlink planted in
+#     the mirror would turn the Mac's own refresh into the write path the copy
+#     exists to remove. Names that reach a message are escaped.
+#   * The VM must not be able to stop the refresh either, or what it wrote
+#     would outlive even a recreated machine: a directory it made read-only is
+#     made writable from inside; one it made unreadable is renamed aside and
+#     rebuilt; what it planted and cannot be removed is left and reported as a
+#     warning instead of failing the refresh.
 #   * Compared by content (size first), never by mtime, so a file rewritten
-#     within the same second, or edited in the mirror, is still put right.
+#     within the same second, or edited in the mirror, is still put right. On
+#     APFS an entry whose name changed only in case or normalisation is
+#     renamed to the source's spelling, never deleted and rewritten.
 #   * One refresh at a time: flock on <mirror>.lock, a sibling in the unshared
 #     parent. Without it, one refresh would delete another's temp files.
 #   * Symlinks in the source are copied as symlinks with the same target text,
@@ -58,7 +69,7 @@ use warnings;
 use Cwd ();
 use Digest::SHA ();
 use File::Path ();
-use Fcntl qw(O_RDONLY O_WRONLY O_RDWR O_CREAT O_EXCL O_NOFOLLOW O_NONBLOCK LOCK_EX LOCK_NB);
+use Fcntl qw(O_RDONLY O_WRONLY O_RDWR O_CREAT O_EXCL O_NOFOLLOW O_NONBLOCK O_DIRECTORY LOCK_EX LOCK_NB);
 
 # What containers mount from an install root, relative to it. launcher.pl binds
 # plugins/ (the ccpraxis-local marketplace, and the backpack scripts and hook
@@ -139,18 +150,44 @@ sub _filter {
     return \%f;
 }
 
+# complete($source, $mirror) -> 1 when the mirror holds, with the source's
+# type, every one of @PATHS the source has: what the launcher's binds need to
+# exist. Never follows a symlink inside the mirror (each component is lstat'ed).
+sub complete {
+    my ($src, $dst) = @_;
+    return 0 unless defined $src && defined $dst;
+    for my $rel (@PATHS) {
+        my $want = _kind(lstat "$src/$rel");
+        next unless length $want;
+        my $path = $dst;
+        my @parts = split m{/}, $rel;
+        while (@parts > 1) {
+            $path .= '/' . shift @parts;
+            return 0 unless _kind(lstat $path) eq 'd';
+        }
+        return 0 unless _kind(lstat "$path/$parts[0]") eq $want;
+    }
+    return 1;
+}
+
+sub _kind { return '' unless @_; return -l _ ? 'l' : -d _ ? 'd' : -f _ ? 'f' : 'o' }
+
 # refresh(source => $install_root, mirror => $dir, create => 0|1,
-#         lock_timeout => $secs) -> { ok, updated, removed, error }
-# Makes $dir hold exactly @PATHS of $source. `create` makes $dir when it is
-# missing (its parent must exist); without it a missing $dir is an error.
-# `updated` counts files and symlinks written, `removed` the entries deleted.
-# Never dies; on failure `error` says why and the mirror keeps whatever whole
-# files it had.
+#         lock_timeout => $secs) -> { ok, updated, removed, error, warnings }
+# Makes $dir hold exactly @PATHS of $source. `create` makes $dir (and its
+# parent) when it is missing; without it a missing $dir is an error. `updated`
+# counts files and symlinks written, `removed` the entries deleted. Never dies.
+# ok => 0: `error` says why, and the mirror keeps whatever whole files it had.
+# ok => 1 with `warnings`: every wanted entry is in place, but something the
+# VM planted could not be removed (an unreadable directory, a tree too deep);
+# it is left, renamed aside when it stood where a wanted directory belongs.
+# Messages carry names the VM may have chosen, so control characters in them
+# are escaped (\xNN) before they can reach a terminal.
 sub refresh {
     my (%o) = @_;
     my ($src, $dst) = @o{qw(source mirror)};
-    my $res = { ok => 0, updated => 0, removed => 0, error => undef };
-    my $fail = sub { $res->{error} = $_[0]; return $res };
+    my $res = { ok => 0, updated => 0, removed => 0, error => undef, warnings => [] };
+    my $fail = sub { $res->{error} = _printable($_[0]); return $res };
     return $fail->('no source directory given') unless defined $src && length $src;
     $src =~ s{/+\z}{};
     return $fail->("the source $src is not a directory") unless -d $src;
@@ -169,6 +206,11 @@ sub refresh {
     }
     return $fail->("$dst is not a directory (a symlink or a file is refused)") unless @st && -d _;
     return $fail->("$dst is not owned by this user") unless $st[4] == $>;
+    # The VM can chmod the share's root, not replace it (its parent is not
+    # shared), so the root is made usable by path before it is opened.
+    if (($st[2] & 0700) != 0700) {
+        chmod((($st[2] & 07777) | 0700), $dst) or return $fail->("cannot make $dst usable: $!");
+    }
 
     my $lockf = "$dst.lock";
     my $lk;
@@ -188,12 +230,11 @@ sub refresh {
     my $back_dh;
     undef $back_dh unless opendir($back_dh, '.');
     my $back_path = Cwd::getcwd();
-    my $ctx = { res => $res, seq => 0 };
+    my $ctx = { res => $res, warnings => $res->{warnings} };
     my $ok = eval {
         opendir(my $dh, $dst) or die "cannot open $dst: $!\n";
         chdir($dh) or die "cannot enter $dst: $!\n";
         die "$dst was replaced while it was being opened\n" unless _same_inode('.', \@st);
-        _writable_here($dst);
         _sync_dir($ctx, $src, _filter(), $dh, '', 0);
         1;
     };
@@ -201,6 +242,7 @@ sub refresh {
     if ($back_dh) { chdir($back_dh) or (defined $back_path && chdir($back_path)) }
     elsif (defined $back_path) { chdir($back_path) }
     close $lk;
+    $res->{warnings} = [ map { _printable($_) } @{ $res->{warnings} } ];
     unless ($ok) {
         $err = 'refresh failed' unless defined $err && length $err;
         chomp $err;
@@ -208,6 +250,14 @@ sub refresh {
     }
     $res->{ok} = 1;
     return $res;
+}
+
+# _printable($s) -> $s with control characters (C0 and DEL) escaped as \xNN.
+sub _printable {
+    my ($s) = @_;
+    return $s unless defined $s;
+    $s =~ s/([\x00-\x1f\x7f])/sprintf('\\x%02x', ord $1)/ge;
+    return $s;
 }
 
 sub _same_inode {
@@ -218,18 +268,64 @@ sub _same_inode {
 
 sub _label { my ($rel, $name) = @_; return length $rel ? "$rel/$name" : $name }
 
-sub _tmp_name { my ($ctx) = @_; return $TMP_PREFIX . $$ . '-' . (++$ctx->{seq}) }
+# _tmp_name($kind) -> a name for an entry refresh() writes and renames, with a
+# random part: a predictable name could be planted in advance to fail every
+# O_EXCL create. Callers retry on EEXIST.
+sub _tmp_name {
+    my ($kind) = @_;
+    return $TMP_PREFIX . (defined $kind ? "$kind-" : '') . $$ . '-'
+         . join('', map { sprintf '%04x', int rand 65536 } 1 .. 4);
+}
+
+# _fold($name) -> the spelling APFS treats as the same name: Unicode NFD,
+# lower case. Only used on darwin, where one directory entry answers to both.
+sub _fold {
+    my ($n) = @_;
+    require Encode;
+    require Unicode::Normalize;
+    my $c = eval { Encode::decode('UTF-8', "$n", Encode::FB_CROAK()) };
+    return lc $n unless defined $c;
+    return Encode::encode('UTF-8', lc Unicode::Normalize::NFD($c));
+}
+
+# _open_dir($name, \@lstat, $here_dh, $label) -> a handle on directory $name,
+# now the working directory. Opened O_DIRECTORY|O_NOFOLLOW, so a symlink
+# swapped in after the lstat is refused rather than entered, then checked
+# against the lstat's device and inode. undef (with $! set) when the directory
+# cannot be read (EACCES: the VM can make one unreadable); dies when it was
+# replaced.
+sub _open_dir {
+    my ($name, $m, $here, $label) = @_;
+    my $fh;
+    unless (sysopen($fh, $name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)) {
+        return undef if $!{EACCES};
+        die "cannot open $label: $!\n";
+    }
+    chdir($fh) or do { my $e = $!; close $fh; die "cannot enter $label: $e\n" };
+    close $fh;
+    unless (_same_inode('.', $m)) {
+        chdir($here);
+        die "$label was replaced while it was being entered\n";
+    }
+    my $dh;
+    unless (opendir($dh, '.')) {
+        my $e = $!;
+        chdir($here);
+        die "cannot read $label: $e\n";
+    }
+    return $dh;
+}
 
 # _sync_dir($ctx, $src_dir, $filter, $here_dh, $rel, $depth) -- the working
 # directory is the mirror directory for $src_dir (held by $here_dh); make it
 # hold exactly what $filter selects from $src_dir.
 sub _sync_dir {
     my ($ctx, $sdir, $filter, $here, $rel, $depth) = @_;
-    die "the tree is deeper than $MAX_DEPTH directories at $rel\n" if $depth > $MAX_DEPTH;
+    die "the source is deeper than $MAX_DEPTH directories at $rel\n" if $depth > $MAX_DEPTH;
     opendir(my $sh, $sdir) or die "cannot read $sdir: $!\n";
     my @names = sort grep { $_ ne '.' && $_ ne '..' } readdir $sh;
     closedir $sh;
-    my %want;
+    my (%want, %synced);
     for my $name (@names) {
         next if $name eq '.git' || index($name, $TMP_PREFIX) == 0;
         next if defined $filter && !exists $filter->{$name};
@@ -262,23 +358,51 @@ sub _sync_dir {
             next if defined $sub;
             $want{$name} = 1;
             _sync_file($ctx, $name, $spath, \@s, $here, $label, $depth);
+        } else {
+            # Sockets, FIFOs and devices are not copied: no bind of the live
+            # install ever carried one, and a copy could not reproduce it.
+            next;
         }
-        # Sockets, FIFOs and devices are not copied: no bind of the live
-        # install ever carried one, and a copy could not reproduce it.
+        my @after = lstat $name;
+        $synced{"$after[0]:$after[1]"} = $name if @after;
     }
     rewinddir $here;
     my @have = grep { $_ ne '.' && $_ ne '..' } readdir $here;
     for my $name (sort @have) {
         next if $want{$name};
-        _remove_entry($ctx, $name, $here, _label($rel, $name), $depth);
+        my $label = _label($rel, $name);
+        # On APFS one entry answers to every case (and normalisation) of its
+        # name, so an entry synced under the source's new spelling still reads
+        # back under its old one: rename it, never remove it.
+        if ($^O eq 'darwin') {
+            my @l = lstat $name;
+            my $same = @l ? $synced{"$l[0]:$l[1]"} : undef;
+            if (defined $same && _fold($same) eq _fold($name)) {
+                rename($name, $same) or push @{ $ctx->{warnings} }, "cannot rename $label to $same: $!";
+                next;
+            }
+        }
+        # Only VM-planted or stale entries are removed here; one that cannot be
+        # (unreadable, too deep, refilled while being emptied) is left and
+        # reported, and the rest of the refresh goes on.
+        my $ok = eval { _remove_entry($ctx, $name, $here, $label, $depth); 1 };
+        unless ($ok) {
+            my $e = $@;
+            chomp $e;
+            chdir($here) or die "cannot return to " . (length $rel ? $rel : 'the mirror') . ": $!\n";
+            push @{ $ctx->{warnings} }, $e;
+            next;
+        }
         $ctx->{res}{removed}++;
     }
 }
 
 # _enter_dir(...) -> a handle on the mirror directory $name (created when
 # missing, replacing a non-directory) after making it the working directory
-# and checking it is the directory lstat saw. Left writable for the refresh;
-# the caller sets the source's mode once the directory is filled.
+# and checking it is the directory lstat saw. One the VM made unreadable is
+# renamed aside (rename never follows a link) and a fresh one is made in its
+# place. Left writable for the refresh; the caller sets the source's mode once
+# the directory is filled.
 sub _enter_dir {
     my ($ctx, $name, $here, $label, $depth) = @_;
     my @m = lstat $name;
@@ -291,11 +415,15 @@ sub _enter_dir {
         @m = lstat $name;
         die "$label vanished after it was created\n" unless @m && -d _;
     }
-    opendir(my $dh, $name) or die "cannot open $label: $!\n";
-    chdir($dh) or die "cannot enter $label: $!\n";
-    unless (_same_inode('.', \@m)) {
-        chdir($here);
-        die "$label was replaced while it was being entered\n";
+    my $dh = _open_dir($name, \@m, $here, $label);
+    unless ($dh) {
+        my $aside = _tmp_name('unreadable');
+        rename($name, $aside) or die "cannot move the unreadable $label aside: $!\n";
+        push @{ $ctx->{warnings} }, "$label could not be read; moved aside as $aside and recreated";
+        mkdir($name, 0700) or die "cannot create $label: $!\n";
+        @m = lstat $name;
+        die "$label vanished after it was created\n" unless @m && -d _;
+        $dh = _open_dir($name, \@m, $here, $label) or die "cannot open $label: $!\n";
     }
     _writable_here($label);
     return $dh;
@@ -318,11 +446,15 @@ sub _sync_file {
     if (@m && -f _ && $m[7] == $s->[7] && ($m[2] & 07777) == $mode) {
         return if _same_content($name, \@m, $spath, $label);
     }
-    my $tmp = _tmp_name($ctx);
     open(my $in, '<:raw', $spath) or die "cannot read $spath: $!\n";
-    my $out;
-    sysopen($out, $tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600)
-        or die "cannot create a temporary file next to $label: $!\n";
+    my ($out, $tmp);
+    for (1 .. 5) {
+        $tmp = _tmp_name();
+        last if sysopen($out, $tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+        undef $out;
+        last unless $!{EEXIST};
+    }
+    unless ($out) { my $e = $!; close $in; die "cannot create a temporary file next to $label: $e\n" }
     binmode $out;
     my $ok = eval {
         my $buf;
@@ -355,8 +487,14 @@ sub _sync_symlink {
         my $cur = readlink $name;
         return if defined $cur && $cur eq $target;
     }
-    my $tmp = _tmp_name($ctx);
-    symlink($target, $tmp) or die "cannot create the symlink $label: $!\n";
+    my $tmp;
+    my $made = 0;
+    for (1 .. 5) {
+        $tmp = _tmp_name();
+        if (symlink($target, $tmp)) { $made = 1; last }
+        last unless $!{EEXIST};
+    }
+    die "cannot create the symlink $label: $!\n" unless $made;
     _put($ctx, $tmp, $name, $here, $label, $depth);
 }
 
@@ -369,7 +507,7 @@ sub _put {
         my $e = $!;
         my @m = lstat $name;
         unless (@m && -d _) { unlink $tmp; die "cannot replace $label: $e\n" }
-        eval { _remove_entry($ctx, $name, $here, $label, $depth); 1 } or do { my $x = $@; unlink $tmp; die $x };
+        eval { _remove_entry($ctx, $name, $here, $label, $depth); 1 } or do { my $x = $@; chdir($here); unlink $tmp; die $x };
         unless (rename($tmp, $name)) { my $e2 = $!; unlink $tmp; die "cannot replace $label: $e2\n" }
     }
     $ctx->{res}{updated}++;
@@ -403,6 +541,8 @@ sub _same_content {
 # _remove_entry($ctx, $name, $here_dh, $label, $depth) -- delete $name from the
 # working directory: unlink a file or symlink (never what it points at); empty
 # a real directory from inside it, entered the same checked way, then rmdir it.
+# Dies on what it cannot remove; the working directory may then be anywhere
+# below $here, and the caller returns to $here itself.
 sub _remove_entry {
     my ($ctx, $name, $here, $label, $depth) = @_;
     my @m = lstat $name;
@@ -411,13 +551,9 @@ sub _remove_entry {
         unlink($name) or $!{ENOENT} or die "cannot remove $label: $!\n";
         return;
     }
-    die "the tree is deeper than $MAX_DEPTH directories at $label\n" if $depth > $MAX_DEPTH;
-    opendir(my $dh, $name) or die "cannot open $label: $!\n";
-    chdir($dh) or die "cannot enter $label: $!\n";
-    unless (_same_inode('.', \@m)) {
-        chdir($here);
-        die "$label was replaced while it was being removed\n";
-    }
+    die "left $label: it is deeper than $MAX_DEPTH directories\n" if $depth > $MAX_DEPTH;
+    my $dh = _open_dir($name, \@m, $here, $label);
+    die "left $label: it cannot be read\n" unless $dh;
     _writable_here($label);
     my @kids = grep { $_ ne '.' && $_ ne '..' } readdir $dh;
     for my $k (@kids) {

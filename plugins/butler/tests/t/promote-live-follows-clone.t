@@ -35,7 +35,7 @@ use lib "$Bin/../lib";
 use HostCaps ();
 use Test::More;
 use File::Basename qw(dirname basename);
-use File::Path qw(make_path);
+use File::Path qw(make_path remove_tree);
 use File::Temp qw(tempdir tempfile);
 use JSON::PP;
 
@@ -419,7 +419,7 @@ SKIP: {
 # A promotion must still reach running sandboxes, so promote.pl refreshes that
 # copy -- only where it exists, and never at the cost of the promotion.
 SKIP: {
-    skip 'LF-6: the live-install mirror exists on macOS only', 17 unless $^O eq 'darwin';
+    skip 'LF-6: the live-install mirror exists on macOS only', 19 unless $^O eq 'darwin';
     my $f = new_fixture(clone_commits => [
         [ { 'plugins/p/a.pl' => "v1\n", 'plugins/p/old.pl' => "old\n", 'skills/s/SKILL.md' => "skill\n",
             'scripts/statusline.pl' => "status\n", 'scripts/other.pl' => "not mounted\n", 'README.md' => "readme\n" }, 'seed' ],
@@ -474,6 +474,16 @@ SKIP: {
     write_bytes("$mirror/plugins/planted", "x\n");
     $r = run_promote($f);
     like($r->{out}, qr/^mirror: refreshed \Q$mirror\E \(0 written, 1 removed\)$/m, 'LF-6: a stray entry in the mirror is removed') or diag($r->{out});
+
+    # One the refresh cannot remove (made unreadable) is reported on the same line.
+    make_path("$mirror/plugins/stuck/inner");
+    chmod 0000, "$mirror/plugins/stuck";
+    $r = run_promote($f);
+    chmod 0755, "$mirror/plugins/stuck";
+    is($r->{exit}, 0, 'LF-6 (planted, unremovable): exit 0') or diag($r->{out} . $r->{err});
+    like($r->{out}, qr/^mirror: up-to-date \Q$mirror\E; warning 1 planted entry could not be removed \(left plugins\/stuck: it cannot be read\)$/m,
+        'LF-6 (planted, unremovable): the mirror line says what was left') or diag($r->{out});
+    remove_tree("$mirror/plugins/stuck");
 
     # A mirror that cannot be refreshed is a warning, never a failed promotion.
     my $elsewhere = tempdir(HostCaps::tempdir_args(), CLEANUP => 1);

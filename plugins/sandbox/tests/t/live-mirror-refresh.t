@@ -21,8 +21,11 @@
 #      mirror can never be the source or inside it.
 #   F. the launcher, by source text (it is never run): binds from the mirror on
 #      darwin and from the install root elsewhere, refreshes it before create
-#      and start, and the preflight checks the mirror; every bind it would emit
-#      is served by the shares PodmanMachine plans.
+#      and start (the [l] recover flow too), and the preflight checks the
+#      mirror except for a connector; every bind it would emit is served by the
+#      shares PodmanMachine plans.
+#   D2-D4. the VM cannot stop the refresh; case-only renames on APFS;
+#      complete(), the launcher's gate before podman create.
 use strict;
 use warnings;
 use FindBin qw($Bin);
@@ -305,6 +308,118 @@ sub refresh_ok {
 }
 
 # ---------------------------------------------------------------------------
+# D2. the VM cannot stop the refresh (what it wrote would outlive the machine)
+# ---------------------------------------------------------------------------
+{
+    my $src = fake_install();
+    my $dst = new_mirror();
+    refresh_ok($src, $dst, 'D2 (setup)');
+    # Every directory the walk touches gets its mode back before cleanup, so
+    # File::Temp can remove the fixture.
+    my $unlock = sub {
+        my @todo = ($dst);
+        while (my $d = shift @todo) {
+            chmod 0755, $d;
+            opendir(my $dh, $d) or next;
+            push @todo, map { "$d/$_" } grep { $_ ne '.' && $_ ne '..' && !-l "$d/$_" && -d "$d/$_" } readdir $dh;
+        }
+    };
+
+    make_path("$dst/plugins/stuck/inner");
+    my $esc = "x\e]0;PWNED\a\e[2J";
+    make_path("$dst/$esc");
+    my $p = "$dst/skills/deep";
+    $p .= '/d' for 1 .. 70;
+    make_path($p);                                   # a planted tree past the depth limit
+    chmod 0000, "$dst/plugins/stuck";                # a planted directory made unreadable
+    chmod 0000, "$dst/$esc";                         # ...with a name that is a terminal escape
+    chmod 0000, "$dst/plugins/a";                    # a wanted directory made unreadable
+    chmod 0000, $dst;                                # and the share's root
+
+    my $r = LiveMirror::refresh(source => $src, mirror => $dst);
+    ok($r->{ok}, 'D2: an unreadable root, unreadable and too-deep planted directories do not fail the refresh') or diag($r->{error});
+    is(slurp("$dst/plugins/a/x.pl"), "#!/usr/bin/perl\nprint 1;\n", 'D2: a wanted directory made unreadable is rebuilt with its files');
+    my @aside = grep { index($_, $LiveMirror::TMP_PREFIX . 'unreadable-') == 0 } do { opendir(my $dh, "$dst/plugins") or die; readdir $dh };
+    is(scalar(@aside), 1, 'D2: ...the unreadable one is moved aside, not followed or deleted');
+    my $w = join("\n", @{ $r->{warnings} });
+    like($w, qr/plugins\/a could not be read; moved aside/, 'D2: ...and that is reported');
+    like($w, qr/left plugins\/stuck: it cannot be read/, 'D2: what cannot be removed is left and reported');
+    like($w, qr/left skills\/deep\/(?:d\/)+d: it is deeper than \d+ directories/, 'D2: ...a tree past the depth limit too');
+    is(scalar(grep { /[\x00-\x1f\x7f]/ } @{ $r->{warnings} }, $r->{error} // ''), 0, 'D2: no control character reaches a message (names are the VM\'s to choose)');
+    like($w, qr/x\\x1b\]0;PWNED\\x07\\x1b\[2J/, 'D2: ...they are escaped instead');
+    $unlock->();   # the leftovers stay unreadable until then
+    my %t = %{ tree($dst) };
+    my %want = %{ tree($src, source => 1) };
+    is_deeply([ grep { !exists $t{$_} || $t{$_} ne $want{$_} } sort keys %want ], [],
+        'D2: every wanted entry is in place, despite the leftovers');
+    $unlock->();
+
+    # Temp names are random, so planting the next one in advance fails nothing.
+    my %names = map { (LiveMirror::_tmp_name() => 1) } 1 .. 50;
+    is(scalar(keys %names), 50, 'D2: temporary names are not predictable');
+
+    # A directory opened for the walk is never a symlink swapped in after the lstat.
+    my $base = Cwd::abs_path(tempdir(CLEANUP => 1));
+    make_path("$base/real", "$base/elsewhere");
+    my @st = lstat "$base/real";
+    symlink("$base/elsewhere", "$base/swapped") or die;
+    my $cwd = Cwd::getcwd();
+    opendir(my $here, $base) or die;
+    chdir($here) or die;
+    my $got = eval { LiveMirror::_open_dir('swapped', \@st, $here, 'swapped') };
+    my $err = $@;
+    my $now = Cwd::getcwd();
+    chdir($cwd);
+    ok(!$got && $err =~ /cannot open swapped/, 'D2: _open_dir refuses a symlink (O_NOFOLLOW) instead of entering it');
+    is($now, Cwd::getcwd() eq $cwd ? Cwd::abs_path($base) : $now, 'D2: ...and never left the directory it started in');
+}
+
+# ---------------------------------------------------------------------------
+# D3. names that change only in case (APFS: one entry answers to both)
+# ---------------------------------------------------------------------------
+SKIP: {
+    my $probe = Cwd::abs_path(tempdir(CLEANUP => 1));
+    spew("$probe/Aa", '');
+    skip 'D3: needs a case-insensitive filesystem (APFS)', 6 unless $^O eq 'darwin' && -e "$probe/aa";
+    my $src = fake_install();
+    my $dst = new_mirror();
+    make_path("$src/plugins/casedir");
+    spew("$src/plugins/casedir/f", "in casedir\n");
+    spew("$src/plugins/casefile", "case file\n");
+    refresh_ok($src, $dst, 'D3 (setup)');
+    rename("$src/plugins/casedir", "$src/plugins/CaseDir") or die;
+    rename("$src/plugins/casefile", "$src/plugins/CaseFile") or die;
+    my $r = refresh_ok($src, $dst, 'D3 (renamed by case)');
+    is($r->{removed}, 0, 'D3: nothing is removed');
+    my %names = map { $_ => 1 } do { opendir(my $dh, "$dst/plugins") or die; readdir $dh };
+    ok($names{CaseDir} && !$names{casedir}, 'D3: a directory renamed by case keeps its entry, under the new spelling');
+    ok($names{CaseFile} && !$names{casefile}, 'D3: ...and so does a file');
+    is(slurp("$dst/plugins/CaseDir/f"), "in casedir\n", 'D3: ...with its contents');
+}
+
+# ---------------------------------------------------------------------------
+# D4. complete(): what the launcher checks before podman create
+# ---------------------------------------------------------------------------
+{
+    my $src = fake_install();
+    my $dst = new_mirror();
+    ok(!LiveMirror::complete($src, $dst), 'D4: an absent mirror is not complete');
+    refresh_ok($src, $dst, 'D4 (fill)');
+    ok(LiveMirror::complete($src, $dst), 'D4: a refreshed mirror is complete');
+    unlink "$dst/scripts/statusline.pl";
+    ok(!LiveMirror::complete($src, $dst), 'D4: one without the statusline is not (a partial first fill must not pass)');
+    remove_tree("$dst/scripts");
+    my $elsewhere = Cwd::abs_path(tempdir(CLEANUP => 1));
+    make_path("$elsewhere/scripts");
+    spew("$elsewhere/scripts/statusline.pl", "x\n");
+    symlink("$elsewhere/scripts", "$dst/scripts") or die;
+    ok(!LiveMirror::complete($src, $dst), 'D4: a component swapped for a symlink is not followed');
+    unlink "$src/scripts/statusline.pl";
+    unlink "$dst/scripts";
+    ok(LiveMirror::complete($src, $dst), 'D4: only what the source has is required');
+}
+
+# ---------------------------------------------------------------------------
 # E. lock, working directory, source and mirror never overlap
 # ---------------------------------------------------------------------------
 {
@@ -385,15 +500,21 @@ ok(defined $src && length $src, 'F: launcher.pl read as text');
             'F: ...while binds straight from the live install would not be served (it is no longer shared)');
     }
 
-    like($src, qr/_refuse_unshared_mounts\('preflight', \{ source => \$PROJECT_PATH, readonly => 0 \},\s*\{ source => \(\$LIVE_MIRROR \/\/ \$INSTALL_ROOT\), readonly => 1 \}\)/,
-        'F: the preflight checks the mirror the binds come from (the install root off macOS)');
+    like($src, qr/_refuse_unshared_mounts\('preflight', \{ source => \$PROJECT_PATH, readonly => 0 \},\s*\{ source => \(\$LIVE_MIRROR \/\/ \$INSTALL_ROOT\), readonly => 1 \}\)\s*unless \$SESSION_MODE \|\| length \$RESUME_SESSION;/,
+        'F: the preflight checks the mirror the binds come from (the install root off macOS), except for a connector, which only joins a running container');
     my $i_rc = index($src, "_refresh_live_mirror('create')");
     my $i_cr = index($src, '@podman_args = $build_create_args->();');
     ok($i_rc > 0 && $i_cr > $i_rc, 'F: the mirror is refreshed before podman create');
-    my $i_rs = index($src, "_refresh_live_mirror('start');");
+    like($src, qr/sub _refresh_live_mirror \{.*?return LiveMirror::complete\(\$INSTALL_ROOT, \$LIVE_MIRROR\) \? 1 : 0;\n\}/s,
+        'F: ...and create goes ahead only when the mirror holds everything the binds need (a partial fill does not pass)');
+    my $i_rs = index($src, "_stage_container_copies('start');");
     my $i_gate = index($src, 'my $gate_result = s03_run_launch_gate(');
-    ok($i_rs > 0 && $i_gate > $i_rs, 'F: ...and before the container is started');
-    like($src, qr/sub _refresh_live_mirror \{\s*my \(\$stage\) = \@_;\s*return 1 unless defined \$LIVE_MIRROR;/,
+    ok($i_rs > 0 && $i_gate > $i_rs, 'F: ...and refreshed before the container is started');
+    like($src, qr/sub _stage_container_copies \{.*?return _refresh_live_mirror\(\$stage, %o\);\n\}/s,
+        'F: ...by the one sub every start path uses (counts copy and mirror together)');
+    like($src, qr/container_start => sub \{.*?_stage_container_copies\('recover', quiet => 1\);\s*my \$out  = `\$PODMAN start/s,
+        'F: the [l] recover flow refreshes them too, quietly, right before its podman start (its machine start may have emptied them)');
+    like($src, qr/sub _refresh_live_mirror \{\s*my \(\$stage, %o\) = \@_;\s*return 1 unless defined \$LIVE_MIRROR;/,
         'F: the refresh is a no-op wherever there is no mirror');
     like($src, qr/PodmanMachine::ensure_share_dirs\(PodmanMachine::layout\(home => \$home\),\s*grep \{ defined \} \$LIVE_MIRROR\)/,
         'F: the mirror folder is recreated before the launcher starts the machine (vfkit refuses a missing share)');

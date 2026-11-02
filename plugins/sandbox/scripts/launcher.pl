@@ -2539,24 +2539,57 @@ sub _refuse_unshared_mounts {
     exit 1;
 }
 
-# _refresh_live_mirror($stage) -> 1 | 0. macOS: bring the live-install mirror
-# ($LIVE_MIRROR, LiveMirror.pm) up to date with this launcher's install root
-# before a container is created ('create') or started ('start'). Everywhere
-# else there is no mirror and this returns 1. A failed refresh is a warning, not
-# a refusal: the mirror keeps the whole files of its last refresh, so the
-# container sees the code as of then. Returns 0 only when the mirror holds no
-# plugins/ tree afterwards, which no bind can be served from.
+# _refresh_live_mirror($stage, quiet => 0|1) -> 1 | 0. macOS: bring the
+# live-install mirror ($LIVE_MIRROR, LiveMirror.pm) up to date with this
+# launcher's install root before a container is created ('create') or started
+# ('start', 'recover'). Everywhere else there is no mirror and this returns 1.
+# A failed refresh is a warning, not a refusal: the mirror keeps the whole files
+# of its last refresh, so the container sees the code as of then. Entries the
+# refresh had to leave (something the VM planted) are warned about too: they
+# mean a process got out of a container. Returns 0 only when the mirror lacks
+# something a bind needs (LiveMirror::complete). `quiet` logs without printing,
+# for callers inside the dashboard's alt-screen.
 sub _refresh_live_mirror {
-    my ($stage) = @_;
+    my ($stage, %o) = @_;
     return 1 unless defined $LIVE_MIRROR;
     my $r = LiveMirror::refresh(source => $INSTALL_ROOT, mirror => $LIVE_MIRROR, create => 1);
+    my @warn = @{ $r->{warnings} || [] };
     log_ev('live_mirror_refresh', { stage => $stage, ok => ($r->{ok} ? 1 : 0),
                                     updated => $r->{updated}, removed => $r->{removed},
-                                    (defined $r->{error} ? (error => $r->{error}) : ()) });
-    _emit_err(_c_warn('WARNING:'), " the sandbox's copy of the live install was not refreshed: $r->{error}\n",
-              "  $LIVE_MIRROR keeps the files of its last refresh.\n")
-        unless $r->{ok};
-    return -d "$LIVE_MIRROR/plugins" ? 1 : 0;
+                                    (defined $r->{error} ? (error => $r->{error}) : ()),
+                                    (@warn ? (warnings => join(' | ', @warn)) : ()) });
+    unless ($o{quiet}) {
+        _emit_err(_c_warn('WARNING:'), " the sandbox's copy of the live install was not refreshed: $r->{error}\n",
+                  "  $LIVE_MIRROR keeps the files of its last refresh.\n")
+            unless $r->{ok};
+        _emit_err(_c_warn('WARNING:'), " the sandbox's copy of the live install held entries the Mac never wrote,",
+                  " which only a process outside a container could have put there:\n",
+                  (map { "  $_\n" } @warn),
+                  "  Treat the podman machine as compromised: recreate it (podman machine rm, then podman-machine.pl\n",
+                  "  apply --confirm), and delete $LIVE_MIRROR, which the next launch rebuilds.\n")
+            if @warn;
+    }
+    return LiveMirror::complete($INSTALL_ROOT, $LIVE_MIRROR) ? 1 : 0;
+}
+
+# _stage_container_copies($stage, quiet => 0|1) -- macOS: refresh what a
+# container's binds read from the machine's ccpraxis shares, before a container
+# (re)starts: the copy of the global-counts snapshot (its single-file bind
+# re-resolves on start, so a restarted container sees counts as fresh as the
+# host's) and the live-install mirror. Both are best effort and no-ops
+# elsewhere. One sub for every start path, so the cold launch and the [l]
+# recover flow cannot drift: ~/.cache cleanup tools empty these folders, and
+# _machine_start_bounded recreates them empty.
+sub _stage_container_copies {
+    my ($stage, %o) = @_;
+    if (defined $CONTAINER_FILES_DIR && defined &MountSpec::stage_global_counts_copy) {
+        my $src = "${CLAUDE_HOST_CONFIG}/almanac-global-counts.json";
+        if (-f $src) {
+            my ($ok, $reason) = MountSpec::stage_global_counts_copy($src, $CONTAINER_FILES_DIR);
+            log_ev('global_counts_copy', { ok => ($ok ? 1 : 0), reason => $reason, stage => $stage });
+        }
+    }
+    return _refresh_live_mirror($stage, %o);
 }
 
 sub build_image {
@@ -2731,9 +2764,14 @@ my $IMAGE_EXISTS;
 # the sources every launch mounts -- the project read-write (/project and
 # claude-home), the checkout read-only; the full list is checked again at create.
 # On macOS the checkout's binds come from its mirror, so the mirror is what the
-# machine must share.
+# machine must share. A connector (--session / --resume-session) never creates
+# or starts a container -- it only joins a running one, whose binds are already
+# made -- so it is not refused here: after a promotion changes what the machine
+# must share, the sandboxes still running from before stay reachable until the
+# operator recreates the machine.
 _refuse_unshared_mounts('preflight', { source => $PROJECT_PATH, readonly => 0 },
-                                     { source => ($LIVE_MIRROR // $INSTALL_ROOT), readonly => 1 });
+                                     { source => ($LIVE_MIRROR // $INSTALL_ROOT), readonly => 1 })
+    unless $SESSION_MODE || length $RESUME_SESSION;
 
 # =====================================================================
 # Container name (generate + persist)
@@ -5293,12 +5331,12 @@ if (! _container_exists($CONTAINER_NAME)) {
     };
 
     # macOS: the binds read the live-install mirror, so it must be current --
-    # and hold a plugin tree at all -- before podman create resolves them.
+    # and hold everything they bind -- before podman create resolves them.
     unless (_refresh_live_mirror('create')) {
-        log_ev('launch_failed', { reason => 'the live-install mirror holds no plugin tree' });
-        _launch_fail('create', 'the live-install mirror holds no plugin tree', undef);
-        _fail_visibly("ERROR: the sandbox's copy of the live install ($LIVE_MIRROR) holds no plugins/ tree,",
-                      "  so podman create has nothing to bind. The warning above says why it could not be refreshed.");
+        log_ev('launch_failed', { reason => 'the live-install mirror lacks what the container binds' });
+        _launch_fail('create', 'the live-install mirror lacks what the container binds', undef);
+        _fail_visibly("ERROR: the sandbox's copy of the live install ($LIVE_MIRROR) lacks plugins/, skills/ or",
+                      "  scripts/statusline.pl, so podman create cannot bind it. The warning above says why it could not be refreshed.");
         LaunchLog::close_log($LAUNCH_LOG);
         SandboxLock::release($LOCK_DIR);
         reset_terminal();
@@ -5800,22 +5838,13 @@ sub _launch_commit_reap_marker {
 }
 _surface_last_reap();
 
-# macOS: refresh the container's copy of the global-counts snapshot before the
-# container (re)starts. Its single-file bind re-resolves on start, so a
-# restarted container sees counts as fresh as the host's -- the freshness the
-# direct bind of ~/.claude/almanac-global-counts.json gave. Best effort: a
-# failure leaves the previous copy (or none) and the launch goes on.
-if (defined $CONTAINER_FILES_DIR && defined &MountSpec::stage_global_counts_copy) {
-    my $src = "${CLAUDE_HOST_CONFIG}/almanac-global-counts.json";
-    if (-f $src) {
-        my ($ok, $reason) = MountSpec::stage_global_counts_copy($src, $CONTAINER_FILES_DIR);
-        log_ev('global_counts_copy', { ok => ($ok ? 1 : 0), reason => $reason });
-    }
-}
-# ...and the live-install mirror the same way (macOS; a no-op elsewhere): a
-# (re)started container's binds then serve the install root as it is now, even
-# when nothing was promoted since the container was created. Best effort.
-_refresh_live_mirror('start');
+# macOS: refresh the copies the container's binds read before it (re)starts --
+# the global-counts snapshot, as fresh as the host's (the freshness the direct
+# bind of ~/.claude/almanac-global-counts.json gave), and the live-install
+# mirror, which then serves the install root as it is now even when nothing was
+# promoted since the container was created. Best effort: a failure leaves the
+# previous copies and the launch goes on. A no-op elsewhere.
+_stage_container_copies('start');
 
 # $start_rc stays undef through a pre-flight abort below (machine
 # unreachable / image missing / degraded exec -- none of which ever call the
@@ -7103,6 +7132,11 @@ sub recover_container {
             # user that). The failure path is worse: multi-line `Error: ...`
             # text straight into the live frame. Capturing also turns the
             # stage's detail from a bare "rc 125" into podman's own sentence.
+            #
+            # macOS: the machine start this flow just ran may have recreated
+            # the ccpraxis share folders empty, and the container's binds read
+            # them -- refill them first, logging only (we are on the alt-screen).
+            _stage_container_copies('recover', quiet => 1);
             my $out  = `$PODMAN start "$CONTAINER_NAME" 2>&1`;
             my $code = $? >> 8;
             # The sentinel refresh is the VERY NEXT podman invocation after the

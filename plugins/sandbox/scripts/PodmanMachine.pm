@@ -799,6 +799,14 @@ sub other_image_names {
     return sort keys %n;
 }
 
+# dedicated_missing($plan) -> the missing share folders that are ccpraxis's own
+# (container-files, test-scratch, the live-install mirror): apply creates them.
+sub dedicated_missing {
+    my ($p) = @_;
+    return grep { my $r = $_->{role} // ''; $r eq 'container-files' || $r eq 'test-scratch' || $r eq 'live-mirror' }
+           @{ $p->{missing} || [] };
+}
+
 # apply(%o) -> exit code. %o: env (podman, run, stream, out, now), layout,
 # plan, confirm, images, containers. Prints the plan's cost, refuses what it
 # must, and with confirm executes the plan.
@@ -812,8 +820,23 @@ sub apply {
     my $act = $p->{action};
     my @pending = pending_archives($L);
 
+    # ccpraxis's own share folders (cleanup tools empty ~/.cache) are created
+    # even when the machine itself matches: vfkit will not start it without them.
+    my @absent = dedicated_missing($p);
     if ($act eq 'none' && !@pending) {
-        $out->('The machine already matches; nothing to do.');
+        unless (@absent) {
+            $out->('The machine already matches; nothing to do.');
+            return 0;
+        }
+        unless ($o{confirm}) {
+            $out->('The machine matches, but it cannot start without these folders it shares:',
+                   (map { "  $_->{source}" } @absent),
+                   '', 'Nothing has changed. To create them, run again with --confirm.');
+            return 0;
+        }
+        my @err = ensure_share_dirs($L, map { $_->{source} } grep { $_->{role} eq 'live-mirror' } @absent);
+        if (@err) { $out->("Refusing: $_") for @err; return 1 }
+        $out->('The machine already matched; created the folders it shares:', map { "  $_->{source}" } @absent);
         return 0;
     }
 
@@ -1283,7 +1306,7 @@ sub cli {
     if ($cmd eq 'plan') {
         $out->(cost_lines($plan, images => $images, containers => $containers, volumes => $volumes));
         $out->('', 'To make the machine match: ' . 'perl ' . HostPlatform::machine_script_path() . ' apply --confirm')
-            unless $plan->{action} eq 'none';
+            unless $plan->{action} eq 'none' && !dedicated_missing($plan);
         return 0;
     }
 

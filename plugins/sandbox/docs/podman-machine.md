@@ -87,14 +87,22 @@ before; only the host side of the bind changed.
 - **Who refreshes it.** `scripts/promote.pl`, right after it fast-forwards the live install, when the
   mirror folder exists (a `mirror:` line in its report; a mirror it cannot refresh is a
   `mirror: warning` line and never fails the promotion). The launcher, before each container create
-  and before each start. Plugin code therefore still reaches running sandboxes on promotion alone.
+  and before each start (the dashboard's recover flow too). Plugin code therefore still reaches
+  running sandboxes on promotion alone.
 - **How.** In place, file by file: each file is written under a temporary name and renamed over the
   old one, so no reader sees a half-written file, and directories keep their inode, so a running
   container's bind of `plugins/` or `skills/<name>` keeps seeing them. During a refresh a reader can
   see some files new and some old, as it always could during the git checkout that updates the live
   install. Files are compared by content. The refresh never follows a symlink inside the mirror (the
   VM can plant one) and removes anything that is not in the source, so it also undoes whatever the VM
-  wrote there.
+  wrote there. The VM cannot make it stop either: a directory it made unreadable is moved aside and
+  rebuilt, and whatever it planted that cannot be removed is left and named in a launch warning (it
+  means a process got out of a container: recreate the machine with `podman machine rm`, then
+  `apply --confirm`, and delete the mirror folder, which the next launch rebuilds).
+- **While switching.** Once a promotion brings in a launcher that binds from the mirror, and until
+  `apply --confirm` makes the machine share it, launches are refused with a message naming the mirror
+  and the `plan` / `apply --confirm` commands. Sessions joining a sandbox that is already running (the
+  dashboard's new-session key, `--session`) still work, since they create and start nothing.
 - **Whose.** The live install's mirror is `~/.cache/ccpraxis/live-mirror`. A launcher run from another
   checkout (a fork, or a clone run by path) keeps its own, `live-mirror-<8 hex of its path>`, so it can
   never put its code in front of the live install's sandboxes. The machine shares the mirror of the
@@ -153,6 +161,7 @@ and `registries.conf`, and `podman info --format '{{.Host.Security.Rootless}}'` 
 - **A missing shared folder stops the machine from starting.** vfkit refuses a share whose folder is
   gone. The launcher recreates its `~/.cache/ccpraxis` folders (the mirror included) before it starts
   the machine, and for any other missing folder it stops with the folder's name and the
-  `remove-project` command instead of trying. A start by hand (`podman machine start`, Podman
+  `remove-project` command instead of trying. `apply --confirm` recreates those folders too, even
+  when the machine otherwise matches. A start by hand (`podman machine start`, Podman
   Desktop) gets only vfkit's own error.
 - **The machine keeps running** (and holding its memory) until `podman machine stop`.

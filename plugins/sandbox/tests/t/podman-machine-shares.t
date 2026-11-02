@@ -314,12 +314,27 @@ sub cli_run {
 {
     my $home = fake_home();
     my $L = PodmanMachine::layout(home => $home);
-    make_path($L->{container_files}, $L->{test_scratch});
+    make_path($L->{container_files}, $L->{test_scratch}, $L->{live_mirror});
     spew($L->{state_file}, JSON::PP->new->encode({ schema => 1, projects => ["$home/Projects/app"], test_scratch => JSON::PP::true() }));
     my %m = machine_seams(home => $home, config => narrow_config($home, "$home/Projects/app"), rootful => 1);
     my ($rc, $text) = cli_run(['plan'], %m);
     like($text, qr/The machine already matches; nothing to do\./, 'D: a machine that matches the list: nothing to do');
     unlike($text, qr/apply --confirm/, 'D: ...and no apply hint');
+
+    # The same machine with one of ccpraxis's share folders emptied away (cleanup
+    # tools empty ~/.cache): vfkit would refuse to start it, so apply creates it.
+    rmdir $L->{live_mirror} or die "rmdir: $!";
+    my $calls;
+    ($rc, $text) = cli_run(['plan'], %m);
+    like($text, qr/Missing on disk:\n  \Q$L->{live_mirror}\E \(apply creates it/, 'D: a matching machine with its mirror folder gone: plan says so');
+    like($text, qr/To make the machine match: .* apply --confirm/, 'D: ...and gives the apply command');
+    ($rc, $text, $calls) = cli_run(['apply'], %m);
+    like($text, qr/cannot start without these folders it shares:\n  \Q$L->{live_mirror}\E\n\nNothing has changed/, 'D: apply without --confirm names the folder and changes nothing');
+    ok(!-d $L->{live_mirror}, 'D: ...nothing is created');
+    ($rc, $text, $calls) = cli_run(['apply', '--confirm'], %m);
+    is($rc, 0, 'D: apply --confirm succeeds') or diag($text);
+    ok(-d $L->{live_mirror}, 'D: ...and creates the folder');
+    is_deeply([ grep { /\Astream:/ } @$calls ], [], 'D: ...without touching the machine');
     ($rc, $text) = cli_run(['plan', '--cpus', '8'], %m);
     like($text, qr/in place \(podman machine set\)/, 'D: a resources-only change is a podman machine set, not a recreate');
     ($rc, $text) = cli_run(['plan', '--disk-size', '50'], %m);
