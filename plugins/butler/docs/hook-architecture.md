@@ -706,15 +706,20 @@ a reporter at its first step, and any other session "only via /butler:continuity
 self-arm". For a manual session after the operator's own `/clear`, the operator re-arms with
 `/butler:continuity on`. After a carry-over, the carry-over skill prose tells the fresh session to run
 `butler-continuity on` when the work was armed. The old id's arm file is not a live session. It stays
-until its transcript is gone, and it stops holding the wake-lock once its transcript has gone an hour
-with no activity (Decision 53). Two SessionStart hooks are registered, and neither carries state across a new id: denial-breaker.sh (never-halt 07) moves its own per-agent counting offset, and session-start-nudge.sh (blueprint where-things-go, package 10), both of which keep the id. SessionStart runs one route on every source: re-attach, then the project digest, then the armed nudges. No SessionEnd hook is registered.
+until its transcript is gone; it stops holding the wake-lock once nothing of it has been in flight for
+20 minutes, and stops counting as live once its transcript has gone an hour with no activity (Decision 53). Two SessionStart hooks are registered, and neither carries state across a new id: denial-breaker.sh (never-halt 07) moves its own per-agent counting offset, and session-start-nudge.sh (blueprint where-things-go, package 10), both of which keep the id. SessionStart runs one route on every source: re-attach, then the project digest, then the armed nudges. No SessionEnd hook is registered.
 
-**Wake-lock (Decision 18, Decision 53).** `BpContinuityLease.pm` (package 04, rewired by package 16) holds the lock
-while an armed session's transcript was written in the last hour. It no longer reads the old
-`.continuity-active` registry, which package 16 retired. The one-hour window is safe because the
-holder's fixed 50-minute timeout wakes a waiting session (which writes its transcript) before the hour
-runs out; it is only the lease's view of activity: it never deletes a file and never changes what
-`is_armed` answers. Its refresher daemon becomes the internal verb
+**Wake-lock (Decision 18, Decision 53, in-flight rule 2026-10-30).** `BpContinuityLease.pm` (package 04, rewired by package 16)
+counts an armed session as live while its transcript was written in the last hour, and holds the lock
+only while a live arm has work in flight: its butler-hold holder is live (a hold that will wake it), or
+its session wrote its transcript, a subagent transcript or its arm file in the last 20 minutes
+(`$IN_FLIGHT_QUIET_SECONDS`, twice the Bash tool's 10-minute ceiling). While every live arm is only
+waiting for the operator (interrupted, stopped by an API or usage-limit error, crashed, or sitting on a
+permission prompt), the lock is released and the refresher keeps ticking, so it takes the lock again on
+its first tick after work resumes. One function decides (`lease_verdict`); `converge` and the
+refresher's tick act on it. It no longer reads the old `.continuity-active` registry, which package 16
+retired. All of this is only the lease's view of activity: it never deletes a file and never changes
+what `is_armed` answers. Its refresher daemon becomes the internal verb
 `butler-continuity lease --daemon`, which also runs `gc_sessions()`. `keep-awake.ps1` is untouched.
 
 **Statusline contract (package 10).** `scripts/statusline.pl` resolves the root through
@@ -1537,11 +1542,12 @@ What package 16 changes rather than deletes, so the "exact list" above stays exa
   gate-headless-background forbids background Bash in coordinators. The design answers it without
   depending on the unmeasured case: a coordinator's hold counts only alongside a running background
   subagent it names, and a killed holder keeps its record. Package 08 measures the behaviour once.
-- **The wake-lock's one-hour window (Decision 53).** Decision 18 ties the wake-lock to the armed
-  state. With disarm-on-timeout gone, an arm file can outlive its session (a closed terminal, the old
-  id after `/clear`). The lease therefore counts only an armed session whose transcript was written in
-  the last hour, safe because the holder's fixed 50-minute timeout wakes a waiting session before the
-  hour runs out. That is only the lease's view of activity; it never disarms anything.
+- **The wake-lock's one-hour window (Decision 53), narrowed to work in flight (2026-10-30).** Decision
+  18 ties the wake-lock to the armed state. With disarm-on-timeout gone, an arm file can outlive its
+  session (a closed terminal, the old id after `/clear`). The lease therefore counts only an armed
+  session whose transcript was written in the last hour, and within that holds the lock only while a
+  live holder or the last 20 minutes of activity shows work in flight. That is only the lease's view
+  of activity; it never disarms anything.
 - **Manual sessions after /clear.** Not a conflict: Decision 2 re-arms drive-solo and reporter sessions
   automatically and leaves every other session to `/butler:continuity on` or self-arm. A new id is a
   new session, so nothing is disarmed.

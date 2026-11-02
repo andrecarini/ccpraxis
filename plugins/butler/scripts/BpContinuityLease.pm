@@ -530,6 +530,136 @@ sub active_reason {
 }
 
 # ---------------------------------------------------------------------------
+# IN FLIGHT, OR ONLY WAITING FOR THE OPERATOR -- what the lock follows.
+#
+# A live arm used to hold the machine awake for as long as it counted as live
+# (its transcript written within the hour). That kept a machine awake after
+# the work had ended, for no one: the operator's requirement (2026-10-29,
+# after a hand-run caffeinate held a lid-closed Mac awake from 23:01, when the
+# work finished, to 08:52) is that the lock follows WORK, not the arm.
+#
+# Continuity has no "armed, waiting for the operator" state to read: the Stop
+# gate never lets an armed session end a turn unless a live holder will wake
+# it, and the skill's path for "nothing can proceed without the operator" is
+# to turn continuity off, which releases the lock at once. What does happen is
+# an arm whose session is doing nothing: its turn ended by an interrupt, an API
+# or usage-limit error or a crash, or it sits on a permission prompt. Nothing
+# is in flight there, and only the operator can move it. So an arm has work in
+# flight when either:
+#
+#   holder    its butler-hold holder is live (BpHook::holder_live): a hold that
+#             will wake the session, over background work it names;
+#   activity  its session wrote its transcript, a subagent transcript, or its
+#             arm file within $IN_FLIGHT_QUIET_SECONDS: it is mid-turn (a
+#             driver run between director ticks is one of these two as well).
+#
+# and every other live arm is only waiting for the operator. The lock is held
+# while ANY live arm has work in flight, released while every one is waiting,
+# and taken again on the refresher's first tick after work resumes: the
+# refresher keeps running for as long as an arm is live (live_arms, the
+# one-hour window), whether the lock is held or not.
+#
+# THE QUIET WINDOW is 20 minutes: the longest silence a working turn can have
+# is one tool call or one model response, and the Bash tool's own ceiling is
+# 10 minutes (a foreground subagent writes its own transcript, which counts).
+# Twice that leaves headroom without holding an idle machine for the hour the
+# old rule did. A false "waiting" while a turn really runs is the expensive
+# mistake (a lid-closed Mac on AC sleeps the moment the assertion goes), so
+# the window errs long.
+#
+# This never touches the arm itself: disarming stays the operator's or the
+# judged two-step's business (.ccpraxis-local-data/guidance/
+# only-the-operator-ends-a-run.md). It decides only whether the lock is held.
+our $IN_FLIGHT_QUIET_SECONDS = 1200;
+
+# _holder_running($root, $sid) -> 0|1 -- BpHook::holder_live's own answer for
+# this arm's holder, asked as a plain (non-coordinator) session whatever role
+# the calling process has. holder_live reads BpHook::state_dir(), which IS the
+# store the lease reads in production (store_root_for); a test that points the
+# lease at another root has no holder to ask about there, so that is 0.
+sub _holder_running {
+    my ($root, $sid) = @_;
+    my $ok = eval { require "$DIR/BpHook.pm" unless defined &BpHook::holder_live; 1 };
+    return 0 unless $ok;
+    local $ENV{BP_LEDGER};
+    local $ENV{BP_ROLE};
+    my $hroot = BpHook::state_dir();
+    return 0 unless defined $hroot && defined $root;
+    (my $x = $hroot) =~ s{/+\z}{};
+    (my $y = $root)  =~ s{/+\z}{};
+    return 0 unless $x eq $y;
+    return eval { BpHook::holder_live($sid, {}) } ? 1 : 0;
+}
+
+# _activity_age($root, $sid) -> seconds since this arm's session last wrote
+# anything the lease can see: the arm file (written by `on`, touched by every
+# Stop), the transcript, and the subagent transcripts beside it
+# (<transcript dir>/<sid>/subagents/agent-*.jsonl). undef when none exists.
+sub _activity_age {
+    my ($root, $sid) = @_;
+    my $af = "$root/armed/$sid";
+    my @m = ((stat $af)[9]);
+    my $tp = _arm_file_transcript_path($af);
+    if (defined $tp) {
+        utf8::encode($tp) if utf8::is_utf8($tp);
+        $tp =~ tr{\\}{/};
+        push @m, (stat $tp)[9];
+        (my $d = $tp) =~ s{/[^/]*\z}{};
+        my $sub = "$d/$sid/subagents";
+        if (opendir(my $dh, $sub)) {
+            for my $e (readdir $dh) {
+                next unless $e =~ /\Aagent-[A-Za-z0-9_-]{1,64}\.jsonl\z/;
+                push @m, (stat "$sub/$e")[9];
+            }
+            closedir $dh;
+        }
+    }
+    my ($newest) = sort { $b <=> $a } grep { defined } @m;
+    return undef unless defined $newest;
+    my $age = time() - $newest;
+    return $age < 0 ? 0 : $age;
+}
+
+# arm_in_flight($root, $sid) -> ('activity' | 'holder' | undef, $quiet_age)
+# Activity is asked first: it is a few stats, while the holder check may run
+# one `ps` on macOS (BpHook::start_fp).
+sub arm_in_flight {
+    my ($root, $sid) = @_;
+    my $age = _activity_age($root, $sid);
+    return ('activity', $age) if defined $age && $age <= $IN_FLIGHT_QUIET_SECONDS;
+    return ('holder', $age) if _holder_running($root, $sid);
+    return (undef, $age);
+}
+
+# lease_verdict($dir) -> ($verdict, \%detail) -- THE decision every lease
+# actuator follows (converge, for every caller that is not the refresher, and
+# the refresher's own tick):
+#
+#   'idle'     no live arm at all: release, and the refresher exits.
+#   'held'     a live arm has work in flight. %detail: reason (active_reason's
+#              shape, naming the arm in flight), why ('activity' | 'holder').
+#   'waiting'  live arms, none in flight: every one is only waiting for the
+#              operator. Release, but keep the refresher. %detail: arms,
+#              quiet (the shortest quiet age among them).
+sub lease_verdict {
+    my ($dir) = @_;
+    my $root = store_root_for($dir);
+    return ('idle', {}) unless defined $root && length $root;
+    my $list = live_arms($root);
+    return ('idle', {}) unless @$list;
+    my $quiet;
+    for my $arm (@$list) {
+        my ($why, $age) = arm_in_flight($root, $arm->{sid});
+        if (defined $why) {
+            my $reason = { sid => $arm->{sid}, basis => $arm->{basis}, age => $arm->{age}, arms => scalar @$list };
+            return ('held', { reason => $reason, why => $why });
+        }
+        $quiet = $age if defined $age && (!defined $quiet || $age < $quiet);
+    }
+    return ('waiting', { arms => scalar @$list, quiet => $quiet });
+}
+
+# ---------------------------------------------------------------------------
 # code_snapshot() -> { abs_path => mtime }                     (package 04)
 # code_changed(\%snap, $now?) -> path | undef
 #
@@ -792,6 +922,11 @@ sub sync {
 #   $verdict : 'held' | 'released'  — what the lease was converged TOWARD.
 #   $holder  : ensure_daemon's verdict, or 'idle' when nothing is armed.
 #
+# FOLLOWS lease_verdict: held while a live arm has work in flight; released
+# when nothing is armed ('idle') AND when every live arm is only waiting for
+# the operator -- the latter keeps (or starts) a refresher, so the lock is
+# taken again on its first tick after work resumes.
+#
 # Both come back from ONE call on purpose. A caller that wanted the holder label
 # and asked ensure_daemon again would do so in the second before a just-spawned
 # daemon has written its pid file — and a second look at a missing pid file
@@ -813,12 +948,14 @@ sub sync {
 sub converge {
     my ($dir, %opts) = @_;
     return ('released', 'idle') unless defined $dir && length $dir;
-    if (any_active($dir)) {
+    my ($verdict) = lease_verdict($dir);
+    if ($verdict eq 'held') {
         refresh($dir, %opts);
         return ('held', ensure_daemon($dir, %opts));
     }
     sync($dir, %opts, active => 0);
-    return ('released', 'idle');
+    return ('released', 'idle') if $verdict eq 'idle';
+    return ('released', ensure_daemon($dir, %opts));
 }
 
 # ---------------------------------------------------------------------------
@@ -1310,12 +1447,31 @@ sub daemon_loop {
     my $loop_result;
     my $loop_err;
     my $ok_loop = eval {
+    my $last_verdict = '';
     while (1) {
-        my $reason_data = active_reason($dir);
+        # The one decision (lease_verdict): idle exits; held takes the lock;
+        # waiting releases it and keeps ticking, to take it again when work
+        # resumes.
+        my ($verdict, $vd) = lease_verdict($dir);
+        if ($verdict eq 'idle') {
+            $log->('IDLE', 'reason=no-live-arm');
+            $exit_plan_step->('refresher-exit');
+            last;
+        }
+        my $reason_data = $verdict eq 'held' ? $vd->{reason} : active_reason($dir);
         unless (defined $reason_data) {
             $log->('IDLE', 'reason=no-live-arm');
             $exit_plan_step->('refresher-exit');
             last;
+        }
+        if ($verdict ne $last_verdict) {
+            if ($verdict eq 'held') {
+                $log->('IN-FLIGHT', sprintf('sid=%s why=%s', $reason_data->{sid}, $vd->{why}));
+            } else {
+                $log->('WAITING', sprintf('reason=waiting-for-operator arms=%d quiet=%ss',
+                    $vd->{arms}, defined $vd->{quiet} ? $vd->{quiet} : 'unknown'));
+            }
+            $last_verdict = $verdict;
         }
 
         if (time() >= $next_handover_try) {
@@ -1349,7 +1505,7 @@ sub daemon_loop {
 
         # S3 (spec 2.3): on the successor's first live tick, replace the
         # inherited helper so it is owned (and logged) by this process.
-        if ($handover_flag && !$did_replace) {
+        if ($handover_flag && !$did_replace && $verdict eq 'held') {
             $did_replace = 1;
             my $ka_pid_f = wakelock_pid_file($dir);
             if (-e $ka_pid_f) {
@@ -1369,10 +1525,16 @@ sub daemon_loop {
             }
         }
 
-        my $desc = _owner_desc_for($reason_data);
-        sync($dir, %opts, active => 1, log => $ka_log, owner_winpid => $owner_winpid, owner_desc => $desc);
-        $log->('TICK', sprintf('active=1 reason=arm sid=%s basis=%s age=%ss arms=%d',
-            $reason_data->{sid}, $reason_data->{basis}, $reason_data->{age}, $reason_data->{arms}));
+        if ($verdict eq 'held') {
+            my $desc = _owner_desc_for($reason_data);
+            sync($dir, %opts, active => 1, log => $ka_log, owner_winpid => $owner_winpid, owner_desc => $desc);
+            $log->('TICK', sprintf('active=1 reason=arm sid=%s basis=%s age=%ss arms=%d',
+                $reason_data->{sid}, $reason_data->{basis}, $reason_data->{age}, $reason_data->{arms}));
+        } else {
+            sync($dir, %opts, active => 0, log => $ka_log, owner_winpid => $owner_winpid);
+            $log->('TICK', sprintf('active=0 reason=waiting-for-operator arms=%d quiet=%ss',
+                $vd->{arms}, defined $vd->{quiet} ? $vd->{quiet} : 'unknown'));
+        }
 
         # Package 06: the power plan follows arming, checked on every tick
         # BEFORE the journal step so a probe spawned in the same tick sees

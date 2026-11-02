@@ -615,4 +615,138 @@ SKIP: {
     is(BpContinuityLease::platform(), 'darwin', 'L-macOS: a Mac host is detected as darwin, not unsupported');
 }
 
+# ===========================================================================
+# L-INFLIGHT -- the lock follows WORK IN FLIGHT, not the arm. Held while a
+# live arm has a live holder (a hold that will wake it) or recent session
+# activity (transcript, subagent transcript, arm file within the quiet
+# window); released while every live arm is only waiting for the operator,
+# with a refresher kept to take it again the tick work resumes. The arm
+# itself is never touched.
+# ===========================================================================
+{
+    my $home   = fresh_home();
+    my $legacy = fresh_legacy();
+    local $ENV{BUTLER_STATE_DIR}               = $home;
+    local $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} = $legacy;
+    local $BpContinuityLease::STATE_ROOT       = BpHook::state_dir();
+    local $BpContinuityLease::PLATFORM         = 'darwin';
+    my $root = BpHook::state_dir();
+    my $q    = $BpContinuityLease::IN_FLIGHT_QUIET_SECONDS;
+    cmp_ok($q, '>=', 600, 'L-INFLIGHT: the quiet window outlasts the Bash tool\'s 10-minute ceiling');
+    cmp_ok($q, '<', $BpContinuityLease::TRANSCRIPT_LIVENESS_SECONDS,
+        'L-INFLIGHT: and is shorter than the one-hour live-arm window it refines');
+
+    my $tdir = tempdir(CLEANUP => 1);
+    my $sid  = 'inflight1';
+    my $tp   = "$tdir/$sid.jsonl";
+    mk_marker($tp);
+    ok(BpHook::arm($sid, role => 'manual', by => 'on', transcript_path => $tp), 'L-INFLIGHT setup: armed with a transcript');
+    my $age_all = sub {
+        my ($secs) = @_;
+        my $t = time - $secs;
+        utime($t, $t, $_) for grep { -e } ($tp, "$root/armed/$sid", glob("$tdir/$sid/subagents/*"));
+    };
+
+    # 1. a working session: held, through the one decision.
+    my ($v, $d) = BpContinuityLease::lease_verdict($legacy);
+    is($v, 'held', 'L-INFLIGHT 1: a session that just wrote its transcript has work in flight');
+    is($d->{why}, 'activity', 'L-INFLIGHT 1: ...because of its activity');
+    is($d->{reason}{sid}, $sid, 'L-INFLIGHT 1: ...naming the arm in flight');
+
+    # 2. quiet past the window, no holder: only waiting for the operator.
+    $age_all->($q + 600);
+    is(BpContinuityLease::any_active($legacy), 1, 'L-INFLIGHT 2: the arm is still live (within the hour)');
+    ($v, $d) = BpContinuityLease::lease_verdict($legacy);
+    is($v, 'waiting', 'L-INFLIGHT 2: quiet past the window with no holder is waiting for the operator');
+    is($d->{arms}, 1, 'L-INFLIGHT 2: one live arm, none in flight');
+    open my $kp, '>', "$legacy/keepawake.pid" or die $!; print {$kp} "424242\n"; close $kp;
+    my (@killed, @spawned_d);
+    my ($cv, $holder) = BpContinuityLease::converge($legacy,
+        kill_pid => sub { push @killed, $_[0]; 'gone' },
+        spawn    => sub { push @spawned_d, $_[0]; 9301 });
+    is($cv, 'released', 'L-INFLIGHT 2: converge releases the lock');
+    is_deeply(\@killed, ['424242'], 'L-INFLIGHT 2: ...stopping the recorded helper');
+    ok(!-e "$legacy/keepawake.pid", 'L-INFLIGHT 2: ...and clearing its pid file');
+    is($holder, 'spawned', 'L-INFLIGHT 2: but a refresher is kept (started here), to take it again when work resumes');
+    ok(-e "$root/armed/$sid", 'L-INFLIGHT 2: the arm itself is untouched (only the operator or the judged off ends it)');
+
+    # 3. a subagent still writing its transcript is work in flight.
+    make_path("$tdir/$sid/subagents");
+    mk_marker("$tdir/$sid/subagents/agent-abc123.jsonl");
+    ($v, $d) = BpContinuityLease::lease_verdict($legacy);
+    is($v, 'held', 'L-INFLIGHT 3: a fresh subagent transcript beside a quiet main one is in flight');
+    unlink "$tdir/$sid/subagents/agent-abc123.jsonl";
+
+    # 4. a live holder (a hold that will wake the session) is in flight.
+    $age_all->($q + 600);
+    my $fp = 'fixture';
+    if (-r '/proc/self/cmdline') {
+        require Digest::SHA;
+        open my $ch, '<:raw', "/proc/$$/cmdline" or die $!;
+        my $cl = do { local $/; <$ch> };
+        close $ch;
+        $fp = Digest::SHA::sha1_hex($cl);
+    }
+    make_path("$root/holder");
+    my $write_holder = sub {
+        my ($pid) = @_;
+        open my $hh, '>', "$root/holder/$sid.json" or die $!;
+        print {$hh} JSON::PP->new->canonical->encode({ session_id => $sid, pid => $pid, fp => $fp,
+            items => ['bg1'], deadline => time + 600 });
+        close $hh;
+    };
+    $write_holder->($$);
+    ($v, $d) = BpContinuityLease::lease_verdict($legacy);
+    is($v, 'held', 'L-INFLIGHT 4: a quiet session with a live holder has work in flight');
+    is($d->{why}, 'holder', 'L-INFLIGHT 4: ...because of its holder');
+    {
+        local $ENV{BP_LEDGER} = '/some/ledger.md';
+        ($v) = BpContinuityLease::lease_verdict($legacy);
+        is($v, 'held', 'L-INFLIGHT 4: whatever role the asking process has (a coordinator env does not hide the arm\'s holder)');
+    }
+    my $dead = fork();
+    die "fork: $!" unless defined $dead;
+    if (!$dead) { require POSIX; POSIX::_exit(0) }
+    waitpid($dead, 0);
+    $write_holder->($dead);
+    ($v) = BpContinuityLease::lease_verdict($legacy);
+    is($v, 'waiting', 'L-INFLIGHT 4: a holder record whose process is gone holds nothing');
+    unlink "$root/holder/$sid.json";
+
+    # 5. two arms: any one in flight holds the lock for both.
+    my $tp2 = "$tdir/inflight2.jsonl";
+    mk_marker($tp2);
+    ok(BpHook::arm('inflight2', role => 'manual', by => 'on', transcript_path => $tp2), 'L-INFLIGHT 5 setup: a second, working arm');
+    ($v, $d) = BpContinuityLease::lease_verdict($legacy);
+    is($v, 'held', 'L-INFLIGHT 5: one arm in flight holds the lock though the other waits');
+    is($d->{reason}{sid}, 'inflight2', 'L-INFLIGHT 5: ...naming the arm in flight');
+    is($d->{reason}{arms}, 2, 'L-INFLIGHT 5: ...out of two live arms');
+    BpHook::disarm('inflight2', actor => 'operator', reason => 'fixture done');
+
+    # 6. the refresher's tick follows the same decision: release while waiting,
+    # take the lock again on the first tick after work resumes.
+    $age_all->($q + 600);
+    my (@ev, @sp, @kl);
+    my %seams = (max_iterations => 1, tick => 1, journal => 0, plan => 0,
+        powershell_available => sub { 1 },
+        spawn    => sub { push @sp, $_[0]; open my $w, '>', $_[0] or die $!; print {$w} "$$\n"; close $w; $$ },
+        kill_pid => sub { push @kl, $_[0]; 'gone' },
+        log      => sub { push @ev, join(' ', grep { defined } @_) });
+    BpContinuityLease::daemon_loop($legacy, %seams);
+    is(scalar(@sp), 0, 'L-INFLIGHT 6: a refresher tick over a waiting arm takes no lock');
+    ok((grep { /^TICK active=0 reason=waiting-for-operator arms=1 quiet=\d+s$/ } @ev),
+        'L-INFLIGHT 6: ...and says so in lease.log')
+        or diag(join("\n", @ev));
+    ok((grep { /^WAITING reason=waiting-for-operator/ } @ev), 'L-INFLIGHT 6: the transition is logged once');
+    ok(!(grep { /^IDLE/ } @ev), 'L-INFLIGHT 6: a waiting arm is not idle: the refresher stays');
+    mk_marker($tp);                       # work resumes
+    @ev = (); @sp = ();
+    BpContinuityLease::daemon_loop($legacy, %seams);
+    is_deeply(\@sp, ["$legacy/keepawake.pid"], 'L-INFLIGHT 6: the first tick after work resumes takes the lock again');
+    ok((grep { /^IN-FLIGHT sid=\Q$sid\E why=activity$/ } @ev), 'L-INFLIGHT 6: ...logging why')
+        or diag(join("\n", @ev));
+    ok((grep { /^TICK active=1 reason=arm sid=\Q$sid\E / } @ev), 'L-INFLIGHT 6: ...and an ordinary held tick');
+    unlink "$legacy/keepawake.pid";
+}
+
 done_testing();
