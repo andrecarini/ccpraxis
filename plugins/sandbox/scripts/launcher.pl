@@ -2574,8 +2574,7 @@ sub _refresh_live_mirror {
         _emit_err(_c_warn('WARNING:'), " the sandbox's copy of the live install held entries the Mac never wrote,",
                   " which only a process outside a container could have put there:\n",
                   (map { "  $_\n" } @warn),
-                  "  Treat the podman machine as compromised: recreate it (podman machine rm, then podman-machine.pl\n",
-                  "  apply --confirm), and delete $LIVE_MIRROR, which the next launch rebuilds.\n")
+                  "  Treat the podman machine as compromised: recreate it (podman machine rm, then podman-machine.pl apply --confirm), and delete $LIVE_MIRROR, which the next launch rebuilds.\n")
             if @warn;
     }
     return LiveMirror::complete($INSTALL_ROOT, $LIVE_MIRROR) ? 1 : 0;
@@ -3728,15 +3727,12 @@ sub plan_wants_prompt {
 
 # sandbox_settings_create_note() -> lines for the stale prompt: what creating a
 # container (every Rebuild does) does to the sandbox's settings.json and
-# CLAUDE.md. Kept short enough for an 80-column frame.
+# CLAUDE.md. One element per paragraph: the frame and the terminal wrap long
+# lines, the code never does (no-hard-wrapped-output.t).
 sub sandbox_settings_create_note {
     return (
-        "  A new container (every Rebuild makes one) keeps this sandbox's",
-        "  own settings: settings.json is merged with the preset key by key,",
-        "  and a key changed on both sides is asked about (default: keep",
-        "  the sandbox's). The old file is backed up first, to",
-        "  .ccpraxis-local-data/claude-home/.launcher/backups/. CLAUDE.md is",
-        "  regenerated; a copy edited in the sandbox is backed up there too.",
+        "  A new container (every Rebuild makes one) keeps this sandbox's own settings: settings.json is merged with the preset key by key, and a key changed on both sides is asked about (default: keep the sandbox's). The old file is backed up first, to .ccpraxis-local-data/claude-home/.launcher/backups/.",
+        "  CLAUDE.md is regenerated; a copy edited in the sandbox is backed up there too.",
     );
 }
 
@@ -4648,8 +4644,7 @@ sub _ask_settings_conflict {
     };
     (my $name = $json->encode("$c->{name}")) =~ s/\A"|"\z//g;
     my @detail = (
-        "  This sandbox and the sandbox preset both changed this key since the",
-        "  sandbox was last given the preset.",
+        "  This sandbox and the sandbox preset both changed this key since the sandbox was last given the preset.",
         '',
         "  this sandbox:   " . $show->($c->{local_found},  $c->{local_val}),
         "  the preset now: " . $show->($c->{remote_found}, $c->{remote_val}),
