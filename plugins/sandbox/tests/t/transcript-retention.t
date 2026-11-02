@@ -688,6 +688,36 @@ my $CONTAINER_BASELINE = {
                 ],
             },
         ],
+        # DELIBERATE DECLARATION, 2026-11-02 (the node-pnpm recipe as the one
+        # way to get Node): the same auto-declare.pl command on two more Bash
+        # events, container only. PreToolUse refuses an ad-hoc Node or pnpm
+        # install and names `/backpack:add --recipe node-pnpm`; PostToolUseFailure
+        # names the recipe when a command fails because node/npm/npx/pnpm/corepack
+        # is missing. The hook dispatches on hook_event_name and answers through
+        # JSON on stdout, so the `|| true` that keeps a missing mount harmless
+        # cannot swallow a refusal. Contract: plugins/backpack/tests/t/node-recipe-hooks.t.
+        PostToolUseFailure => [
+            {
+                matcher => 'Bash',
+                hooks   => [
+                    {
+                        command => '[ -f "$HOME/.claude/auto-declare.pl" ] && perl "$HOME/.claude/auto-declare.pl" || true',
+                        type    => 'command',
+                    },
+                ],
+            },
+        ],
+        PreToolUse => [
+            {
+                matcher => 'Bash',
+                hooks   => [
+                    {
+                        command => '[ -f "$HOME/.claude/auto-declare.pl" ] && perl "$HOME/.claude/auto-declare.pl" || true',
+                        type    => 'command',
+                    },
+                ],
+            },
+        ],
     },
     inputNeededNotifEnabled      => JSON::PP::true,
     promptSuggestionEnabled      => JSON::PP::false,

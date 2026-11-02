@@ -299,10 +299,18 @@ The `project-setup` category handles project-level setup commands (e.g. `npm ci 
 - `yarn global add …`
 - `pip install X[==v]` / `pip3 install …` / `python -m pip install …` (skipped when `-r`/`-e`/`-c`/`--requirement` points at a file)
 - `cargo install X[@v]` (also `--version V X`)
-- Leading `sudo` is stripped per-segment (sandbox runs as root, so `sudo` isn't installed; the strip is defensive parsing for the case where an agent prepends it out of habit)
-- Compound commands (`A && B`) are split on `&&`/`;`/`||`; each segment is matched independently
+- Leading `sudo`, `env` and `VAR=value` prefixes are dropped per simple command (sandbox runs as root, so `sudo` isn't installed; the strip is defensive parsing for the case where an agent prepends it out of habit)
+- Commands are read the way the shell reads them: split at unquoted `&&`/`||`/`;`/`|`/newlines, with quoted text, comments and here-document bodies treated as data, and `sh -c '…'`/`eval` looked through; each simple command is matched independently
 
 The hook **does not write to backpack.json**. It detects install-shape commands, filters out items already in the backpack, and emits a `hookSpecificOutput.additionalContext` block with pre-filled `/backpack:add` invocations and `<WHY>` placeholders for the rationale. Claude decides per-item whether to commit (replacing `<WHY>` with a real one-line reason) or skip (one-off install). If skipped, no pollution lands; if the agent installs the same thing again later, they get re-prompted. The retry cost is near-zero, the pollution problem (one-off `apt-get install -y jq` to inspect a JSON, then never needed again) is structurally avoided. A safe-name regex `^[\@a-zA-Z0-9][a-zA-Z0-9._/+\-]*$` rejects parsed tokens that don't look like real package names. The hook always exits 0 — failures must not disrupt Claude.
+
+**Node.js and pnpm: one way in.** The image ships no Node; a project declares it with `/backpack:add --recipe node-pnpm` (`plugins/backpack/recipes/node-pnpm.json`: an exact Node LTS and pnpm, sha256-checked, under `/opt/tools/node`). The same hook file is registered on two more Bash events in the container's `settings.json`, so the recipe does not depend on an agent having read the add skill:
+
+- `PreToolUse` refuses an ad-hoc Node or pnpm install (apt `nodejs`/`npm`, nvm, n, fnm, volta, nodenv, asdf, mise, their installers, NodeSource, a nodejs.org tarball download, corepack for pnpm or without the recipe's Node, a global or `npx` pnpm, `pnpm env use`) and any Node or pnpm backpack item added without `--recipe`; the refusal names the recipe. The full matrix, with the reason for each entry, is in the hook's header.
+- `PostToolUseFailure` names the recipe when a command fails because `node`, `npm`, `npx`, `pnpm` or `corepack` is missing, adjusted to what the backpack already declares (declared but not installed: `/backpack:install`; a grandfathered Node item without pnpm: replace it with the recipe).
+- `PostToolUse` never proposes a Node or pnpm install as a backpack item; it proposes the recipe instead.
+
+Items already in a backpack keep replaying, grandfathered Node items included: the install pass runs each item inside `backpack.pl`, never as a Bash tool call, so no hook sees it.
 
 **Trust-hash defense.** `.ccpraxis-local-data/claude-home/.launcher/backpack-trusted-hash` (host-side, `:ro`-mounted into the container so it's tamper-evident) defends against two attack scenarios: a backpack.json supplied by a third-party project clone, or one overwritten by a compromised in-container agent. Both would otherwise run `install`/`verify` commands as root on the next launcher pass. On every launch:
 

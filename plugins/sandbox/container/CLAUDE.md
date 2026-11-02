@@ -38,7 +38,7 @@ You have full autonomy. No permission prompts. Go fast.
 - ✅ `firebase`, `gcloud`, `terraform`
 - ✅ ANY build tool, linter, formatter, or compiler
 
-**Node.js and pnpm are NOT preinstalled.** The image carries no language runtime beyond the Perl that ccpraxis itself runs on. If the project builds with Node (a `package.json`, an `.nvmrc`, a JS build), declare it with `/backpack:add --recipe node-pnpm` and then `/backpack:install`: an exact Node LTS plus pnpm under `/opt/tools/node`, whose `bin` is already on `PATH`, so `npm install -g` tools are found too. Do not `apt-get install nodejs`: Debian's is Node 18, end of life.
+**Node.js and pnpm are NOT preinstalled.** The image carries no language runtime beyond the Perl that ccpraxis itself runs on. If the project builds with Node (a `package.json`, an `.nvmrc`, a JS build), declare it with `/backpack:add --recipe node-pnpm` and then `/backpack:install`: an exact Node LTS plus pnpm under `/opt/tools/node`, whose `bin` is already on `PATH`, so `npm install -g` tools are found too. It is the only way: a hook refuses every other Node or pnpm install (apt's Node 18 is end of life) and names the recipe.
 
 There is no host machine to protect — this container IS the sandbox, and a compromise stays contained in it even with full in-container root.
 Worst case, the container gets recreated. Project files are bind-mounted and git-recoverable.

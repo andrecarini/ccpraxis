@@ -67,6 +67,28 @@
             ],
             "matcher" : "Bash"
          }
+      ],
+      "PostToolUseFailure" : [
+         {
+            "hooks" : [
+               {
+                  "command" : "[ -f \"$HOME/.claude/auto-declare.pl\" ] && perl \"$HOME/.claude/auto-declare.pl\" || true",
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Bash"
+         }
+      ],
+      "PreToolUse" : [
+         {
+            "hooks" : [
+               {
+                  "command" : "[ -f \"$HOME/.claude/auto-declare.pl\" ] && perl \"$HOME/.claude/auto-declare.pl\" || true",
+                  "type" : "command"
+               }
+            ],
+            "matcher" : "Bash"
+         }
       ]
    },
    "inputNeededNotifEnabled" : true,

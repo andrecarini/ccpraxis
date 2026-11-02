@@ -1,6 +1,6 @@
 ---
 name: add
-description: Record an item in the sandbox backpack so it's restored on every container rebuild. Use when (a) the auto-declare hook's additionalContext surfaces a pre-filled invocation after a successful install — decide whether to run it (with a real rationale) or skip the install as a one-off; (b) the user says "add to the backpack", "declare X", "pack X", "persist this install"; (c) you installed something via an unusual shape the hook can't parse (curl-pipe-bash, custom script) and want to record it manually; (d) the project needs Node.js or pnpm, which the sandbox image does not ship — add the sanctioned `node-pnpm` recipe. Also use to fill in a missing rationale on an existing entry — re-running add with the same category+name updates in place. Skip on the host.
+description: Record an item in the sandbox backpack so it's restored on every container rebuild. Use when (a) the auto-declare hook's additionalContext surfaces a pre-filled invocation after a successful install — decide whether to run it (with a real rationale) or skip the install as a one-off; (b) the user says "add to the backpack", "declare X", "pack X", "persist this install"; (c) you installed something via an unusual shape the hook can't parse (curl-pipe-bash, custom script) and want to record it manually; (d) the project needs a runtime that has a recipe (`--recipe node-pnpm` for Node.js and pnpm), the only way to add it. Also use to fill in a missing rationale on an existing entry — re-running add with the same category+name updates in place. Skip on the host.
 user-invocable: true
 argument-hint: "[--category C --name N --install I --verify V --rationale R]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -80,11 +80,16 @@ shipped Node now sits ahead of the recipe: `/backpack:remove` it and add it agai
 The npm and pnpm supply-chain settings (no install scripts, a 7-day minimum package age for pnpm)
 are set by the image and apply to this Node the moment it exists.
 
-A project that needs a different major (say Node 22, pinned by its `engines`) still uses the recipe as
-the template: copy its install and verify, change the version literals and both sha256 values (from
-`https://nodejs.org/dist/v<version>/SHASUMS256.txt`), and add it under a name that starts with
-`node` (`node22`, `node22+pnpm`), which is how the butler dependency check recognises a declared Node.
-Never `latest`, `lts` or a bare major.
+The recipe is the only way in. Inside the sandbox the backpack's hook refuses every other route to
+Node or pnpm (apt, nvm, n, fnm, volta, NodeSource, a hand-downloaded nodejs.org tarball, corepack or a
+global install for pnpm) and every Node or pnpm item added without `--recipe`, and its refusal names
+this recipe. Items already in a backpack keep replaying.
+
+A project that needs a different major (say Node 22, pinned by its `engines`) still adds it with
+`--recipe node-pnpm` and overrides the version: `--name` (one that starts with `node`, such as
+`node22+pnpm`, which is how the butler dependency check recognises a declared Node), and `--install` and
+`--verify` with the version literals and both sha256 values changed (from
+`https://nodejs.org/dist/v<version>/SHASUMS256.txt`). Never `latest`, `lts` or a bare major.
 
 ## PATH — entries no longer need a hand-rolled preamble
 
