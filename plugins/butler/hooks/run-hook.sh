@@ -274,6 +274,23 @@ for clause in "${pre_clauses[@]}"; do
                     esac
                 fi
                 ;;
+            itext:*)
+                # text: in any letter case, for a command name macOS and
+                # Windows resolve case-insensitively. nocasematch is bash
+                # >= 3.1 (macOS /bin/bash 3.2 has it), restored as found.
+                needle=${atom#itext:}
+                if [ "$BP_PAYLOAD_TRUNCATED" = "1" ]; then
+                    holds=1
+                else
+                    ci_was=0
+                    shopt -q nocasematch && ci_was=1
+                    shopt -s nocasematch
+                    case $BP_PAYLOAD in
+                        *"$needle"*) holds=1 ;;
+                    esac
+                    [ "$ci_was" -eq 1 ] || shopt -u nocasematch
+                fi
+                ;;
             ledger)
                 _bp_clause_holds "$atom" && holds=1
                 ;;

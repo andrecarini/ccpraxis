@@ -55,7 +55,7 @@ and `runs/<pkg>.force-stop`.
 
 | source | event | matcher | hook |
 |---|---|---|---|
-| hooks.json | PreToolUse | Bash | guard-bash.sh, guard-git-mutations.sh --only-during-butler-run, arm-on-entry.sh, continuity-off-check.sh, guard-disarm-judge-readonly.sh |
+| hooks.json | PreToolUse | Bash | guard-bash.sh, guard-git-mutations.sh --only-during-butler-run, arm-on-entry.sh, continuity-off-check.sh, guard-disarm-judge-readonly.sh, guard-sleep-control.sh |
 | hooks.json | PreToolUse | Edit\|Write\|MultiEdit\|NotebookEdit | guard-writes.sh, ledger-guard.sh, guard-blueprint-write.sh |
 | hooks.json | PreToolUse | Bash\|Edit\|Write\|MultiEdit\|NotebookEdit | guard-continuity-state.sh |
 | hooks.json | PreToolUse | Edit\|Write\|MultiEdit\|NotebookEdit\|Task\|Agent | gate-shutdown.sh |
@@ -88,6 +88,8 @@ completion still clears its writer marker.
 judged-continuity-disarm package 03 added a 28th hooks.json command, guard-disarm-judge-readonly.sh on PreToolUse Bash; the count above predates it.
 
 The continuity-state guard (2026-10-23) added a 29th, guard-continuity-state.sh, in its own PreToolUse group on Bash and the four edit tools.
+
+The sleep-control guard (2026-10-30) added a 30th, guard-sleep-control.sh, as the last entry of the PreToolUse Bash group.
 
 ### file: arm-on-entry.sh
 verdict: keep
@@ -136,6 +138,14 @@ reason: Package 03 of blueprint judged-continuity-disarm added this guard; it li
 ### registration: hooks.json PreToolUse [Bash] guard-disarm-judge-readonly.sh
 verdict: keep
 reason: Registered in the Bash group so every Bash call of the judge's own claude process gets an explicit allow or deny; a no-op unless CCPRAXIS_DISARM_JUDGE is exactly 1.
+
+### file: guard-sleep-control.sh
+verdict: keep
+reason: Added 2026-10-30 after a hand-run caffeinate kept a lid-closed Mac awake ten hours past its work; it denies a Bash command that changes sleep behaviour by hand and names arming continuity.
+
+### registration: hooks.json PreToolUse [Bash] guard-sleep-control.sh
+verdict: keep
+reason: In the Bash group for every session, main thread and subagents alike; its case-insensitive text prefilter keeps perl from starting on any command that names no target.
 
 ### file: guard-fork.sh
 verdict: keep
@@ -361,6 +371,7 @@ are a closed set owned by 03:
 | `armed` | `armed/<sid>` exists, or the session id could not be extracted |
 | `driver` | the first line of `armed/<sid>` contains `"role":"driver"`, or the session id could not be extracted |
 | `text:<s>` | the raw payload contains `<s>` |
+| `itext:<s>` | the raw payload contains `<s>` in any letter case (bash `nocasematch`, which macOS's bash 3.2 has), for a command name macOS and Windows resolve case-insensitively |
 
 Steps:
 
@@ -1333,6 +1344,7 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 | ac-standdown-gate.sh | 2 | --pre acstanddown : exits when the AC-loss stand-down marker is absent (env-only, no session file read) |
 | guard-disarm-judge-readonly.sh | 1 | no run-hook.sh and no --pre (pure bash env check, never starts perl unless set) : exits when CCPRAXIS_DISARM_JUDGE is not exactly 1 |
 | guard-continuity-state.sh | 2 | --pre text:continuity,text:Continuity,text:CONTINUITY : exits when the payload text lacks continuity in all three casings |
+| guard-sleep-control.sh | 6 | --pre itext:caffeinate,itext:pmset,itext:powercfg,itext:systemd-inhibit,itext:setthreadexecutionstate,itext:keep-awake.ps1,itext:keepawake.p : exits when the payload names none of them in any letter case |
 
 **Who each rule applies to.** A fork counts as a subagent everywhere.
 
@@ -1358,6 +1370,7 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 - track-dispatch: coordinator, and an armed driver's main thread.
 - guard-fork: every session and caller (Decision 64).
 - guard-continuity-state: every session and caller, main, coordinator or subagent. The early exit is text-only, so perl starts only for a payload that names continuity. An `armed` clause would have let the transcript half see every call in an armed session, at about 110 ms a call (measured 2026-10-23); editing one's own transcript is deliberate by nature, which the operator ruled out of scope, so the transcript half fires only when the payload also names continuity.
+- guard-sleep-control: every session and caller, main, coordinator or subagent, armed or not: no session may change the machine's sleep behaviour by hand. The early exit is text-only (case-insensitive), so perl starts only for a payload that names a target.
 - arm-nudge-prompt: the main thread's operator prompts only; a task-notification, a subagent payload
   or a BP_LEDGER environment is skipped before anything is written.
 - session-start-nudge: every main-thread session, on every source (startup, resume, clear, compact),
@@ -1420,6 +1433,25 @@ that this is guidance for a cooperating but fallible agent, not a security bound
 slip into a visible refusal, and deliberate circumvention (variables, `eval`, scripts) is out of scope,
 so the matching stays plain substring tests. Paths compare case-insensitively on Windows and macOS,
 with slashes normalised. Source: `plugins/butler/tests/t/guard-continuity-state.t`.
+
+guard-sleep-control.sh (added 2026-10-30, after an unattended session's hand-run
+`caffeinate -i -s -m -t 50400` kept a lid-closed Mac on AC awake from 23:01, when its work ended, to
+08:52) denies a Bash command that changes the machine's sleep behaviour by hand: `caffeinate` in any
+spelling (a path, zsh `=caffeinate`, `\caffeinate`, any letter case, behind `nohup`, `env`, `sudo`,
+`time`, `timeout`, `exec`, `command`, `xargs` or `doas`, backgrounded with `&`, inside `$(...)`,
+backticks, `sh -c`, `eval`, a heredoc or pipe into a shell, or an interpreter one-liner that execs
+it), `pkill`/`killall caffeinate`, every `pmset` verb but `-g` (writes, `disablesleep`, `noidle`, and
+`sleepnow`, which would suspend the machine running the work), `systemd-inhibit` but `--list`, every
+`powercfg` verb but the queries (`/requests`, `/list`, `/query`, `/a`, `/lastwake`, ...;
+`/requestsoverride` is a query only with no arguments), `SetThreadExecutionState` through PowerShell,
+and a hand-started `keep-awake.ps1`, `bp-keepawake.pl hold` or `KeepAwake.pm hold`. The commands are
+walked with GuardBash's command walker (`_hyg_commands`), so a mention (`grep caffeinate`, a commit
+message, a heredoc written to a file) passes. The denial names the one sanctioned path, arming
+continuity, whose lease holds the managed wake-lock only while work is in flight (on a Mac: `caffeinate
+-i`, AC power only, never against a closed lid), and adjusts for an armed session and for a subagent.
+ccpraxis's own holders and Claude Code's own `caffeinate -i -t 300` are started by fork+exec, never
+through the Bash tool, so the guard never sees them. Guidance for a cooperating agent, like
+guard-continuity-state. Source: `plugins/butler/tests/t/guard-sleep-control.t`.
 
 Fail direction per hook, applied only after the early exit has let the call through. Fail open
 (exit 0) for everything except coordinator `guard-writes.sh`, `ledger-guard.sh` and `gate-shutdown.sh`
