@@ -3,7 +3,7 @@
 # launcher.pl's wiring of the sandbox settings merge, read as TEXT ONLY --
 # never spawned (it would build an image and start a container). The merge
 # itself, the backups and the declined-preset memory are driven directly in
-# sandbox-settings-merge.t; This file
+# sandbox-settings-merge.t; the registry in sandbox-registry.t. This file
 # pins that the launcher actually routes through them:
 #
 #   W1  a Rebuild no longer refreshes the per-project copies before the create
@@ -16,6 +16,8 @@
 #       settings
 #   W5  the conflict prompt: TUI only on an active frame, q/ESC keeps the
 #       sandbox value, and with no terminal nothing reads STDIN
+#   W6  the sandbox is recorded in the machine's sandbox list, fail-soft,
+#       before the container starts
 use strict;
 use warnings;
 use FindBin qw($Bin);
@@ -125,5 +127,16 @@ sub code_of { my ($s) = @_; return join "\n", grep { !/^\s*#/ } split /\n/, ($s 
     ok($start_at > index($SRC, 'sub _ask_settings_conflict'), 'W5 the prompt is defined before podman start (no STDIN read after it)');
 }
 
+# ---- W6 ----
+{
+    my $end_at = index($SRC, '# <<< launch-emit:create:END');
+    my $reg_at = index($SRC, 'SandboxRegistry::register(');
+    ok($reg_at > $end_at, 'W6 the sandbox is registered after the create block');
+    my ($call) = $SRC =~ /(SandboxRegistry::register\(.*?\);)/s;
+    like($call // '', qr/registry\s*=>\s*SandboxRegistry::registry_path\(\$CLAUDE_HOST_CONFIG\)/, 'W6 in the host ~/.claude, never in the project');
+    like($call // '', qr/launcher\s*=>\s*\$SandboxIdentity::ID/, 'W6 with the launcher identity');
+    my $win = substr($SRC, $reg_at - 200, 900);
+    like($win, qr/my \$reg = eval \{/, 'W6 fail-soft: a registry failure cannot stop the launch');
+}
 
 done_testing();

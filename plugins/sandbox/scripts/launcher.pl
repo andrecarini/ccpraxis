@@ -168,6 +168,7 @@ use PluginSync ();  # Fix 2: copy-model plugin-store reconcile (copy/prune/recon
 use PortAlloc ();         # fix-multiple-running-sandboxes: per-container port-block allocation
 use SandboxLock ();       # 04-build-race-lock: generalised mkdir lock + global build-race guard
 use SandboxSettings ();   # the sandbox's settings.json merge / CLAUDE.md refresh at create, with backups
+use SandboxRegistry ();   # this machine's list of sandboxed projects (read by /steward:backup)
 use JSON::PP ();          # parse backpack.json + write the approved install-set
 use Errno ();              # 04-run-panel-ledger-truth: %! (EPERM) for _pid_alive's kill(0,...) probe
 use File::Path qw(make_path);
@@ -5565,6 +5566,27 @@ else {
 }
 # <<< launch-emit:create:END
 
+# This machine's list of sandboxed projects (SandboxRegistry), which
+# /steward:backup reads to compare each sandbox's settings with the preset.
+# Recorded on every manager launch, not only at create, so a sandbox created
+# before the list existed appears without a Rebuild; a launch that changes
+# nothing rewrites nothing, and entries whose directory is gone are pruned.
+# Fail-soft: the list is a convenience for the backup, never a reason to stop
+# a launch.
+{
+    my $reg = eval {
+        SandboxRegistry::register(
+            registry     => SandboxRegistry::registry_path($CLAUDE_HOST_CONFIG),
+            project_path => $PROJECT_PATH,
+            launcher     => $SandboxIdentity::ID,
+            container    => $CONTAINER_NAME,
+        );
+    } || { error => ($@ || 'unknown error') };
+    _emit_err(_c_warn("WARNING:"), " this sandbox was not recorded in the machine's sandbox list ($reg->{error}); /steward:backup will not see its settings until a later launch records it\n")
+        if defined $reg->{error};
+    log_ev('sandbox_registry', { id => $reg->{id}, changed => $reg->{changed}, reminted => $reg->{reminted},
+                                 pruned => $reg->{pruned}, error => $reg->{error} });
+}
 
 # =====================================================================
 # Backpack approval (host-side, BEFORE podman start)
