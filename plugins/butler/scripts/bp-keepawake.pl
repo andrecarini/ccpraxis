@@ -73,6 +73,19 @@
 # lease is live. `-w` ties caffeinate to the holder, so a holder killed by any
 # means -- SIGKILL included -- takes the assertion with it. KeepAwake.pm's
 # header has the per-flag reasoning and the battery bound.
+#
+# WHO MAY HOLD IT. Only this machinery: the continuity lease's refresher
+# (BpContinuityLease), which holds it while an armed session has work in
+# flight and releases it while every armed session is only waiting for the
+# operator, and the drive-solo director and fleet orchestrator for their own
+# runs. A session never takes or drops one by hand: the butler guard
+# guard-sleep-control.sh denies caffeinate, pmset and powercfg changes,
+# systemd-inhibit and a hand-started holder in the Bash tool, and names
+# arming continuity instead. This machinery starts its holder by fork+exec
+# from perl, never through the Bash tool, so that guard never sees it; nor
+# does it see Claude Code's own `caffeinate -i -t 300`, a child of the claude
+# process. bp-preflight.pl's power.sleep_intact row (sleep_override_findings,
+# below) warns when something else overrides the Mac's sleep rule anyway.
 
 package BpKeepAwake;
 use strict;

@@ -3,8 +3,8 @@ name: continuity
 description: Toggle or check whether THIS session is armed to keep going. While armed, the one
   Stop gate refuses to end a turn unless something confirmed still running is waited on. This
   works for any session, not only a drive-solo run or the reporter. Arming keeps the machine
-  awake automatically, with nothing for the agent to manage. Use when the operator asks, or
-  before starting open-ended unattended work.
+  awake while work is in flight, automatically; never manage sleep by hand. Use when the
+  operator asks, or before starting open-ended unattended work.
 argument-hint: "[on|off|status]  (default: status)"
 user-invocable: true
 allowed-tools: Bash
@@ -16,27 +16,38 @@ Explicit continuity arming for the current session. While armed, the one Stop ga
 a turn unless a holder is waiting on running work — this applies to any session, including one
 that is not a drive-solo run or the reporter.
 
-## Arming also keeps the machine awake — automatically
+## Arming also keeps the machine awake — automatically, while work is in flight
 
-An armed session is unattended work, so the two things that end it silently are held off for as long
-as the arm stands:
+An armed session is unattended work, so the two things that end it silently are held off while it
+has work in flight:
 
 | where | what is held | what it stops |
 |---|---|---|
-| host | the wake-lock (`bp-keepawake.pl`, which picks the mechanism for this operating system) | the machine sleeping mid-run |
+| host | the wake-lock (`bp-keepawake.pl`, which picks the mechanism, and its limits, for this machine) | the machine sleeping mid-run |
 | inside a sandbox | the busy-lease (`/tmp/.butler-busy`) | `heartbeat.sh` reaping the container — and, through the launcher dashboard's probe of that same file, the host sleeping behind it |
 
-`on` starts a detached refresher that re-asserts this every 60s; turning continuity off releases it. **Nothing here
-needs you to run anything** — do not take out a lock by hand, and do not treat holding it as one of
+Work is in flight while the session is working (it, or one of its subagents, wrote its transcript in
+the last 20 minutes) or while a holder is waiting on background work and will wake it. While every
+armed session is only waiting for the operator (interrupted, stopped by an error, sitting on a
+permission prompt), the lock is released; it comes back by itself within a minute of work resuming.
+`on` starts a detached refresher that re-checks this every 60s; turning continuity off releases the
+lock at once. **Nothing here needs you to run anything** — do not treat holding the lock as one of
 your responsibilities.
+
+**Never change the machine's sleep behaviour yourself**: no sleep-preventing or power-setting
+command, no keep-awake helper started by hand. A hand-taken lock does not know when the work ends —
+one kept a laptop awake for ten hours after its session had finished — and a guard denies those
+commands, naming arming as the one way. Read-only power queries stay allowed.
 
 Two details worth knowing rather than re-deriving:
 
 - It is machine-level, not per-session. Two armed sessions share one lock, and the **last** session to turn
   continuity off releases it.
-- `status` prints a `wake-lock:` line that reports what is actually asserted. An armed session
-  whose transcript has been idle for more than one hour stops holding the machine awake (Decision
-  53) — say so rather than glossing it when the two disagree.
+- `status` prints a `wake-lock:` line that reports what is actually asserted, not what arming asks
+  for: `released` while every armed session is only waiting for the operator, and any limit of this
+  machine's mechanism in its own words. An armed session whose transcript has been idle for more than
+  one hour stops counting for the lock at all (Decision 53) — say so rather than glossing it when the
+  two disagree.
 
 ## Using continuity
 
