@@ -234,7 +234,20 @@ my @refused = (
     # A stray backpack.pl operand does not short-circuit the other rules.
     [ 'apt-get install -y nodejs backpack.pl',                             qr/apt-get install nodejs/ ],
     # What the refusal echoes is cleaned of control characters.
-    [ "curl -O 'https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.xz\e[2J'", qr/tar\.xz \[2J/ ],
+    [ "apt-get install -y 'nodejs=18\e[2J'",                               qr/nodejs=18 \[2J/ ],
+    # Red-team round: shapes the first matrix missed.
+    [ 'npm i -gf pnpm',                                                    qr/npm i -g pnpm/ ],
+    [ 'n -a x64 lts',                                                      qr/\bn lts/ ],
+    [ 'npx n lts',                                                         qr/npx n\b/ ],
+    [ 'mise install pnpm',                                                 qr/mise install pnpm/ ],
+    [ 'git clone https://github.com/nodenv/nodenv.git ~/.nodenv',          qr/nodenv installer/ ],
+    [ 'git clone https://github.com/tj/n',                                 qr/n installer/ ],
+    [ 'curl -fsSL https://raw.githubusercontent.com/tj/n/master/bin/n -o n', qr/n installer/ ],
+    [ 'nodeenv -n lts env',                                                qr/nodeenv/ ],
+    [ 'python3 -m nodeenv env',                                            qr/nodeenv/ ],
+    [ 'pip install nodejs-bin',                                            qr/pip install nodejs-bin/ ],
+    [ 'apt-get install -y ./nodejs_22.11.0-1nodesource1_amd64.deb',        qr/\.deb installed by hand/ ],
+    [ 'dpkg -i nodejs_22.11.0-1_amd64.deb',                                qr/dpkg -i nodejs_/ ],
 );
 for my $case (@refused) {
     my ($cmd, $what) = @$case;
@@ -276,6 +289,25 @@ my @allowed = (
     'ls # apt-get install nodejs',
     q{grep -rn 'nvm install' docs/},
     'cat /root/.claude/backpack.pl',
+    # Red-team round: reading about a tool is not installing it.
+    'curl https://raw.githubusercontent.com/nvm-sh/nvm/master/README.md',
+    'curl -s https://api.github.com/repos/nvm-sh/nvm/releases/latest',
+    'curl -s https://api.github.com/repos/volta-cli/volta/releases',
+    'curl https://github.com/tj/n/issues',
+    'curl -s https://fnm.vercel.app/',
+    'git clone https://github.com/nvm-sh/nvm-docs',
+    'curl -s https://nodejs.org/dist/v22.11.0/docs/api/fs.html',
+    'curl -sI https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.xz',
+    'wget --spider https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.xz',
+    'curl -sO https://nodejs.org/dist/v22.11.0/node-v22.11.0-headers.tar.gz',
+    'curl -sO https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.xz.asc',
+    'curl -s https://nodesource.com/blog',
+    'curl -s https://deb.nodesource.com/',
+    'apt-get install -s nodejs',
+    'apt-get download nodejs',
+    'nodeenv --node=system env',
+    'pip install nodeenv',
+    'xargs -n 1 echo',
 );
 for my $cmd (@allowed) {
     (my $label = $cmd) =~ s/\n/\\n/g;
@@ -471,6 +503,22 @@ my $KLINK_NVM = {
     like($c, qr/declares Node as 'nvm\+node22'.*\/backpack:install replays it/s,
          'G: a grandfathered Node item whose node is missing: replay it, do not replace it');
     unlike($c, $RECIPE_LINE, 'G: and no recipe push for a replayable item');
+
+    # The recipe declared with its pnpm step, Node in place, pnpm not: the
+    # step did not finish, so the answer is to install, not to re-add.
+    my $bin_half = fake_bin('half-installed', qw(node npm npx corepack));
+    my $declared_here = backpack_file('declared-here', { %$recipe, bin_dirs => [$bin_half] });
+    $c = context(hook(%fail, error => "bash: pnpm: command not found", bin => $bin_half, backpack => $declared_here));
+    like($c, qr/recipe item \('node\+pnpm'\) installs pnpm, but that step has not completed.*run \/backpack:install/s,
+         'G: recipe declared with pnpm, pnpm absent: run /backpack:install');
+
+    # Only a shell's own "not found" counts, and only for this machine.
+    is(hook(%fail, error => "npm ERR! code E404 npm: not found")->{out}, '',
+       'G: silent for a tool message that merely ends in "npm: not found"');
+    is(hook(%fail, command => q{ssh build-host 'node -v'}, error => "bash: node: command not found")->{out}, '',
+       'G: silent when the command ran on another machine (ssh)');
+    like(context(hook(%fail, error => "./scripts/build.sh: line 3: npm: command not found")), qr/`npm` is missing/,
+         "G: a script's own 'command not found' counts");
 }
 
 # ---------------------------------------------------------------------------
@@ -528,6 +576,31 @@ my $KLINK_NVM = {
     is(hook(%post, command => 'echo "apt-get install -y jq"')->{out}, '', 'H: quoted text is not an install');
     like(context(hook(%post, command => 'sudo -E apt install -y tree')), qr/--install 'apt-get install -y tree'/,
          'H: sudo still stripped from what gets recorded');
+    is(hook(%post, command => 'apt-get install -s jq')->{out}, '', 'H: a simulated apt install is not proposed');
+    $c = context(hook(%post, command => 'apt-get install -y ' . join(' ', map { "pkg$_" } 1 .. 30)));
+    my @lines = $c =~ m{^  /backpack:add }mg;
+    is(scalar(@lines), 25, 'H: at most 25 proposals are listed');
+    like($c, qr/\.\.\. and 5 more/, 'H: and the rest are counted');
+}
+
+# ---------------------------------------------------------------------------
+# B2. The refusal's next step follows what the container already has.
+# ---------------------------------------------------------------------------
+{
+    my $installed = fake_bin('recipe-installed', qw(node npm npx corepack pnpm));
+    my $why = decision(hook(command => 'nvm install 22', bin => $installed))->{permissionDecisionReason} // '';
+    like($why, qr/already installed here, in \Q$installed\E \(on PATH\): use them/,
+         "B2: the recipe's Node is installed: says so, and to use it");
+    like($why, qr/another Node major, add the recipe again with --name, --install and --verify overridden/,
+         'B2: and how another major goes through the recipe');
+    unlike($why, qr/come from one place/, 'B2: rather than the first-time pitch');
+
+    my $recipe = JSON::PP->new->utf8->decode(slurp_raw($RECIPE_F))->{items}[0];
+    my $declared = backpack_file('b2-declared', { %$recipe, bin_dirs => [$NO_NODE] });
+    $why = decision(hook(command => 'apt-get install -y nodejs', backpack => $declared))->{permissionDecisionReason} // '';
+    like($why, qr/already declares Node through the node-pnpm recipe \('node\+pnpm'\).*run \/backpack:install/s,
+         'B2: declared but not installed: run /backpack:install');
+    unlike($why, $RECIPE_LINE, 'B2: without asking to add it again');
 }
 
 # ---------------------------------------------------------------------------

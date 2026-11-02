@@ -41,26 +41,36 @@
 # replays it on every rebuild. Refused, each because it puts a Node or a pnpm
 # into the container that is not that one:
 #
-#   apt / apt-get / aptitude install nodejs | npm | node
+#   apt / apt-get / aptitude install nodejs | npm | node (not -s, a simulation)
 #       Debian bookworm's Node is 18, end of life, and nothing records it.
+#   apt install ./nodejs_*.deb, dpkg -i nodejs_*.deb
+#       a hand-fetched package: no pins, no checksum, no rebuild restores it.
 #   nvm install; n lts|latest|<version>|auto; fnm install; volta install|fetch|pin;
-#   nodenv install; asdf install|plugin add ... nodejs; mise|rtx install|use node
-#       version managers: an unpinned, unverified Node that no rebuild restores.
-#   curl | wget | git clone of the nvm, n, fnm or volta installer
-#       the same thing, one step earlier.
-#   curl | wget of deb.nodesource.com (or rpm.)
+#   nodenv install; asdf install|plugin add ... nodejs; mise|rtx install|use
+#   node (or pnpm); nodeenv without --node=system; pip install nodejs-bin
+#       version managers and Node-bundling packages: an unpinned, unverified
+#       Node that no rebuild restores.
+#   curl | wget | git clone of the nvm, n, nodenv, fnm or volta installer itself
+#   (nvm-sh/nvm/<ref>/install.sh, a clone of the nvm, n or nodenv repository,
+#   fnm.vercel.app/install, get.volta.sh, ...)
+#       the same thing, one step earlier. A README, a release API or an
+#       issue page of those projects stays readable.
+#   curl | wget of deb.nodesource.com/setup_* (or rpm.)
 #       a third-party apt repository, set up by a root curl|bash.
-#   curl | wget of a file under nodejs.org/dist/<version>/ (also /download/…)
-#       a Node unpacked by hand. index.json and SHASUMS256.txt stay readable:
-#       pinning a recipe needs them.
+#   curl | wget of a Node archive in nodejs.org/dist/<version>/ (also
+#   /download/…): node-v<version>-<platform>.tar.xz and kin, or `$T`
+#       a Node unpacked by hand. The rest stays readable: index.json and
+#       SHASUMS256.txt (pinning a recipe needs them), signatures, the headers
+#       tarball node-gyp fetches, the docs, and any curl -I / wget --spider.
 #   corepack enable|prepare|install|use|up|pnpm|… while the recipe's Node is
 #   absent
 #       corepack is part of the recipe's Node; one from elsewhere is not.
 #   corepack enable (bare, or naming pnpm); corepack prepare|use|… pnpm
 #       swaps the recipe's pinned pnpm for a shim that downloads its own.
-#   npm|pnpm global install, yarn global add, of pnpm, @pnpm/exe, n, node,
-#   corepack; pnpm self-update; pnpm env use|add; npx|npm exec|pnpm dlx|yarn dlx
-#   pnpm; npx node@<version>; curl|wget get.pnpm.io
+#   npm|pnpm global install (-g, also inside a cluster such as -gf), yarn
+#   global add, of pnpm, @pnpm/exe, n, node, corepack; pnpm self-update; pnpm
+#   env use|add; npx|npm exec|pnpm dlx|yarn dlx pnpm; npx n; npx
+#   node@<version>; curl|wget get.pnpm.io/install.sh
 #       an unpinned pnpm, or a second Node.
 #   backpack.pl add without --recipe, when its --install does any of the above
 #   or its --name names node or pnpm (node22, node+pnpm, nvm+node22, ...);
@@ -129,6 +139,7 @@ my $ADD_RECIPE    = "/backpack:add --recipe $RECIPE --rationale '<WHY: what this
 # Why each kind of refusal is one (deny_reason).
 my %WHY = (
     apt          => "Debian's nodejs and npm packages are Node 18, which is end of life, and no rebuild would restore them.",
+    deb          => "A Node .deb installed by hand skips the recipe's pins and checksums, and no rebuild restores it.",
     manager      => "A Node version manager downloads an unpinned, unverified Node that the next container rebuild does not restore.",
     nodesource   => "NodeSource's setup script adds a third-party apt repository, as root.",
     dist         => "A Node unpacked by hand is gone at the next rebuild. Reading nodejs.org/dist/index.json or a SHASUMS256.txt is still fine.",
@@ -170,6 +181,9 @@ exit 0 unless defined $raw && length $raw;
 
 # ── Fast path: decide from the raw payload whether there is anything to do ──
 {
+    # A command of many thousand escapes exceeds the regex engine's recursion
+    # limit: the match then fails, the full parse runs, and the warning is noise.
+    no warnings 'regexp';
     my $ev = $raw =~ /"hook_event_name"\s*:\s*"(PreToolUse|PostToolUseFailure)"/ ? $1 : 'PostToolUse';
     if ($ev eq 'PostToolUseFailure') {
         exit 0 unless $raw =~ /not found|No such file/;
@@ -223,6 +237,14 @@ sub on_failure {
     my $err = $data->{error};
     return unless defined $err && !ref $err;
     my $tool = missing_node_tool($err) // return;
+    # A tool missing on another machine (ssh, a container) is not this sandbox's.
+    for my $words (simple_commands($data->{tool_input}{command})) {
+        my @t = map { $_->[0] } @$words;
+        my $k = command_start(\@t);
+        next if $k > $#t;
+        (my $head = $t[$k]) =~ s{.*/}{};
+        return if $head =~ /^(?:ssh|docker|podman|kubectl|lxc|vagrant)$/;
+    }
     emit('PostToolUseFailure', additionalContext => failure_hint($tool));
 }
 
@@ -288,7 +310,20 @@ sub deny_reason {
              . "--name, --install and --verify (change the version literals and both sha256 values). "
              . "Items already in the backpack keep replaying.";
     }
-    return "[backpack] Refused: $v->{what}. " . ($WHY{$v->{rule}} // '') . " "
+    my $lead = "[backpack] Refused: $v->{what}. " . ($WHY{$v->{rule}} // '') . " ";
+    # The next step depends on what this container and its backpack already have.
+    if (-x "$RECIPE_BIN/node") {
+        return $lead . "Node.js and pnpm from the $RECIPE recipe are already installed here, in $RECIPE_BIN "
+             . "(on PATH): use them. If the project needs another Node major, add the recipe again with "
+             . "--name, --install and --verify overridden (the version literals and both sha256 values):\n"
+             . "  $ADD_RECIPE\nthen /backpack:install.";
+    }
+    my ($recipe_item) = grep { is_recipe_item($_) } load_items();
+    if ($recipe_item) {
+        return $lead . "The backpack already declares Node through the $RECIPE recipe ('$recipe_item->{name}'), "
+             . "and this container has not installed it yet: run /backpack:install.";
+    }
+    return $lead
          . "Node.js, npm, npx, corepack and pnpm come from one place in this sandbox, the $RECIPE recipe:\n"
          . "  $ADD_RECIPE\n"
          . "then /backpack:install. It installs an exact Node LTS and pnpm, checksum-verified, under $prefix "
@@ -312,18 +347,21 @@ sub recipe_proposal {
 }
 
 # missing_node_tool($error) -> the Node tool a failed command could not find,
-# or undef. The shapes: bash `bash: line 1: node: command not found`, dash
-# `sh: 1: node: not found`, zsh `zsh: command not found: node`, a script's
+# or undef. Only a shell's own message counts, at the start of a line: bash
+# `bash: line 1: node: command not found` (or a script's path in place of
+# `bash`), dash `sh: 1: node: not found`, zsh `zsh: command not found: node`, a
 # `#!/usr/bin/env node` shebang (`/usr/bin/env: 'node': No such file or
 # directory`, typographic quotes in a UTF-8 locale), and GNU make's recipe line.
+# A tool's own output that happens to end in "npm: not found" is not one.
 sub missing_node_tool {
     my ($t) = @_;
     my $tool = qr/node|nodejs|npm|npx|pnpm|pnpx|corepack/;
     my $hit;
-    if    ($t =~ /(?:^|[\s:])($tool): (?:command not found|not found)\s*$/m)                          { $hit = $1 }
-    elsif ($t =~ /command not found: ($tool)\s*$/m)                                                   { $hit = $1 }
-    elsif ($t =~ /\benv: ['"\x{2018}]?($tool)['"\x{2019}]?: No such file or directory/)               { $hit = $1 }
-    elsif ($t =~ /\bmake(?:\[\d+\])?: ($tool): (?:Command not found|No such file or directory)/)      { $hit = $1 }
+    if    ($t =~ m{^(?:\S*/\S*|\S*sh): (?:line \d+: )?($tool): command not found\s*$}m)         { $hit = $1 }
+    elsif ($t =~ m{^\S*sh: (?:\d+: )?($tool): not found\s*$}m)                                 { $hit = $1 }
+    elsif ($t =~ m{^\S*zsh: command not found: ($tool)\s*$}m)                                  { $hit = $1 }
+    elsif ($t =~ /\benv: ['"\x{2018}]?($tool)['"\x{2019}]?: No such file or directory/)          { $hit = $1 }
+    elsif ($t =~ /^make(?:\[\d+\])?: ($tool): (?:Command not found|No such file or directory)/m) { $hit = $1 }
     return undef unless defined $hit;
     return $hit eq 'nodejs' ? 'node' : $hit eq 'pnpx' ? 'pnpm' : $hit;
 }
@@ -341,9 +379,13 @@ sub failure_hint {
              . "call it by that path, or put $bin first on PATH.";
     }
     if (-x "$bin/node") {
-        return "$lead The backpack's Node was declared without pnpm. Add it again from the recipe, "
-             . "whose install step brings pnpm:\n  $ADD_RECIPE\nthen /backpack:install."
-            if $tool eq 'pnpm';
+        if ($tool eq 'pnpm') {
+            return "$lead The backpack's recipe item ('$recipe_item->{name}') installs pnpm, but that step has "
+                 . "not completed in this container: run /backpack:install."
+                if $recipe_item && ($recipe_item->{install} // '') =~ /\bpnpm\b/;
+            return "$lead The backpack's Node was declared without pnpm. Add it again from the recipe, "
+                 . "whose install step brings pnpm:\n  $ADD_RECIPE\nthen /backpack:install.";
+        }
         return "$lead The recipe's Node in " . recipe_prefix() . " is incomplete: run /backpack:install, "
              . "and if it reports the item as already present, remove " . recipe_prefix() . " and run it again.";
     }
@@ -435,17 +477,31 @@ sub words_violation {
     if ($head =~ /^(?:apt|apt-get|aptitude)$/) {
         my ($sub, @pkgs) = apt_operands(@rest);
         return undef unless defined $sub && $sub =~ /^(?:install|reinstall)$/;
+        return undef if grep { /^(?:-s|--simulate|--dry-run|--just-print|--no-act|--recon)$/ } @rest;
         for my $p (@pkgs) {
+            return viol('deb', "$head install $p") if node_deb($p);
             (my $base = $p) =~ s{[=/:].*$}{};
             return viol('apt', "$head install $p") if $base =~ /^(?:nodejs|npm|node)$/;
         }
         return undef;
     }
+    if ($head eq 'dpkg' && grep { /^(?:-i|--install)$/ } @rest) {
+        for (@rest) { return viol('deb', "dpkg -i $_") if node_deb($_) }
+        return undef;
+    }
 
     my $sub = $rest[0] // '';
     return viol('manager', "nvm $sub") if $head eq 'nvm' && $sub =~ /^install/;
-    return viol('manager', "n $sub")
-        if $head eq 'n' && $sub =~ /^(?:lts|latest|current|stable|auto|engine|install|i|v?\d[\d.x]*)$/;
+    if ($head eq 'n') {
+        my @pos;
+        for (my $i = 0; $i < @rest; $i++) {
+            if ($rest[$i] =~ /^(?:-a|--arch)$/) { $i++; next }
+            push @pos, $rest[$i] unless $rest[$i] =~ /^-/;
+        }
+        my $nsub = $pos[0] // return undef;
+        return $nsub =~ /^(?:lts|latest|current|stable|auto|engine|install|i|download|v?\d[\d.x]*)$/
+            ? viol('manager', "n $nsub") : undef;
+    }
     return viol('manager', "fnm $sub")
         if $head eq 'fnm' && ($sub =~ /^(?:install|i)$/ || grep { $_ eq '--install-if-missing' } @rest);
     return viol('manager', "volta $sub")    if $head eq 'volta'  && $sub =~ /^(?:install|fetch|pin|setup)$/;
@@ -453,20 +509,40 @@ sub words_violation {
     return viol('manager', "asdf $sub nodejs")
         if $head eq 'asdf' && $sub =~ /^(?:install|plugin|plugin-add|global|local|set|shell)$/
            && grep { /^nodejs$/ } @rest;
-    return viol('manager', "$head $sub node")
-        if $head =~ /^(?:mise|rtx)$/ && $sub =~ /^(?:install|i|use|u|global|local)$/
-           && grep { /^node(?:js)?(?:@.*)?$/ } @rest[1 .. $#rest];
+    if ($head =~ /^(?:mise|rtx)$/ && $sub =~ /^(?:install|i|use|u|global|local)$/) {
+        for (@rest[1 .. $#rest]) {
+            return viol('manager', "$head $sub $_") if /^node(?:js)?(?:@.*)?$/;
+            return viol('pnpm', "$head $sub $_")    if /^pnpm(?:@.*)?$/;
+        }
+    }
+    # nodeenv downloads a Node into a virtualenv unless told to use the system's.
+    return viol('manager', 'nodeenv') if $head eq 'nodeenv' && !nodeenv_system(@rest);
+    if (my @pip = pip_args($head, @rest)) {
+        return viol('manager', 'python -m nodeenv') if $pip[0] eq 'nodeenv' && !nodeenv_system(@pip[1 .. $#pip]);
+        if ($pip[0] eq 'install') {
+            for (@pip) { return viol('node-pkg', "pip install $_") if /^nodejs-bin(?:[=<>!~\[].*)?$/ }
+        }
+    }
 
     if ($head =~ /^(?:curl|wget|aria2c)$/ || ($head eq 'git' && grep { $_ eq 'clone' } @rest)) {
+        # The installers themselves, never a README, a release API or an issue page.
+        my $clone     = $head eq 'git';
+        my $head_only = grep { /^(?:--head|--spider)$/ || /^-[A-Za-z]*I[A-Za-z]*$/ } @rest;    # curl -I, wget --spider
         for my $u (@rest) {
-            return viol('manager', 'fetching the nvm installer')   if $u =~ m{nvm-sh/nvm}i;
-            return viol('manager', 'fetching the fnm installer')   if $u =~ m{fnm\.vercel\.app|Schniz/fnm}i;
-            return viol('manager', 'fetching the volta installer') if $u =~ m{get\.volta\.sh|volta-cli/volta}i;
+            return viol('manager', 'fetching the nvm installer')
+                if $u =~ m{nvm-sh/nvm/[^/\s]+/install\.sh}i || ($clone && $u =~ m{nvm-sh/nvm(?:\.git)?/?$}i);
+            return viol('manager', 'fetching the fnm installer')   if $u =~ m{fnm\.vercel\.app/install\b}i;
+            return viol('manager', 'fetching the volta installer')
+                if $u =~ m{get\.volta\.sh|volta-cli/volta/\S*install\S*\.sh}i;
             return viol('manager', 'fetching the n installer')
-                if $u =~ m{(?:bit\.ly|git\.io)/n-install|mklement0/n-install|(?:^|/)tj/n(?:/|\.git|$)}i;
-            return viol('nodesource', 'fetching a NodeSource setup script') if $u =~ m{nodesource\.com}i;
-            return viol('pnpm', 'fetching the pnpm standalone installer')   if $u =~ m{get\.pnpm\.io}i;
-            return viol('dist', "downloading Node from nodejs.org ($u)") if !$ctx->{recipe} && node_dist_file($u);
+                if $u =~ m{(?:bit\.ly|git\.io)/n-install|mklement0/n-install|(?:^|/)tj/n/[^/\s]+/bin/n$}i
+                   || ($clone && $u =~ m{(?:^|/)tj/n(?:\.git)?/?$}i);
+            return viol('manager', 'fetching the nodenv installer')
+                if $u =~ m{nodenv/nodenv-installer}i || ($clone && $u =~ m{nodenv/(?:nodenv|node-build)(?:\.git)?/?$}i);
+            return viol('nodesource', 'fetching a NodeSource setup script') if $u =~ m{(?:deb|rpm)\.nodesource\.com/setup}i;
+            return viol('pnpm', 'fetching the pnpm standalone installer')   if $u =~ m{get\.pnpm\.io/install}i;
+            return viol('dist', "downloading Node from nodejs.org ($u)")
+                if !$clone && !$head_only && !$ctx->{recipe} && node_dist_file($u);
         }
         return undef;
     }
@@ -517,14 +593,17 @@ sub words_violation {
     return undef;
 }
 
-# node_dist_file($url) -> true for a file under a version directory of
-# nodejs.org's dist tree (a tarball, or `$T` in the recipe's own install),
-# false for the index and the checksum lists a pin is computed from.
+# node_dist_file($url) -> true for a Node archive in a version directory of
+# nodejs.org's dist tree (node-v<version>-<platform>.tar.xz and kin, or a bare
+# `$T` as in the recipe's own install), false for everything else there: the
+# index and checksum lists a pin is computed from, signatures, the headers
+# tarball node-gyp fetches, the docs.
 sub node_dist_file {
     my ($u) = @_;
     return 0 unless $u =~ m{(?:^|[/.@])nodejs\.org/(?:dist|download/[^/\s]+)/(?:v\d|latest|node-v)[^/\s]*/([^?#\s]*)}i;
     my $file = $1;
-    return length($file) && $file !~ /^SHASUMS/i;
+    return $file =~ /^node-v[^\/]*?(?<!-headers)\.(?:tar\.(?:xz|gz)|tgz|zip|7z|pkg|msi)$/i
+        || $file =~ /^\$\{?\w+\}?$/;
 }
 
 sub npx_violation {
@@ -542,7 +621,7 @@ sub npx_violation {
     }
     for (@pkgs) {
         return viol('pnpm', "npx $_")     if $_ =~ $PNPM_PKG;
-        return viol('node-pkg', "npx $_") if /^node@/;
+        return viol('node-pkg', "npx $_") if /^node@/ || /^n(?:@.*)?$/;
     }
     return undef;
 }
@@ -592,6 +671,34 @@ sub apt_operands {
     return ($sub, @pkgs);
 }
 
+# node_deb($arg) -> true for a local Debian package of Node (nodejs_22.11.0-1_amd64.deb).
+sub node_deb { return $_[0] =~ m{(?:^|/)(?:nodejs|node|npm)_[^/]*\.deb$}i }
+
+# nodeenv_system(@args) -> true when nodeenv is told to use the system's Node
+# (--node=system, -n system) and so downloads none.
+sub nodeenv_system {
+    my @a = @_;
+    for my $i (0 .. $#a) {
+        return 1 if $a[$i] =~ /^--node=system$/;
+        return 1 if $a[$i] =~ /^(?:-n|--node)$/ && ($a[$i + 1] // '') eq 'system';
+    }
+    return 0;
+}
+
+# pip_args($head, @rest) -> pip's own arguments for `pip|pip3 ...` and
+# `python[3] -m pip|nodeenv ...` (with the module name first for nodeenv),
+# else ().
+sub pip_args {
+    my ($head, @rest) = @_;
+    return @rest if $head =~ /^pip[\d.]*$/ && @rest;
+    if ($head =~ /^python[\d.]*$/ && ($rest[0] // '') eq '-m') {
+        my $mod = $rest[1] // return ();
+        return @rest[2 .. $#rest] if $mod eq 'pip' && @rest > 2;
+        return @rest[1 .. $#rest] if $mod eq 'nodeenv';
+    }
+    return ();
+}
+
 # pm_operands(@args) -> ($subcommand, $is_global, @positionals) for npm, pnpm
 # and yarn.
 sub pm_operands {
@@ -608,7 +715,8 @@ sub pm_operands {
             last;
         }
         if ($x =~ /^-/) {
-            $global = 1 if $x =~ /^(?:-g|--global|--global=true|--location=global)$/;
+            $global = 1 if $x =~ /^(?:--global|--global=true|--location=global)$/
+                || $x =~ /^-[A-Za-z]*g[A-Za-z]*$/;    # -g, or a cluster such as -gf
             if ($x eq '--location') { $global = 1 if ($a[$i + 1] // '') eq 'global'; $i++; next }
             $i++ if $with_arg{$x};
             next;
@@ -851,7 +959,10 @@ sub build_proposal {
     my $msg = "[backpack] Detected $n install-shape $plural in that Bash call that aren't tracked yet. "
             . "Decide whether each should persist to the next container rebuild. To track an item, run its pre-filled "
             . "/backpack:add with a real rationale; skip any that were one-offs (you'll be prompted again if you install them again later).\n\n";
-    for my $d (@$decls) {
+    # A generated command can install hundreds of packages; the context stays readable.
+    my $max = 25;
+    my @shown = $n > $max ? @$decls[0 .. $max - 1] : @$decls;
+    for my $d (@shown) {
         my $line = "  /backpack:add --category " . shesc($d->{category})
                  . " --name "    . shesc($d->{name})
                  . " --install " . shesc($d->{install})
@@ -859,6 +970,8 @@ sub build_proposal {
         $line .= " --rationale '<WHY: one line — what this is for, why this version>'";
         $msg .= "$line\n";
     }
+    $msg .= "  ... and " . ($n - $max) . " more; record them with /backpack:add the same way if they should persist.\n"
+        if $n > $max;
     return $msg;
 }
 
@@ -894,6 +1007,8 @@ sub parse_apt {
     my @results;
     # Both `apt-get install` and `apt install`.
     for my $seg (install_segments($cmd, qr/(?:apt(?:-get)?\s+install)/)) {
+        # A simulated install installed nothing.
+        next if $seg =~ /\s(?:-s|--simulate|--dry-run|--just-print|--no-act|--recon)(?:\s|$)/;
         my @tokens = split /\s+/, $seg;
         # Drop the leading `apt-get install` or `apt install`.
         shift @tokens;  # apt or apt-get
