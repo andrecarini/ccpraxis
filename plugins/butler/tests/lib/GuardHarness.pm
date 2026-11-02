@@ -151,6 +151,11 @@ sub _snapshot_real_state {
         for my $entry (readdir $dh) {
             next if $entry eq '.' || $entry eq '..';
             my $full = "$d/$entry";
+            # continuity/sandbox-holds/ is rewritten every two minutes by any
+            # LIVE claude-sandbox launcher (bp-power-plan reconcile --hold), so
+            # watching it failed every standalone run made while a sandbox was
+            # open (2026-11-02). No test writes there; it is the machine's.
+            next if -d $full && $entry eq 'sandbox-holds' && $d =~ m{/continuity\z};
             if (-d $full) { push @stack, $full; next }
             my @st = stat $full;
             (my $rel = $full) =~ s{\\}{/}g;
