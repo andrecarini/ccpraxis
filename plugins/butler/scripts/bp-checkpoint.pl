@@ -503,8 +503,24 @@ sub checkpoint {
     #    done-criterion (c) wants, and the repo's hooks are the human's contract.
     my $msg = commit_message({ pkg => $pkg, status => $a->{status},
                                step => $a->{step}, now => $a->{now} });
-    my ($cout, $crc) = _git($root, '-c', 'user.email=butler@localhost', '-c', 'user.name=butler',
-                            'commit', '-q', '-m', $msg, '--', @staged);
+    my ($cout, $crc);
+    # `git add -A -- <dir>` succeeds for a directory that exists but holds
+    # nothing git can track yet (empty, or only ignored files), so that entry
+    # counts as staged; `git commit -- <paths>` then refuses the WHOLE commit
+    # with "pathspec '<dir>' did not match any file(s) known to git". Measured
+    # 2026-11-02: four checkpoints of one package lost that way over 12 minutes.
+    # Drop the named entry and retry, at most once per staged entry.
+    for (0 .. scalar @staged) {
+        ($cout, $crc) = _git($root, '-c', 'user.email=butler@localhost', '-c', 'user.name=butler',
+                             'commit', '-q', '-m', $msg, '--', @staged);
+        last if _git_broke($crc) || (defined $crc && $crc == 0);
+        my ($bad) = (defined $cout ? $cout : '') =~ /pathspec '([^']*)' did not match any file\(s\) known to git/;
+        last unless defined $bad && grep { $_ eq $bad } @staged;
+        @staged = grep { $_ ne $bad } @staged;
+        push @unmatched, $bad;
+        $r->{staged} = \@staged;
+        return _noop($r, 'all-pathspecs-unmatched') unless @staged;
+    }
     # A child that never ran to completion is NOT a commit: `$? >> 8` reads a
     # signal-killed git as 0, which would report `committed` (with the previous
     # HEAD as its sha) for a commit that does not exist.
