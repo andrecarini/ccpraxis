@@ -1076,4 +1076,43 @@ if ($^O =~ /^(MSWin32|cygwin|msys)$/) {
     }
 }
 
+# ---------------------------------------------------------------------------
+# PowerShell's module-analysis cache is pinned inside the per-file sandbox,
+# and the sandbox's AppData folders exist (todo 20261029-114028-227f0000: an
+# unpinned cache whose path resolved relative left Microsoft/Windows/
+# PowerShell/ModuleAnalysisCache at the repo root in three sweeps).
+# ---------------------------------------------------------------------------
+{
+    my $src = <<'SRC';
+#!/usr/bin/env perl
+# platform: any
+use strict;
+use warnings;
+my $report = $ENV{FIXTURE_REPORT_DIR};
+die "FIXTURE_REPORT_DIR not set\n" unless defined $report && length $report;
+open(my $fh, '>', "$report/pscache-seen.txt") or die "$!";
+print {$fh} 'HOME=', ($ENV{HOME} // ''), "\n";
+print {$fh} 'PSCACHE=', ($ENV{PSModuleAnalysisCachePath} // '<UNSET>'), "\n";
+print {$fh} 'LOCALAPPDATA_DIR=', ((defined $ENV{LOCALAPPDATA} && -d $ENV{LOCALAPPDATA}) ? 1 : 0), "\n";
+print {$fh} 'APPDATA_DIR=', ((defined $ENV{APPDATA} && -d $ENV{APPDATA}) ? 1 : 0), "\n";
+close $fh;
+print "ok 1 - pscache-probe fixture ran\n";
+print "1..1\n";
+SRC
+    my $repo       = build_fake_repo('pscache-probe.t' => $src);
+    my $outer_home = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+    my $report_dir = File::Temp::tempdir(HostCaps::tempdir_args(), CLEANUP => 1);
+    my $res = run_fake_sweep(repo => $repo, args => [],
+        env => { HOME => $outer_home, FIXTURE_REPORT_DIR => $report_dir }, timeout => $BOUND);
+    is($res->{rc}, 0, 'pscache: the probe fixture runs cleanly')
+        or diag("stdout:\n$res->{out}\nstderr:\n$res->{err}");
+    my %seen = map { /^(\w+)=(.*)$/ ? ($1 => $2) : () } split /\n/, (read_report($report_dir, 'pscache-seen.txt') // '');
+    ok(length($seen{HOME} // ''), 'pscache: the fixture reported its HOME');
+    my $home = $seen{HOME} // "\0";
+    like($seen{PSCACHE} // '', qr/^\Q$home\E[\\\/]/, 'pscache: PSModuleAnalysisCachePath lies inside the per-file sandbox')
+        or diag("PSCACHE=$seen{PSCACHE} HOME=$home");
+    is($seen{LOCALAPPDATA_DIR}, 1, 'pscache: the sandbox LOCALAPPDATA folder exists');
+    is($seen{APPDATA_DIR},      1, 'pscache: the sandbox APPDATA folder exists');
+}
+
 done_testing();

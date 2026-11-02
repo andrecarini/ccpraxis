@@ -1049,6 +1049,17 @@ sub run_one {
     $ENV{USERPROFILE}                       = $sandbox;
     $ENV{APPDATA}                           = File::Spec->catdir($sandbox, 'AppData', 'Roaming');
     $ENV{LOCALAPPDATA}                      = File::Spec->catdir($sandbox, 'AppData', 'Local');
+    # PowerShell's module-analysis cache, pinned inside the sandbox (todo
+    # 20261029-114028-227f0000). Unpinned, powershell.exe derives it from
+    # LOCALAPPDATA, else from the profile folder, and when neither resolves the
+    # path comes out relative: a stray Microsoft/Windows/PowerShell/
+    # ModuleAnalysisCache in the test's cwd, the repo root, seen in three
+    # sweeps (2026-09-26, 10-21, 11-02) and never reproduced on demand. Tests
+    # that unset LOCALAPPDATA for their own reasons still inherit this, and it
+    # overrides every fallback. The AppData dirs are created too, so the
+    # profile-folder lookup .NET does (empty for a missing folder) resolves.
+    $ENV{PSModuleAnalysisCachePath}         = File::Spec->catfile($sandbox, 'PowerShell', 'ModuleAnalysisCache');
+    File::Path::make_path($ENV{APPDATA}, $ENV{LOCALAPPDATA}, File::Spec->catdir($sandbox, 'PowerShell'));
     $ENV{TEMP}                              = $win_tmp;
     $ENV{TMP}                               = $win_tmp;
     $ENV{TMPDIR}                            = $sandbox;
