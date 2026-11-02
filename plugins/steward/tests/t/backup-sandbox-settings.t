@@ -307,10 +307,69 @@ is(git_out($f->{home}, $f->{clone}, 'log', '--format=%s', '-1'), "global theme f
     my $preset = jread("$g->{clone}/plugins/sandbox/container/settings.json");
     is($preset->{theme}, 'dark', 'conflict: the contested unit is not written');
     is($preset->{extra}, "caf\x{e9}", 'conflict: the uncontested unit is, encoded once');
-    like(join(' ', map { $_->{error} // '' } @{ $b->{json}{phases} // [] }), qr/'theme' was sent to the preset from 2 sandboxes with different values/,
+    like(join(' ', map { $_->{error} // '' } @{ $b->{json}{phases} // [] }), qr/'theme' was sent to the preset from 2 sandbox\(es\) with different values/,
         'conflict: the failure names the unit');
     my $out = state_of($g)->{phases}{export}{items}{sandbox_outcome}{data};
     is_deeply([ map { $_->{key} } @{ $out->{refused} } ], ['theme'], 'conflict: sandbox_outcome lists it as refused');
+}
+
+# ===========================================================================
+# encoding and the review's other edges: a non-ASCII project path and key
+# survive the pause/resume round trip (the run-state file hands strings back
+# flagged), a remembered answer for "café" is found again, a sensitive key
+# says so, a project with no base never claims the sandbox removed a key,
+# overlapping units from two sandboxes are refused together, and a revert
+# waits while a launcher is setting the sandbox up.
+{
+    use Encode ();
+    my $valid_utf8 = sub { my $c = $_[0]; return eval { Encode::decode('UTF-8', $c, Encode::FB_CROAK()); 1 } ? 1 : 0 };
+    my $g = setup();
+    my $nb = sandbox($g, "Andr\xc3\xa9-sbx", base => $PRESET,
+        settings => { %$PRESET, "caf\x{e9}" => 1, env => { A => '1', SECRET => 'x' } });
+    my $nobase = sandbox($g, 'nobase', settings => { theme => 'dark', model => 'opus', env => { A => '1' } });
+    my $sa = sandbox($g, 'over-a', base => $PRESET, settings => { %$PRESET, env => 'flat' });
+    my $sb = sandbox($g, 'over-b', base => $PRESET, settings => { %$PRESET, env => { A => '1', B => 'b' } });
+    seed_state($g);
+    my $a = backup($g);
+    is($a->{exit}, 10, 'edges: pauses') or diag($a->{out} . $a->{err});
+    ok($valid_utf8->($a->{out}) && index($a->{out}, "\xc3\x83") < 0, 'edges: the decisions output is valid UTF-8, nothing encoded twice');
+    my %d = map { ("$_->{data}{project_id}/$_->{data}{key}" => $_) } sandbox_decisions($a);
+    my $cafe = $d{"$nb->{id}/caf\xc3\xa9"};
+    ok($cafe, 'edges: the non-ASCII key is a decision');
+    my $sec = $d{"$nb->{id}/env.SECRET"};
+    ok($sec && $sec->{data}{security_relevant}, 'edges: env.SECRET is marked security-relevant');
+    like($sec->{detail} // '', qr/reaches every sandbox/, '... and its detail says what to_preset would do');
+    my $nk = $d{"$nobase->{id}/keep"};
+    like($nk->{title} // '', qr/is in the sandbox preset but not in this sandbox/, 'edges: no base: the title does not claim the sandbox removed it');
+    like($nk->{detail} // '', qr/No record of the preset/, '... and the detail says why it cannot tell');
+
+    # a launcher holds the setup lock of the non-ASCII sandbox
+    make_path("$nb->{launcher_dir}/.launcher.lock");
+    my $before = read_text($nb->{settings});
+    my $b = backup($g, '--resume', $a->{json}{resume_token},
+        '--answer', "$cafe->{id}=keep_in_sandbox_remember",
+        '--answer', "$sec->{id}=revert_sandbox",
+        '--answer', "$nk->{id}=keep_in_sandbox",
+        '--answer', "$d{\"$sa->{id}/env\"}{id}=to_preset",
+        '--answer', "$d{\"$sb->{id}/env.B\"}{id}=to_preset");
+    is($b->{exit}, 20, 'edges: completes with failures (the refused units, the locked revert)') or diag($b->{out} . $b->{err});
+    ok($valid_utf8->($b->{out}) && index($b->{out}, "\xc3\x83") < 0, 'edges: the resumed output is valid UTF-8, nothing encoded twice');
+    is(read_text($nb->{settings}), $before, 'edges: no revert while a launcher holds the setup lock');
+    my $err = join(' ', map { $_->{error} // '' } @{ $b->{json}{phases} // [] });
+    like($err, qr/setting it up right now/, '... and the failure says why');
+    like($err, qr/'env' was sent to the preset .* overlaps 'env\.B'/, 'edges: env and env.B from two sandboxes are refused together');
+    is_deeply(jread("$g->{clone}/plugins/sandbox/container/settings.json")->{env}, { A => '1' }, '... and the preset env is untouched');
+    my $prefs = jread("$g->{live}/.backup-preferences.json");
+    is_deeply([ keys %{ $prefs->{"container_vs_sandbox:$nb->{id}"} // {} } ], [ "caf\x{e9}" ],
+        'edges: the remembered non-ASCII key is saved as itself, not double-encoded');
+    ok(index($b->{out} . read_text($g->{state}), "Andr\xc3\x83") < 0, 'edges: no double-encoded path anywhere in the output or the run state');
+
+    rmdir "$nb->{launcher_dir}/.launcher.lock";
+    seed_state($g);
+    my $c = backup($g);
+    my @again = map { $_->{data}{key} } grep { $_->{data}{project_id} eq $nb->{id} } sandbox_decisions($c);
+    ok(!grep({ $_ eq "caf\xc3\xa9" } @again), 'edges: next run, the remembered café answers itself');
+    ok($valid_utf8->($c->{out}) && $valid_utf8->(read_text($g->{state})), 'edges: the auto-applied note leaves no raw Latin-1 byte');
 }
 
 done_testing();

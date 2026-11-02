@@ -893,7 +893,9 @@ sub _do_container_outcome {
         if (my $pair = $remember_map{$choice}) {
             my ($category, $action) = @$pair;
             my $sp = _run_capture($^X, "$root/plugins/steward/scripts/save-preference.pl",
-                '--prefs', $prefs_path, '--scope', 'global_vs_container', '--key', $key,
+                # _item_bytes: the key came off the run-state file flagged;
+                # as argv it would reach the child encoded twice.
+                '--prefs', $prefs_path, '--scope', 'global_vs_container', '--key', _item_bytes($key),
                 '--category', $category, '--action', $action);
             if ($sp->{spawned} && $sp->{exit} == 0) {
                 push @prefs_saved, { key => $key, category => $category, action => $action };
@@ -1259,11 +1261,13 @@ sub _do_sandbox_diff {
         }
         push @projects, \%p;
     }
-    $ctx->{note}->('sandbox_settings_skipped_projects', \@skipped) if @skipped;
-    my @auto = map { my $p = $_; map { { %$_, project => $p->{path} } } @{ $p->{auto_applied} } } @projects;
-    $ctx->{note}->('sandbox_settings_auto_applied', \@auto) if @auto;
-
+    # Everything below comes out of the sanitised copy: filter-diff.pl's
+    # output (the auto_applied keys) is widened text, and a widened string
+    # reaching a note would leave a raw Latin-1 byte in backup.pl's output.
     my $data = _sanitize_utf8({ status => 'compared', preset => $preset_rel, projects => \@projects });
+    $ctx->{note}->('sandbox_settings_skipped_projects', _sanitize_utf8(\@skipped)) if @skipped;
+    my @auto = map { my $p = $_; map { { %$_, project => $p->{path} } } @{ $p->{auto_applied} } } @{ $data->{projects} };
+    $ctx->{note}->('sandbox_settings_auto_applied', \@auto) if @auto;
     $ctx->{checkpoint}->('sandbox_diff', $data);
     my @decisions = _sandbox_decisions($ctx, $data);
     return @decisions ? { decisions => \@decisions } : {};
@@ -1312,22 +1316,36 @@ sub _sandbox_decisions {
             my ($key, $id) = @{ $pairs[$i] };
             my $u   = $p->{units}[$i];
             my $rel = $u->{relation};
-            my $kd  = _title_key($key);
-            my $show = sub { my ($f, $v) = @_; return $f ? _clip_utf8_bytes($jv->encode($v), 1000) : '(not set)' };
+            (my $kd = $key) =~ s/[\s\x00-\x1f\x7f]+/ /g;
+            $kd = _clip_utf8_bytes($kd, 83);
+            my $sec  = _sandbox_key_is_sensitive($u->{path}) ? 1 : 0;
+            # A value a sensitive key carries goes to every sandbox on a
+            # to_preset, so it is shown whole; others are clipped.
+            my $show = sub { my ($f, $v) = @_; return '(not set)' unless $f;
+                             my $s = $jv->encode($v); return $sec ? $s : _clip_utf8_bytes($s, 1000) };
+            # With no record of what the sandbox was last given, a key on one
+            # side only may as well be the preset's doing: say so, and never
+            # claim the sandbox removed it.
+            my $nb = $p->{base_missing} ? 1 : 0;
+            my @detail = ("project: $p->{path}",
+                          'this sandbox:       ' . $show->($u->{sandbox_found}, $u->{sandbox_value}),
+                          'the sandbox preset: ' . $show->($u->{preset_found},  $u->{preset_value}));
+            push @detail, 'No record of the preset this sandbox was last given, so this may be a change the preset made, not the sandbox.' if $nb;
+            push @detail, "This key can run commands, hold credentials or widen what Claude may do: sent to the preset it reaches every sandbox at its next container create. Read the whole value before choosing to_preset." if $sec;
+            push @detail, 'Every sandbox takes the preset\'s value on its next merge unless it changed the key itself.';
             push @decisions, $ctx->{decision}->(
                 kind    => 'sandbox_settings_key',
                 id      => $id,
-                title   => _clip_utf8_bytes($rel eq 'only_left'  ? "sandbox '$pname': settings key '$kd' exists only in this sandbox, not in the sandbox preset"
-                         : $rel eq 'only_right' ? "sandbox '$pname': settings key '$kd' was removed in this sandbox but is in the sandbox preset"
-                         :                        "sandbox '$pname': settings key '$kd' differs from the sandbox preset", 200),
+                title   => _clip_utf8_bytes(
+                             $rel eq 'only_left'          ? "sandbox '$pname': settings key '$kd' is in this sandbox but not in the sandbox preset"
+                           : $rel eq 'only_right' && $nb ? "sandbox '$pname': settings key '$kd' is in the sandbox preset but not in this sandbox"
+                           : $rel eq 'only_right'        ? "sandbox '$pname': settings key '$kd' was removed in this sandbox but is in the sandbox preset"
+                           :                               "sandbox '$pname': settings key '$kd' differs from the sandbox preset", 200),
                 subject => $key,
-                detail  => join("\n",
-                    "project: $p->{path}",
-                    'this sandbox:       ' . $show->($u->{sandbox_found}, $u->{sandbox_value}),
-                    'the sandbox preset: ' . $show->($u->{preset_found},  $u->{preset_value}),
-                    'Every sandbox takes the preset\'s value on its next merge unless it changed the key itself.'),
+                detail  => join("\n", @detail),
                 data    => { project_id => $p->{id}, project_path => $p->{path}, project_name => $p->{name},
-                             key => $key, path => $u->{path}, relation => $rel,
+                             key => $key, path => $u->{path}, relation => $rel, base_missing => $nb,
+                             security_relevant => $sec,
                              sandbox_found => $u->{sandbox_found}, sandbox_value => $u->{sandbox_value},
                              preset_found => $u->{preset_found}, preset_value => $u->{preset_value} },
                 choices => _sandbox_choices($rel),
@@ -1335,6 +1353,21 @@ sub _sandbox_decisions {
         }
     }
     return @decisions;
+}
+
+# Settings keys whose value can run a command, carry a credential helper or
+# widen what Claude may do -- a to_preset of one of these reaches every
+# sandbox, so its decision says so and shows the whole value. Top-level names
+# (a unit under one, such as env.X or permissions.allow, counts).
+my %SANDBOX_SENSITIVE_KEYS = map { $_ => 1 } qw(
+    hooks statusLine apiKeyHelper awsAuthRefresh awsCredentialExport otelHeadersHelper
+    env permissions enabledPlugins extraKnownMarketplaces enableAllProjectMcpServers
+    enabledMcpjsonServers disableAllHooks skipDangerousModePermissionPrompt
+);
+sub _sandbox_key_is_sensitive {
+    my ($path) = @_;
+    return 0 unless ref($path) eq 'ARRAY' && @$path;
+    return $SANDBOX_SENSITIVE_KEYS{ $path->[0] } ? 1 : 0;
 }
 
 sub _sandbox_choices {
@@ -1369,7 +1402,12 @@ sub _sandbox_choices {
 # ===========================================================================
 sub _do_sandbox_outcome {
     my ($ctx, $root, $repo, $home_n) = @_;
-    my $diff = $ctx->{get_item}->('sandbox_diff');
+    # Off the run-state file every string comes back utf8-FLAGGED around raw
+    # UTF-8 bytes (Run.pm reads without ->utf8). Used as it is, a non-ASCII
+    # path or key would be encoded a second time -- in a child's argv (a
+    # preference saved under "cafÃ©", never matched again), a file path, a
+    # note. Back to plain bytes first, numbers left as numbers.
+    my $diff = _item_bytes_deep($ctx->{get_item}->('sandbox_diff'));
     my @decisions = _sandbox_decisions($ctx, $diff);
     return {} unless @decisions;
 
@@ -1412,15 +1450,33 @@ sub _do_sandbox_outcome {
         }
     }
 
-    # to_preset: one value per unit, or nothing for that unit.
-    my @writes;
-    for my $key (sort keys %preset_units) {
+    # to_preset: one value per unit, or nothing for that unit. Units of
+    # different granularity overlap (one sandbox's whole env against
+    # another's env.B): writing both would let the second replace the first
+    # wholesale, so overlapping units sent by different sandboxes are refused
+    # together, like one unit sent with two values.
+    my $canon = JSON::PP->new->canonical->allow_nonref;
+    my (@writes, %refuse);
+    my @keys = sort keys %preset_units;
+    for my $key (@keys) {
         my @from = @{ $preset_units{$key} };
-        my %distinct = map { (($_->{sandbox_found} ? 'v:' . JSON::PP->new->canonical->allow_nonref->encode($_->{sandbox_value}) : 'absent') => 1) } @from;
-        if (keys(%distinct) > 1) {
-            push @refused, { key => $key, projects => [ map { $_->{project_path} } @from ] };
+        my %distinct = map { (($_->{sandbox_found} ? 'v:' . $canon->encode($_->{sandbox_value}) : 'absent') => 1) } @from;
+        $refuse{$key} = 'different values' if keys(%distinct) > 1;
+    }
+    for my $i (0 .. $#keys) {
+        for my $j ($i + 1 .. $#keys) {
+            my ($pa, $pb) = ($preset_units{ $keys[$i] }[0]{path}, $preset_units{ $keys[$j] }[0]{path});
+            next unless $pa->[0] eq $pb->[0] && (@$pa == 1 || @$pb == 1);
+            $refuse{ $keys[$i] } //= "overlaps '$keys[$j]'";
+            $refuse{ $keys[$j] } //= "overlaps '$keys[$i]'";
+        }
+    }
+    for my $key (@keys) {
+        my @from = @{ $preset_units{$key} };
+        if (my $why = $refuse{$key}) {
+            push @refused, { key => $key, reason => $why, projects => [ map { $_->{project_path} } @from ] };
             push @failed_msgs, "sandbox_outcome: '$key' was sent to the preset from "
-                             . scalar(@from) . ' sandboxes with different values; nothing was written for it';
+                             . scalar(@from) . " sandbox(es) with $why; nothing was written for it";
             next;
         }
         push @writes, $from[0];
@@ -1455,7 +1511,8 @@ sub _do_sandbox_outcome {
         my $project = _item_bytes($units[0]{project_path});
         my $home = SandboxRegistry::claude_home_for($project);
         my $r = SandboxSettings::apply_units(
-            target     => "$home/settings.json",
+            target       => "$home/settings.json",
+            launcher_dir => "$home/.launcher",
             backup_dir => SandboxSettings::backup_dir_maker("$home/.launcher", time),
             units      => [ map { { name => _widen_utf8($_->{key}), path => _widen_utf8($_->{path}),
                                     found => $_->{preset_found}, value => _widen_utf8($_->{preset_value}) } } @units ],
@@ -1467,6 +1524,8 @@ sub _do_sandbox_outcome {
         push @reverted, { project => $project, keys => [ map { $_->{key} } @units ], backup => $r->{backup} };
     }
 
+    # All of it is plain bytes already (the checkpoint was un-flagged above),
+    # so _sanitize_utf8 leaves valid UTF-8 untouched.
     my $out = _sanitize_utf8({ to_preset => \@to_preset, reverted => \@reverted, kept => \@kept,
                                preferences_saved => \@prefs_saved, refused => \@refused, wrote => \@wrote });
     $ctx->{checkpoint}->('sandbox_outcome', $out);
@@ -1476,6 +1535,19 @@ sub _do_sandbox_outcome {
     my $ret = {};
     $ret->{failed} = join('; ', @failed_msgs) if @failed_msgs;
     return $ret;
+}
+
+# _item_bytes over a whole checkpointed structure: every string back to plain
+# bytes, every key too; a genuine JSON number stays a number (downgrading one
+# would stringify it, and the preset would get "1" for 1) and a boolean stays
+# a boolean.
+sub _item_bytes_deep {
+    my ($v) = @_;
+    my $r = ref($v);
+    return { map { _item_bytes($_) => _item_bytes_deep($v->{$_}) } keys %$v } if $r eq 'HASH';
+    return [ map { _item_bytes_deep($_) } @$v ] if $r eq 'ARRAY';
+    return $v if $r || !defined $v || _json_number($v);
+    return _item_bytes($v);
 }
 
 # The sandbox modules, from the live install (the tree every wrapped script

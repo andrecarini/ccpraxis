@@ -16,6 +16,7 @@ use strict;
 use warnings;
 use JSON::PP;
 use Getopt::Long;
+use Encode ();
 
 my ($prefs_file, $scope, $key, $category, $action, $remove);
 GetOptions(
@@ -33,7 +34,21 @@ unless ($prefs_file && $scope && ($key || $remove)) {
     exit 2;
 }
 
-my $pretty = JSON::PP->new->pretty->canonical;
+# The file is UTF-8 JSON (decode_json reads it as such, and so do
+# filter-diff.pl and promote.pl), so it is written with ->utf8, and the names
+# given on the command line -- UTF-8 bytes -- are decoded to text first.
+# Without both, a non-ASCII key ("café") was written as bytes next to the
+# decoded text of the keys already in the file: the next save re-encoded it,
+# the one after that could not parse the file, and every backup then failed
+# in filter-diff.pl.
+my $pretty = JSON::PP->new->utf8->pretty->canonical;
+my ($scope_b, $key_b, $remove_b) = ($scope, $key, $remove);   # bytes, for messages
+for my $v ($scope, $key, $remove) {
+    next unless defined $v && !utf8::is_utf8($v);
+    my $copy = $v;
+    my $text = eval { Encode::decode('UTF-8', $copy, Encode::FB_CROAK()) };
+    $v = $text if defined $text;
+}
 
 # Read existing preferences
 my $prefs = {};
@@ -49,9 +64,9 @@ if ($remove) {
         delete $prefs->{$scope}{$remove};
         # Clean up empty scope
         delete $prefs->{$scope} unless %{$prefs->{$scope}};
-        print "Removed preference: $scope / $remove\n";
+        print "Removed preference: $scope_b / $remove_b\n";
     } else {
-        print "No saved preference for: $scope / $remove\n";
+        print "No saved preference for: $scope_b / $remove_b\n";
     }
 } else {
     # Validate category/action combination
@@ -74,11 +89,11 @@ if ($remove) {
 
     $prefs->{$scope} ||= {};
     $prefs->{$scope}{$key} = { category => $category, action => $action };
-    print "Saved preference: $scope / $key = $action ($category)\n";
+    print "Saved preference: $scope_b / $key_b = $action ($category)\n";
 }
 
 # Write back
-open my $fh, '>', $prefs_file or do { print STDERR "Cannot write $prefs_file: $!\n"; exit 2 };
+open my $fh, '>:raw', $prefs_file or do { print STDERR "Cannot write $prefs_file: $!\n"; exit 2 };
 print $fh $pretty->encode($prefs);
 close $fh;
 
