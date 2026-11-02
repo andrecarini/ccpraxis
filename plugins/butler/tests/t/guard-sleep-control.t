@@ -190,6 +190,16 @@ allowed($_) for (
         'subagent: told it is the main session\'s business');
 }
 
+# ---- a walk past its time bound fails open (and quietly) ----------------------------
+{
+    no warnings 'once';
+    local $BpHook::Guards::GuardSleepControl::WALK_SECONDS = -1;
+    is(BpHook::Guards::GuardSleepControl::verdict_for('caffeinate -i'), undef,
+        'a command walk past its deadline is allowed, like every internal failure here');
+}
+is_deeply(BpHook::Guards::GuardSleepControl::verdict_for('caffeinate -i'), { what => 'caffeinate' },
+    '...and the bound is per call: the next walk decides normally');
+
 # ---- not a Bash call, or no command: nothing to judge ------------------------------
 {
     my $res = GuardHarness::run_module('Guards::GuardSleepControl',

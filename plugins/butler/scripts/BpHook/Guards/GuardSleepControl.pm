@@ -194,12 +194,18 @@ sub _scan_text {
     return undef;
 }
 
+# The walk is bounded like GuardBash's own (_hyg_commands takes an absolute
+# deadline and dies past it): a pathological command costs at most this long,
+# and then the guard lets it through (fail open, as every check here does).
+our $WALK_SECONDS = 2;
+our $DEADLINE_AT;
+
 # _verdict($cmd, $depth) -> { what, hint } | undef for a whole command.
 sub _verdict {
     my ($cmd, $depth) = @_;
     $depth //= 0;
     return undef if $depth > 3 || !defined $cmd || !length $cmd;
-    my @commands = BpHook::Guards::GuardBash::_hyg_commands($cmd, 0);
+    my @commands = BpHook::Guards::GuardBash::_hyg_commands($cmd, 0, $DEADLINE_AT);
     my $unresolved = 0;
     for my $e (@commands) {
         next unless ref $e eq 'HASH';
@@ -267,8 +273,15 @@ sub _verdict {
     return undef;
 }
 
-# Public for tests: the verdict for a command string, no payload needed.
-sub verdict_for { my ($cmd) = @_; return _verdict($cmd, 0) }
+# verdict_for($cmd) -> { what, hint } | undef. The whole decision for a
+# command string, bounded by $WALK_SECONDS; undef (allow) if the walk fails
+# or runs out of time. Public for tests: no payload needed.
+sub verdict_for {
+    my ($cmd) = @_;
+    local $DEADLINE_AT = do { require Time::HiRes; Time::HiRes::time() + $WALK_SECONDS };
+    my $v = eval { _verdict($cmd, 0) };
+    return $@ ? undef : $v;
+}
 
 # _platform_line() -> what the managed lock does on THIS host, chosen here
 # rather than listed per OS in the message.
@@ -297,7 +310,7 @@ sub run {
     my $cmd = $ti->{command};
     return 0 unless defined $cmd && !ref($cmd) && length $cmd;
 
-    my $hit = _verdict($cmd, 0);
+    my $hit = verdict_for($cmd);
     return 0 unless $hit;
 
     my @lines = ("BLOCKED: $hit->{what} changes this machine's sleep behaviour by hand, and nothing releases a hand-taken lock when the work ends.");
