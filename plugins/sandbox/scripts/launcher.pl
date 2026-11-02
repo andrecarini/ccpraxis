@@ -9118,7 +9118,10 @@ sub _relaunch_self {
     eval { _resources_sampler_stop($RESOURCES_SAMPLER_CHILD, $RESOURCES_SAMPLER_PID) };
     eval { _spend_sampler_stop($SPEND_SAMPLER_CHILD) };
     eval { _container_sampler_stop($CONTAINER_SAMPLER_CHILD) };
-    eval { _keepawake_stop() };
+    # Through the holder, which knows its helper and pid file: a bare
+    # _keepawake_stop() stopped nothing, and the helper (whose owner pid survives
+    # the exec) ran on until the new process's dashboard entry reaped it.
+    _keepawake_release_global();
 
     _restore_terminal(1);
 

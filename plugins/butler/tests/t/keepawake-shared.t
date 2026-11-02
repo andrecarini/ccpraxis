@@ -313,6 +313,18 @@ SKIP: {
     my $h3 = $start->($pid_f, '--lease', '600', '--poll', '0.1');
     ok($wait_for->(sub { $slurp->($log_f) =~ /pid=$h3 STANDBY reason=battery/ }, 5),
         'battery: a holder started off AC logs STANDBY (replace() counts that as up)');
+    # A stale 'asserted' from a predecessor never speaks for a new holder:
+    # it writes 'standby' with its pid, before its first power read.
+    {
+        my $h5_pid = "$dir/fresh.pid";
+        open my $st, '>', KeepAwake::state_path($h5_pid) or die $!; print {$st} "asserted\n"; close $st;
+        my $h5 = $start->($h5_pid, '--lease', '600', '--poll', '0.1');
+        ok($wait_for->(sub { $slurp->($h5_pid) eq "$h5\n" }, 5), 'fresh holder: up');
+        is(KeepAwake::holder_state($h5_pid), 'standby', 'fresh holder: the stale asserted state is replaced at once');
+        kill 'TERM', $h5;
+        waitpid($h5, 0);
+        ok(!-e KeepAwake::state_path($h5_pid), 'fresh holder: its state file goes with it');
+    }
     Time::HiRes::sleep(0.5);
     ok(!-e $args, 'battery: and no caffeinate was ever started');
     is(KeepAwake::holder_state($pid_f), 'standby', 'battery: its state file says standby');
@@ -380,7 +392,14 @@ SKIP: {
     is(KeepAwake::power_source(), 'unknown', 'power_source: a .t never reads the real machine (unknown without the seam)');
     open my $p, '>', "$d/ps" or die $!; print {$p} "AC\n"; close $p;
     local $ENV{CCPRAXIS_AC_PROBE_FILE} = "$d/ps";
-    is(KeepAwake::power_source(), 'ac', 'power_source: the seam file is read, case-insensitively');
+    {
+        local $ENV{CCPRAXIS_CAFFEINATE_BIN};
+        delete $ENV{CCPRAXIS_CAFFEINATE_BIN};
+        is(KeepAwake::power_source(), 'unknown',
+            'power_source: the seam is ignored without a substitute caffeinate (a leaked seam never lets the real one run on battery)');
+    }
+    local $ENV{CCPRAXIS_CAFFEINATE_BIN} = '/some/fake';
+    is(KeepAwake::power_source(), 'ac', 'power_source: with a substitute caffeinate, the seam file is read, case-insensitively');
 }
 
 # ---- the macOS doctor (bp-preflight.pl power.sleep_intact) ---------------------

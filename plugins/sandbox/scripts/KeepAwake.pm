@@ -124,12 +124,16 @@ sub parse_pmset_ps {
 # power_source() -> 'ac' | 'dc' | 'unknown'. The test seam comes first, and it
 # is the AC-loss watch's own: CCPRAXIS_AC_PROBE_FILE, an absolute path whose
 # first line is ac, dc or unknown, read on every call so a test can switch the
-# "power source" under a running holder. Otherwise one bounded
-# `pmset -g ps` -- refused (unknown) under a .t and under CCPRAXIS_NO_WAKELOCK,
-# the AC-loss watch's rule: a test reads the seam, never the real machine.
+# "power source" under a running holder. It is honoured only together with
+# CCPRAXIS_CAFFEINATE_BIN (a substitute caffeinate that asserts nothing): a
+# leaked or inherited seam must never let the REAL caffeinate run on battery.
+# Otherwise one bounded `pmset -g ps` -- refused (unknown) under a .t and under
+# CCPRAXIS_NO_WAKELOCK, the AC-loss watch's rule: a test reads the seam, never
+# the real machine.
 sub power_source {
     my $pf = $ENV{CCPRAXIS_AC_PROBE_FILE};
-    if (defined $pf && length $pf && $pf =~ m{\A/}) {
+    my $fake = defined $ENV{CCPRAXIS_CAFFEINATE_BIN} && length $ENV{CCPRAXIS_CAFFEINATE_BIN};
+    if ($fake && defined $pf && length $pf && $pf =~ m{\A/}) {
         open(my $fh, '<:raw', $pf) or return 'unknown';
         my $line = <$fh>;
         close $fh;
@@ -305,6 +309,9 @@ sub hold_main {
     open(my $pfh, '>', $pid_f) or do { $log->("FAILED cannot write $pid_f: $!"); return 4 };
     print {$pfh} "$$\n";
     close $pfh;
+    # Nothing is asserted until the first power read says AC: say so at once,
+    # so a predecessor's stale 'asserted' can never speak for this holder.
+    _write_state($pid_f, 'standby');
 
     my $stop = 0;
     local $SIG{TERM} = sub { $stop = 'signal-term' };
@@ -322,10 +329,14 @@ sub hold_main {
         if (waitpid($caf, POSIX::WNOHANG()) == 0) {
             kill('TERM', $caf);
             my $deadline = Time::HiRes::time() + 1;
-            while (waitpid($caf, POSIX::WNOHANG()) == 0 && Time::HiRes::time() < $deadline) {
+            my $reaped = 0;
+            while (Time::HiRes::time() < $deadline) {
+                if (waitpid($caf, POSIX::WNOHANG()) != 0) { $reaped = 1; last }
                 Time::HiRes::sleep(0.02);
             }
-            if (kill(0, $caf)) { kill('KILL', $caf); waitpid($caf, 0) }
+            # KILL only a child not yet reaped: once reaped, its pid may
+            # already belong to an unrelated process.
+            unless ($reaped) { kill('KILL', $caf); waitpid($caf, 0) }
         }
         undef $caf;
     };

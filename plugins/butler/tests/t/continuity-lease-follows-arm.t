@@ -630,6 +630,7 @@ SKIP: {
     local $ENV{CCPRAXIS_CONTINUITY_ACTIVE_DIR} = $legacy;
     local $BpContinuityLease::STATE_ROOT       = BpHook::state_dir();
     local $BpContinuityLease::PLATFORM         = 'darwin';
+    no warnings 'once';
     my $root = BpHook::state_dir();
     my $q    = $BpContinuityLease::IN_FLIGHT_QUIET_SECONDS;
     cmp_ok($q, '>=', 600, 'L-INFLIGHT: the quiet window outlasts the Bash tool\'s 10-minute ceiling');

@@ -910,6 +910,10 @@ sub apply {
                 }
             }
             unlink $pid_f;
+            # The macOS holder's state file goes with its pid file (a holder
+            # killed before it could tidy up would otherwise leave 'asserted'
+            # behind). There is none on Windows.
+            unlink "$dir/keepawake.state";
         }
     }
 }

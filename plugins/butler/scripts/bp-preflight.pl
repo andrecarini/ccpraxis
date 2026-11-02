@@ -227,7 +227,11 @@ my %CHECK = (
         require "$Bin/bp-keepawake.pl";
         my @f = BpKeepAwake::sleep_override_findings();
         return ('warn', join(' | ', @f)) if @f;
-        ('ok', 'sleep rule intact: SleepDisabled is not set, and no caffeinate holds -s/-d/-u under ccpraxis or a Claude Code session');
+        # Claude Code's own `caffeinate -i -t 300` (while a session is busy, on
+        # battery too) is Claude Code's, not ccpraxis's; it is not counted, and
+        # the row says so rather than claiming more than it checked.
+        ('ok', 'sleep rule intact: SleepDisabled is not set, and no caffeinate holds -s/-d/-u under ccpraxis or a Claude Code session '
+             . '(Claude Code\'s own caffeinate -i -t 300 while busy is not counted)');
     } },
 
     'harness.wake' => { run => sub {
