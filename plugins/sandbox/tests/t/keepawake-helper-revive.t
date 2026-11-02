@@ -139,4 +139,12 @@ like($start // '', qr/\@log_args = \('-LogFile', native_path\(\$logfile\)\)/, 't
 like($start // '', qr/rename\(\$logfile, "\$logfile\.1"\) if defined \$sz && \$sz > 1024 \* 1024/, 'rotated past 1 MB');
 like($start // '', qr/\@owner_args, \@log_args\)/, 'and the log args reach the exec');
 
+# --- [r] re-exec -------------------------------------------------------------------------------------
+# _relaunch_self used to call _keepawake_stop() with no arguments, a silent no-op: every [r] left the
+# old helper running beside the new process's own (found 2026-11-02).
+my ($relaunch) = $SRC =~ /(sub _relaunch_self \{.*?\n\})/s;
+ok(defined $relaunch, '_relaunch_self is extractable');
+like($relaunch // '', qr/\$KEEPAWAKE->release if \$KEEPAWAKE/, '[r] releases the helper through the holder');
+unlike($relaunch // '', qr/_keepawake_stop\(\s*\)/, 'no argument-less _keepawake_stop() left');
+
 done_testing();

@@ -9112,7 +9112,11 @@ sub _relaunch_self {
     eval { _resources_sampler_stop($RESOURCES_SAMPLER_CHILD, $RESOURCES_SAMPLER_PID) };
     eval { _spend_sampler_stop($SPEND_SAMPLER_CHILD) };
     eval { _container_sampler_stop($CONTAINER_SAMPLER_CHILD) };
-    eval { _keepawake_stop() };
+    # Through the holder, which knows the helper's pid: calling _keepawake_stop
+    # bare (it takes the pid and pidfile) was a silent no-op, so every [r] left the old helper running
+    # beside the new process's own. The power-plan hold is left alone; the new
+    # process re-asserts it on its first keep-awake tick.
+    eval { $KEEPAWAKE->release if $KEEPAWAKE };
 
     _restore_terminal(1);
 
