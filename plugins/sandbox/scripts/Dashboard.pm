@@ -966,6 +966,9 @@ use constant HOT_RELOAD_REPORT_SECS => 20;
 # extra full repaints, all during/just after an active resize -- see
 # Dashboard.pm:3145-3150 below for why ticks and not seconds).
 use constant RESIZE_SETTLE_TICKS       => 5;
+# Every row is re-emitted (no clear) this often, wiping console text the loop
+# never wrote. See the periodic-repaint note in run().
+use constant FULL_REPAINT_SECS         => 30;
 use constant SPINNER_PERIOD_SECS       => 0.5;
 # Was 2.0, on the reasoning that a title is glanced at rather than watched and
 # each change costs an OSC write. The operator watched it and wanted it faster,
@@ -3263,6 +3266,7 @@ sub run {
     my ($last_cols, $last_rows) = ($cols, $rows);
     # Open while a resize is still settling -- see the note at the geometry poll.
     my $settle_ticks = 0;
+    my $last_full_repaint = $start;      # see FULL_REPAINT_SECS
     my $prev;
     my %state;
     my $pending = '';
@@ -3478,6 +3482,17 @@ sub run {
                 # would look like flicker.
                 my $settling = 0;
                 if ($settle_ticks > 0) { $settle_ticks--; $settling = 1; $last_frame_sig = undef }
+                # A PERIODIC repaint, through the same no-clear path. Text this
+                # loop never wrote can land on the console: the MSYS runtime
+                # prints "dofork: ... died unexpectedly ... error 1455" straight
+                # to the console when a sampler's fork fails at the commit limit
+                # (its child dies before the stderr redirect exists), and only
+                # rows whose CONTENT changed are repainted, so it sat on screen
+                # until [r] (operator, 2026-11-03). At most FULL_REPAINT_SECS of
+                # garbage now, at the cost of one row-for-row re-emit.
+                if ($t - $last_full_repaint >= FULL_REPAINT_SECS()) {
+                    $settling = 1; $last_frame_sig = undef; $last_full_repaint = $t;
+                }
 
                 # state refresh (slower cadence than input polling)
                 if (!defined $last_state || $t - $last_state >= $state_int) {
