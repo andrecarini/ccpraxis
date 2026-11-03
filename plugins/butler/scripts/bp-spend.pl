@@ -219,6 +219,47 @@ sub claude_from_gate {
              diagnostic => _gate_diagnostic($first, $exit, 'gate reported no figures') };
 }
 
+# ---------------------------------------------------------------------------
+# The orchestrator fallback (bug a2da). PURE halves here; the file reading is
+# _orchestrator_polls in package main.
+#
+# data_root_from_global_dir($dir) -> <project>/.ccpraxis-local-data | undef.
+# The launcher's global dir is <data>/claude-home/.launcher; nothing else maps.
+sub data_root_from_global_dir {
+    my ($d) = @_;
+    return undef unless defined $d && !ref $d && length $d;
+    (my $n = $d) =~ s{\\}{/}g;
+    $n =~ s{/+\z}{};
+    return $n =~ m{\A(.+)/claude-home/\.launcher\z} ? $1 : undef;
+}
+
+# How old an orchestrator reading may be and still stand in for the gate. The
+# orchestrator polls once a minute while it runs; ten minutes tolerates a
+# paused or briefly stalled loop, and anything older says nothing about now.
+our $ORCH_POLL_MAX_AGE = 600;
+
+# claude_from_orchestrator_polls(\@polls, $now) -> a claude result | undef.
+# @polls: { epoch, five, seven }. The newest reading no older than
+# $ORCH_POLL_MAX_AGE (and not from the future) wins; its age is in the
+# diagnostic so the figures are never mistaken for a live poll.
+sub claude_from_orchestrator_polls {
+    my ($polls, $now) = @_;
+    return undef unless ref $polls eq 'ARRAY' && defined $now;
+    my ($best) = sort { $b->{epoch} <=> $a->{epoch} }
+                 grep { ref $_ eq 'HASH' && defined $_->{epoch}
+                        && defined $_->{five} && defined $_->{seven}
+                        && $_->{epoch} <= $now + 60
+                        && $now - $_->{epoch} <= $ORCH_POLL_MAX_AGE } @$polls;
+    return undef unless $best;
+    my $age = $now - $best->{epoch};
+    $age = 0 if $age < 0;
+    my $ago = $age < 60 ? '<1m' : int($age / 60) . 'm';
+    return { provider  => 'claude', status => 'ok',
+             five_hour => { utilization => $best->{five} + 0 },
+             seven_day => { utilization => $best->{seven} + 0 },
+             diagnostic => "via fleet orchestrator, $ago old" };
+}
+
 # _gate_diagnostic($line, $exit, $fallback) -> a short, SAFE one-line string.
 #
 # The gate's own `detail=` is preferred because it names the actual cause
@@ -3031,7 +3072,20 @@ unless (caller) {
         @results = ({ provider => 'claude', status => 'absent' });
     }
     else {
-        push @results, _fetch_claude($opt{gate_cmd});
+        my $claude = _fetch_claude($opt{gate_cmd});
+        # Bug a2da: the gate reads the HOST's interactive token, which only
+        # refreshes while a host session is in use, so with the operator away
+        # it fell under its floor and the panel went "unreadable" -- while a
+        # fleet orchestrator in this project, on its own refreshed token, was
+        # logging a usage_poll every minute. Fall back to the newest of those.
+        if (($claude->{status} // '') eq 'unknown') {
+            my $root = BpSpend::data_root_from_global_dir($opt{global_dir});
+            my $fb = defined $root
+                ? BpSpend::claude_from_orchestrator_polls(_orchestrator_polls($root), $now)
+                : undef;
+            $claude = $fb if $fb;
+        }
+        push @results, $claude;
     }
 
     my @written;
@@ -3049,6 +3103,33 @@ unless (caller) {
 
     print "$_\n" for @written;
     exit 0;
+}
+
+# _orchestrator_polls($data_root) -> [ { epoch, five, seven } ]: the successful
+# usage_poll records near the end of every orchestrator.log in this project.
+# Only the last 64 KB of each log is read (the orchestrator logs one poll a
+# minute among ~6 busy-lease ticks, so that holds well over ten minutes).
+sub _orchestrator_polls {
+    my ($root) = @_;
+    my @out;
+    for my $log (glob("$root/blueprints/*/runs/orchestrator.log")) {
+        open(my $fh, '<:raw', $log) or next;
+        my $size = -s $fh;
+        seek($fh, $size > 65536 ? $size - 65536 : 0, 0);
+        my @lines = <$fh>;
+        close $fh;
+        for my $l (@lines) {
+            next unless $l =~ /"type":"usage_poll"/ && $l =~ /"result":200\b/;
+            my ($f) = $l =~ /"five":(-?\d+(?:\.\d+)?)/;
+            my ($s) = $l =~ /"seven":(-?\d+(?:\.\d+)?)/;
+            my ($ts) = $l =~ /"ts":"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)Z"/;
+            next unless defined $f && defined $s && defined $ts;
+            my ($Y, $M, $D, $h, $m, $sec) = $ts =~ /(\d+)-(\d+)-(\d+)T(\d+):(\d+):(\d+)/;
+            my $epoch = eval { require Time::Local; Time::Local::timegm($sec, $m, $h, $D, $M - 1, $Y) };
+            push @out, { epoch => $epoch, five => $f, seven => $s } if defined $epoch;
+        }
+    }
+    return \@out;
 }
 
 # _fetch_claude($gate_cmd) -> a claude result hash. Runs bp-usage-gate.pl (or

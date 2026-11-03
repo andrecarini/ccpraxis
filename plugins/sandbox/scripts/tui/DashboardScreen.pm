@@ -2849,6 +2849,12 @@ sub _spend_claude_spans {
             push @parts, "$tag $w->{text}";
         }
         push @spans, { text => (@parts ? join('  ', @parts) : 'no windows reported'), role => 'text.primary' };
+        # A reading that did not come from this host's own poll says where it
+        # came from (bug a2da: "via fleet orchestrator, 3m old"), so figures
+        # standing in for an unreadable gate are never mistaken for live ones.
+        if (defined($c->{diagnostic}) && !ref($c->{diagnostic}) && length($c->{diagnostic})) {
+            push @spans, { text => "  $c->{diagnostic}", role => 'text.muted' };
+        }
         return (\@spans, 0);
     }
     # NO DEFAULT DIAGNOSTIC. This fell back to the literal 'usage endpoint
