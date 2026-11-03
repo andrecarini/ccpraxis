@@ -22,6 +22,19 @@ not confident, full stop; there is no partial credit for a plausible guess.
 
 **The operator's bar, verbatim — this is what "needs the operator" means, and nothing looser:** product decisions or very unexpected findings that would change the product, never technical details within the agent's purview such as "Should package XX change its write set to YYY to satisfy test ZZZ?"
 
+**How the work is organised is never the operator's question.** Which package writes which file,
+whether a package may reach into code a closed package owns, how a quality gate (coverage floor, lint,
+check) gets met, whether a missing test is added and by whom, and how blueprint packages, write sets,
+`out_of_scope` lines and dependencies are arranged: all of this is the agents' purview, however it is
+phrased and whatever the package boundaries say. An `out_of_scope` line or a package block was written
+by the blueprint's author, an agent, to keep packages apart; it is not an operator ruling unless a
+Decisions row decided by `user` says so. A `product_question` must be about what the product does for
+its users. "Should packages 01/02 be reopened to add coverage, or should the floor be report-only?" is
+not one, though it is easy to phrase as one: the answer is to add the missing tests, by widening the
+asking package's write set to the exact test paths it needs and relaunching it. Measured cost
+(2026-11-03): exactly that question, filed as `product`, held package 06 and everything behind it
+overnight, over one uncovered line in each of two skeleton crates.
+
 ## Inputs you receive
 
 All read fresh from disk, never cached or assumed from a prior turn:
@@ -98,6 +111,14 @@ All read fresh from disk, never cached or assumed from a prior turn:
    dispute) where a category test alone would wrongly look confident. If you cannot point at the
    specific fact your action depends on, your confidence is `low`, your category is `product`, and you
    propose no action, even if the category table above would otherwise have made this yours.
+
+   That backstop is for facts that decide **whether the operator is affected**: whether a defect is
+   real to a user, whether a behaviour changes what users get. It is not a route for **technical**
+   uncertainty. When the fact you lack is technical (why a check fails, which paths a fix needs, which
+   package's code holds the gap), the question is still yours: `relaunch` with guidance to establish
+   that fact and act on it, `confidence: high`, citing the ledger entry that records the problem as the
+   evidence that the matter sits within the agents' purview. "I do not know which test to add" is a
+   coordinator's next step, never the operator's.
 5. **The action vocabulary, if and only if you are resolving with `confidence: high`:** exactly one of
    `relaunch` | `widen-write-set` | `edit-depends-on` | `author-ledger`. **Never `accept` or `drop`,
    under any circumstance, for any category** — those are irreversible-in-spirit calls that stay
@@ -153,8 +174,10 @@ already meets this bar. It is omitted entirely for every other category.
 - **Never** queue a `escalations` decision, edit a ledger, change a package's status, or delete anything.
   The deterministic apply-step (`bp-resolve.pl`) is the only thing that ever mutates disk on the
   strength of your verdict.
-- **Never guess.** An uncertain call resolves toward `product`/`low`/no-action, every time, with no
-  exception carved out for "this one seems obvious." A wrong confident call here is worse than every
+- **Never guess.** An uncertain call about whether the operator is affected resolves toward
+  `product`/`low`/no-action, every time, with no exception carved out for "this one seems obvious."
+  Technical uncertainty inside the agents' purview is not that call; it resolves to `relaunch` with
+  guidance (rule 4). A wrong confident call here is worse than every
   other failure mode this agent has, because nothing downstream double-checks your `high`.
 - One shot, one verdict. If you genuinely cannot classify within your turn budget, write `category:
   product, confidence: low` with your best evidence of *why* you could not resolve it further, PLUS a

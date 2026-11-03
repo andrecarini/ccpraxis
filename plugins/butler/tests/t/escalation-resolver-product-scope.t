@@ -41,4 +41,19 @@ like($flat, qr/A row decided by `user` is the operator's/, 'a user-decided row s
 like($flat, qr/data retention, PII, security, money, or naming\/product-identity/,
      'the override itself is unchanged for genuine retention/PII/security/money/identity questions');
 
+# 2026-11-03: a coverage-floor gap in two closed packages' code went to the
+# operator as `product` and held package 06 overnight.
+like($flat, qr/\*\*How the work is organised is never the operator's question\.\*\*/,
+     'how the work is organised is named as never the operator\'s');
+like($flat, qr/how a quality gate \(coverage floor, lint, check\) gets met, whether a missing test is added and by whom/,
+     'meeting a coverage floor and who adds a missing test are the agents\' purview');
+like($flat, qr/An `out_of_scope` line or a package block was written by the blueprint's author, an agent/,
+     'out_of_scope lines are agent-authored, not operator rulings');
+like($flat, qr/A `product_question` must be about what the product does for its users\./,
+     'a product_question must be about what the product does for its users');
+like($flat, qr/It is not a route for \*\*technical\*\* uncertainty\./,
+     'technical uncertainty is not a route to the operator');
+like($flat, qr/Technical uncertainty inside the agents' purview is not that call; it resolves to `relaunch` with guidance/,
+     'the never-guess rule sends technical uncertainty to relaunch');
+
 done_testing();
