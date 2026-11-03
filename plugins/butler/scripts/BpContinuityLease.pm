@@ -98,6 +98,7 @@ use JSON::PP ();
 
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
 require "$DIR/bp-keepawake.pl";
+require "$DIR/BpAwakeConst.pm" unless defined &BpAwakeConst::AC_STALE;
 # Batch C (spec 16-cutover, criterion C-6): the BpSession require is gone --
 # it existed solely for _marker_is_live's BpSession::find_transcript call,
 # and _marker_is_live (with the legacy registry it served) is deleted below.
@@ -153,7 +154,7 @@ sub clamp_tick {
 # The busy-lease freshness window. Must match heartbeat.sh's HB and
 # launcher.pl's BUSY_STALE_SECS (both 600s) — it is the same file and the same
 # question, asked from three sides.
-our $BUSY_STALE_SECONDS = 600;
+our $BUSY_STALE_SECONDS = BpAwakeConst::LEASE_FRESH();
 
 # $PLATFORM — a seam, not a setting. Every branch in this file is
 # platform-selected, and a host can only ever run one of them; without a way to

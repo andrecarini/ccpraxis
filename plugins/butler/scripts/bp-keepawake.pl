@@ -66,6 +66,7 @@ use Errno ();
 use Cwd ();
 
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
+require "$DIR/BpAwakeConst.pm" unless defined &BpAwakeConst::AC_STALE;
 
 # STARTING_GRACE_SECONDS — how long a pid file with no pid in it counts as "a
 # helper is coming up" rather than "nothing is here".
@@ -240,7 +241,7 @@ sub spawn {
         exec('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
              '-WindowStyle', 'Hidden', '-File', winify($ps1),
              '-PidFile', winify_out($pid_f),
-             '-LeaseSeconds', '900',
+             '-LeaseSeconds', BpAwakeConst::HELPER_LEASE(),
              '-LogFile', winify_out($log_f),
              @extra)
             or POSIX::_exit(127);

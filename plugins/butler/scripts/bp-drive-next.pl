@@ -115,6 +115,10 @@ BEGIN { $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $^O =~ /^(MSWin32|cygwin|msys)$/; }
 # How many verdict attempts before degrading (spec §2.5, Decision #14).
 our $VERDICT_RETRY_MAX = 3;
 
+# Absolute script dir: lets tests `require` from any working dir.
+my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
+require "$DIR/BpAwakeConst.pm" unless defined &BpAwakeConst::AC_STALE;
+
 # THE ONE PAUSE HORIZON. How far ahead a usage pause may resume and still be
 # waited out: within it, the machine is held awake AND the session waits;
 # beyond it, the wake-lock is released AND the session hands off (pause-long).
@@ -125,10 +129,7 @@ our $VERDICT_RETRY_MAX = 3;
 # which made no sense, and the operator asked for one threshold: 12 hours. It
 # still covers the five-hour window with room to spare, and still never waits
 # out a seven-day reset that is days away.
-our $PAUSE_HORIZON_SECONDS = 12 * 3600;   # 43200, package-global, test-readable
-
-# Absolute script dir: lets tests `require` from any working dir.
-my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
+our $PAUSE_HORIZON_SECONDS = BpAwakeConst::SOLO_PAUSE_HORIZON();   # 43200, package-global, test-readable
 
 # b44: require bp-orchestrator.pl SOLELY to delegate to its one new pure
 # function, BpOrch::order_ready (priority-ordering of an already-eligible ready

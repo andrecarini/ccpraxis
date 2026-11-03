@@ -38,6 +38,7 @@ my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f 
 # whether it arrived via require or as the main script.
 require "$DIR/BpContinuityLease.pm" unless defined &BpContinuityLease::platform;
 require "$DIR/BpPowerJournal.pm"    unless grep { m{(?:^|/)BpPowerJournal\.pm$} }    keys %INC;
+require "$DIR/BpAwakeConst.pm"      unless defined &BpAwakeConst::AC_STALE;
 
 our $BALANCED_GUID      = '381b4222-f694-41f0-9685-ff5bb260df2e';
 our $CONTINUOUS_WORK_NAME = 'Continuous work';
@@ -576,7 +577,7 @@ my $USAGE = "usage: bp-power-plan reconcile [--why WORD] [--json] [--hold NAME |
 # every launcher keep-awake tick (two minutes) and removed by `--release`. A
 # launcher that dies without releasing leaves a file that stops counting after
 # $SANDBOX_HOLD_FRESH_SECONDS, so a crash cannot pin Continuous work forever.
-our $SANDBOX_HOLD_FRESH_SECONDS = 600;
+our $SANDBOX_HOLD_FRESH_SECONDS = BpAwakeConst::LEASE_FRESH();
 my $HOLD_NAME_RE = qr/\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\z/;
 
 sub sandbox_hold_dir { my ($root) = @_; return "$root/sandbox-holds" }

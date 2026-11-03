@@ -6230,7 +6230,7 @@ sub enter_dashboard {
     # tick never releases the lock mid-run; the host only sleeps once the run has
     # been genuinely idle or parked this long. Env-overridable.
     my $BUSY_STALE   = ($ENV{BUSY_STALE_SECS} && $ENV{BUSY_STALE_SECS} =~ /^\d+$/)
-                       ? $ENV{BUSY_STALE_SECS} : 600;
+                       ? $ENV{BUSY_STALE_SECS} : KeepAwake::lease_fresh();
     my $ka_helper    = "$SANDBOX_PLUGIN/scripts/keep-awake.ps1";
     my $ka_pidfile   = "$SAMPLER_TMPDIR/keepawake.pid";
     my $ka_logfile   = "$SAMPLER_TMPDIR/keepawake.log";
@@ -7009,7 +7009,7 @@ sub _lifecycle_run {
         : Dashboard::stop_runs_plan($state);
 
     my $busy_stale = ($ENV{BUSY_STALE_SECS} && $ENV{BUSY_STALE_SECS} =~ /^\d+$/)
-                       ? $ENV{BUSY_STALE_SECS} : 600;
+                       ? $ENV{BUSY_STALE_SECS} : KeepAwake::lease_fresh();
 
     return Dashboard::run_stages(
         plan            => $plan,

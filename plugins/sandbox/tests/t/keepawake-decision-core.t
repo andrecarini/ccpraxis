@@ -26,9 +26,9 @@ is(KeepAwake::should_stay_awake(99999, 180), 0, 'very stale lease -> sleep');
 is(KeepAwake::should_stay_awake(-5,    180), 1, 'negative age (clock skew on a fresh lease) -> stay awake (active-run safety)');
 is(KeepAwake::should_stay_awake(-9999, 180), 1, 'large negative age (big skew) -> still stay awake');
 # stale defaulting / garbage guard
-is(KeepAwake::should_stay_awake(120),        1, 'default stale (180): age 120 -> awake');
-is(KeepAwake::should_stay_awake(120, undef),  1, 'undef stale -> default 180 -> awake');
-is(KeepAwake::should_stay_awake(120, 'x'),    1, 'garbage stale -> default 180 -> awake');
+is(KeepAwake::should_stay_awake(120),        1, 'default stale (LEASE_FRESH): age 120 -> awake');
+is(KeepAwake::should_stay_awake(120, undef),  1, 'undef stale -> default LEASE_FRESH -> awake');
+is(KeepAwake::should_stay_awake(120, 'x'),    1, 'garbage stale -> default LEASE_FRESH -> awake');
 is(KeepAwake::should_stay_awake(300, 600),    1, 'custom larger stale window respected');
 
 # ---- holder lifecycle (seam-injected) -------------------------------------

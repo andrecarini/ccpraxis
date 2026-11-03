@@ -21,7 +21,14 @@ use Time::Local ();
 
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
 
-use constant GRACE         => 300;
+# BpAwakeConst is six constants and no I/O, so loading it eagerly at compile
+# time costs the guard path nothing -- the LAZY rule in the header above is
+# for BpPowerJournal/BpContinuityLease, not for this.
+BEGIN {
+    my $d = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
+    require "$d/BpAwakeConst.pm" unless defined &BpAwakeConst::AC_STALE;
+}
+use constant GRACE         => BpAwakeConst::AC_GRACE();
 use constant PROBE_INTERVAL => 55;   # $BpPowerJournal::PROBE_MIN_INTERVAL
 use constant MONITOR_TICK  => 60;
 use constant GAP_FACTOR    => 3;
@@ -869,7 +876,7 @@ sub _default_wakelock_state {
         1;
     };
     return 'unknown' unless $ok;
-    my $stale_after = eval { $BpContinuityLease::TICK_SECONDS * BpContinuityLease::stale_ticks() } // 1800;
+    my $stale_after = eval { $BpContinuityLease::TICK_SECONDS * BpContinuityLease::stale_ticks() } // BpAwakeConst::AC_STALE();
     my $wl = eval {
         BpContinuityLease::state($ldir, pid_alive => sub {
             my $pf = BpContinuityLease::wakelock_pid_file($ldir);
@@ -888,7 +895,7 @@ sub _drive_solo_lock_state {
     my @st = stat(_dsdir($data_dir) . '/keepawake.pid');
     return 'absent' unless @st;
     my $age = time() - $st[9];
-    return ($age < 900) ? 'held' : 'absent';
+    return ($age < BpAwakeConst::HELPER_LEASE()) ? 'held' : 'absent';
 }
 
 # ---------------------------------------------------------------------------

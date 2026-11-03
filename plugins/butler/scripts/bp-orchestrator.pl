@@ -69,6 +69,7 @@ require "$DIR/bp-judge.pl";
 require "$DIR/bp-remediate.pl";    # b07: auto-remediation engine (pure decision core)
 require "$DIR/bp-checkpoint.pl";   # b02: durable WIP checkpoint commits
 require "$DIR/bp-write-guard.pl";  # a01: BpWrite::guarded_write -- lock/re-read/read-back
+require "$DIR/BpAwakeConst.pm" unless defined &BpAwakeConst::AC_STALE;
 
 our $USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 our $USER_AGENT = $ENV{BP_USER_AGENT} // 'claude-code/2.1.170';
@@ -2505,7 +2506,7 @@ sub pause_holds_awake {
     return 0 if $paused->{manual};
     my $at = $paused->{relaunch_at};
     return 1 unless defined $at && !ref $at && $at =~ /^\d+(?:\.\d+)?$/;
-    $horizon = 32 * 3600 unless defined $horizon && !ref $horizon && $horizon =~ /^\d+$/;
+    $horizon = BpAwakeConst::FLEET_PAUSE_HORIZON() unless defined $horizon && !ref $horizon && $horizon =~ /^\d+$/;
     return ($at - $now <= $horizon) ? 1 : 0;
 }
 
@@ -4057,7 +4058,7 @@ sub _tunables_base {
         ceil7      => $ENV{BP_CEIL_7D}            // 90,
         # How far ahead a timed pause's relaunch may be and still hold the
         # machine awake (pause_holds_awake). Operator, 2026-11-01: 32 hours.
-        pause_horizon => $ENV{BP_PAUSE_HORIZON_SECS} // 32 * 3600,
+        pause_horizon => $ENV{BP_PAUSE_HORIZON_SECS} // BpAwakeConst::FLEET_PAUSE_HORIZON(),
         drain      => $ENV{BP_DRAIN_SECS}         // 600,
         max_par    => $ENV{BP_MAX_PARALLEL}       // 2,
         cap        => $ENV{BP_ATTEMPT_CAP}        // 5,

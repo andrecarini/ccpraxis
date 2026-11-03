@@ -5,13 +5,15 @@ package KeepAwake;
 # OR when the only outstanding work is parked-waiting-for-a-human.
 #
 # The "active vs parked" judgement lives in the orchestrator (A3): it refreshes
-# the busy-lease (`/tmp/.butler-busy`) every ~60s while work is active or an
-# auto-resume is pending, and STOPS touching it when idle or only-parked. So the
-# host-side dashboard does not re-derive that state — **busy-lease freshness is
-# the keep-awake signal**. This module is the pure decision + a small lifecycle
-# holder; the actual Windows wake-lock is asserted by `keep-awake.ps1`
-# (SetThreadExecutionState via PowerShell, since Win32::API is absent in the host
-# perl), started/stopped through injected seams so the lifecycle is testable.
+# the busy-lease (`/tmp/.butler-busy`) on every watch tick (`watch_tick`, 10 s
+# by default, `BP_WATCH_TICK`) while work is active or an auto-resume is
+# pending within the fleet pause horizon, and STOPS touching it when idle or
+# only-parked. So the host-side dashboard does not re-derive that state —
+# **busy-lease freshness is the keep-awake signal**. This module is the pure
+# decision + a small lifecycle holder; the actual Windows wake-lock is
+# asserted by `keep-awake.ps1` (SetThreadExecutionState via PowerShell, since
+# Win32::API is absent in the host perl), started/stopped through injected
+# seams so the lifecycle is testable.
 #
 # Split (mirrors Dashboard.pm / BackpackReview.pm): pure logic + seam-injected
 # lifecycle here (unit-tested); the real spawn/kill of the PS helper + the lease
@@ -19,11 +21,33 @@ package KeepAwake;
 # on a real desktop (attended).
 use strict;
 use warnings;
+use File::Basename qw(dirname);
+
+# blueprint wake-and-pause-consolidation, Decision 13: the sandbox plugin must
+# keep working with no butler plugin beside it, so LEASE_FRESH is read
+# through a path-based, eval-guarded loader with a literal fallback pinned
+# equal to BpAwakeConst::LEASE_FRESH (see
+# plugins/butler/tests/t/awake-constants-single-source.t).
+my $LEASE_FRESH_FALLBACK = 600;   # == BpAwakeConst::LEASE_FRESH; pinned by awake-constants-single-source.t
+my $LEASE_FRESH = do {
+    my $v;
+    eval {
+        (my $here = __FILE__) =~ s{\\}{/}g;
+        my $p = dirname($here) . '/../../butler/scripts/BpAwakeConst.pm';
+        $p = "./$p" unless $p =~ m{^/} || $p =~ m{^[A-Za-z]:/};
+        require $p unless defined &BpAwakeConst::LEASE_FRESH;
+        $v = BpAwakeConst::LEASE_FRESH();
+        1;
+    };
+    (defined $v && !ref $v && $v =~ /^\d+$/ && $v > 0) ? $v + 0 : $LEASE_FRESH_FALLBACK;
+};
+sub lease_fresh { return $LEASE_FRESH }
 
 # should_stay_awake($lease_age_secs, $stale_secs) -> 1|0
 #   $lease_age_secs = seconds since the busy-lease's mtime, or undef if the lease
 #                     is absent / unreadable. $stale_secs = the freshness window
-#                     (match the orchestrator's BUSY_STALE_SECS).
+#                     (match the orchestrator's BUSY_STALE_SECS); defaults to
+#                     lease_fresh() when omitted or non-numeric.
 #   Awake iff the lease exists AND is fresh. Absent lease (undef) -> sleep.
 #   A NEGATIVE age means the lease mtime is in the "future" — i.e. host/container
 #   clock skew on a lease the orchestrator just wrote, which only happens while a
@@ -35,7 +59,7 @@ use warnings;
 sub should_stay_awake {
     my ($age, $stale) = @_;
     return 0 unless defined $age;
-    $stale = 180 unless defined $stale && $stale =~ /^-?\d+(?:\.\d+)?$/;
+    $stale = lease_fresh() unless defined $stale && $stale =~ /^-?\d+(?:\.\d+)?$/;
     return 1 if $age < 0;          # clock-skew on a freshly-touched lease -> stay awake
     return ($age <= $stale) ? 1 : 0;
 }
