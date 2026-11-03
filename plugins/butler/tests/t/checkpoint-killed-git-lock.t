@@ -83,4 +83,16 @@ local $BpCheckpoint::GIT_TIMEOUT = 3;
     unlink $lock;
 }
 
+# 3. What made the commit slow enough to time out in the first place: host and
+#    container git share the index and record different stat data, so every
+#    tracked file looked dirty to the other side (21-26 s per status over the
+#    bind mount, measured 2026-11-03). The checkpoint compares size and mtime only.
+{
+    open my $fh, '<:raw', "$Bin/../../scripts/bp-checkpoint.pl" or die $!;
+    my $src = do { local $/; <$fh> };
+    my ($git) = $src =~ /(sub _git \{.*?\n\})/s;
+    like($git // '', qr/'core\.checkStat=minimal'/,  'every checkpoint git runs with core.checkStat=minimal');
+    like($git // '', qr/'core\.trustctime=false'/,   'and core.trustctime=false');
+}
+
 done_testing();

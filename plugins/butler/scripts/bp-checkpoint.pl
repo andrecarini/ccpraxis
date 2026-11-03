@@ -290,7 +290,16 @@ sub _git {
         # `or _exit` (not a following statement): exec failure leaves this child
         # holding the PARENT's END blocks and destructors, and a plain exit()
         # would run them in a process that is only half a copy of the caller.
+        # core.checkStat=minimal + trustctime=false: a sandboxed project's
+        # index is shared by the container's git and the host's (the
+        # statusline, the dashboard, the operator), which record different
+        # inode/dev/uid/ctime. Each side then saw every tracked file as
+        # stat-dirty and re-read it over the bind mount: measured 2026-11-03 on
+        # acxpraxis, the first container `git status` after any host git took
+        # 21-26 s (3.8 s with these), so a commit on top of it crossed
+        # GIT_TIMEOUT. Size + mtime still catch every real edit.
         exec('git', '-c', 'core.fsmonitor=', '-c', "core.hooksPath=$groot/.git/hooks",
+             '-c', 'core.checkStat=minimal', '-c', 'core.trustctime=false',
              '-C', $groot, @args) or POSIX::_exit(127);    # git binary missing
     }
 
