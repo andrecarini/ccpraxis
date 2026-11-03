@@ -58,6 +58,7 @@ our $DETAIL_MAX = 200;                 # `detail` is one trimmed line, at most t
 our $PKG_MAX    = 120;                 # a package id is a slug; a subject line is not a ledger cell
 our $GIT_TIMEOUT = 30;                 # seconds a single git child may take before it is killed
 our $OUT_MAX    = 1 << 20;             # captured git output we are willing to hold in memory
+our $INDEX_LOCK;                       # this checkpoint's <gitdir>/index.lock, once known (see _git)
 
 # ===========================================================================
 # PURE
@@ -294,7 +295,8 @@ sub _git {
     }
 
     my ($out, $timed_out, $errs) = ('', 0, 0);
-    my $deadline = time + $GIT_TIMEOUT;
+    my $started  = time;
+    my $deadline = $started + $GIT_TIMEOUT;
     my $rbits = '';
     vec($rbits, fileno($fh), 1) = 1;
     while (1) {
@@ -316,6 +318,17 @@ sub _git {
         kill 'KILL', $pid;
         waitpid($pid, 0);
         close $fh;
+        # A git killed mid-add/commit leaves its index.lock behind, and every
+        # later git in the repo then fails "Unable to create index.lock" until
+        # a human deletes it. Measured 2026-11-02: one 30 s commit timeout on
+        # acxpraxis-step-2 failed every checkpoint of four packages for twelve
+        # hours. Remove the lock only when it was created after this git
+        # started, i.e. by the git we just killed: coordinators and workers are
+        # hook-blocked from git, so inside a run nothing else commits here.
+        if (defined $INDEX_LOCK && -e $INDEX_LOCK) {
+            my $m = (stat $INDEX_LOCK)[9];
+            unlink $INDEX_LOCK if defined $m && $m >= $started - 1;
+        }
         return ("git timed out after ${GIT_TIMEOUT}s: git " . join(' ', @args), -3);
     }
     close $fh;                                             # reaps the child, sets $?
@@ -434,6 +447,7 @@ sub checkpoint {
         # `git -C $root` resolves a relative --git-dir against $root.
         $gitdir = "$root/$gitdir" unless $gitdir =~ m{\A(?:/|[A-Za-z]:[\\/])};
     }
+    local $INDEX_LOCK = "$gitdir/index.lock";
 
     # 3b. HEAD-state gate — a checkpoint is only ever an inline WIP commit ON A
     #     BRANCH (Decision #2). Two states make that impossible, and in both the
