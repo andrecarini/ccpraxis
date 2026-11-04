@@ -1415,6 +1415,10 @@ our %KIND_REGISTRY = (
     # _block_and_queue is never called for it (queue_needs_you files it
     # directly, from bp-resolve.pl, exactly like every other producer).
     'chronic-scoping'         => { family => 'package' },
+    # bug 20261104-163148-782c: bp-launch.sh refused the ledger itself (exit 5:
+    # no ledger, empty write_set, unknown effort). Filed once per refusal and
+    # held until the ledger bytes change or the record is answered.
+    'launch-refused'          => { family => 'package' },
 );
 our @KNOWN_KINDS = sort keys %KIND_REGISTRY;
 # N8 (06-fleet-inbox-bridge): the bridge calls this with arbitrary kinds from
@@ -2363,6 +2367,211 @@ sub death_backoff_secs {
     $n = 1 if !defined $n || $n < 1;
     my $s = $base; $s *= $mult for 2 .. $n;
     return $s > $max ? $max : $s;
+}
+
+# ===========================================================================
+# Launch refusals and launch backoff (bug 20261104-163148-782c).
+#
+# A package whose ledger bp-launch.sh refuses was retried on every tick, from
+# the watchdog and from the fresh-launch path both, for as long as the run
+# lasted: 1024 launch_failed lines in one acxpraxis run, with no escalation.
+# A refusal of the ledger itself (exit 5) cannot succeed on retry, so it is
+# escalated once and the package is held at every launch site until the
+# ledger's bytes change or the escalation is answered. Any other non-zero
+# exit may succeed later, so it backs off geometrically instead. The state is
+# kept in the registry so a restarted orchestrator does not start the storm
+# over again.
+# ===========================================================================
+use constant LAUNCH_RC_REFUSED => 5;   # bp-launch.sh: static ledger refusal
+
+# launch_backoff_secs(n) = min(base * mult^(n-1), max); n<=0/undef treated as 1.
+# Same shape as death_backoff_secs, its own tunables.
+sub launch_backoff_secs {
+    my ($n, $t) = @_;
+    $t ||= {};
+    my $base = $t->{launch_bo_base} // $ENV{BP_LAUNCH_BACKOFF_BASE_SECS} // 30;
+    my $mult = $t->{launch_bo_mult} // $ENV{BP_LAUNCH_BACKOFF_MULT}      // 2;
+    my $max  = $t->{launch_bo_max}  // $ENV{BP_LAUNCH_BACKOFF_MAX_SECS}  // 900;
+    $n = 1 if !defined $n || $n < 1;
+    my $s = $base; $s *= $mult for 2 .. $n;
+    return $s > $max ? $max : $s;
+}
+
+# SHA-1 of the ledger's raw bytes, or the literal 'missing' when it cannot be
+# read. The hold compares this against the digest recorded at refusal time.
+sub ledger_digest {
+    my ($bpdir, $pkg) = @_;
+    my $bytes = _read_file("$bpdir/packages/$pkg.md");
+    return 'missing' unless defined $bytes;
+    require Digest::SHA;
+    return Digest::SHA::sha1_hex($bytes);
+}
+
+# Why bp-launch.sh refused this ledger, re-derived from the same three checks
+# it makes (its stderr is not captured by the launch seam).
+sub launch_refusal_reason {
+    my ($bpdir, $pkg) = @_;
+    return "no ledger at packages/$pkg.md" unless -f "$bpdir/packages/$pkg.md";
+    my $ws = ledger_fm($bpdir, $pkg, 'write_set');
+    return 'the ledger has an empty write_set' unless defined $ws && length $ws;
+    my $effort = ledger_fm($bpdir, $pkg, 'effort');
+    return "the ledger names an unknown effort '$effort' (valid: low, medium, high, xhigh, max)"
+        if defined $effort && length $effort && $effort !~ /\A(?:low|medium|high|xhigh|max)\z/;
+    return 'bp-launch.sh refused the ledger (exit 5); its stderr names the check that failed';
+}
+
+# True while the package's last launch attempt failed and no coordinator has
+# started since: bp-launch.sh writes launched_at only after a real start, so a
+# launched_at at or after the failure means something else started one.
+sub never_launched_since_failure {
+    my ($r) = @_;
+    return 0 unless ref $r eq 'HASH';
+    my $rc = $r->{last_launch_rc};
+    return 0 unless defined $rc && !ref $rc && $rc =~ /\A-?\d+\z/ && $rc != 0;
+    my $fail_at = $r->{last_launch_fail_at};
+    return 1 unless defined $fail_at && !ref $fail_at && $fail_at =~ /\A\d+\z/;
+    my $la = defined $r->{launched_at} ? BpGovern::iso_to_epoch($r->{launched_at}) : undef;
+    return (defined $la && $la >= $fail_at) ? 0 : 1;
+}
+
+sub _escalation_id_of { my ($path) = @_; return undef unless $path; (my $id = $path) =~ s{\A.*[\\/]}{}; $id =~ s/\.json\z//i; return $id; }
+
+sub _queue_launch_refused {
+    my ($c, $reason) = @_;
+    my ($runs, $bpdir, $pkg) = @{$c}{qw(runs bpdir pkg)};
+    my $path = queue_needs_you($runs, {
+        package    => $pkg,
+        blueprint  => $c->{bp},
+        kind       => 'launch-refused',
+        category   => 'scoping',
+        question   => "bp-launch.sh refused to launch package '$pkg': $reason. Retrying the same ledger "
+                    . 'cannot succeed, so the package is held (no attempt burned, other packages keep '
+                    . "running). Fix packages/$pkg.md; the hold lifts by itself as soon as the ledger "
+                    . 'changes. Answering this escalation also lifts it.',
+        context    => { ledger => "packages/$pkg.md", reason => $reason, rc => LAUNCH_RC_REFUSED },
+        created_at => $c->{now},
+    }, $bpdir);
+    return _escalation_id_of($path);
+}
+
+# _launch_hold($c) -> undef (may launch) | { reason => ..., ... } (hold it).
+# $c: { runs, bpdir, log, bp, reg (the tick's registry snapshot), pkg, now, t,
+#       site, logged (loop-scope dedupe hash) }. Called at every launch site:
+# the watchdog's dead and wedged branches and the fresh-launch ready set.
+sub _launch_hold {
+    my ($c) = @_;
+    my ($runs, $bpdir, $log, $pkg, $now) = @{$c}{qw(runs bpdir log pkg now)};
+    my $r = $c->{reg}{$pkg} || {};   # read-only lookup: never vivify a registry row
+    my $logged = $c->{logged} || {};
+    if (defined $r->{launch_refused_digest}) {
+        my $id  = $r->{launch_refused_decision};
+        my $dir = escalations_dir($runs);
+        if (defined $id && length $id && !-e "$dir/$id.json") {
+            # Answered (or otherwise settled): the operator has acted, so try again.
+            _log($log, 'launch_refusal_released', { package => $pkg, reason => 'escalation_answered', decision => $id });
+            my %clear = (launch_refused_digest => undef, launch_refused_decision => undef);
+            _upd_pkg($runs, $log, $pkg, \%clear);
+            $r->{$_} = undef for keys %clear;
+            delete $logged->{"$pkg:refused"};
+            return undef;
+        }
+        my $cur = ledger_digest($bpdir, $pkg);
+        if ($cur ne $r->{launch_refused_digest}) {
+            _log($log, 'launch_refusal_released', { package => $pkg, reason => 'ledger_changed' })
+                unless $logged->{"$pkg:released:$cur"}++;
+            delete $logged->{"$pkg:refused"};
+            return undef;
+        }
+        unless (defined $id && length $id) {
+            # The escalation write failed when the refusal was recorded; retry it
+            # (queue_needs_you dedupes, so this is at most one record).
+            my $nid = _queue_launch_refused($c, $r->{launch_refused_reason} // launch_refusal_reason($bpdir, $pkg));
+            if (defined $nid) {
+                _upd_pkg($runs, $log, $pkg, { launch_refused_decision => $nid });
+                $r->{launch_refused_decision} = $id = $nid;
+            }
+        }
+        _log($log, 'launch_held', { package => $pkg, reason => 'launch_refused', site => $c->{site},
+              decision => $id, detail => 'bp-launch.sh refused this ledger; held until it changes or the escalation is answered' })
+            unless $logged->{"$pkg:refused"}++;
+        return { reason => 'launch_refused', decision => $id };
+    }
+    my $streak  = _reg_int($r->{launch_fail_streak});
+    my $fail_at = $r->{last_launch_fail_at};
+    if ($streak && defined $fail_at && !ref $fail_at && $fail_at =~ /\A\d+\z/ && $fail_at <= $now) {
+        my $wait = launch_backoff_secs($streak, $c->{t});
+        if ($now - $fail_at < $wait) {
+            _log($log, 'launch_held', { package => $pkg, reason => 'launch_backoff', site => $c->{site},
+                  streak => $streak, backoff_secs => $wait, retry_in => $wait - ($now - $fail_at),
+                  last_rc => $r->{last_launch_rc} })
+                unless $logged->{"$pkg:backoff:$fail_at"}++;
+            return { reason => 'launch_backoff', wait => $wait };
+        }
+    }
+    return undef;
+}
+
+# _note_launch_outcome($c, $rc) -- every launch site's single bookkeeping step
+# for a launch it just attempted. Logs the failure line itself (launch_refused
+# for exit 5, launch_failed otherwise); the caller logs nothing for a failure.
+sub _note_launch_outcome {
+    my ($c, $rc) = @_;
+    my ($runs, $bpdir, $log, $pkg, $now) = @{$c}{qw(runs bpdir log pkg now)};
+    my $r = ($c->{reg}{$pkg} ||= {});
+    if (defined $rc && $rc == 0) {
+        my $prev_rc = $r->{last_launch_rc};
+        my $dirty = (defined $prev_rc && $prev_rc != 0) || defined $r->{launch_refused_digest}
+                 || defined $r->{launch_refused_decision} || _reg_int($r->{launch_fail_streak});
+        return unless $dirty;
+        my $id = $r->{launch_refused_decision};
+        if (defined $id && length $id) {
+            my $qp = escalations_dir($runs) . "/$id.json";
+            if (-e $qp) {
+                my $rec = _read_json($qp);
+                if (archive_settled_escalation($runs, $id, (ref $rec eq 'HASH' ? $rec : {}),
+                        'bp-launch.sh accepted the ledger and the package launched')) {
+                    _log($log, 'launch_refusal_settled', { package => $pkg, decision => $id });
+                }
+            }
+        }
+        my %clear = (last_launch_rc => 0, launch_fail_streak => 0, last_launch_fail_at => undef,
+                     launch_refused_digest => undef, launch_refused_decision => undef,
+                     launch_refused_reason => undef);
+        _upd_pkg($runs, $log, $pkg, \%clear);
+        $r->{$_} = $clear{$_} for keys %clear;
+        return;
+    }
+    if (defined $rc && $rc == LAUNCH_RC_REFUSED) {
+        my $reason = launch_refusal_reason($bpdir, $pkg);
+        my $digest = ledger_digest($bpdir, $pkg);
+        my $id = _queue_launch_refused($c, $reason);
+        _log($log, 'launch_refused', { package => $pkg, kind => $c->{site}, rc => $rc, reason => $reason,
+              decision => $id, ledger_digest => $digest });
+        my %f = (last_launch_rc => $rc, last_launch_fail_at => $now, launch_fail_streak => 0,
+                 launch_refused_digest => $digest, launch_refused_decision => $id,
+                 launch_refused_reason => $reason);
+        _upd_pkg($runs, $log, $pkg, \%f);
+        $r->{$_} = $f{$_} for keys %f;
+        delete $c->{logged}{"$pkg:refused"} if $c->{logged};
+        return;
+    }
+    if (defined $rc && $rc == -1) {
+        # exec failure: the fleet-level broken-env trip owns this (no backoff,
+        # so three consecutive attempts still reach it).
+        _log($log, 'launch_failed', { package => $pkg, kind => $c->{site}, rc => $rc });
+        my %f = (last_launch_rc => $rc, last_launch_fail_at => $now);
+        _upd_pkg($runs, $log, $pkg, \%f);
+        $r->{$_} = $f{$_} for keys %f;
+        return;
+    }
+    my $n = (_reg_int($r->{launch_fail_streak}) // 0) + 1;
+    my $wait = launch_backoff_secs($n, $c->{t});
+    _log($log, 'launch_failed', { package => $pkg, kind => $c->{site}, rc => $rc,
+          launch_fail_streak => $n, backoff_secs => $wait });
+    my %f = (last_launch_rc => (defined $rc ? $rc : 1), last_launch_fail_at => $now, launch_fail_streak => $n);
+    _upd_pkg($runs, $log, $pkg, \%f);
+    $r->{$_} = $f{$_} for keys %f;
+    return;
 }
 
 # --- 03-deaths-are-diagnosable: total reader of the JSON exit-status record
@@ -4131,6 +4340,12 @@ sub _tunables_base {
         death_bo_base => $ENV{BP_DEATH_BACKOFF_BASE_SECS} // 30,    # matches today's min_relaunch default
         death_bo_mult => $ENV{BP_DEATH_BACKOFF_MULT}      // 2,
         death_bo_max  => $ENV{BP_DEATH_BACKOFF_MAX_SECS}  // 1800,  # matches creds_bo_max
+        # bug 20261104-163148-782c: a launch that fails for a reason a retry may fix
+        # (bp-launch.sh exit 1/2/3/4) backs off 30, 60, 120 ... capped at 900s,
+        # instead of retrying on every tick.
+        launch_bo_base => $ENV{BP_LAUNCH_BACKOFF_BASE_SECS} // 30,
+        launch_bo_mult => $ENV{BP_LAUNCH_BACKOFF_MULT}      // 2,
+        launch_bo_max  => $ENV{BP_LAUNCH_BACKOFF_MAX_SECS}  // 900,
     };
 }
 
@@ -4519,6 +4734,9 @@ sub run {
     # four SEPARATE go() calls at a fixed $now to simulate four restarts. Same
     # convention/rationale as %seen/%ckpt above.
     my %last_relaunch_at;
+    # bug 20261104-163148-782c: dedupe for launch_held / launch_refusal_released,
+    # so a held package logs once per hold episode, not once per tick.
+    my %launch_hold_logged;
     # judge in-flight + start-epoch state lives on disk (judge_inflight*), so nothing
     # to declare here — it survives an orchestrator restart (A5).
     my (@s5, @s7);       # usage utilization samples [[epoch,pct],...]
@@ -5780,6 +5998,14 @@ sub run {
                 }
             }
 
+            # bug 20261104-163148-782c: one context shape for the launch-hold check and
+            # the launch-outcome bookkeeping at every launch site.
+            my $lctx = sub {
+                my ($p, $site) = @_;
+                return { runs => $runs, bpdir => $bpdir, log => $log, bp => $bp, reg => $reg, pkg => $p,
+                         now => $now, t => $t, site => $site, logged => \%launch_hold_logged };
+            };
+
             # ---- WATCH + WATCHDOG (assess each non-terminal launched package) ----
             my @live;     # packages occupying a coordinator slot now
             my $foreign_live = foreign_live_count($runs);   # other blueprints' share of the global cap
@@ -5895,6 +6121,10 @@ sub run {
                         push @live, $pkg;
                     } elsif ($v eq 'cold-relaunch') {
                         next if $shutdown;     # shutdown gate (A4) parks it; we don't relaunch
+                        # Same rule as Fix B below: a package whose launches are held
+                        # (refused ledger, or backing off) is not killed, because it
+                        # would not be replaced this tick.
+                        if (_launch_hold($lctx->($pkg, 'cold-wedged'))) { push @live, $pkg; next; }
                         # r01 Fix B: never kill a still-alive coordinator you've decided not to
                         # replace this tick — check the min-interval floor BEFORE kill_pid.
                         my $last = $last_relaunch_at{$pkg};
@@ -5909,10 +6139,10 @@ sub run {
                         my $snap = launch_snapshot($bpdir, $runs, $pkg, $now);
                         my $rc = $launch->({ pkg => $pkg, args => [], kind => 'cold-wedged' });
                         $note_exec->($pkg, $rc);
+                        _note_launch_outcome($lctx->($pkg, 'cold-wedged'), $rc);   # logs the failure line itself
                         if (defined $rc && $rc == 0) { _upd_pkg($runs, $log, $pkg, { launch_snapshot => $snap }); push @live, $pkg;
                                                        $last_relaunch_at{$pkg} = $now;
                                                        _observe_cache($bpdir, $pkg, $now, $log); }
-                        else { _log($log, 'launch_failed', { package => $pkg, kind => 'cold-wedged', rc => $rc }); }
                     } elsif ($v eq 'block') {
                         _log($log, 'watchdog_block', { package => $pkg, reason => 'wedged past attempt cap', attempts => $att->{$pkg} });
                         kill_pid($pid->{$pkg});
@@ -5936,6 +6166,9 @@ sub run {
                         # eligible again the moment the ledger reads cleanly.
                         next;
                     }
+                    # bug 20261104-163148-782c: a refused ledger or a launch in
+                    # backoff is held here exactly as at the fresh-launch site.
+                    next if _launch_hold($lctx->($pkg, 'watchdog'));
                     # A coordinator that exhausted its turn budget exits 1 exactly
                     # like a crash — only its TERMINAL jsonl event tells them apart.
                     # Classify first so a productive package is continued with a
@@ -6220,8 +6453,15 @@ sub run {
                             # the 436 that carry no information at all.
                             my $death = ($tv->{verdict} eq 'unknown')
                                       ? coordinator_death_evidence($runs, $pkg) : undef;
+                            # bug 20261104-163148-782c: runs/<pkg>.jsonl still holds the
+                            # PREVIOUS coordinator's stream when the last launch attempt
+                            # never started one, so its terminal verdict is not this
+                            # package's exit reason. Say so, and keep the old one beside it.
+                            my $never = never_launched_since_failure($reg->{$pkg});
                             _log($log, 'watchdog_relaunch', { package => $pkg, mode => $mode, age_min => $age,
-                                attempts => $att->{$pkg}, exit_reason => $tv->{verdict},
+                                attempts => $att->{$pkg}, exit_reason => ($never ? 'never_launched' : $tv->{verdict}),
+                                ($never ? (prior_exit_reason => $tv->{verdict},
+                                           last_launch_rc   => $reg->{$pkg}{last_launch_rc}) : ()),
                                 ($ctx_forced_cold ? (ctx_ceiling_forced_cold => 1) : ()),
                                 ($ctx_forced_cold ? (ctx_ceiling_tier => $ctx_forced_tier) : ()),
                                 (defined $ctx_flush_overrun_lines ? (ctx_flush_overrun => $ctx_flush_overrun_lines) : ()),
@@ -6234,6 +6474,7 @@ sub run {
                             my $snap = launch_snapshot($bpdir, $runs, $pkg, $now);
                             my $rc = $launch->({ pkg => $pkg, args => \@args, kind => $mode });
                             $note_exec->($pkg, $rc);
+                            _note_launch_outcome($lctx->($pkg, $mode), $rc);   # logs the failure line itself
                             if (defined $rc && $rc == 0) {
                                 _upd_pkg($runs, $log, $pkg, { %pending_reg, launch_snapshot => $snap });
                                 $reg->{$pkg}{$_} = $pending_reg{$_} for keys %pending_reg;
@@ -6244,7 +6485,6 @@ sub run {
                                 # nothing was exec'd: roll the widened budget back so the
                                 # next tick recomputes from the persisted value.
                                 $reg->{$pkg}{max_turns} = $reg_rollback if defined $reg_rollback;
-                                _log($log, 'launch_failed', { package => $pkg, kind => $mode, rc => $rc });
                             }
                         } else {
                             _log($log, 'relaunch_deferred', { package => $pkg, reason => 'parallel cap full' });
@@ -6358,19 +6598,22 @@ sub run {
                     # straight back up by the fresh-launch path (its pause only gates
                     # ticks N+1...).
                     $launch_status->{$_} = 'turn-starved' for keys %starved;
-                    my @ready = ready_packages($meta, $launch_status, \@live);
+                    # bug 20261104-163148-782c: drop held packages (refused ledger,
+                    # launch backoff) BEFORE the batch is picked, so a held package
+                    # never takes the slot a ready sibling could use.
+                    my @ready = grep { !_launch_hold($lctx->($_, 'fresh')) }
+                                ready_packages($meta, $launch_status, \@live);
                     my @batch = pick_launch_batch(\@ready, $meta, [ map { $meta->{$_}{write_set} } @live ], $slots);
                     for my $pkg (@batch) {
                         my $snap = launch_snapshot($bpdir, $runs, $pkg, $now);
                         my $rc = $launch->({ pkg => $pkg, args => [], kind => 'fresh' });
                         $note_exec->($pkg, $rc);
+                        _note_launch_outcome($lctx->($pkg, 'fresh'), $rc);   # logs the failure line itself
                         if (defined $rc && $rc == 0) {
                             _upd_pkg($runs, $log, $pkg, { launch_snapshot => $snap });
                             _log($log, 'launch', { package => $pkg, kind => 'fresh' });
                             push @live, $pkg;
                             _observe_cache($bpdir, $pkg, $now, $log);
-                        } else {
-                            _log($log, 'launch_failed', { package => $pkg, kind => 'fresh', rc => $rc });
                         }
                     }
                 }

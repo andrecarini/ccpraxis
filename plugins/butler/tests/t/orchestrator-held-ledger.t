@@ -3,8 +3,8 @@
 # t/105 — a02-api-and-guard-defects, DEFECT 5.
 # A package row added to blueprint.md with NO packages/<pkg>.md ledger yet is
 # derived as 'pending' (bp-orchestrator.pl:1902, ledger_fm(...) // 'pending'),
-# enters ready_packages, is handed to bp-launch.sh, which hard-exits 1 ("no
-# ledger at ...") -- every tick, forever, burning a launch slot each time.
+# enters ready_packages, is handed to bp-launch.sh, which hard-exits 5 ("no
+# ledger at ...", its static-refusal code) -- every tick, forever, burning a launch slot each time.
 # Spec §2.5/§2.6 / AC-11..AC-15.
 #
 # WRITTEN BLIND TO THE IMPLEMENTATION. `ledger_missing` does not exist yet in
@@ -90,8 +90,8 @@ sub log_events {
 
 # =============================================================================
 # AC-13 / AC-14: full BpOrch::run() across >=2 ticks with an injected launch
-# recorder that faithfully mimics bp-launch.sh's real failure mode (hard-exit 1
-# when packages/<pkg>.md is absent -- spec §1, bp-launch.sh:42). Two sequential
+# recorder that faithfully mimics bp-launch.sh's real failure mode (hard-exit 5
+# when packages/<pkg>.md is absent -- spec §1, bp-launch.sh's no-ledger check). Two sequential
 # once=>1 calls model two ticks; state persists on disk (registry.json,
 # orchestrator.log, ledger files) between them exactly as a real daemon's ticks
 # would. Never lets the real bp-launch.sh run -- launch is always the injected
@@ -130,9 +130,9 @@ sub log_events {
         my ($a) = @_;
         my $pkg = $a->{pkg};
         push @launched, $pkg;
-        # Faithful mimic of bp-launch.sh:42's real behaviour: hard-exit 1 when
-        # the package's ledger file does not exist on disk.
-        return (-f "$dir/packages/$pkg.md") ? 0 : 1;
+        # Faithful mimic of bp-launch.sh's real behaviour: hard-exit 5 (static
+        # ledger refusal) when the package's ledger file does not exist on disk.
+        return (-f "$dir/packages/$pkg.md") ? 0 : 5;
     };
 
     my %run_opts = (
@@ -257,7 +257,7 @@ sub log_events {
                       tele_retry=>3, usage_fail=>60, busy_path=>"$ROOT/busy105held" };
     my $launch = sub {
         my ($a) = @_;
-        return (-f "$dir/packages/$a->{pkg}.md") ? 0 : 1;
+        return (-f "$dir/packages/$a->{pkg}.md") ? 0 : 5;   # bp-launch.sh: no ledger -> exit 5
     };
     my %run_opts = (
         blueprint => 'T105held', bp_dir => $dir, creds_path => "$dir/creds.json",

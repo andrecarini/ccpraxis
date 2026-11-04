@@ -74,8 +74,12 @@ revive() {  # BP_NAME PKG SID PID AGE STATUS
   fi
   printf '%-28s %-12s DEAD -> %s\n' "$bp/$pkg" "$status" "$mode"
   if [ "$APPLY" -eq 1 ]; then
-    "$SCRIPT_DIR/bp-launch.sh" "$bp" "$pkg" "${args[@]}" || \
-      printf '%-28s %-12s LAUNCH FAILED (parallel cap? see message above)\n' "$bp/$pkg" "$status"
+    # Any non-zero exit is a failure here; bp-launch.sh's header lists what
+    # each code means (3 = parallel cap full, 5 = the ledger itself was refused).
+    "$SCRIPT_DIR/bp-launch.sh" "$bp" "$pkg" "${args[@]}" || {
+      rc=$?
+      printf '%-28s %-12s LAUNCH FAILED (bp-launch.sh exit %s; see its message above)\n' "$bp/$pkg" "$status" "$rc"
+    }
   fi
 }
 

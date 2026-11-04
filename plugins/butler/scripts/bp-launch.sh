@@ -13,6 +13,21 @@
 # exported here: BP_LEDGER, BP_WRITE_SET, BP_TEST_PATHS, BP_DIR, BP_PROJECT_ROOT,
 # BP_REPORT_DIR (this package's reports dir — capture drivers derive their output path from
 # it rather than hardcoding one; see coordinator-protocol/SKILL.md).
+#
+# Exit codes (bp-orchestrator.pl branches on these; keep them stable):
+#   0  launched (the coordinator pid is alive and recorded in the registry)
+#   1  transient or environmental failure: a required command is missing, the
+#      watcher reported no pid within 10s, or the coordinator died at once.
+#      A retry may succeed, so the orchestrator backs off and tries again.
+#   2  usage error (unknown option). A caller defect, not a ledger defect.
+#   3  the global parallelism cap (BP_MAX_PARALLEL) is full. Transient.
+#   4  refused: not inside the sandbox (bp_require_sandbox).
+#   5  static ledger refusal: no ledger file, an empty write_set, or an
+#      unknown effort value. Retrying the same ledger can never succeed, so
+#      the orchestrator escalates once and holds the package until the ledger
+#      bytes change or the escalation is answered. Every exit-5 check runs
+#      BEFORE the attempt counter, the pid file or runs/<pkg>.jsonl is touched,
+#      so a refusal leaves the previous coordinator's state exactly as it was.
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PLUGIN_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
@@ -32,14 +47,14 @@ while [ $# -gt 0 ]; do
     --max-turns)      MAXT="$2"; shift 2 ;;
     --force)          FORCE=1; shift ;;
     --resume-session) RESUME_SID="$2"; shift 2 ;;
-    *) echo "bp-launch: unknown option $1" >&2; exit 1 ;;
+    *) echo "bp-launch: unknown option $1" >&2; exit 2 ;;
   esac
 done
 
 PROJECT_ROOT=$(bp_project_root)
 BPDIR=$(bp_dir "$BP_NAME")
 LEDGER=$(bp_ledger "$BP_NAME" "$PKG")
-[ -f "$LEDGER" ] || { echo "bp-launch: no ledger at $LEDGER" >&2; exit 1; }
+[ -f "$LEDGER" ] || { echo "bp-launch: no ledger at $LEDGER" >&2; exit 5; }
 BLUEPRINT_FILE="$BPDIR/blueprint.md"
 mkdir -p "$BPDIR/runs" "$BPDIR/dispatch" "$BPDIR/reports/$PKG" "$BPDIR/specs"
 
@@ -56,7 +71,7 @@ TEST_PATHS=$(fm_get "$LEDGER" test_paths)
 # catching wedged ones. snapshot_progressed() already detects a wedged agent
 # SEMANTICALLY (ledger checkboxes, outputs, mtime), so the cap can be high.
 [ -n "$MAXT" ]  || MAXT="${BP_DEFAULT_MAX_TURNS:-800}"
-[ -n "$WRITE_SET" ] || { echo "bp-launch: ledger has empty write_set — refusing to launch an unscoped coordinator" >&2; exit 1; }
+[ -n "$WRITE_SET" ] || { echo "bp-launch: ledger has empty write_set — refusing to launch an unscoped coordinator" >&2; exit 5; }
 
 # -------- effort (b23): opt-in only. Absent -> no --effort flag at all, byte-
 # identical to today's command line; the session then inherits effortLevel from
@@ -69,7 +84,7 @@ EFFORT_ARGS=()
 if [ -n "$EFFORT" ]; then
   case "$EFFORT" in
     low|medium|high|xhigh|max) ;;
-    *) echo "bp-launch: unknown effort '$EFFORT' in ledger $LEDGER — refusing to launch (valid: low, medium, high, xhigh, max)" >&2; exit 1 ;;
+    *) echo "bp-launch: unknown effort '$EFFORT' in ledger $LEDGER — refusing to launch (valid: low, medium, high, xhigh, max)" >&2; exit 5 ;;
   esac
   EFFORT_ARGS=(--effort "$EFFORT")
 fi
