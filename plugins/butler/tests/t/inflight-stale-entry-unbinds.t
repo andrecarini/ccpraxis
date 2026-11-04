@@ -23,7 +23,6 @@
 #       is not scoped to it (WriteGuards' own count ignores the entry).
 #   B5  control: a live sole entry is still bound and scoped, as before.
 #
-# Runs standalone: perl plugins/butler/tests/t/inflight-stale-entry-unbinds.t
 use strict;
 use warnings;
 use Test::More;

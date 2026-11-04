@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 # platform: windows
 #
-# ps-analysis-cache-pinned.t -- todo 20261104-035939-482d0000: a stray
+# todo 20261104-035939-482d0000: a stray
 # Microsoft/Windows/PowerShell/ModuleAnalysisCache kept appearing at the repo
 # root during test runs.
 #
