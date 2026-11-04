@@ -158,25 +158,19 @@ like($src, qr/OWNER-REPLACED/,
 }
 
 # ---------------------------------------------------------------------------
-# Decision 16 (c): launcher.pl's own keep-awake exec must pass an owner pid
-# sourced from the launcher's own WINDOWS pid (self_winpid, the cygwin/MSYS
-# native-pid seam), and never from the bare MSYS pid ($$). Static/source-
-# level only -- this file's write set is keep-awake.ps1 + this test, so
-# launcher.pl itself is read-only here, never edited or driven as a
-# subprocess (that would collide with test-wakelock-hygiene.t's actuator
-# sweep and this file's own no-real-wake-lock discipline stated in the
-# header above).
+# Decision 16 (c): the owner pid of the ONE remaining host helper must be
+# sourced from a real WINDOWS pid (self_winpid, the cygwin/MSYS native-pid
+# seam), and never from the bare MSYS pid ($$). Static/source-level only.
 #
-# Rewritten for 07-one-keepawake-helper (blueprint wake-and-pause-
-# consolidation, Decision 21; reviewer-step6.md m1): package 07 moved the
-# real spawn out of launcher.pl's own `sub _keepawake_start` (deleted) and
-# into BpKeepAwake::spawn, called from the `start => sub { ... }` closure
-# launcher.pl now hands to KeepAwake->new(...). Looking for the deleted sub
-# name left this whole block skipping silently on every run, with none of
-# its coverage replaced elsewhere (m1). Re-pointed at the closure's own body
-# so this runs (not skips) again, and keeps checking the same requirement in
-# plain English: the owner pid is the launcher's own WINDOWS pid, obtained
-# through BpKeepAwake::self_winpid(), never the bare MSYS $$.
+# Moved for 08-host-awake-actuator (Decision 23, gate G2): the launcher owns
+# no helper of its own any more -- it only publishes a registry entry
+# through KeepAwake::registry_seams/HostAwake::publish, with no
+# BpKeepAwake::spawn( call anywhere in its source. The one remaining spawn
+# site is BpContinuityLease::daemon_loop's own body, which defaults
+# owner_winpid to BpKeepAwake::self_winpid() rather than to $$ (spec 2.3). So
+# this block now pins daemon_loop's body (not launcher.pl's deleted start
+# closure) and separately pins that launcher.pl calls BpKeepAwake::spawn(
+# nowhere at all.
 # ---------------------------------------------------------------------------
 {
     my $LAUNCHER = "$Bin/../../scripts/launcher.pl";
@@ -188,46 +182,56 @@ like($src, qr/OWNER-REPLACED/,
     }
 
     SKIP: {
-        skip 'Decision 16(c): launcher.pl not found -- cannot check its keep-awake wiring', 4
+        skip 'Decision 16(c): launcher.pl not found -- cannot check its keep-awake wiring', 1
             unless defined $lsrc;
+        unlike($lsrc, qr/BpKeepAwake::spawn\s*\(/,
+            'Decision 16(c)/G2: launcher.pl calls BpKeepAwake::spawn( nowhere (package 08: it owns no helper)');
+    }
 
-        # Isolate the start closure's own body: the text between `start    =>
-        # sub {` and the following `stop     =>` key of the same
-        # KeepAwake->new(...) call, so the ordering/never-$$ checks below are
-        # anchored to the right closure rather than the whole 9000-line file.
-        my ($start_sub_body) = ($lsrc =~ /start\s*=>\s*sub\s*\{(.*?)\n\s*\},\n\s*stop\s*=>/s);
+    my $CL_PM = "$Bin/../../../butler/scripts/BpContinuityLease.pm";
+    my $clsrc;
+    if (open(my $cfh, '<:raw', $CL_PM)) {
+        local $/;
+        $clsrc = <$cfh>;
+        close $cfh;
+    }
+
+    SKIP: {
+        skip 'Decision 16(c): BpContinuityLease.pm not found -- cannot check daemon_loop\'s owner pinning', 4
+            unless defined $clsrc;
+
+        my ($loop_body) = ($clsrc =~ /\nsub\s+daemon_loop\s*\{(.*?)\n\}\n/s);
 
         SKIP: {
-            skip 'Decision 16(c): no start => sub { ... } closure found ahead of a stop => key in '
-               . 'launcher.pl -- the keep-awake start wiring this decision requires may live under a '
-               . 'different shape', 4
-                unless defined $start_sub_body;
+            skip 'Decision 16(c): sub daemon_loop not found in BpContinuityLease.pm -- the owner-pinning '
+               . 'wiring this decision requires may live under a different shape', 4
+                unless defined $loop_body;
 
-            like($start_sub_body, qr/BpKeepAwake::self_winpid\s*\(\s*\)/,
-                "Decision 16(c): launcher.pl's keep-awake start closure calls BpKeepAwake::self_winpid() "
-              . '(the owner pid is the launcher\'s own WINDOWS pid, not derived any other way)');
+            like($loop_body, qr/BpKeepAwake::self_winpid\s*\(\s*\)/,
+                "Decision 16(c): BpContinuityLease::daemon_loop's body calls BpKeepAwake::self_winpid() "
+              . '(the owner pid defaults to the daemon\'s own WINDOWS pid, not derived any other way)');
 
-            like($start_sub_body, qr/owner_winpid\s*=>/,
-                'Decision 16(c): the start closure passes owner_winpid => to the real spawn call');
+            like($loop_body, qr/owner_winpid\s*=>/,
+                'Decision 16(c): daemon_loop passes owner_winpid => into sync/the real spawn call');
 
-            # Ordering: the self_winpid() read must happen textually BEFORE
-            # BpKeepAwake::spawn( is called inside the closure's own body --
+            # Ordering: the self_winpid() default must happen textually BEFORE
+            # BpKeepAwake::spawn( is ever reached inside the loop's body --
             # "read in the parent... before forking" (spawn() does the fork).
-            my $self_winpid_pos = ($start_sub_body =~ /BpKeepAwake::self_winpid\s*\(\s*\)/) ? $-[0] : undef;
-            my $spawn_pos       = ($start_sub_body =~ /BpKeepAwake::spawn\s*\(/) ? $-[0] : undef;
-            ok(defined($self_winpid_pos) && defined($spawn_pos) && $self_winpid_pos < $spawn_pos,
-                'Decision 16(c): BpKeepAwake::self_winpid() is called before BpKeepAwake::spawn(, i.e. the '
-              . 'owner WINPID is read in the PARENT before the helper is forked')
+            my $self_winpid_pos = ($loop_body =~ /BpKeepAwake::self_winpid\s*\(\s*\)/) ? $-[0] : undef;
+            my $spawn_pos       = ($loop_body =~ /BpKeepAwake::spawn\s*\(/) ? $-[0] : undef;
+            ok(defined($self_winpid_pos) && (!defined($spawn_pos) || $self_winpid_pos < $spawn_pos),
+                'Decision 16(c): BpKeepAwake::self_winpid() default is computed before any BpKeepAwake::spawn( '
+              . 'call reachable from daemon_loop\'s own body')
                 or diag(sprintf('self_winpid_pos=%s spawn_pos=%s',
                     defined($self_winpid_pos) ? $self_winpid_pos : 'undef',
                     defined($spawn_pos)       ? $spawn_pos       : 'undef'));
 
-            # The value handed to owner_winpid must never be the bare MSYS pid
-            # ($$) itself -- forbid the exact shape of passing it directly as
-            # that key's value, which is precisely the CLAUDE.md MSYS-pid/
-            # WINPID landmine this decision exists to avoid.
-            unlike($start_sub_body, qr/owner_winpid\s*=>\s*\$\$\b/,
-                'Decision 16(c): owner_winpid is never handed the bare MSYS pid ($$) directly');
+            # The value handed to owner_winpid must never default to the bare
+            # MSYS pid ($$) itself -- forbid the exact shape of defaulting it
+            # directly to that key's value, which is precisely the
+            # CLAUDE.md MSYS-pid/WINPID landmine this decision exists to avoid.
+            unlike($loop_body, qr/owner_winpid\s*(?:=>|=)\s*\$\$\b/,
+                'Decision 16(c): owner_winpid never defaults to the bare MSYS pid ($$) directly');
         }
     }
 }

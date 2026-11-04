@@ -21,8 +21,9 @@
 use strict;
 use warnings;
 BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 } # package 16 post-fix-batch (Decision 80): this file names a wake-lock actuator, in prose or a path check, never a real invocation -- the guard is the cheap side of test-wakelock-hygiene.t's deliberate over-matching.
-# Both the horizon constant and the BpKeepAwake::apply override are referenced
-# exactly once, which is what 'once' warns about; here that is the intent.
+# Both the horizon constant and the BpDrive::keepawake_apply override are
+# referenced exactly once, which is what 'once' warns about; here that is the
+# intent.
 no warnings 'once';
 use FindBin qw($Bin);
 use Test::More;
@@ -96,11 +97,15 @@ sub make_bp_dir {
     }
 }
 
-# Capture the phase handed to the shared wake-lock module.
+# spec 08-host-awake-actuator §2.5/§6.3 [A]: drive-solo on the host no longer
+# actuates BpKeepAwake::apply -- it publishes intent through
+# BpDrive::keepawake_apply (which calls HostAwake::announce/withdraw). Stub
+# that entry point instead, capturing the phase ($_[0]) exactly as before;
+# the expected phase lists this file asserts are unchanged.
 our @PHASES;
 {
     no warnings 'redefine';
-    *BpKeepAwake::apply = sub { push @PHASES, $_[0]; return };
+    *BpDrive::keepawake_apply = sub { push @PHASES, $_[0]; return };
 }
 
 sub run_pause {

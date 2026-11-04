@@ -193,46 +193,60 @@ $SIG{TERM} = sub { reap_all_kids(); exit 1 };
         is(BpKeepAwake::log_tail("$f.none"), undef, 'AC7: a missing log gives undef');
     }
 }
-like($LSRC, qr/log_ev\('keepawake_died', .{0,300}?helper_last => BpKeepAwake::log_tail\(/s,
-     "AC7: a death is logged with BpKeepAwake::log_tail's own last line");
+# package 08 (host-awake-actuator): the launcher's AC7 launcher-half
+# assertion ("a death is logged with log_tail's own last line") is REMOVED.
+# The launcher owns no helper any more, so it has no helper whose death to
+# log; `keepawake_died` is a dead letter for the launcher after this
+# package. AC7's pure log_tail half above is unchanged.
+note('AC7 launcher half removed (package 08): the launcher has no helper whose death to log');
 
 # =====================================================================
-# AC8: launcher.pl's BpKeepAwake wiring (static, text-level).
+# AC8 (package 08, host-awake-actuator): launcher.pl's KeepAwake wiring is
+# built from registry_seams' start/stop, with no `alive` key at all (there
+# is no child process of the launcher's own to poll), and the launcher never
+# calls ->revive. load_bp_keepawake( still precedes reap_orphan(, which
+# still precedes KeepAwake->new( (both now only clear a PRE-08 launcher's
+# leftover helper); load_host_awake( also precedes KeepAwake->new(.
 # =====================================================================
-like($LSRC, qr/alive\s*=>[^\n]*\\&BpKeepAwake::child_alive/,
-     'AC8: the launcher hands KeepAwake the BpKeepAwake::child_alive seam');
-like($LSRC, qr/my \$rv = \$KEEPAWAKE->revive;/, 'AC8: and revives on every tick');
 {
-    my ($tick) = $LSRC =~ /(my \$rv = \$KEEPAWAKE->revive;.*?if \(\$probe_state ne 'probe-failed'\))/s;
-    ok(defined $tick, 'AC8: the revive call is before the probe-failed gate (a held-through probe failure is covered too)');
-}
-{
-    my $spawn_pos = $LSRC =~ /BpKeepAwake::spawn\s*\(/ ? $-[0] : undef;
-    ok(defined $spawn_pos, 'AC8: the start closure calls BpKeepAwake::spawn(');
-    my $window = defined $spawn_pos ? substr($LSRC, $spawn_pos, 400) : '';
-    like($window, qr/lease_seconds\s*=>\s*0/, 'AC8: ...with lease_seconds => 0 in the same call');
-    like($window, qr/owner_winpid\s*=>/, 'AC8: ...and owner_winpid => in the same call');
-}
-like($LSRC, qr/BpKeepAwake::stop_child\(/, 'AC8: the stop closure calls BpKeepAwake::stop_child(');
-{
-    my $load_pos = $LSRC =~ /KeepAwake::load_bp_keepawake\(/ ? $-[0] : undef;
-    my $reap_pos = $LSRC =~ /BpKeepAwake::reap_orphan\(/     ? $-[0] : undef;
-    my $new_pos  = $LSRC =~ /KeepAwake->new\(/                ? $-[0] : undef;
+    my ($new_call) = $LSRC =~ /(KeepAwake->new\s*\(.*?\n\s*\);)/s;
+    ok(defined $new_call, 'AC8: KeepAwake->new(...) call is extractable');
+    if (defined $new_call) {
+        like($new_call, qr/start\s*=>/, 'AC8: KeepAwake->new is built with a start key');
+        like($new_call, qr/stop\s*=>/,  'AC8: KeepAwake->new is built with a stop key');
+        unlike($new_call, qr/\balive\s*=>/, 'AC8: KeepAwake->new is built with no alive key (package 08: no child to poll)');
+    }
+    unlike($LSRC, qr/\$KEEPAWAKE->revive\b/, 'AC8: launcher.pl never calls $KEEPAWAKE->revive (package 08: no helper of its own)');
+
+    my $load_pos  = $LSRC =~ /KeepAwake::load_bp_keepawake\(/ ? $-[0] : undef;
+    my $reap_pos  = $LSRC =~ /BpKeepAwake::reap_orphan\(/     ? $-[0] : undef;
+    my $new_pos   = $LSRC =~ /KeepAwake->new\(/                ? $-[0] : undef;
+    my $hload_pos = $LSRC =~ /KeepAwake::load_host_awake\(/    ? $-[0] : undef;
     ok(defined($load_pos) && defined($reap_pos) && defined($new_pos)
         && $load_pos < $reap_pos && $reap_pos < $new_pos,
        'AC8: KeepAwake::load_bp_keepawake precedes BpKeepAwake::reap_orphan, which precedes KeepAwake->new')
         or diag(sprintf('load=%s reap=%s new=%s',
             map { defined $_ ? $_ : 'undef' } ($load_pos, $reap_pos, $new_pos)));
+    ok(defined($hload_pos) && defined($new_pos) && $hload_pos < $new_pos,
+       'AC8: KeepAwake::load_host_awake precedes KeepAwake->new')
+        or diag(sprintf('hload=%s new=%s',
+            map { defined $_ ? $_ : 'undef' } ($hload_pos, $new_pos)));
 }
 
 # =====================================================================
-# AC9: [r] release goes through the holder, never a bare _keepawake_stop().
+# AC9 (package 08): _relaunch_self contains no $KEEPAWAKE->release and no
+# withdraw -- there is no child process of the launcher's own to orphan any
+# more, and leaving the registry entry lets the re-exec'd process refresh it
+# on its first probe without a gap (spec 2.6). No bare _keepawake_stop(
+# survives anywhere in launcher.pl.
 # =====================================================================
 {
     my ($relaunch) = $LSRC =~ /(sub _relaunch_self \{.*?\n\})/s;
     ok(defined $relaunch, 'AC9 precondition: _relaunch_self is extractable');
-    like($relaunch // '', qr/\$KEEPAWAKE->release if \$KEEPAWAKE/,
-         'AC9: [r] releases the helper through the holder');
+    unlike($relaunch // '', qr/\$KEEPAWAKE->release\b/,
+         'AC9: _relaunch_self (package 08: [r]) does not release the holder');
+    unlike($relaunch // '', qr/\bwithdraw\b/,
+         'AC9: _relaunch_self (package 08: [r]) does not withdraw the registry entry either');
     unlike($LSRC, qr/_keepawake_stop\(/, 'AC9: no _keepawake_stop( call survives anywhere in launcher.pl');
 }
 

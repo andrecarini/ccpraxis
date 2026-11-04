@@ -720,6 +720,18 @@ sub reconcile {
     # counts "whatever the wake-lock lease counts as active", so a fresh sandbox
     # hold counts as an arm (bug 20261031-225231-6764).
     push @$arms, map { { sid => "sandbox:$_" } } @{ sandbox_holds($root) };
+    # Package 08-host-awake-actuator: a counting registry entry (sandbox/
+    # fleet/solo) counts as an arm too, for every reconcile caller alike --
+    # the refresher's own tick, the bp-power-plan CLI an old launcher still
+    # calls, butler-continuity off, the AC monitor. That shared set is
+    # what keeps the plan from flapping between whichever caller last
+    # reconciled it. HostAwake.pm is loaded lazily (symbol guard, never
+    # %INC -- see this file's own header); a load or call failure adds
+    # nothing and changes nothing else.
+    eval {
+        require "$DIR/HostAwake.pm" unless defined &HostAwake::counting_ids;
+        push @$arms, map { { sid => "source:$_" } } @{ HostAwake::counting_ids($root, time()) };
+    };
     my $armed = scalar @$arms;
     my $arm_ids = [ map { $_->{sid} } @$arms ];
 

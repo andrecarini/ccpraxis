@@ -112,12 +112,21 @@ is(BpKeepAwake::should_be_on('nonsense'),      0, 'unknown phase -> released (fa
     unlike($fleet, qr/exec\(\s*'powershell\.exe'/,
         'the fleet does NOT carry its own copy of the powershell actuation');
 
-    # The fleet must both TAKE and RELEASE the lock. A driver that only takes it
-    # leaves the machine awake forever after it exits.
-    like($fleet, qr/BpKeepAwake::apply\(\s*\$ka_phase/,
-        'the fleet applies the lock each tick, phase-driven');
-    like($fleet, qr/BpKeepAwake::apply\(\s*'settled'/,
-        'the fleet releases the lock on exit — including the error path');
+    # spec 08-host-awake-actuator §2.5/§6.3 [A]: the fleet no longer actuates
+    # BpKeepAwake::apply directly -- it PUBLISHES intent through
+    # HostAwake.pm's registry via fleet_awake_step, and the one remaining
+    # host-side actuator (the continuity refresher) does the spawning. The
+    # fleet must still both TAKE and RELEASE the lock, phase-driven, each
+    # tick and on exit -- that half of the intent is unchanged, only its
+    # mechanism moved.
+    like($fleet, qr/fleet_awake_step\(\s*\{[^}]*phase\s*=>\s*\$ka_phase/s,
+        'the fleet calls fleet_awake_step with $ka_phase each tick, phase-driven');
+    like($fleet, qr/fleet_awake_step\(\s*\{[^}]*phase\s*=>\s*'settled'/s,
+        'the fleet calls fleet_awake_step with settled on exit — including the error path');
+    unlike($solo,  qr/BpKeepAwake::apply\(/,
+        "solo's source contains no BpKeepAwake::apply( — it publishes, it does not actuate");
+    unlike($fleet, qr/BpKeepAwake::apply\(/,
+        "the fleet's source contains no BpKeepAwake::apply( — it publishes, it does not actuate");
 
     # A manual pause is waiting on an absent human; holding the machine awake
     # for them is cost without benefit. Since 2026-11-01 the phase goes through

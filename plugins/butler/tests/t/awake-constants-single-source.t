@@ -61,6 +61,12 @@ my %EXPECT = (
     AC_STALE            => 1800,
 );
 
+# Decision 22 (08-host-awake-actuator, G1 granted): 08 adds exactly one sub,
+# state_root, to BpAwakeConst.pm (the state-root rule the launcher can load
+# per Decision 13). AC-1/AC-2 are amended to admit exactly the six constants
+# PLUS that one sub, and nothing else. Everything else here is unchanged.
+my @ADMITTED_SUBS = (@CONST_NAMES, 'state_root');
+
 my $AWAKE_CONST_PM = "$BUTLER_SCRIPTS/BpAwakeConst.pm";
 my $AWAKE_LOADED = do {
     local $@;
@@ -69,15 +75,15 @@ my $AWAKE_LOADED = do {
 if (!$AWAKE_LOADED) {
     fail("AC-1: BpAwakeConst.pm failed to load: $@");
 } else {
-    # AC-1: exactly the six names in %BpAwakeConst::, excluding the special blocks,
-    # with the expected values.
+    # AC-1: exactly the six constants plus sub state_root in %BpAwakeConst::,
+    # excluding the special blocks, with the expected values.
     no strict 'refs';
     my @stash_subs = grep {
         defined &{"BpAwakeConst::$_"} && $_ !~ /^(?:BEGIN|END|INIT|CHECK|UNITCHECK)$/
     } keys %BpAwakeConst::;
     use strict 'refs';
-    is_deeply([ sort @stash_subs ], [ sort @CONST_NAMES ],
-        'AC-1: BpAwakeConst:: defines exactly the six named constants, nothing else');
+    is_deeply([ sort @stash_subs ], [ sort @ADMITTED_SUBS ],
+        'AC-1 (Decision 22): BpAwakeConst:: defines exactly the six named constants plus sub state_root, nothing else');
     for my $name (@CONST_NAMES) {
         my $got = eval { BpAwakeConst->can($name) ? BpAwakeConst::->$name() : undef };
         no strict 'refs';
@@ -85,15 +91,26 @@ if (!$AWAKE_LOADED) {
         use strict 'refs';
         is($got, $EXPECT{$name}, "AC-1: BpAwakeConst::$name() == $EXPECT{$name}");
     }
+    ok(defined &BpAwakeConst::state_root, 'AC-1 (Decision 22): BpAwakeConst::state_root is defined');
 }
 
-# AC-2: source shape
+# AC-2: source shape. Decision 22: exactly ONE `sub state_root { ... }` block
+# is admitted in addition to the previously-allowed shapes; it is stripped
+# out whole (so its body's own statements are never checked against the
+# constant-only line shapes) before the line-by-line pass below.
 {
     my $src = slurp($AWAKE_CONST_PM);
     if (!defined $src) {
         fail('AC-2: could not read BpAwakeConst.pm source');
     } else {
-        my @lines = split /\n/, $src;
+        my @state_root_blocks = $src =~ /^sub state_root\s*\{.*?\n\}\n/msg;
+        is(scalar(@state_root_blocks), 1,
+            'AC-2 (Decision 22): exactly one sub state_root { ... } block is present')
+            or diag('found ' . scalar(@state_root_blocks) . ' state_root block(s)');
+
+        (my $stripped = $src) =~ s/^sub state_root\s*\{.*?\n\}\n//ms;
+
+        my @lines = split /\n/, $stripped;
         my @filtered = grep { /\S/ && !/^\s*#/ } @lines;
         my @bad;
         my @const_names_seen;
@@ -107,14 +124,14 @@ if (!$AWAKE_LOADED) {
             if ($line =~ /^1;\s*$/) { next }
             push @bad, $line;
         }
-        is(scalar(@bad), 0, 'AC-2: every non-comment, non-blank line matches an allowed shape')
+        is(scalar(@bad), 0, 'AC-2: every non-comment, non-blank, non-state_root-body line matches an allowed shape')
             or diag("unexpected line(s): " . join(' | ', @bad));
         is_deeply([ sort @const_names_seen ], [ sort @CONST_NAMES ],
             'AC-2: the use-constant lines name exactly the six constants');
 
         # the line immediately preceding each `use constant` line in the
-        # UNFILTERED file is a comment line.
-        my @all_lines = split /\n/, $src;
+        # UNFILTERED (but state_root-stripped) file is a comment line.
+        my @all_lines = split /\n/, $stripped;
         my @missing_comment;
         for my $i (0 .. $#all_lines) {
             if ($all_lines[$i] =~ /^use constant [A-Z_]+/) {
@@ -124,6 +141,19 @@ if (!$AWAKE_LOADED) {
         }
         is(scalar(@missing_comment), 0, 'AC-2: every use-constant line is immediately preceded by a comment line')
             or diag("missing comment before: " . join(' | ', @missing_comment));
+
+        # the line immediately preceding the sub state_root block (in the
+        # UNFILTERED, unstripped file) is also a comment line, same rule.
+        my @orig_lines = split /\n/, $src;
+        my $sr_missing_comment = 1;
+        for my $i (0 .. $#orig_lines) {
+            if ($orig_lines[$i] =~ /^sub state_root\s*\{/) {
+                my $prev = $i > 0 ? $orig_lines[$i - 1] : '';
+                $sr_missing_comment = ($prev =~ /^\s*#/) ? 0 : 1;
+                last;
+            }
+        }
+        is($sr_missing_comment, 0, 'AC-2 (Decision 22): sub state_root is immediately preceded by a comment line');
     }
 }
 

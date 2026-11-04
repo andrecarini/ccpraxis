@@ -15,6 +15,34 @@ use File::Path qw(make_path);
 use File::Basename qw(basename);
 use Cwd qw(getcwd abs_path);
 use POSIX qw(strftime);
+use Digest::MD5 ();
+use File::Basename qw(dirname);
+
+# -----------------------------------------------------------------------------
+# root_tag_oracle($path) / solo_id_oracle($dsdir) -- an INDEPENDENT re-
+# implementation of HostAwake.pm's root_tag/solo_id (spec 08-host-awake-
+# actuator-spec.md 2.2), used ONLY to compute the expected registry filename
+# for AC-4(token-refresh-failed) and AC-42 below. Never loads HostAwake.pm.
+# -----------------------------------------------------------------------------
+sub root_tag_oracle {
+    my ($path) = @_;
+    return undef unless defined $path && length $path;
+    (my $norm = $path) =~ tr{\\}{/};
+    $norm =~ s{/+$}{};
+    if ($norm =~ s{^([A-Za-z]):/}{}) {
+        $norm = '/' . lc($1) . '/' . $norm;
+    }
+    my $bytes = $norm;
+    utf8::encode($bytes) if utf8::is_utf8($bytes);
+    return substr(Digest::MD5::md5_hex($bytes), 0, 8);
+}
+sub solo_id_oracle {
+    my ($dsdir) = @_;
+    my $data = dirname($dsdir);
+    my $root = (basename($data) eq '.ccpraxis-local-data') ? dirname($data) : $data;
+    my $tag  = root_tag_oracle($root);
+    return defined $tag ? "solo-$tag" : undef;
+}
 
 # AC15 (08-blueprint-parks fix-batch, SF-3): pin HOME/USERPROFILE/
 # ALMANAC_HOME to an isolated tempdir before any production code loads, so
@@ -386,6 +414,13 @@ sub capture_run {
     my $dsdir = "$data/.drive-solo"; make_path($dsdir);
     write_json("$dsdir/order.json", { order => ['bp-x'], recorded_at => $NOW });
 
+    # package 08 (host-awake-actuator): drive-solo now withdraws through
+    # HostAwake::withdraw + HostAwake::retire_legacy_helper, which require
+    # host_side() == 1 and a resolvable registry root.
+    my $BUTLER_STATE_DIR = tempdir(CLEANUP => 1);
+    local $ENV{BUTLER_STATE_DIR} = $BUTLER_STATE_DIR;
+    local $HostAwake::HOST_SIDE = 1;
+
     # A live wake-lock that the stop MUST release.
     my $pid_f = "$dsdir/keepawake.pid";
     open(my $pf, '>', $pid_f) or die $!; print $pf "424242\n"; close $pf;
@@ -412,13 +447,19 @@ sub capture_run {
         'AC-4(token-refresh-failed): detail carries the keeper detail');
 
     is_deeply(\@killed, ['424242'],
-        'AC-4(token-refresh-failed): the wake-lock is released, not left held');
+        'AC-4(token-refresh-failed): the wake-lock is released, not left held (via retire_legacy_helper)');
     ok(!-e $pid_f,
         'AC-4(token-refresh-failed): the keepawake pid file is cleared');
 
     my $runlog = -e "$dsdir/run.md" ? do { open my $r,'<',"$dsdir/run.md"; local $/; <$r> } : '';
     like($runlog, qr/ERROR token refresh failed/,
         'AC-4(token-refresh-failed): the error is logged, not silent');
+
+    my $sid = solo_id_oracle($dsdir);
+    ok(defined $sid, 'AC-4(token-refresh-failed) setup: a solo id is computable for this fixture');
+    ok(!-e "$BUTLER_STATE_DIR/continuity/awake-sources/$sid.json",
+        'AC-4(token-refresh-failed): no solo registry entry is present after the stop (withdrawn, never left behind)')
+        if defined $sid;
 }
 
 {   # pause-token + refresh seam that DIES → still a clean stop, never a crash.
@@ -1104,13 +1145,20 @@ sub capture_run {
 {
     my $data = tempdir(CLEANUP => 1);
     make_bp_dir($data, 'bp-ka', [ {key=>'p1', status=>'pending', write_set=>'ka/p1/'} ]);
-    make_path("$data/.drive-solo");
-    write_json("$data/.drive-solo/order.json", { order => ['bp-ka'], recorded_at => 1 });
+    my $dsdir = "$data/.drive-solo";
+    make_path($dsdir);
+    write_json("$dsdir/order.json", { order => ['bp-ka'], recorded_at => 1 });
+
+    # package 08 (host-awake-actuator): drive-solo PUBLISHES a registry entry
+    # for the refresher to actuate instead of calling BpKeepAwake::spawn
+    # itself. BUTLER_STATE_DIR/HOST_SIDE let publish() resolve a real root and
+    # pass the .t guard.
+    my $BUTLER_STATE_DIR = tempdir(CLEANUP => 1);
+    local $ENV{BUTLER_STATE_DIR} = $BUTLER_STATE_DIR;
+    local $HostAwake::HOST_SIDE = 1;
 
     my $spawned = 0;
     no warnings 'redefine';
-    # The actuator moved to BpKeepAwake (one definition, shared with the fleet —
-    # t/111). Stub it THERE; BpDrive no longer defines one, which is the point.
     local *BpKeepAwake::spawn = sub { $spawned++; return 4242 };
     use warnings 'redefine';
 
@@ -1136,16 +1184,24 @@ sub capture_run {
     my $act = eval { $J->decode($line) };
     is($act->{action}, 'run-package', 'AC-42: fixture yields runnable work (keep-awake should be ON)');
 
-    SKIP: {
-        # The actuation moved to BpKeepAwake (ONE definition, shared with the
-        # fleet — see t/111). What AC-42 pins is unchanged: the PRODUCTION
-        # default must really actuate, because it was once an empty sub and the
-        # director claimed a wake-lock it never held.
-        skip('AC-42: no powershell on this platform — keep-awake is a documented no-op here', 1)
-            unless BpKeepAwake::ps_available();
-        ok($spawned > 0,
-            'AC-42: the production default ACTUATES the wake-lock (it was an empty sub, so the '
-          . 'director claimed a lock it never held)');
+    # package 08 (host-awake-actuator): the production default now PUBLISHES
+    # a solo-<tag>.json entry (awake=1) for the refresher to actuate, and
+    # never calls BpKeepAwake::spawn directly -- unconditionally, with no
+    # platform SKIP (publish() has no powershell dependency).
+    is($spawned, 0,
+        'AC-42: the production default calls BpKeepAwake::spawn 0 times (publish, do not actuate)');
+    my $sid = solo_id_oracle($dsdir);
+    ok(defined $sid, 'AC-42 setup: a solo id is computable for this fixture');
+    if (defined $sid) {
+        my $entry_path = "$BUTLER_STATE_DIR/continuity/awake-sources/$sid.json";
+        ok(-e $entry_path, 'AC-42: the production default publishes a solo-<tag>.json registry entry')
+            or diag("expected entry at $entry_path");
+        if (-e $entry_path) {
+            my $raw = do { open my $r, '<:raw', $entry_path or die $!; local $/; <$r> };
+            my $decoded = eval { $J->decode($raw) };
+            is($decoded->{awake}, 1, 'AC-42: the published entry has awake == 1') if ref $decoded eq 'HASH';
+            ok(ref $decoded eq 'HASH', 'AC-42: the published entry is valid JSON') or diag($raw);
+        }
     }
 }
 

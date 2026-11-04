@@ -3360,12 +3360,21 @@ sub run {
     # tui::BackpackScreen -- that module may not call time() (spec S2.0),
     # so it stays pure/testable and a caller that never wires `heartbeat`
     # gets tui::BackpackScreen's no-op default.
+    # Decision 25 (08-host-awake-actuator fix-batch, red-team M1): the
+    # launcher's sandbox registry entry (HostAwake's keep-awake lock, 08) is
+    # refreshed ONLY from this same main-loop path -- the 120s block that
+    # calls $keepawake below at 3555 -- so the [b] modal blocking this whole
+    # loop also starves the host wake-lock, not just the container heartbeat
+    # MEDIUM-1 above already fixed for. Reuse the SAME throttle: call
+    # $keepawake->(\%state) here too, so an operator who opens [b] and walks
+    # away keeps the machine awake for exactly as long as before.
     my $modal_heartbeat = sub {
         my $t = $now->();
         if ($t - $last_beat >= $beat_int) {
             my $hb = $heartbeat->();
             $last_beat = $t;
             $hb_state = $hb if defined $hb;
+            eval { $keepawake->(\%state) };
         }
     };
 

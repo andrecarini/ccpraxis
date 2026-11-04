@@ -838,6 +838,13 @@ sub converge {
         refresh($dir, %opts);
         return ('held', ensure_daemon($dir, %opts));
     }
+    # Package 08-host-awake-actuator: never release the daemon's helper
+    # while a registry source counts (sandbox/fleet/solo) -- that would
+    # drop the one host lock a counting source is relying on, with nobody
+    # else about to notice until its own next refresh.
+    if (@{ sources_counting($dir) }) {
+        return ('held', ensure_daemon($dir, %opts));
+    }
     sync($dir, %opts, active => 0);
     return ('released', 'idle');
 }
@@ -878,6 +885,49 @@ sub holds_pending {
     return $@ ? 0 : ($result // 0);
 }
 
+# sources_pending($dir, %o) -> 0|1       (package 08-host-awake-actuator)
+#
+# holds_pending's own shape, for the new registry: is there at least one
+# <id>.json file (valid or not -- a garbled one still pins a HOLD tick until
+# pruned, B22) whose id is not in $o{skip}? Windows-platform only, and only
+# when $dir resolves to the real store, same guards holds_pending applies.
+# HostAwake.pm is loaded lazily with the symbol-table guard every lazy
+# require in this file uses (BpPowerPlan's own header explains why an %INC
+# guard is wrong here). Never dies: 0 on any failure.
+sub sources_pending {
+    my ($dir, %o) = @_;
+    my $result = eval {
+        return 0 unless platform() eq 'windows';
+        my $root = store_root_for($dir);
+        return 0 unless defined $root && length $root;
+        require "$DIR/HostAwake.pm" unless defined &HostAwake::publish;
+        my $skip = (ref $o{skip} eq 'HASH') ? $o{skip} : {};
+        my $entries = HostAwake::read_registry($root);
+        for my $e (@$entries) {
+            return 1 unless exists $skip->{$e->{id}};
+        }
+        return 0;
+    };
+    return $@ ? 0 : ($result // 0);
+}
+
+# sources_counting($dir) -> [ids]        (package 08-host-awake-actuator)
+#
+# converge's own question: which registry entries actually count RIGHT NOW
+# (entry_counts, not merely present)? Windows-platform only; [] on any
+# failure or off Windows, same discipline as holds_pending/sources_pending.
+sub sources_counting {
+    my ($dir) = @_;
+    my $result = eval {
+        return [] unless platform() eq 'windows';
+        my $root = store_root_for($dir);
+        return [] unless defined $root && length $root;
+        require "$DIR/HostAwake.pm" unless defined &HostAwake::publish;
+        return HostAwake::counting_ids($root, time());
+    };
+    return (ref $result eq 'ARRAY') ? $result : [];
+}
+
 # ---------------------------------------------------------------------------
 # ensure_daemon($dir, %opts) -> 'running' | 'spawned' | 'idle' | 'refused'
 #
@@ -910,18 +960,24 @@ sub ensure_daemon {
     # well would make the decision itself untestable.
     return 'refused' if $ENV{CCPRAXIS_NO_WAKELOCK};
 
-    # Nothing armed AND no sandbox hold pending, nothing to refresh. Without
-    # this, the repair verb (`lease`) and `status` would each start a daemon
-    # whose entire life is to notice it has no reason to exist — harmless, but
-    # a process spawned per call on paths that run routinely, and a 'spawned'
-    # that reads as if something is now being held when nothing is.
+    # Nothing armed, no sandbox hold pending, and no registry source entry
+    # pending (package 08-host-awake-actuator's three-way gate): nothing to
+    # refresh. Without this, the repair verb (`lease`) and `status` would
+    # each start a daemon whose entire life is to notice it has no reason to
+    # exist — harmless, but a process spawned per call on paths that run
+    # routinely, and a 'spawned' that reads as if something is now being held
+    # when nothing is.
     #
     # holds_pending is the package 02-plan-hold-expiry half of its own
     # mechanism: a launcher's `--hold` tick must be able to start a refresher
     # with NO host arm live, or a crashed launcher's stale hold would never be
-    # reconciled again (nothing else re-runs reconcile without one). Short-
-    # circuited after any_active so an armed caller never loads BpPowerPlan.
-    return 'idle' unless any_active($dir) || holds_pending($dir);
+    # reconciled again (nothing else re-runs reconcile without one).
+    # sources_pending is the same idea for 08's registry: a sandbox, fleet or
+    # solo entry with no host arm must still be able to start a refresher.
+    # Short-circuited in this order (any_active, then holds_pending, then
+    # sources_pending) so an armed caller never loads BpPowerPlan or
+    # HostAwake.pm at all.
+    return 'idle' unless any_active($dir) || holds_pending($dir) || sources_pending($dir);
 
     my $pf = daemon_pid_file($dir);
     if (-e $pf) {
@@ -1561,6 +1617,12 @@ sub daemon_loop {
     # `--hold`) starts with an empty skip set and tries again.
     my %unremovable;
 
+    # Package 08-host-awake-actuator: the same per-process skip set, for
+    # registry entries this process has already failed to prune (spec 2.2,
+    # B11's rule extended to the new registry). SOURCE-PRUNE-FAILED is
+    # logged once per id, same shape as HOLD-PRUNE-FAILED above.
+    my %unremovable_src;
+
     # Package 05: the power journal's per-process probe cache/seq counter,
     # and the JOURNAL-ERROR repeat-suppression state (spec 2.8: after two
     # consecutive identical JOURNAL-ERRORs, the same text logs no more than
@@ -1571,27 +1633,74 @@ sub daemon_loop {
     my $journal_err_logged_at = 0;
     my $snap = code_snapshot();
 
+    # review m2: logged once per process the first time HostAwake::gather (or
+    # decide) dies or returns something unusable, so a half-installed or
+    # syntax-broken HostAwake.pm degrades silently to pre-08 arm-or-hold
+    # behaviour (dropping every registry source) WITHOUT also dropping the
+    # only line that would tell an operator why. Not repeated every tick --
+    # that would fill lease.log the same way an unremovable source does.
+    my $source_error_logged = 0;
+
     my $loop_result;
     my $loop_err;
     my $ok_loop = eval {
     while (1) {
         my $reason_data = active_reason($dir);
-        # Package 02-plan-hold-expiry: no host arm no longer means "exit" by
-        # itself -- a sandbox hold file (fresh or stale) is its own reason to
-        # keep ticking, so a launcher that crashed while holding still gets
-        # reconciled again (spec 2.2/2.3, B1/B13). %unremovable keeps a name
-        # this process already failed to prune from resurrecting hold mode
-        # forever (B11).
-        my $hold_mode = 0;
-        unless (defined $reason_data) {
-            if (holds_pending($dir, skip => \%unremovable)) {
-                $hold_mode = 1;
+        # Package 08-host-awake-actuator: the tick's mode now comes from
+        # HostAwake's own decide(), fed by gather() -- the registry (sandbox/
+        # fleet/solo entries) and the old sandbox-holds files are both
+        # considered, not just an arm. %unremovable/%unremovable_src keep a
+        # name or id this process already failed to prune from resurrecting
+        # hold/source mode forever (B11). A load or call failure degrades to
+        # today's pre-08 "arm or hold-only" shape rather than taking the
+        # refresher down with it.
+        my $ha_d;
+        {
+            local $@;
+            eval {
+                require "$DIR/HostAwake.pm" unless defined &HostAwake::gather;
+                my $ha_in = HostAwake::gather($dir,
+                    arms => (defined $reason_data ? $reason_data->{arms} : 0),
+                    skip_holds => \%unremovable, skip_sources => \%unremovable_src);
+                $ha_d = HostAwake::decide($ha_in);
+            };
+        }
+        unless (ref $ha_d eq 'HASH') {
+            unless ($source_error_logged) {
+                $log->('SOURCE-ERROR', 'HostAwake::gather/decide unavailable, falling back to arm-or-hold');
+                $source_error_logged = 1;
+            }
+            if (defined $reason_data) {
+                $ha_d = { mode => 'arm', counting => [] };
+            } elsif (holds_pending($dir, skip => \%unremovable)) {
+                $ha_d = { mode => 'hold', counting => [] };
             } else {
-                $log->('IDLE', 'reason=no-live-arm');
-                $exit_plan_step->('refresher-exit');
-                last;
+                $ha_d = { mode => 'idle', counting => [] };
             }
         }
+        if ($ha_d->{mode} eq 'idle') {
+            # This normal IDLE exit always reconciles the plan ($exit_plan_step
+            # -> run_plan_step -> BpPowerPlan::reconcile), which is what
+            # restores it once nothing counts (review m3/redteam m3/m4's
+            # scenarios are both about this call NEVER HAPPENING: the process
+            # dying outright -- killed, crashed, console closed -- bypasses
+            # this whole loop body including this line). 26(e) (KeepAwake's
+            # registry_seams `stop`) narrows that window for the launcher's
+            # own exit by ensuring a successor once more right after its last
+            # withdraw, but ensure_daemon's gate (above) answers 'idle' with
+            # nothing pending, so a daemon dead with nothing left to count
+            # never gets a chance to run THIS reconcile either. That residual
+            # gap -- a dead refresher, a plan already switched away, and no
+            # producer left to re-ensure one -- is the same accepted-risk
+            # shape as spec 5.1's promotion window: bounded to an operator
+            # noticing and manually re-running `lease`/`status`, not engineered
+            # around here.
+            $log->('IDLE', 'reason=no-live-arm');
+            $exit_plan_step->('refresher-exit');
+            last;
+        }
+        my $hold_mode   = ($ha_d->{mode} eq 'hold')   ? 1 : 0;
+        my $source_mode = ($ha_d->{mode} eq 'source') ? 1 : 0;
 
         if (time() >= $next_handover_try) {
             _snapshot_add_new($snap);
@@ -1633,12 +1742,20 @@ sub daemon_loop {
             # Addendum A.3.3 (reviewer MINOR-1, red-team m3): a new host arm
             # that lands while this tick is asleep waits for the next tick --
             # up to $tick seconds -- before converge sees 'running' and starts
-            # its own helper. Accepted: hold mode exists only while a sandbox
-            # hold file exists, and a launcher writes one only while IT holds
-            # its own wake-lock, so the machine is already awake for that
-            # minute regardless. Fixing the gap would need a refresher-wake
-            # channel or sliced sleeps that poll arms -- new machinery for a
-            # window another lock already covers.
+            # its own helper. Accepted, for two different reasons depending on
+            # what put this tick into hold mode (package 08-host-awake-
+            # actuator widened hold mode beyond its original one case):
+            #   - an old-style sandbox hold file: a launcher writes one only
+            #     while IT holds its own wake-lock, so the machine is already
+            #     awake for that minute regardless.
+            #   - a stale or garbled registry entry with no lock held
+            #     anywhere (no arm, no counting source): there is genuinely
+            #     no lock during this gap, bounded at $tick seconds (the same
+            #     bound B10's "level, not edge" design accepts everywhere
+            #     else).
+            # Fixing either gap would need a refresher-wake channel or sliced
+            # sleeps that poll arms/sources -- new machinery for a window
+            # bounded at one tick.
             sync($dir, %opts, active => 0, log => $ka_log, owner_winpid => $owner_winpid, owner_desc => undef);
 
             my $root = store_root_for($dir);
@@ -1646,8 +1763,19 @@ sub daemon_loop {
             my $fresh = eval { BpPowerPlan::sandbox_holds($root) } || [];
             my $file_count = scalar grep { !exists $unremovable{$_} } @$files;
             my $fresh_count = scalar @$fresh;
-            $log->('HOLD-TICK', sprintf('active=0 reason=sandbox-hold files=%d fresh=%d',
-                $file_count, $fresh_count));
+            # Package 08-host-awake-actuator: the registry's own entry files
+            # (any id, valid or not -- the same count gather()'s `pending`
+            # already looked at), minus ids this process has already failed
+            # to prune, appended to the same line so an operator reading
+            # lease.log sees both pending mechanisms at a glance.
+            my $entries_count = eval {
+                require "$DIR/HostAwake.pm" unless defined &HostAwake::read_registry;
+                my $reg = HostAwake::read_registry($root);
+                scalar grep { !exists $unremovable_src{$_->{id}} } @$reg;
+            };
+            $entries_count = 0 unless defined $entries_count;
+            $log->('HOLD-TICK', sprintf('active=0 reason=sandbox-hold files=%d fresh=%d entries=%d',
+                $file_count, $fresh_count, $entries_count));
 
             $run_plan_step->('refresher-hold-tick');
 
@@ -1667,6 +1795,48 @@ sub daemon_loop {
                     }
                 }
             }
+        } elsif ($source_mode) {
+            # Package 08-host-awake-actuator: a SOURCE-TICK. No host arm is
+            # live, but at least one registry entry (sandbox/fleet/solo)
+            # counts -- the same shape as an arm tick (one host helper held,
+            # the plan switched to Continuous work), except there is no
+            # $reason_data to describe: the owner description names the
+            # source count instead.
+            my $src_desc = BpKeepAwake::owner_desc_clean(
+                sprintf('host-awake,sources=%d', scalar @{ $ha_d->{counting} || [] }));
+
+            # S3 (spec 2.3), same code as the arm branch below: on the
+            # successor's first live tick, replace the inherited helper so
+            # it is owned (and logged) by this process.
+            if ($handover_flag && !$did_replace) {
+                $did_replace = 1;
+                my $ka_pid_f = wakelock_pid_file($dir);
+                if (-e $ka_pid_f) {
+                    my $old_h = BpKeepAwake::read_pid($ka_pid_f);
+                    if (defined $old_h && BpKeepAwake::pid_alive($old_h)) {
+                        my $r = BpKeepAwake::replace($dir, {
+                            owner_winpid => $owner_winpid, owner_desc => $src_desc, log => $ka_log,
+                        });
+                        if ($r eq 'replaced') {
+                            my $new_h = BpKeepAwake::read_pid($ka_pid_f);
+                            $log->('HELPER-REPLACED', "old=$old_h new=" . (defined $new_h ? $new_h : 'unknown'));
+                        } else {
+                            $log->('HELPER-REPLACE-FAILED', "old=$old_h reason=$r");
+                        }
+                    }
+                }
+            }
+
+            sync($dir, %opts, active => 1, log => $ka_log, owner_winpid => $owner_winpid, owner_desc => $src_desc);
+            $log->('SOURCE-TICK', sprintf('active=1 reason=source sources=%s count=%d',
+                join(',', @{ $ha_d->{counting} || [] }), scalar @{ $ha_d->{counting} || [] }));
+
+            # Package 06's plan-follows-arming step runs here too (spec 2.3):
+            # a counting registry entry is just as much a reason to switch to
+            # Continuous work as a host arm is. No journal (nothing arm-shaped
+            # to describe) and no gc_sessions (it reaps arm files; there is
+            # none here).
+            $run_plan_step->('refresher-source-tick');
         } else {
             # S3 (spec 2.3): on the successor's first live tick, replace the
             # inherited helper so it is owned (and logged) by this process.
@@ -1743,6 +1913,29 @@ sub daemon_loop {
                 };
             }
         }
+
+        # Package 08-host-awake-actuator: registry prune, after the tick's
+        # own plan step, for every non-idle mode (arm, source and hold
+        # alike) -- a registry entry can go stale under an arm tick too, and
+        # must not wait for a source/hold tick to be noticed. Wrapped in
+        # eval, same discipline as the journal/gc steps above: a prune
+        # failure must never take the refresher down with it.
+        eval {
+            require "$DIR/HostAwake.pm" unless defined &HostAwake::prune_registry;
+            my $root = store_root_for($dir);
+            my $pruned = HostAwake::prune_registry($root, skip => \%unremovable_src);
+            if (ref $pruned eq 'HASH') {
+                for my $r (@{ $pruned->{removed} || [] }) {
+                    $log->('SOURCE-PRUNED', sprintf('id=%s age=%ss', $r->{id}, $r->{age}));
+                }
+                for my $id (@{ $pruned->{failed} || [] }) {
+                    unless (exists $unremovable_src{$id}) {
+                        $log->('SOURCE-PRUNE-FAILED', "id=$id");
+                        $unremovable_src{$id} = 1;
+                    }
+                }
+            }
+        };
 
         # Shared, unchanged order: heartbeat, iteration bound, sleep -- for
         # both an arm tick and a hold-only tick, so a hold-only refresher's

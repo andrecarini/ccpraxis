@@ -1843,13 +1843,14 @@ sub _backpack_triage_via_screen {
 }
 
 # B5 keep-awake holder (set up in enter_dashboard). File-scope so the signal/END
-# teardown can release the wake-lock — a leaked PowerShell helper would keep the
-# machine awake forever. Release is idempotent + tolerant of an unset holder.
+# teardown can release the wake-lock — a leaked registry entry would keep the
+# machine awake until it lapses. Release is idempotent + tolerant of an unset
+# holder. package 08: a release withdraws the registry entry (through
+# registry_seams' stop); there is no power-plan call of our own any more --
+# that follows the registry entirely on the host side now.
 my $KEEPAWAKE;
 sub _keepawake_release_global {
-    my $was_held = eval { $KEEPAWAKE && $KEEPAWAKE->running };
     eval { $KEEPAWAKE->release if $KEEPAWAKE };
-    eval { _power_plan_hold(0, 'sandbox-exit') } if $was_held;
 }
 
 # 03-resources-reader-model: cygwin pid of our sampler child, or undef. Same
@@ -6207,7 +6208,6 @@ sub enter_dashboard {
     my $cached_busy_stamp       = 0;       # host time() when $cached_busy_age was measured
     my $cached_probe_result     = { state => 'lease-absent' };   # s21: KeepAwake's pinned probe struct
     my $last_keepawake_log      = 0;       # when the periodic keep-awake decision was last written
-    my $plan_told;                         # 1|0 last sent to the power plan (_power_plan_hold); undef = never
     my $cached_needs_you        = 0;       # B3: escalations only the OPERATOR can clear
     my $cached_triage_queued    = 0;       # ...and those queued for the escalation resolver
     my $cached_backpack         = undef;   # B4: backpack items + per-item approval
@@ -6223,11 +6223,14 @@ sub enter_dashboard {
     my $bp_appr_file      = "$LAUNCHER_DIR/backpack-approvals.json";
 
     # B5 keep-awake: hold a wake-lock only while the orchestrator's busy-lease is
-    # fresh (active work / pending auto-resume). The real spawn/liveness/stop/
-    # reap of the helper live in BpKeepAwake (bp-keepawake.pl, butler), loaded
-    # here by path, inside eval: the sandbox plugin must keep working with no
-    # butler plugin beside it (Decision 13). A failed load is logged ONCE and
-    # the dashboard runs with no wake-lock at all, never a die.
+    # fresh (active work / pending auto-resume). package 08-host-awake-actuator:
+    # the launcher no longer owns a helper or a power-plan call of its own -- it
+    # PUBLISHES its intent into HostAwake's shared registry (butler), and the
+    # host-side continuity refresher is the only actuator left (spec 2.6). Both
+    # HostAwake.pm and the pre-08 bp-keepawake.pl are still loaded here by path,
+    # inside eval (Decision 13: the sandbox plugin must keep working with no
+    # butler plugin beside it). A failed load is logged ONCE and the dashboard
+    # runs with no wake-lock at all, never a die.
     # Keep-awake holds the host awake while the busy-lease was touched within this
     # window. 10 min (matching the loosened heartbeat HB) so a brief gap / slow
     # tick never releases the lock mid-run; the host only sleeps once the run has
@@ -6235,13 +6238,18 @@ sub enter_dashboard {
     my $BUSY_STALE   = ($ENV{BUSY_STALE_SECS} && $ENV{BUSY_STALE_SECS} =~ /^\d+$/)
                        ? $ENV{BUSY_STALE_SECS} : KeepAwake::lease_fresh();
     my $ka_pidfile   = "$SAMPLER_TMPDIR/keepawake.pid";     # literal line kept (idle-footprint.t pins it)
-    my $ka_logfile   = "$SAMPLER_TMPDIR/keepawake.log";
     # NIT-1 (redteam-step6.md): pass the ABSOLUTE $INSTALL_ROOT-based path
     # rather than letting load_bp_keepawake default to a path built from
     # KeepAwake.pm's own __FILE__. A relative launcher invocation plus the
     # first-setup chdir (above, before enter_dashboard) would otherwise
     # resolve that default relative to the wrong directory and silently lose
     # the wake-lock, logging keepawake_unavailable once and nothing else.
+    #
+    # Still loaded and still reaped here even though this launcher owns no
+    # helper any more: a PRE-08 launcher's leftover keepawake.pid (left
+    # running at $SAMPLER_TMPDIR/keepawake.pid across an [r] into new code,
+    # or a crash) is cleared exactly once, the same way reap_orphan always
+    # has, rather than running out its own lease untouched.
     my ($ka_ok, $ka_why) = KeepAwake::load_bp_keepawake("$INSTALL_ROOT/plugins/butler/scripts/bp-keepawake.pl");
     log_ev('keepawake_unavailable', { reason => $ka_why }) unless $ka_ok;
     if ($ka_ok) {
@@ -6251,39 +6259,29 @@ sub enter_dashboard {
         # touched, which is not a reap event worth an entry in the launch log.
         log_ev('keepawake_orphan_reaped', { pid => $w, result => $r }) if defined $r && $r eq 'gone';
     }
+
+    # package 08: this launcher's OWN wake-lock signal now goes through
+    # HostAwake's registry rather than through any helper of its own.
+    # load_host_awake(, like load_bp_keepawake( above, is an absolute
+    # $INSTALL_ROOT-based path (NIT-1 style) -- never the module's own
+    # relative default.
+    my ($ha_ok, $ha_why) = KeepAwake::load_host_awake("$INSTALL_ROOT/plugins/butler/scripts/HostAwake.pm");
+    log_ev('keepawake_unavailable', { reason => $ha_why }) unless $ha_ok;
+
+    my %ka_reg = KeepAwake::registry_seams(
+        source    => ($ha_ok ? HostAwake::sandbox_id($CONTAINER_NAME) : undef),
+        available => ($ha_ok && HostAwake::host_side()),
+        intent    => sub { { reason => (ref $cached_probe_result eq 'HASH' ? $cached_probe_result->{reason} : undef) } },
+        ensure    => \&_host_awake_ensure,
+        log       => \&log_ev,
+    );
+    # No `alive` and no `on_event`: there is no child process of the
+    # launcher's own to poll any more, nor a death of one to report. The
+    # registry entry's freshness IS the liveness signal, and that lives on
+    # the host side (HostAwake::entry_counts), not here.
     $KEEPAWAKE = KeepAwake->new(
-        start    => sub {
-            return undef unless $ka_ok;
-            # Named by its WINDOWS pid, so the helper can tell a quiet owner
-            # from a gone one (keep-awake.ps1 -OwnerWinPid, Decision 16); the
-            # owner-started bound is computed inside BpKeepAwake::spawn,
-            # before its own fork, from this same owner_winpid.
-            my $owner = eval { BpKeepAwake::self_winpid() };
-            my $pid = eval { BpKeepAwake::spawn($ka_pidfile,
-                                                 { owner_winpid => $owner },
-                                                 { lease_seconds => 0 }) };
-            if (!defined $pid) {
-                log_ev('keepawake_start_failed',
-                       { reason => ($@ ? _trim_err($@) : 'declined (not Windows, or CCPRAXIS_NO_WAKELOCK)') });
-                return undef;
-            }
-            log_ev('keepawake_started', { pid => $pid, owner_winpid => ($owner // 'none') });
-            return $pid;
-        },
-        stop     => sub {
-            return unless $ka_ok;
-            log_ev('keepawake_stopped', { pid => $_[0] }) if BpKeepAwake::stop_child($_[0], $ka_pidfile);
-        },
-        alive    => ($ka_ok ? \&BpKeepAwake::child_alive : undef),
-        on_event => sub {
-            my (%e) = @_;
-            return unless ($e{kind} // '') eq 'died';
-            # The helper's own last line says why it went (RELEASE reason=...),
-            # which is exactly what was missing when bug 4eca was found.
-            log_ev('keepawake_died', { pid => $e{handle}, restarting => $e{restarting},
-                                       pidfile_present => (-e $ka_pidfile ? 1 : 0),
-                                       helper_last => BpKeepAwake::log_tail($ka_logfile) });
-        },
+        start => $ka_reg{start},
+        stop  => $ka_reg{stop}
     );
 
     # 03-resources-reader-model: detached resources sampler. Reap any helper
@@ -6839,30 +6837,15 @@ sub enter_dashboard {
             # exactly as on_probe left it.
             my $probe_state = ref $st->{lease_probe} eq 'HASH'
                             ? ($st->{lease_probe}{state} // '') : '';
-            # A held lock must have a live helper behind it, whatever the probe
-            # says (bug 20261031-225228-4eca). Runs during a probe failure too:
-            # that is when the lock is being held on purpose.
-            my $rv = $KEEPAWAKE->revive;
-            log_ev('keepawake', { want => 1, action => $rv, busy_age => $st->{busy_age} })
-                if $rv eq 'restart';
+            # package 08: no helper-revival call here any more -- there is no
+            # child process of the launcher's own to die and need restarting.
+            # The registry entry's freshness is what the host-side refresher
+            # judges liveness by, not a pid this process polls.
             my $act = 'noop';
             if ($probe_state ne 'probe-failed') {
                 $act = $KEEPAWAKE->sync($st->{stay_awake} ? 1 : 0);
                 log_ev('keepawake', { want => ($st->{stay_awake} ? 1 : 0), action => $act,
                                       busy_age => $st->{busy_age} }) if $act ne 'noop';
-            }
-            # The power plan follows the lock (Decision 14, bug 6764), by LEVEL:
-            # whatever $KEEPAWAKE->running says on this tick, compared with what
-            # the plan was last told. It used to follow this callback's own sync
-            # transitions only, so a start or stop decided by on_probe (the
-            # probe path, :6554) never reached the plan, and a run that settled
-            # left the machine on Continuous work (architecture review,
-            # 2026-11-01). undef at first, so the first tick also clears a hold
-            # a crashed launcher left behind.
-            my $plan_want = $KEEPAWAKE->running ? 1 : 0;
-            if (!defined $plan_told || $plan_told != $plan_want) {
-                _power_plan_hold($plan_want, $plan_want ? 'sandbox-hold' : 'sandbox-release');
-                $plan_told = $plan_want;
             }
             # AND THE STEADY STATE GETS WRITTEN DOWN. Logging only transitions
             # meant the state that actually matters -- held, hour after hour --
@@ -6874,10 +6857,10 @@ sub enter_dashboard {
             my $now_ka = time;
             if ($now_ka - $last_keepawake_log >= $KEEPAWAKE_LOG_SECONDS) {
                 $last_keepawake_log = $now_ka;
-                # Keep the plan's sandbox hold fresh while the lock is held: it
-                # stops counting after ten minutes, so a dead launcher cannot
+                # Keep the registry entry fresh while the lock is held: it
+                # stops counting after LEASE_FRESH, so a dead launcher cannot
                 # pin Continuous work.
-                _power_plan_hold(1, 'sandbox-refresh') if $KEEPAWAKE->running;
+                $ka_reg{refresh}->() if $KEEPAWAKE->running;
                 log_ev('keepawake_decision', {
                     want       => ($st->{stay_awake} ? 1 : 0),
                     held       => ($KEEPAWAKE->running ? 1 : 0),
@@ -7432,26 +7415,25 @@ sub _trim_err {
 }
 
 # ---------------------------------------------------------------------
-# B5 keep-awake: the real spawn/liveness/stop/reap of the helper now live in
-# BpKeepAwake (bp-keepawake.pl, butler) -- see enter_dashboard's wiring and
-# KeepAwake::load_bp_keepawake. This launcher only keeps the holder's
-# lifecycle (revive, [r] release) and the host power plan below.
+# B5 keep-awake: package 08-host-awake-actuator. This launcher owns no
+# helper and makes no power-plan call of its own any more -- it only
+# publishes into HostAwake's shared registry (see enter_dashboard's wiring,
+# KeepAwake::load_host_awake and KeepAwake::registry_seams). The host-side
+# continuity refresher is the sole actuator: it is the one thing that spawns
+# a wake-lock helper and reconciles the power plan, from everything the
+# registry and the live host arms say together.
 # ---------------------------------------------------------------------
 
-# _power_plan_hold($on, $why) -- tell the host power plan that this launcher
-# holds (1) or released (0) the wake-lock for its container. Decision 14: the
-# plan is Continuous work while anything the wake-lock counts as active is
-# running; a sandboxed run arms only inside its container, which the host
-# reconciler never reads (bug 20261031-225231-6764). `bp-power-plan reconcile
-# --hold|--release <container>` records the hold where the reconciler counts it,
-# then reconciles. Called on every hold transition and on each two-minute
-# keep-awake tick while held (the hold goes stale after ten minutes, so a dead
-# launcher cannot pin the plan). Windows only; fire and forget, double-forked so
-# no zombie is left per tick; a failure costs the plan switch, never the launch.
-sub _power_plan_hold {
-    my ($on, $why) = @_;
-    return unless $WINDOWS_FAMILY && defined $CONTAINER_NAME && length $CONTAINER_NAME;
-    my $cli = "$INSTALL_ROOT/plugins/butler/scripts/bp-power-plan.pl";
+# _host_awake_ensure() -- nudge the host-side continuity refresher awake
+# right after this launcher's own registry publish, so a registry entry
+# written while nothing was holding the plan does not wait for that
+# refresher's next independent trigger. Windows only; fire and forget,
+# double-forked so no zombie is left per call; a failure costs nothing but
+# a slightly later convergence, never the launch. Logs nothing: the
+# refresher's own tick logging (SOURCE-TICK etc.) already covers this.
+sub _host_awake_ensure {
+    return unless $WINDOWS_FAMILY;
+    my $cli = "$INSTALL_ROOT/plugins/butler/scripts/HostAwake.pm";
     return unless -f $cli;
     my $pid = fork();
     return unless defined $pid;
@@ -7461,11 +7443,9 @@ sub _power_plan_hold {
         open(STDIN,  '<', '/dev/null');
         open(STDOUT, '>', '/dev/null');
         open(STDERR, '>', '/dev/null');
-        exec($^X, $cli, 'reconcile', '--why', $why, ($on ? '--hold' : '--release'), $CONTAINER_NAME)
-            or POSIX::_exit(127);
+        exec($^X, $cli, 'ensure') or POSIX::_exit(127);
     }
     waitpid($pid, 0);
-    log_ev('power_plan_hold', { on => ($on ? 1 : 0), why => $why });
 }
 
 # ---------------------------------------------------------------------
@@ -9055,12 +9035,12 @@ sub _relaunch_self {
     eval { _resources_sampler_stop($RESOURCES_SAMPLER_CHILD, $RESOURCES_SAMPLER_PID) };
     eval { _spend_sampler_stop($SPEND_SAMPLER_CHILD) };
     eval { _container_sampler_stop($CONTAINER_SAMPLER_CHILD) };
-    # Through the holder, which knows the helper's pid: the former
-    # keep-awake stop sub, called bare with just a pid and pidfile, was a
-    # silent no-op here, so every [r] left the old helper running beside the
-    # new process's own. The power-plan hold is left alone; the new process
-    # re-asserts it on its first keep-awake tick.
-    eval { $KEEPAWAKE->release if $KEEPAWAKE };
+    # package 08: no holder release here. There is no child process of
+    # the launcher's own to orphan any more -- the registry entry is left in
+    # place, so the re-exec'd process can refresh it on its first probe with
+    # no gap at all. If that process then decides "not wanted", the entry
+    # lapses within LEASE_FRESH on its own -- the same bounded over-hold as
+    # today's plan hold left alone across [r], just through the registry.
 
     _restore_terminal(1);
 

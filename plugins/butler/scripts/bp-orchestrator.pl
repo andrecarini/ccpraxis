@@ -65,6 +65,7 @@ require "$DIR/bp-log.pl";
 require "$DIR/bp-http.pl";
 require "$DIR/bp-token-keeper.pl";
 require "$DIR/bp-keepawake.pl";    # the shared wake-lock (also used by solo)
+require "$DIR/HostAwake.pm" unless defined &HostAwake::publish;   # package 08: publish, don't actuate
 require "$DIR/bp-judge.pl";
 require "$DIR/bp-remediate.pl";    # b07: auto-remediation engine (pure decision core)
 require "$DIR/bp-checkpoint.pl";   # b02: durable WIP checkpoint commits
@@ -4244,6 +4245,47 @@ sub _load_state {
     return (\%meta, \%status, \%att, \%pid, \%sid);
 }
 
+# fleet_awake_step(\%a) -> 'published'|'withdrawn'|'skipped'|'failed'   (08)
+#
+# Package 08-host-awake-actuator: the orchestrator PUBLISHES its wake-lock
+# intent into HostAwake's registry instead of actuating BpKeepAwake::apply
+# directly -- the continuity refresher is the one host-side actuator now.
+# %a = (phase, bp, bpdir, runs, state => \%h, log => coderef($msg),
+# ensure => coderef|undef, now).
+sub fleet_awake_step {
+    my ($a) = @_;
+    my $result;
+    if (!HostAwake::host_side()) {
+        $result = 'skipped';
+    }
+    else {
+        my $id = HostAwake::fleet_id($a->{bp}, _project_root_of($a->{bpdir}) // (abs_path($a->{bpdir}) // $a->{bpdir}));
+        if (!defined $id) {
+            $result = 'failed';
+        }
+        elsif (($a->{phase} // '') eq 'settled') {
+            HostAwake::withdraw($id);
+            HostAwake::retire_legacy_helper($a->{runs});
+            $result = 'withdrawn';
+        }
+        else {
+            my %announce_opts = (now => $a->{now});
+            $announce_opts{ensure} = $a->{ensure} if $a->{ensure};
+            my ($wrote) = HostAwake::announce($id, { awake => 1, reason => $a->{phase}, until => undef }, %announce_opts);
+            $result = $wrote ? 'published' : 'failed';
+        }
+    }
+
+    # Edge-triggered: one log line per transition, not one per tick.
+    my $state = (ref $a->{state} eq 'HASH') ? $a->{state} : {};
+    if (!defined $state->{last} || $state->{last} ne $result) {
+        my $id_for_log = eval { HostAwake::fleet_id($a->{bp}, _project_root_of($a->{bpdir}) // (abs_path($a->{bpdir}) // $a->{bpdir})) } // 'unknown';
+        $a->{log}->("host-awake $result $id_for_log") if ref $a->{log} eq 'CODE';
+        $state->{last} = $result;
+    }
+    return $result;
+}
+
 sub run {
     my ($opt) = @_;
     $opt ||= {};
@@ -4541,6 +4583,11 @@ sub run {
     # observe, so the first tick of every run is never a suspend.
     my $prev_tick;
 
+    # Package 08-host-awake-actuator: fleet_awake_step's edge-triggered log
+    # state (last result), loop-scoped so one log line per transition
+    # survives across ticks, not just within one.
+    my %ka_state;
+
     my $err;
     eval {
         while (!$STOP) {
@@ -4729,8 +4776,9 @@ sub run {
             my $ka_phase = !$paused ? 'active'
                          : BpAwakeIntent::want_awake({ scope => 'fleet', paused => $paused, now => $now, horizon => $t->{pause_horizon} })->{awake} ? 'pause-pending'
                          : 'settled';
-            BpKeepAwake::apply($ka_phase, $runs,
-                { log => sub { _log($log, 'keepawake', { detail => $_[0] }) } });
+            fleet_awake_step({ phase => $ka_phase, bp => $bp, bpdir => $bpdir, runs => $runs,
+                state => \%ka_state, now => $now, ensure => $opt->{ensure_refresher},
+                log => sub { _log($log, 'keepawake', { detail => $_[0] }) } });
 
             # ---- USAGE POLL (burn-rate-adaptive cadence) ----
             if ($now >= $next_usage) {
@@ -6603,8 +6651,9 @@ sub run {
     # reached whether the loop ended cleanly, hit `once`, or died. A fleet that
     # crashed while holding the machine awake would keep it awake indefinitely,
     # with no process left to ever release it.
-    BpKeepAwake::apply('settled', $runs,
-        { log => sub { _log($log, 'keepawake', { detail => $_[0] }) } });
+    fleet_awake_step({ phase => 'settled', bp => $bp, bpdir => $bpdir, runs => $runs,
+        state => \%ka_state, now => $now_fn->(),
+        log => sub { _log($log, 'keepawake', { detail => $_[0] }) } });
 
     release_marker($marker_fh, "$runs/.orchestrator");
 

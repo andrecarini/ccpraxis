@@ -146,23 +146,34 @@ sub setactive_to { my ($calls) = @_; my @s = grep { $_->[0] eq '/setactive' } @$
 }
 
 # --- AC4 ---------------------------------------------------------------------------------------------
+# package 08 (host-awake-actuator), spec 6.3: AC4 is INVERTED. The launcher no
+# longer calls bp-power-plan or owns a helper of its own: it publishes an
+# intent into HostAwake's registry (one source among several) and the
+# continuity refresher is the single actuator that converges the helper AND
+# the plan by level, every tick. AC1-AC3 above are unchanged -- old,
+# unrestarted launchers still use the CLI and `reconcile` still counts their
+# holds (Decision 7).
 {
     my $src = do { open my $fh, '<:raw', "$Bin/../../../sandbox/scripts/launcher.pl" or die $!; local $/; <$fh> };
-    my ($sub) = $src =~ /(sub _power_plan_hold \{.*?\n\})/s;
-    like($sub // '', qr/bp-power-plan\.pl/, 'the launcher calls bp-power-plan');
-    like($sub // '', qr/'reconcile', '--why', \$why, \(\$on \? '--hold' : '--release'\), \$CONTAINER_NAME/,
-         'with --hold / --release and its container name');
-    like($sub // '', qr/return unless \$WINDOWS_FAMILY/, 'on Windows only');
-    # By LEVEL, from $KEEPAWAKE->running, not from one path's transitions: a
-    # start or stop decided by on_probe never reached the plan when it followed
-    # the keepawake callback's own sync action (architecture review 2026-11-01).
-    like($src, qr/my \$plan_want = \$KEEPAWAKE->running \? 1 : 0;\s*if \(!defined \$plan_told \|\| \$plan_told != \$plan_want\) \{\s*_power_plan_hold\(\$plan_want, \$plan_want \? 'sandbox-hold' : 'sandbox-release'\);\s*\$plan_told = \$plan_want;/,
-         'on taking and releasing the lock, judged from the lock state itself every tick');
-    unlike($src, qr/if \(\$act eq 'start' \|\| \$rv eq 'restart'\) \{ _power_plan_hold/,
-         'no longer from one code path\'s transitions only');
-    like($src, qr/_power_plan_hold\(1, 'sandbox-refresh'\) if \$KEEPAWAKE->running;/, 'refreshed on the two-minute tick while held');
-    like($src, qr/sub _keepawake_release_global \{.*?_power_plan_hold\(0, 'sandbox-exit'\) \} if \$was_held;/s,
-         'and released when the launcher exits holding it');
+    unlike($src, qr/sub\s+_power_plan_hold\b/,
+        'AC4: launcher.pl no longer defines _power_plan_hold');
+    unlike($src, qr/_power_plan_hold\s*\(/,
+        'AC4: launcher.pl no longer calls _power_plan_hold( anywhere');
+    unlike($src, qr/bp-power-plan/,
+        'AC4: launcher.pl no longer names bp-power-plan at all (CLI or script)');
+    unlike($src, qr/\bplan_told\b/,
+        'AC4: launcher.pl no longer declares or reads $plan_told');
+    # _keepawake_release_global now only releases the holder (eval { $KEEPAWAKE->release if $KEEPAWAKE };),
+    # with no separate plan call of its own.
+    my ($rel_sub) = $src =~ /(sub _keepawake_release_global \{.*?\n\})/s;
+    ok(defined $rel_sub, 'AC4: sub _keepawake_release_global is extractable')
+        or diag('could not extract sub _keepawake_release_global from launcher.pl');
+    if (defined $rel_sub) {
+        like($rel_sub, qr/eval\s*\{\s*\$KEEPAWAKE->release\s+if\s+\$KEEPAWAKE;?\s*\};?/,
+            'AC4: _keepawake_release_global only releases the holder ($KEEPAWAKE->release inside eval)');
+        unlike($rel_sub, qr/_power_plan_hold/,
+            'AC4: _keepawake_release_global makes no separate plan call of its own');
+    }
 }
 
 done_testing();

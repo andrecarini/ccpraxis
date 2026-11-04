@@ -86,7 +86,12 @@
 #                   no longer exist.
 #   inflight.lock   exclusive-lock file guarding one `next` call's read+prune
 #                   +write of inflight.json (never deleted; contents unused).
-#   keepawake.pid   PID of the wake-lock process (host only; sandbox = no file)
+#   keepawake.pid   pre-08 legacy: PID of drive-solo's own wake-lock helper,
+#                   retired (killed and unlinked) on this session's first
+#                   settle under package 08-host-awake-actuator.
+#   <state root>/awake-sources/solo-<tag>.json   the registry entry that
+#                   replaces it (package 08): this is what the host-side
+#                   continuity refresher actually reads now.
 #   run.md          append-only structured run log
 
 package BpDrive;
@@ -119,6 +124,7 @@ our $VERDICT_RETRY_MAX = 3;
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f });
 require "$DIR/BpAwakeConst.pm" unless defined &BpAwakeConst::AC_STALE;
 require "$DIR/BpAwakeIntent.pm" unless defined &BpAwakeIntent::want_awake;
+require "$DIR/HostAwake.pm" unless defined &HostAwake::publish;   # package 08: publish, don't actuate
 
 # THE ONE PAUSE HORIZON. How far ahead a usage pause may resume and still be
 # waited out: within it, the machine is held awake AND the session waits;
@@ -1121,14 +1127,45 @@ sub pause_is_long {
         now => $now, horizon => $PAUSE_HORIZON_SECONDS })->{handoff};
 }
 
+
+# keepawake_apply($phase, $dsdir, $opts, $until) -- package 08-host-awake-
+# actuator: drive-solo PUBLISHES its wake-lock intent into HostAwake's
+# registry instead of calling BpKeepAwake::apply/spawn directly; the
+# continuity refresher is the one host-side actuator now. $until is the 4th,
+# optional argument: a pause call site passes the resume epoch so the entry
+# survives a pause drive-solo (one call per `next`) would otherwise not
+# refresh again until the pause reopens (Decision 17).
 sub keepawake_apply {
-    my ($phase, $dsdir, $opts) = @_;
-    # The seam shape (spawn / kill_pid / powershell_available in %$opts) is
-    # preserved verbatim so injected fakes keep working; only the body moved.
-    BpKeepAwake::apply($phase, $dsdir, {
-        %{ $opts // {} },
-        log => sub { _append_run_log($dsdir, $_[0]) },
-    });
+    my ($phase, $dsdir, $opts, $until) = @_;
+    $opts //= {};
+    return unless HostAwake::host_side();
+
+    my $data = dirname($dsdir);
+    my $root = (basename($data) eq '.ccpraxis-local-data') ? dirname($data) : $data;
+    my $id = HostAwake::solo_id($root);
+    unless (defined $id) {
+        _append_run_log($dsdir, "WARN keepawake: could not derive a solo id for $root");
+        return;
+    }
+
+    my $now = (ref $opts->{now} eq 'CODE') ? $opts->{now}->() : time();
+    if (BpKeepAwake::should_be_on($phase)) {
+        my $u = $now + BpAwakeConst::HELPER_LEASE();
+        if ($phase eq 'pause-pending' && defined $until && "$until" =~ /\A\d+(?:\.\d+)?\z/) {
+            $u = $until if $until > $u;
+        }
+        my %announce_opts = (now => $now);
+        $announce_opts{ensure} = $opts->{ensure_refresher} if $opts->{ensure_refresher};
+        my ($wrote) = HostAwake::announce($id, { awake => 1, reason => $phase, until => $u }, %announce_opts);
+        _append_run_log($dsdir, $wrote ? "KEEPAWAKE published $id reason=$phase until=$u"
+                                       : "WARN keepawake: could not publish $id");
+    } else {
+        HostAwake::withdraw($id);
+        my %retire_opts;
+        $retire_opts{kill_pid} = $opts->{kill_pid} if $opts->{kill_pid};
+        HostAwake::retire_legacy_helper($dsdir, %retire_opts);
+        _append_run_log($dsdir, "KEEPAWAKE withdrew $id");
+    }
 }
 
 # ===========================================================================
@@ -1713,7 +1750,7 @@ sub _cmd_next {
             my $phase = $intent->{awake} ? 'pause-pending' : 'settled';
             my $action = { action => 'pause', reason => $reason, until_epoch => $until };
             print _encode_action($action), "\n";
-            keepawake_apply($phase, $dsdir, $opts);
+            keepawake_apply($phase, $dsdir, $opts, $until);
             return 0;
         }
 
@@ -2566,7 +2603,12 @@ STATE  (<data>/.drive-solo/, all director-owned)
   announced.json  {"announced":[…]}   blueprints whose blueprint-done already fired
   inflight.json   {"packages":[{"blueprint":…,"package":…,"ledger":…,"since":<epoch>}],
                   "updated_at":<epoch>}   the project-level in-flight set: added on run-package, pruned once its ledger turns terminal. Concurrent hand-out (a further ready package disjoint from every in-flight write set) is unconditional.
-  keepawake.pid   PID of the wake-lock process (host only; sandbox = no file)
+  keepawake.pid   pre-08 legacy: PID of drive-solo's own wake-lock helper,
+                  retired (killed and unlinked) on this session's first
+                  settle under package 08-host-awake-actuator.
+  <state root>/awake-sources/solo-<tag>.json   the registry entry that
+                  replaces it (package 08): this is what the host-side
+                  continuity refresher actually reads now.
   run.md          append-only structured run log
 END_HELP
 
@@ -2779,11 +2821,14 @@ sub run {
         data_dir => $data_dir,
         now      => $now_fn,
         verdict  => $verdict_fn,
-        # Keep-awake actuation is NOT defaulted here any more: BpKeepAwake::apply
-        # supplies the real spawn/kill/probe when the opts omit them, and an
-        # injected fake still overrides because keepawake_apply passes %$opts
-        # straight through. Defaulting here as well meant this file carried its
-        # own copy of the actuation — the duplication t/111 now forbids.
+        # Keep-awake actuation is NOT defaulted here: since package 08
+        # (host-awake-actuator), keepawake_apply no longer actuates anything
+        # itself -- it PUBLISHES an intent into HostAwake's registry, and the
+        # continuity refresher is the one host-side actuator. An injected
+        # fake (now/ensure_refresher/kill_pid) still reaches it because
+        # keepawake_apply reads straight out of $opts. Defaulting here as
+        # well would make this file carry its own copy of that wiring again
+        # — the duplication t/111 originally forbade for BpKeepAwake::apply.
         #
         # (These were once empty subs, which made the whole mechanism inert in
         # production while still looking wired — see 3c661a0. The module's

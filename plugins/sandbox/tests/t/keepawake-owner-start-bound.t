@@ -86,17 +86,17 @@ sub slurp { my ($f) = @_; open(my $fh, '<:raw', $f) or return undef; local $/; m
     like($ps1, qr/reason=started-after-spawn/, 'keep-awake.ps1 logs the started-after-spawn rejection');
     ok($ps1 !~ /[^\x00-\x7f]/, 'keep-awake.ps1 stays pure ASCII');
 
-    # 07-one-keepawake-helper, Decision 19 / spec section 7(1), part 2: the real
-    # spawn (and therefore the real -OwnerStartedBeforeTicks bound) moved from
-    # launcher.pl's own _keepawake_start into BpKeepAwake::spawn. The launcher
-    # now only passes owner_winpid => through to BpKeepAwake::spawn( and
-    # computes no bound of its own.
+    # package 08 (host-awake-actuator), Decision 23 (G2): the launcher owns no
+    # helper of its own any more -- it PUBLISHES a registry entry (through
+    # KeepAwake::registry_seams/HostAwake::publish) and the continuity
+    # refresher daemon is the single remaining actuator that calls
+    # BpKeepAwake::spawn. So launcher.pl must call BpKeepAwake::spawn( NOWHERE
+    # (the owner-pinning it used to do inline no longer applies to it at
+    # all), and the existing no--OwnerStartedBeforeTicks guard still holds.
     my $lsrc = slurp("$SANDBOX_SCRIPTS/launcher.pl") // '';
     ok(length($lsrc), 'launcher.pl is readable');
-    my $spawn_pos = $lsrc =~ /BpKeepAwake::spawn\s*\(/ ? $-[0] : undef;
-    ok(defined $spawn_pos, "launcher.pl's start closure calls BpKeepAwake::spawn(");
-    my $spawn_window = defined $spawn_pos ? substr($lsrc, $spawn_pos, 400) : '';
-    like($spawn_window, qr/owner_winpid\s*=>/, '...passing owner_winpid => in the same call');
+    unlike($lsrc, qr/BpKeepAwake::spawn\s*\(/,
+        'launcher.pl no longer calls BpKeepAwake::spawn( anywhere (package 08: it owns no helper)');
     unlike($lsrc, qr/-OwnerStartedBeforeTicks/,
         "launcher.pl contains no '-OwnerStartedBeforeTicks' of its own -- the bound is now computed inside BpKeepAwake::spawn");
 

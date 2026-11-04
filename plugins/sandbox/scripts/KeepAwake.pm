@@ -435,4 +435,119 @@ sub intent_log_fields {
     return @out;
 }
 
+# --- package 08-host-awake-actuator (blueprint wake-and-pause-consolidation):
+# the launcher stops owning a wake-lock helper of its own and instead
+# publishes its intent into HostAwake's shared registry; the host-side
+# continuity refresher is the ONLY actuator left (spec 2.6). The two subs
+# below wire that registry, loaded by HostAwake.pm, into the same holder
+# lifecycle (KeepAwake->new/sync/release) the launcher already had, so the
+# rest of this module -- load_bp_keepawake, revive, on_probe, sync -- needs
+# no change at all.
+
+# load_host_awake($path) -> ($ok, $reason). Same never-dies/never-prints
+# contract as load_bp_keepawake above, but with NO default path: the
+# launcher always passes an absolute $INSTALL_ROOT-based one (NIT-1 style),
+# and a registry path built relative to this module's own __FILE__ would be
+# wrong the same way a relative bp-keepawake.pl path would be.
+sub load_host_awake {
+    my ($path) = @_;
+    return (0, 'missing: ' . (defined $path ? $path : '')) unless defined $path && -f $path;
+    # Same STDERR-silencing rationale as load_bp_keepawake: the dashboard owns
+    # the alt-screen terminal while this runs.
+    unless (eval { local $SIG{__WARN__} = sub { }; require $path; 1 }) {
+        my $err = $@ // 'unknown error';
+        ($err) = split /\n/, $err, 2;
+        return (0, "load failed: $err");
+    }
+    # Order pinned by spec 2.6 and host-awake-actuator.t's AC17 (and the
+    # sandbox fixture one-keepawake-helper.t): publish, withdraw, sandbox_id,
+    # host_side, then BpAwakeConst::state_root. Decision 22 (granted) moved
+    # state_root onto BpAwakeConst.pm; HostAwake.pm delegates to it (Decision
+    # 26(a)). Loading HostAwake.pm pulls in BpAwakeConst.pm itself (it is
+    # HostAwake's own first require), so this symbol is defined whenever
+    # HostAwake.pm loaded cleanly above.
+    for my $full (qw(HostAwake::publish HostAwake::withdraw HostAwake::sandbox_id
+                      HostAwake::host_side BpAwakeConst::state_root)) {
+        return (0, "incomplete: ${full} undefined") unless defined &{$full};
+    }
+    return (1, undef);
+}
+
+# registry_seams(%a) -> (start => CODE, stop => CODE, refresh => CODE)
+#   %a = (source => $id|undef, available => 0|1,
+#         intent => CODE returning {reason=>...}, ensure => CODE,
+#         log => CODE($event, \%fields)).
+#
+# Wires HostAwake's registry (publish/withdraw) into the holder's start/stop
+# seams, replacing the launcher's own spawn/stop_child/child_alive lifecycle
+# -- package 08: the launcher owns no helper of its own any more, only this
+# one registry entry. `refresh` is a third seam the holder itself has no use
+# for (it has no periodic-touch concept); the launcher calls it directly on
+# its own 120s keep-awake-log cadence to keep the entry's written_at fresh
+# without going through a start/stop transition.
+#
+# A sandbox entry never carries `until` (2.6): the launcher refreshes
+# continuously, so copying the container's own `until` would let a crashed
+# launcher pin the host for up to 32h.
+sub registry_seams {
+    my (%a) = @_;
+    my $source    = $a{source};
+    my $available = $a{available};
+    my $intent    = (ref $a{intent} eq 'CODE') ? $a{intent} : sub { {} };
+    my $ensure    = (ref $a{ensure} eq 'CODE') ? $a{ensure} : sub { };
+    my $log       = (ref $a{log}    eq 'CODE') ? $a{log}    : sub { };
+
+    my $reason_now = sub {
+        my $i = eval { $intent->() };
+        $i = {} unless ref $i eq 'HASH';
+        return $i->{reason} // 'busy-lease';
+    };
+
+    my $start = sub {
+        return undef unless $available;
+        unless (defined $source) {
+            # red-team m6: an over-long or CR-tainted container name makes
+            # HostAwake::sandbox_id return undef upstream, so $source arrives
+            # here undef. Before, that failed silently; now it logs once
+            # instead of just never holding a lock.
+            eval { $log->('keepawake_source_invalid', {}) };
+            return undef;
+        }
+        my $reason = $reason_now->();
+        my $wrote = HostAwake::publish($source, { awake => 1, reason => $reason, until => undef });
+        if ($wrote) {
+            eval { $ensure->() };
+            eval { $log->('keepawake_published', { source => $source, reason => $reason }) };
+            return $source;
+        }
+        eval { $log->('keepawake_start_failed', { source => $source, reason => 'registry write failed' }) };
+        return undef;
+    };
+
+    my $stop = sub {
+        return unless $available && defined $source;
+        HostAwake::withdraw($source);
+        eval { $log->('keepawake_withdrawn', { source => $source }) };
+        # Decision 26(e): withdrawing ensures the refresher, so it can
+        # converge (and restore the power plan) one more time even if it had
+        # already died between this launcher's last refresh and its exit
+        # (review m3/m4) -- the launcher itself makes no plan call.
+        eval { $ensure->() };
+    };
+
+    my $refresh = sub {
+        return undef unless $available && defined $source;
+        my $reason = $reason_now->();
+        my $wrote = HostAwake::publish($source, { awake => 1, reason => $reason, until => undef });
+        if ($wrote) {
+            eval { $ensure->() };
+            return $source;
+        }
+        eval { $log->('keepawake_publish_failed', { source => $source, reason => 'registry write failed' }) };
+        return undef;
+    };
+
+    return (start => $start, stop => $stop, refresh => $refresh);
+}
+
 1;

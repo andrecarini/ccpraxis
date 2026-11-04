@@ -584,4 +584,80 @@ print((-f BpKeepAwake::helper_path()) ? 1 : 0);
          'AC17: bp-keepawake.pl cites the fork measurement (ledger 07-one-keepawake-helper, 2026-11-04)');
 }
 
+# =====================================================================
+# package 08 (host-awake-actuator): the launcher owns no helper of its own
+# any more. It publishes a registry entry (through KeepAwake::registry_seams
+# / HostAwake::publish) and actuates nothing directly: no BpKeepAwake::spawn(,
+# stop_child(, child_alive, or _power_plan_hold. KeepAwake::load_host_awake(
+# is called with an $INSTALL_ROOT-based path, NIT-1 style.
+# =====================================================================
+unlike($LSRC, qr/BpKeepAwake::spawn\s*\(/,
+    'package 08: launcher.pl calls BpKeepAwake::spawn( nowhere (it owns no helper)');
+unlike($LSRC, qr/BpKeepAwake::stop_child\s*\(/,
+    'package 08: launcher.pl calls BpKeepAwake::stop_child( nowhere');
+unlike($LSRC, qr/BpKeepAwake::child_alive\b/,
+    'package 08: launcher.pl names BpKeepAwake::child_alive nowhere');
+unlike($LSRC, qr/_power_plan_hold\b/,
+    'package 08: launcher.pl names _power_plan_hold nowhere');
+like($LSRC, qr/KeepAwake::load_host_awake\(\s*"?\$?\{?INSTALL_ROOT\b/,
+    'package 08: launcher.pl passes an absolute $INSTALL_ROOT-based path to '
+  . 'KeepAwake::load_host_awake, not a bare no-argument call');
+
+# =====================================================================
+# package 08 AC17 [DC5, Decision 13]: KeepAwake::load_host_awake, each case
+# in a FRESH perl subprocess (same discipline as AC14's load_bp_keepawake
+# probes above). Never loaded in-process, so a dying fixture cannot take
+# this test file down with it.
+# =====================================================================
+my $HOST_AWAKE_PM = "$BUTLER_SCRIPTS/HostAwake.pm";
+my $HA_PROBE_TEMPLATE = q{
+use strict; use warnings;
+unshift @INC, '%s';
+require KeepAwake;
+print "BEFORE\n";
+my ($ok, $why) = KeepAwake::load_host_awake(%s);
+print "AFTER\n";
+print "OK=" . (defined($ok) ? $ok : 'undef') . "\n";
+print "WHY=" . (defined($why) ? $why : 'undef') . "\n";
+};
+
+{
+    # case 1: the real tree -> (1, undef), silent.
+    my $code = sprintf($HA_PROBE_TEMPLATE, $SANDBOX_SCRIPTS, "'$HOST_AWAKE_PM'");
+    my $out  = run_fresh_perl($code);
+    my $p    = parse_probe($out);
+    is($p->{ok},  '1',     'package 08 AC17: load_host_awake(<real path>) against the real tree gives ok=1') or diag($out);
+    is($p->{why}, 'undef', 'package 08 AC17: ...and no reason');
+    ok($p->{silent}, 'package 08 AC17: the call itself prints nothing');
+}
+
+{
+    # case 2: a nonexistent path -> (0, 'missing: <path>').
+    my $missing = "$BUTLER_SCRIPTS/does-not-exist-08-host-awake-actuator.pm";
+    my $code = sprintf($HA_PROBE_TEMPLATE, $SANDBOX_SCRIPTS, "'$missing'");
+    my $out  = run_fresh_perl($code);
+    my $p    = parse_probe($out);
+    is($p->{ok}, '0', 'package 08 AC17: a nonexistent path gives ok=0') or diag($out);
+    is($p->{why}, "missing: $missing", 'package 08 AC17: ...with the missing: reason naming the path');
+    ok($p->{silent}, 'package 08 AC17: the call itself prints nothing');
+}
+
+{
+    # case 3: a fixture defining only HostAwake::publish -> incomplete,
+    # naming HostAwake::withdraw as the first missing sub (spec 2.6's order:
+    # publish, withdraw, sandbox_id, host_side, BpAwakeConst::state_root).
+    my $dir = tempdir(CLEANUP => 1);
+    my $incomplete = "$dir/incomplete-hostawake.pl";
+    open(my $fh, '>', $incomplete) or die $!;
+    print {$fh} "package HostAwake; sub publish { } 1;\n";
+    close $fh;
+    my $code = sprintf($HA_PROBE_TEMPLATE, $SANDBOX_SCRIPTS, "'$incomplete'");
+    my $out  = run_fresh_perl($code);
+    my $p    = parse_probe($out);
+    is($p->{ok}, '0', 'package 08 AC17: a fixture defining only HostAwake::publish gives ok=0') or diag($out);
+    is($p->{why}, 'incomplete: HostAwake::withdraw undefined',
+        'package 08 AC17: ...naming HostAwake::withdraw as the first missing sub');
+    ok($p->{silent}, 'package 08 AC17: the call itself prints nothing');
+}
+
 done_testing();
