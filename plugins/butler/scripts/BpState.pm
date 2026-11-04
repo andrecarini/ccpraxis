@@ -357,4 +357,83 @@ sub blueprint_lifecycle {
     return 'drafting';
 }
 
+# inflight_stale_reason($data, $bp, $pkg) -> '' | $reason
+# The ONE rule for "this <data>/.drive-solo/inflight.json entry no longer
+# names work anybody can drive". '' means live; otherwise a short reason,
+# checked in this order:
+#   no-blueprint     blueprints/<bp>/ is gone
+#   no-ledger        packages/<pkg>.md is gone
+#   terminal         the ledger's frontmatter status is done/dropped/blocked/parked
+#   no-blueprint-md  blueprints/<bp>/blueprint.md is gone
+#   drafting         blueprint.md's first status: line says drafting
+#   parked           blueprint.md's authored (fenced) status is parked
+# The director's prune (bp-drive-next.pl _prune_inflight) drops an entry for
+# ANY reason. The hooks that pick a subagent's binding from the same file
+# (BpHook::BindDispatch, BpHook::WriteGuards) use inflight_unbindable below,
+# the subset that is about the package itself. Bug 20261104-164548-2d3a: the
+# director never wrote its prune back once every blueprint was done, and the
+# hooks then bound every later subagent to a finished package and refused
+# its edits.
+#
+# The ledger-level reasons come first so a caller that ignores the
+# blueprint.md-level ones still sees a terminal or missing ledger behind a
+# missing blueprint.md.
+#
+# The two status reads deliberately keep bp-drive-next.pl's own shapes
+# rather than this module's normalising readers: the first 'status:' line
+# within blueprint.md's first 40 lines (lowercased, first word), and the raw
+# first 'status:' value of a leading '---' ledger frontmatter block, matched
+# exactly. Moving the director onto package_status() would treat a decorated
+# value such as a checkmark-prefixed done as terminal, a behaviour change the
+# prune never had.
+sub inflight_stale_reason {
+    my ($data, $bp, $pkg) = @_;
+    return 'no-blueprint' unless defined $data && defined $bp && length $bp;
+    return 'no-ledger'    unless defined $pkg && length $pkg;
+    my $bpdir = "$data/blueprints/$bp";
+    return 'no-blueprint' unless -d $bpdir;
+
+    my $ledger = "$bpdir/packages/$pkg.md";
+    return 'no-ledger' unless -f $ledger;
+
+    my $status = 'pending';
+    my $txt = _slurp($ledger);
+    if (defined $txt) {
+        my ($fm) = $txt =~ /\A---\s*\n(.*?)\n---/s;
+        if (defined $fm) {
+            for my $ln (split /\n/, $fm) {
+                if ($ln =~ /^status:\s*(.*?)\s*$/) { $status = $1; last }
+            }
+        }
+    }
+    return 'terminal' if $status =~ /^(?:done|dropped|blocked|parked)$/;
+
+    return 'no-blueprint-md' unless -f "$bpdir/blueprint.md";
+
+    my $lifecycle = '';
+    if (open my $fh, '<', "$bpdir/blueprint.md") {
+        while (my $l = <$fh>) {
+            last if $. > 40;
+            if ($l =~ /^status:\s*(\S+)/) { $lifecycle = lc $1; last }
+        }
+        close $fh;
+    }
+    return 'drafting' if $lifecycle eq 'drafting';
+
+    return 'parked'
+        if norm_bp_status(bp_meta_get("$bpdir/blueprint.md", 'status')) eq 'parked';
+    return '';
+}
+
+# inflight_unbindable($data, $bp, $pkg) -> '' | $reason
+# The subset of inflight_stale_reason a write guard acts on when choosing a
+# subagent's binding: the package's ledger is gone or terminal, or its
+# blueprint is gone or parked. A missing blueprint.md or a drafting status is
+# the director's business (it prunes those), not grounds for a hook to
+# unbind: hook fixtures and half-created blueprints legitimately lack one.
+sub inflight_unbindable {
+    my $r = inflight_stale_reason(@_);
+    return ($r =~ /\A(?:no-blueprint|no-ledger|terminal|parked)\z/) ? $r : '';
+}
+
 1;

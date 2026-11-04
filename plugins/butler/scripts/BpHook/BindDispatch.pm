@@ -193,6 +193,27 @@ sub _inflight_members {
 }
 
 # ---------------------------------------------------------------------------
+# _member_stale($data, $m) -> 1 | 0 -- bug 20261104-164548-2d3a. 1 iff this
+# inflight.json member names a package whose ledger is gone or terminal, or
+# whose blueprint is gone or parked: BpState::inflight_unbindable, the
+# package-level subset of the rule bp-drive-next.pl's _prune_inflight uses.
+# Fails toward 0 (not stale: the pre-fix behaviour) if BpState cannot be
+# loaded, so a broken install never loosens anything by itself.
+# ---------------------------------------------------------------------------
+sub _member_stale {
+    my ($data, $m) = @_;
+    my $r = eval {
+        require "$SELF_DIR/../BpState.pm"
+            unless defined &BpState::inflight_unbindable;
+        (my $d = $data) =~ tr{\\}{/};
+        $d =~ s{/+\z}{};
+        BpState::inflight_unbindable($d, $m->{bp}, $m->{pkg});
+    };
+    return (defined $r && $r ne '') ? 1 : 0;
+}
+sub member_stale { return _member_stale(@_) }
+
+# ---------------------------------------------------------------------------
 # _ledger_line($data, $bp, $pkg) -- spec sec 2.5: <L>/blueprints/<bp>/
 # packages/<pkg>.md, where <L> is the basename of <data> after turning '\'
 # into '/' and dropping trailing slashes.
@@ -540,7 +561,40 @@ sub _decide_driver {
 
     return { verdict => 'allow' } unless defined $data && length $data;
 
-    my @members = _inflight_members($data);
+    # Bug 20261104-164548-2d3a: an inflight.json entry that is stale (ledger
+    # terminal or gone, blueprint parked or gone: BpState::inflight_unbindable,
+    # shared with the director's prune) is never auto-bound. The set used to
+    # keep such an entry after the run finished, and every later dispatch
+    # was bound to it; the binding record outlives the set, so those
+    # subagents stayed refused (WriteGuards' refused_bound) even after the
+    # set was emptied. Stale entries drop out of the auto-bind count.
+    #
+    # The one exception keeps Decision 69 A3: a dispatch whose labelled
+    # "Ledger:" line names a stale member explicitly is decided over the
+    # UNFILTERED set, exactly as before this fix, so it is still bound to
+    # that package and its edits are still refused.
+    my @all_members = _inflight_members($data);
+    my (@members, @stale);
+    for my $m (@all_members) {
+        if (_member_stale($data, $m)) { push @stale, $m } else { push @members, $m }
+    }
+    if (@stale) {
+        my $prompt0 = _prompt_of($p);
+        if (_has_ledger_signal($prompt0)) {
+            my $names_stale = 0;
+            for my $decl (_decl_lines($prompt0)) {
+                for my $m (@stale) {
+                    if ($decl eq _ledger_line($data, $m->{bp}, $m->{pkg})
+                        || canon($decl) eq canon(_ledger_abs($data, $m->{bp}, $m->{pkg}))) {
+                        $names_stale = 1;
+                        last;
+                    }
+                }
+                last if $names_stale;
+            }
+            @members = @all_members if $names_stale;
+        }
+    }
     my $n = scalar @members;
     return { verdict => 'allow' } if $n == 0;
 

@@ -99,6 +99,18 @@ sub write_inflight {
         packages => [ map { { blueprint => $_->{bp}, package => $_->{pkg}, ledger => 'ignored-by-hook', since => 1 } } @members ],
         updated_at => 1,
     });
+    # Bug 20261104-164548-2d3a: the hook no longer auto-binds a member whose
+    # ledger is missing or terminal (BpState::inflight_unbindable), so every
+    # member listed here gets a live ledger unless the case wrote its own.
+    for my $m (@members) {
+        my $lp = "$data/blueprints/$m->{bp}/packages/$m->{pkg}.md";
+        next if -e $lp;
+        make_path("$data/blueprints/$m->{bp}/packages");
+        open(my $lfh, '>:raw', $lp) or die "cannot write $lp: $!";
+        print {$lfh} "---\npackage: $m->{pkg}\nblueprint: $m->{bp}\nstatus: running\n"
+                   . "write_set: src/$m->{pkg}/\n---\n";
+        close $lfh;
+    }
 }
 
 sub bindings_dir     { my ($data) = @_; return "$data/.drive-solo/bindings" }

@@ -474,27 +474,61 @@ sub _bp_parked {
 
 # _prune_inflight($data, \@entries) -> $dirty (spec §2.6). Mutates @entries
 # in place (drops terminal-ledger, missing-ledger and parked-blueprint ones).
+#
+# The per-entry rule lives in BpState::inflight_stale_reason, shared with the
+# hooks that bind a subagent from this same file (BpHook::BindDispatch and
+# BpHook::WriteGuards), so the director and the guards agree on which entries
+# are stale. It drops an entry whose blueprint dir/blueprint.md is gone, whose
+# blueprint.md says `drafting` (red-team M3: such an entry can never be
+# resumed by any driver, so it must not block overlapping work forever),
+# whose ledger is gone, whose blueprint is parked, or whose ledger status is
+# terminal (_is_terminal's set).
 sub _prune_inflight {
     my ($data, $entries) = @_;
+    require "$DIR/BpState.pm" unless defined &BpState::inflight_stale_reason;
     my @kept;
     my $dirty = 0;
     for my $e (@$entries) {
-        my ($bp, $pkg) = ($e->{blueprint}, $e->{package});
-        my $bpdir = "$data/blueprints/$bp";
-        # red-team M3: a set entry whose blueprint dir/blueprint.md is gone, or
-        # whose blueprint.md itself says `drafting`, can never be resumed by
-        # any driver -- prune it rather than let it block overlapping work
-        # forever. Same status read the director already uses for blueprints.
-        if (!-d $bpdir || !-f "$bpdir/blueprint.md") { $dirty = 1; next; }
-        if (blueprint_lifecycle($bpdir) eq 'drafting') { $dirty = 1; next; }
-        if (!-f "$bpdir/packages/$pkg.md") { $dirty = 1; next; }
-        if (_bp_parked($bpdir))            { $dirty = 1; next; }
-        my $status = ledger_fm($bpdir, $pkg, 'status') // 'pending';
-        if (_is_terminal($status))         { $dirty = 1; next; }
+        if (BpState::inflight_stale_reason($data, $e->{blueprint}, $e->{package}) ne '') {
+            $dirty = 1;
+            next;
+        }
         push @kept, $e;
     }
     @$entries = @kept;
     return $dirty;
+}
+
+# _persist_pruned_inflight($data, $dsdir, $now, $opts) -> \@entries
+# (bug 20261104-164548-2d3a). Load, prune and -- when either changed the set
+# -- write inflight.json back, under the inflight lock, then release the lock
+# on return. Before this existed the prune was written back only inside the
+# hand-out block, so a `next` that returned done/in-flight pruned a copy and
+# dropped it; once every blueprint was done the hand-out block was never
+# reached again, a finished package stayed in the set forever, and the write
+# guards bound every later subagent to it and refused its edits. Called on
+# both done paths and the in-flight path. NEVER FATAL, like
+# _write_inflight_set and _acquire_inflight_lock: a lock failure proceeds
+# unlocked, a write failure is one WARN line.
+#
+# Deliberately NOT called on:
+#   * the blueprint-done path: _archive_blockers reads the UNPRUNED set on
+#     purpose so an entry for a just-finished package defers that
+#     blueprint's archive for one call, and the run-done sweep (B6) is the
+#     pinned place that then archives it (drive-next-archives-finished.t
+#     AC6(ii)). The next call prunes it.
+#   * the pause, pause-long and token-stop paths: they touch no state file
+#     but run.md (drive-next.t AC-10(pkg10) pins inflight.json
+#     byte-identical across a pause-long). The hooks ignore a stale entry on
+#     their own (BpState::inflight_unbindable), so a pause cannot lock out
+#     unrelated work either.
+sub _persist_pruned_inflight {
+    my ($data, $dsdir, $now, $opts) = @_;
+    my $lock_fh = _acquire_inflight_lock($dsdir, $opts);
+    my ($entries, $dirty) = load_inflight($data, $dsdir, $now);
+    $dirty = 1 if _prune_inflight($data, $entries);
+    _write_inflight_set($dsdir, $entries, $now) if $dirty;
+    return $entries;
 }
 
 # _write_inflight_set($dsdir, \@entries, $now) — atomic, NEVER FATAL (spec
@@ -1523,6 +1557,7 @@ sub _cmd_next {
 
     if (!@candidates) {
         _append_run_log($dsdir, 'DONE (nothing in scope: no blueprint matches the scope spec)');
+        _persist_pruned_inflight($data, $dsdir, $now, $opts);
         print _encode_action({ action => 'done', denials => _denials_count($data) }), "\n";
         keepawake_apply('settled', $dsdir, $opts);
         return 0;
@@ -1921,9 +1956,10 @@ sub _cmd_next {
         # never reached it, read (and prune, read-only) it here rather than
         # letting @$inflight_entries autovivify into an empty list, which
         # would tell a recovering session that nothing is in flight.
+        # Bug 20261104-164548-2d3a: the prune is written back here too
+        # (under the lock), never dropped as a read-only copy.
         unless (ref $inflight_entries eq 'ARRAY') {
-            ($inflight_entries) = load_inflight($data, $dsdir, $now);
-            _prune_inflight($data, $inflight_entries);
+            $inflight_entries = _persist_pruned_inflight($data, $dsdir, $now, $opts);
         }
         $action->{inflight} = [ map {
             { blueprint => $_->{blueprint}, package => $_->{package},
@@ -2010,6 +2046,13 @@ sub _cmd_next {
         }
         _drop_from_order($dsdir, @newly_archived) if @newly_archived;
     }
+
+    # Bug 20261104-164548-2d3a: write the pruned set back before reporting
+    # done. After the run-done sweep above, so an archived blueprint's entry
+    # is gone with it; once every blueprint is done this is the only path the
+    # director still reaches, and the write guards bind subagents from this
+    # file.
+    _persist_pruned_inflight($data, $dsdir, $now, $opts);
 
     print _encode_action({ action => 'done', denials => _denials_count($data) }), "\n";
     keepawake_apply('settled', $dsdir, $opts);

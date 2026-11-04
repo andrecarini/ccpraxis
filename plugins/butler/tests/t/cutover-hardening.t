@@ -85,6 +85,14 @@ sub fwd { (my $p = shift) =~ s{\\}{/}g; $p =~ s{/+\z}{}; return $p }
             { blueprint => 'bp1', package => '02-b', ledger => 'y', since => time() },
         ],
     });
+    # Bug 20261104-164548-2d3a: bind-dispatch no longer counts a member whose
+    # ledger is missing or terminal, so both members get a live ledger.
+    make_path("$data/blueprints/bp1/packages");
+    for my $pk ('01-a', '02-b') {
+        open my $lfh, '>:raw', "$data/blueprints/bp1/packages/$pk.md" or die "open ledger $pk: $!";
+        print {$lfh} "---\npackage: $pk\nblueprint: bp1\nstatus: running\nwrite_set: src/$pk/\n---\n";
+        close $lfh;
+    }
     my $L = $data; $L =~ s{.*/}{};   # basename, as BindDispatch::_ledger_line uses
 
     my $tuid = 'toolu_f1_001';

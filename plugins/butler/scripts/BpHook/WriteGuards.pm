@@ -699,6 +699,12 @@ sub resolve {
     my @members = BpHook::BindDispatch::inflight_members($data);
     my @U;
     for my $m (@members) {
+        # Bug 20261104-164548-2d3a: a stale entry (BpState::inflight_unbindable,
+        # shared with the director's prune; it also drops a parked
+        # blueprint's package, which _usable alone does not) never counts as
+        # in flight, so a set the director failed to prune cannot scope or
+        # refuse unrelated work.
+        next if BpHook::BindDispatch::member_stale($data, $m);
         my $u = _usable($data, $m->{bp}, $m->{pkg});
         push @U, $u if defined $u;
     }
