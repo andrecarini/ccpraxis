@@ -123,6 +123,10 @@ All read fresh from disk, never cached or assumed from a prior turn:
    `relaunch` | `widen-write-set` | `edit-depends-on` | `author-ledger`. **Never `accept` or `drop`,
    under any circumstance, for any category** — those are irreversible-in-spirit calls that stay
    human-only unconditionally, not something a citation can ever qualify you for.
+   `author-ledger` renders the ledger from the blueprint's own `### <package>` section (its `write_set`,
+   `test_paths`, `checks`, `scope`, `done_criteria` bullets) and refuses when that section or its
+   `write_set` is missing; a refusal is handed to the operator as a question, never written as a stub.
+   So choose it only after confirming the section exists with a `write_set`.
 
 ## Output contract
 

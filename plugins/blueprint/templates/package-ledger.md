@@ -52,6 +52,10 @@ last_updated: <ISO timestamp>
 
 <Files (with line refs where known), decision numbers from the blueprint, docs.>
 
+## Out of scope
+
+<Copied from the blueprint package block: what this package must NOT do.>
+
 ## Pipeline
 
 - [ ] 1. Scout (skip if scope already maps cleanly — record the skip)

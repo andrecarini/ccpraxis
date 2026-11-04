@@ -415,7 +415,14 @@ sub _dispatch_action {
             '--file', $blueprint_md, '--pkg', $rec->{package}, '--deps', $deps);
     }
     if ($action eq 'author-ledger') {
-        return _author_ledger($rec->{package}, $ctx) ? 0 : 1;
+        # A refusal here is never transient: the blueprint lacks what a ledger
+        # needs, and re-running the resolver cannot add it. The reason goes back
+        # through $ctx so apply_verdict can hand the record to a human instead of
+        # leaving it queued for the resolver to pick the same action again.
+        my ($ok, $why) = _author_ledger($rec->{package}, $ctx);
+        return 0 if $ok;
+        $ctx->{needs_human} = $why;
+        return 1;
     }
     # Unreachable in practice -- verdict_in_bounds already refused anything
     # else before apply_verdict ever dispatches.
@@ -427,70 +434,262 @@ sub _iso_now {
     return sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ', $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
 }
 
-# author-ledger: reads blueprint.md's OWN row for the package (pkg,
-# deliverable, depends_on, model -- the columns e03's fixtures/blueprint.md
-# both use) and writes a fixed-template packages/<pkg>.md via
-# BpWrite::guarded_write. A missing/incomplete template source is exactly the
-# case e01 §2.4 says falls back to product/confidence:low at the AGENT level
-# -- this function never invents ledger content, it only fails closed (0) if
-# the row it needs is not there.
+# ---------------------------------------------------------------------------
+# author-ledger (bug 20261104-163147-07ae).
+#
+# This USED to build the ledger from blueprint.md's package-STATUS ROW alone
+# (pkg | deliverable | depends_on | model) through a hand-rolled heredoc: an
+# empty `write_set:`, `depends_on:` copied into the frontmatter, the one-line
+# deliverable as the whole Scope, "TBD" done criteria, and no effort/max_turns/
+# test_paths/checks. Each of those is fatal: bp-launch refuses an empty
+# write_set, and bp-ledger refuses EVERY write (set-status included) to a ledger
+# whose frontmatter carries depends_on, so the authored ledger could neither be
+# launched nor repaired through the API. Observed in acxpraxis-step-2, package
+# 12-model-merge, whose own `### 12-model-merge` section carried every field the
+# stub lacked.
+#
+# The status row is the DAG and nothing more. The contract is the package's own
+# `### <pkg>` section (plugins/blueprint/templates/blueprint.md, "Packages"), so
+# the ledger is rendered from that section through the SAME path an author uses:
+# `bp-ledger.pl create` for the frontmatter, then `set-section` for Scope / Done
+# criteria / Inputs / Out of scope. It is validate()-clean by construction and
+# never carries depends_on (ordering stays in the status table).
+#
+# It is staged in a temp dir and committed only when every step succeeded, and
+# never over an existing ledger. Anything missing (no section, no write_set, no
+# scope or done criteria, a value bp-ledger refuses) is a REFUSAL with a reason;
+# apply_verdict then hands the record to a human (category operator-action)
+# instead of writing an unlaunchable stub or marking the escalation resolved.
+# ---------------------------------------------------------------------------
+
+# _package_section($blueprint_bytes, $pkg) -> { title => $t, fields => {k=>v} } | undef
+# PURE. Finds the `### <pkg>` heading (outside fenced code, after HTML comments
+# are removed -- the template annotates its bullets with <!-- --> comments) and
+# collects its `- **key:** value` bullets, each running until the next key
+# bullet or the next level 1-3 heading. Continuation lines are kept, so a
+# multi-line scope or a numbered done-criteria list survives intact. Keys are
+# normalised to lower case with spaces/hyphens as '_'.
+sub _package_section {
+    my ($txt, $pkg) = @_;
+    return undef unless defined $txt && defined $pkg && length $pkg;
+    (my $t = $txt) =~ s/<!--.*?-->//gs;
+    $t =~ s/\r\n/\n/g;
+    my @lines = split /\n/, $t, -1;
+    my ($start, $title);
+    my $fence = 0;
+    for my $i (0 .. $#lines) {
+        if ($lines[$i] =~ /^\s*(?:```|~~~)/) { $fence = !$fence; next; }
+        next if $fence;
+        if ($lines[$i] =~ /^###\s+\Q$pkg\E(?=\s|:|\z)(.*)$/) {
+            ($start, $title) = ($i, $1);
+            last;
+        }
+    }
+    return undef unless defined $start;
+    # Separator between the id and the title: ':' or an em/en dash or '-'.
+    $title =~ s/\A\s*(?::|\xE2\x80\x94|\xE2\x80\x93|-)?\s*//;
+    $title =~ s/\s+\z//;
+
+    my (%f, $key);
+    $fence = 0;
+    for my $i ($start + 1 .. $#lines) {
+        my $l = $lines[$i];
+        if ($l =~ /^\s*(?:```|~~~)/) { $fence = !$fence; }
+        last if !$fence && $l =~ /^#{1,3}\s/;
+        if (!$fence && $l =~ /^\s?[-*]\s+\*\*\s*([A-Za-z][A-Za-z0-9 _-]*?)\s*(?::\s*\*\*|\*\*\s*:)\s?(.*)$/) {
+            ($key = lc $1) =~ s/[\s-]+/_/g;
+            $f{$key} = $2;
+            next;
+        }
+        next unless defined $key;
+        (my $c = $l) =~ s/^ {1,2}//;
+        $f{$key} .= "\n$c";
+    }
+    for my $k (keys %f) { $f{$k} =~ s/\A\s+|\s+\z//g; }
+    return { title => $title, fields => \%f };
+}
+
+# A colon-delimited frontmatter field from a bullet value. The template writes
+# these in backticks (`a/:b/`); several backticked spans are joined with ':'.
+# A placeholder dash or "none" is empty.
+sub _author_path_field {
+    my ($v) = @_;
+    return '' unless defined $v;
+    my @spans = ($v =~ /`([^`]*)`/g);
+    my $s = @spans ? join(':', grep { length } map { my $x = $_; $x =~ s/^\s+|\s+$//g; $x } @spans) : $v;
+    $s =~ s/^\s+|\s+$//g;
+    return '' if $s =~ /\A(?:-|\xE2\x80\x94|none|n\/a)?\z/i;
+    return $s;
+}
+
+# The first word of a bullet value (model/effort), lower-cased, or undef.
+sub _author_word_field {
+    my ($v) = @_;
+    return undef unless defined $v && $v =~ /\A\W*([A-Za-z][A-Za-z0-9.-]*)/;
+    return lc $1;
+}
+
+# list-form system() with stdout discarded and stderr captured through a FILE,
+# never an in-memory scalar (Git-for-Windows perl fails reopening STDERR onto
+# one -- repo CLAUDE.md, "Windows landmines"). -> ($rc, $first_stderr_line)
+sub _run_capture {
+    my (@cmd) = @_;
+    require File::Temp;
+    my ($efh, $efile) = File::Temp::tempfile('bp-resolve-err-XXXXXX', TMPDIR => 1, UNLINK => 1);
+    close $efh;
+    my ($so, $se);
+    open($so, '>&', \*STDOUT) or return (1, 'cannot dup STDOUT');
+    open($se, '>&', \*STDERR) or return (1, 'cannot dup STDERR');
+    unless (open(STDOUT, '>', File::Spec->devnull)) { open(STDOUT, '>&', $so); return (1, 'cannot redirect STDOUT'); }
+    unless (open(STDERR, '>', $efile)) { open(STDOUT, '>&', $so); open(STDERR, '>&', $se); return (1, 'cannot redirect STDERR'); }
+    my $rc = system(@cmd);
+    open(STDOUT, '>&', $so); open(STDERR, '>&', $se);
+    close $so; close $se;
+    my $err = BpOrch::_read_file($efile) // '';
+    unlink $efile;
+    my ($first) = grep { /\S/ } split /\n/, $err;
+    $first //= '';
+    $first =~ s/\s+\z//;
+    return (0, '') if $rc == 0;
+    return ((($rc >> 8) || 1), $first);
+}
+
+# _author_ledger($pkg, \%ctx) -> (1, undef) | (0, $reason). Never dies.
 sub _author_ledger {
     my ($pkg, $ctx) = @_;
-    return 0 unless defined $pkg && length $pkg;
-    my $bpdir = $ctx->{bpdir};
+    my @r = eval { _author_ledger_inner($pkg, $ctx) };
+    return (0, "author-ledger failed: $@") if $@;
+    return @r;
+}
+
+sub _author_ledger_inner {
+    my ($pkg, $ctx) = @_;
+    return (0, 'the escalation names no package') unless defined $pkg && length $pkg;
+    my $bpdir  = $ctx->{bpdir};
+    my $bp     = $ctx->{bp} // '';
+    # fixbatch step7 / LOW: sanitize $pkg the same way _unique_decision_path
+    # does (BpOrch::_safe_path_component) -- strips only path separators and
+    # NUL, never touching legitimate non-ASCII.
+    my $ledger = "$bpdir/packages/" . BpOrch::_safe_path_component($pkg) . ".md";
+    my $fix = "Add a complete '### $pkg' section to blueprint.md (scope, done_criteria, write_set, "
+            . "test_paths, checks, model, max_turns, inputs, out_of_scope) and answer not-mine to retry, "
+            . "or create the ledger with bp-ledger.pl create.";
+
+    return (0, "a ledger already exists at packages/$pkg.md; author-ledger never overwrites one. "
+             . 'Repair it with the bp-ledger.pl verbs instead.') if -e $ledger;
+
     my $txt = BpOrch::_read_file("$bpdir/blueprint.md");
-    return 0 unless defined $txt;
+    return (0, "cannot read blueprint.md, so there is nothing to author packages/$pkg.md from. $fix")
+        unless defined $txt;
+    my $sec = _package_section($txt, $pkg);
+    return (0, "blueprint.md has no '### $pkg' section, so there is no write_set, scope or done "
+             . "criteria to author packages/$pkg.md from (the status-table row is ordering only). $fix")
+        unless $sec;
+    my $f = $sec->{fields};
+
+    my $ws = _author_path_field($f->{write_set});
+    return (0, "blueprint.md's '### $pkg' section has no write_set; a ledger without one cannot be "
+             . "launched. $fix") unless length $ws;
+    for my $k (qw(scope done_criteria)) {
+        return (0, "blueprint.md's '### $pkg' section has no $k; author-ledger will not invent one. $fix")
+            unless defined $f->{$k} && $f->{$k} =~ /\S/;
+    }
+
+    # model: the section first, then the status table's model column.
+    my $model = _author_word_field($f->{model});
+    unless (defined $model) {
+        my $row = _status_row($txt, $pkg);
+        $model = _author_word_field($row->{model}) if $row;
+    }
+    my $effort  = _author_word_field($f->{effort});
+    my ($turns) = (($f->{max_turns} // '') =~ /([0-9]+)/);
+    my $tp      = _author_path_field($f->{test_paths});
+    my $checks  = _author_path_field($f->{checks});
+    my $title   = length($sec->{title}) ? $sec->{title} : $pkg;
+
+    my $tpl = "$SELF_DIR/../../blueprint/templates/package-ledger.md";
+    return (0, "the package-ledger template is missing ($tpl)") unless -f $tpl;
+    my $ledger_pl = "$SELF_DIR/bp-ledger.pl";
+
+    require File::Temp;
+    my $stage = File::Temp::tempdir('bp-author-ledger-XXXXXX', TMPDIR => 1, CLEANUP => 1);
+    my $sl = "$stage/$pkg.md";
+    my $ledger_call = sub {
+        my ($verb, @a) = @_;
+        my ($rc, $err) = _run_capture($^X, $ledger_pl, $verb, '--ledger', $sl, @a);
+        return $rc ? "bp-ledger.pl $verb refused (exit $rc): $err" : undef;
+    };
+    my $n = 0;
+    my $textfile = sub {
+        my ($body) = @_;
+        my $p = "$stage/text-" . $n++ . '.txt';
+        open(my $fh, '>:raw', $p) or die "cannot write $p: $!\n";
+        print $fh $body;
+        close $fh or die "cannot close $p: $!\n";
+        return $p;
+    };
+
+    my $why = $ledger_call->('create',
+        '--package', $pkg, '--blueprint', $bp, '--template', $tpl, '--write-set', $ws,
+        '--title', $title,
+        (length $tp      ? ('--test-paths', $tp)     : ()),
+        (length $checks  ? ('--checks',     $checks) : ()),
+        (defined $model  ? ('--model',      $model)  : ()),
+        (defined $effort ? ('--effort',     $effort) : ()),
+        (defined $turns  ? ('--max-turns',  $turns)  : ()));
+    return (0, "$why. $fix") if defined $why;
+
+    my $none = "_Not stated in blueprint.md's '### $pkg' section._";
+    for my $s (['Scope', 'scope'], ['Done criteria', 'done_criteria'],
+               ['Inputs', 'inputs'], ['Out of scope', 'out_of_scope']) {
+        my $v = $f->{ $s->[1] };
+        my $body = (defined $v && $v =~ /\S/) ? $v : $none;
+        $why = $ledger_call->('set-section', '--section', $s->[0], '--text-file', $textfile->($body));
+        return (0, "$why. $fix") if defined $why;
+    }
+    $why = $ledger_call->('append-attempt', '--text-file', $textfile->(
+        "bp-escalation-resolver (author-ledger): ledger rendered from blueprint.md's '### $pkg' section "
+      . 'through bp-ledger.pl create and set-section.'));
+    return (0, "$why. $fix") if defined $why;
+    $why = $ledger_call->('set-next-action', '--body-file', $textfile->('Start at Pipeline step 1.'));
+    return (0, "$why. $fix") if defined $why;
+
+    my $bytes = BpOrch::_read_file($sl);
+    return (0, 'the staged ledger could not be read back') unless defined $bytes && length $bytes;
+
+    unless (-d "$bpdir/packages") {
+        require File::Path;
+        eval { File::Path::make_path("$bpdir/packages"); 1 };
+    }
+    my $r = BpWrite::guarded_write({
+        site   => 'bp-resolve.author-ledger',
+        path   => $ledger,
+        valid  => sub { return defined $_[0] ? 'a ledger appeared concurrently; never overwritten' : undef },
+        mutate => sub { return ($bytes, undef); },
+    });
+    return (1, undef) if $r && $r->{ok};
+    return (0, "writing packages/$pkg.md failed: " . (($r && $r->{reason}) // 'unknown'));
+}
+
+# The package-status table row for $pkg as { lc(column) => cell }, or undef.
+sub _status_row {
+    my ($txt, $pkg) = @_;
     my @lines = split /\n/, $txt;
     my $hdr_i;
     for my $i (0 .. $#lines) {
         if ($lines[$i] =~ /^\|\s*pkg\s*\|/i) { $hdr_i = $i; last; }
     }
-    return 0 unless defined $hdr_i;
-    my @hdr = _table_cells($lines[$hdr_i]);
-    my %col; for my $i (0 .. $#hdr) { $col{lc $hdr[$i]} = $i; }
-    return 0 unless exists $col{pkg};
-
-    my $row;
+    return undef unless defined $hdr_i;
+    my @hdr = map { lc } _table_cells($lines[$hdr_i]);
+    my %col; for my $i (0 .. $#hdr) { $col{$hdr[$i]} = $i; }
+    return undef unless exists $col{pkg};
     for my $i ($hdr_i + 2 .. $#lines) {
         last unless $lines[$i] =~ /^\|/;
         my @cells = _table_cells($lines[$i]);
         next unless defined $cells[$col{pkg}] && $cells[$col{pkg}] eq $pkg;
-        $row = \@cells; last;
+        return { map { $_ => $cells[$col{$_}] } keys %col };
     }
-    return 0 unless $row;
-
-    my $deliverable = (exists $col{deliverable} ? $row->[$col{deliverable}] : undef) // '';
-    my $depends_on  = (exists $col{depends_on}  ? $row->[$col{depends_on}]  : undef) // '';
-    my $model       = (exists $col{model}       ? $row->[$col{model}]       : undef) // 'sonnet';
-    $depends_on = '' if $depends_on eq '—' || $depends_on eq '-';
-    return 0 unless length $deliverable;   # no template source -> never invent content
-
-    # fixbatch step7 / LOW: sanitize $pkg the same way _unique_decision_path
-    # now does (BpOrch::_safe_path_component) -- strips only path separators
-    # and NUL, never touching legitimate non-ASCII (this host's own paths
-    # are Unicode, CLAUDE.md).
-    my $ledger  = "$bpdir/packages/" . BpOrch::_safe_path_component($pkg) . ".md";
-    my $now_iso = _iso_now();
-    my $body =
-        "---\npackage: $pkg\nblueprint: " . ($ctx->{bp} // '') . "\nstatus: pending\n"
-      . "write_set: \ndepends_on: $depends_on\nmodel: $model\nlast_updated: $now_iso\n---\n\n"
-      . "# Package $pkg\n\n"
-      . "## Scope\n\n$deliverable\n\n"
-      . "## Done criteria\n\n1. TBD -- authored from blueprint.md's own row by bp-escalation-resolver; "
-      . "the operator/architect should review and refine before this package's pipeline proceeds.\n\n"
-      . "## Pipeline\n\n- [ ] 1. Scout\n\n"
-      . "## Decisions & attempt log\n\n"
-      . "- $now_iso -- bp-escalation-resolver -- ledger authored from blueprint.md (author-ledger action).\n\n"
-      . "## Next action\n\nStart at Pipeline step 1.\n\n"
-      . "## Outputs\n\n"
-      . "## Escalation\n\n";
-
-    my $r = BpWrite::guarded_write({
-        site   => 'bp-resolve.author-ledger',
-        path   => $ledger,
-        mutate => sub { return ($body, undef); },
-    });
-    return ($r && $r->{ok}) ? 1 : 0;
+    return undef;
 }
 
 sub _table_cells {
@@ -539,6 +738,38 @@ sub _bump_chronic_scoping_counter {
         1;
     };
     return;
+}
+
+# _surface_needs_human($qpath, \%rec, \%verdict, $why, $log, $id) -> 1|0
+# An action the apply-step REFUSED for a reason no resolver rerun can change
+# (author-ledger against a blueprint with no usable package section, bug
+# 20261104-163147-07ae) must not stay resolver-triageable: the orchestrator
+# would fire the resolver again, it would pick the same action, and the
+# package would sit unlaunchable with nobody told. Re-tag the queued record in
+# place as operator-action with the refusal as its product_question, so the
+# inbox bridge files it for a human; nothing is unlinked. Same lock and
+# freshness check as the tag-only branch: a record the operator already
+# disposed of is left alone.
+sub _surface_needs_human {
+    my ($qpath, $rec, $verdict, $why, $log, $id) = @_;
+    my $stale = 0;
+    my ($ok) = _with_qpath_lock($qpath, sub {
+        my $fresh = BpOrch::_read_json($qpath);
+        unless (_same_queued_record($fresh, $rec)) { $stale = 1; return 0; }
+        my %tagged = (%$rec);
+        my $pkg = $rec->{package} // '?';
+        $tagged{category}         = 'operator-action';
+        $tagged{resolved_by}      = 'bp-resolve';
+        $tagged{confidence}       = $verdict->{confidence};
+        $tagged{evidence}         = $verdict->{evidence};
+        $tagged{resolution}       = "the resolver chose $verdict->{action}, and it was refused: $why";
+        $tagged{product_question} = "Package $pkg cannot be given a ledger automatically: $why";
+        return _atomic_write_json($qpath, \%tagged);
+    });
+    _rlog($log, ($ok ? 'escalation_resolve_needs_human' : 'escalation_resolve_needs_human_failed'),
+        { decision => $id, package => (ref $rec eq 'HASH' ? $rec->{package} : undef),
+          action => $verdict->{action}, why => $why, ($stale ? (stale => 1) : ()) });
+    return $ok ? 1 : 0;
 }
 
 # ---------------------------------------------------------------------------
@@ -653,6 +884,12 @@ sub apply_verdict {
     my $dispatch_rc = _dispatch_action($verdict, $rec, $id, $ctx);
     my $applied = ($dispatch_rc == 0) ? 1 : 0;
 
+    # A refusal the resolver cannot fix goes to a human (see
+    # _surface_needs_human). The archive below still records applied=false.
+    my $refusal = $applied ? undef : delete $ctx->{needs_human};
+    my $surfaced = defined($refusal)
+        ? _surface_needs_human($qpath, $rec, $verdict, $refusal, $log, $id) : 0;
+
     # Re-write the archive with the REAL applied outcome, return value now
     # CHECKED (fixbatch step7 / MEDIUM: it used to be silently ignored). If
     # this second write fails and dispatch did NOT succeed, the archive
@@ -674,6 +911,7 @@ sub apply_verdict {
             evidence    => $verdict->{evidence},
             resolved_at => time,
             applied     => $applied ? JSON::PP::true : JSON::PP::false,
+            (defined $refusal ? (refusal => $refusal, surfaced_to => ($surfaced ? 'operator-action' : undef)) : ()),
         };
         my $arc2_ok = _atomic_write_json($archive_path, $arc2);
         unless ($arc2_ok) {
@@ -705,7 +943,10 @@ sub apply_verdict {
     }
 
     return { outcome => 'act', applied => $applied, archived => 1,
-             reason => ($applied ? undef : "dispatch failed, rc=$dispatch_rc") };
+             ($surfaced ? (surfaced => 'operator-action') : ()),
+             reason => ($applied ? undef
+                       : defined($refusal) ? "$verdict->{action} refused: $refusal"
+                       : "dispatch failed, rc=$dispatch_rc") };
 }
 
 # ---------------------------------------------------------------------------
