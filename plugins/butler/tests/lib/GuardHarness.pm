@@ -170,6 +170,11 @@ sub _snapshot_real_state {
             # which is exactly how the 08 subprocess leak was caught. Record
             # presence only; the END check ignores their removal.
             if ($d =~ m{/continuity/awake-sources\z}) { $seen{$rel} = 'present'; next }
+            # continuity/armed/<session> is an armed LIVE session's own record,
+            # refreshed by its hooks on every tool call -- so an armed session
+            # running tests always "changed" it. Same rule as awake-sources: a
+            # NEW record is a test leak, a refresh or a disarm is not.
+            if ($d =~ m{/continuity/armed\z}) { $seen{$rel} = 'present'; next }
             $seen{$rel} = ($st[9] // 0) . ':' . ($st[7] // 0);
         }
         closedir $dh;
@@ -195,7 +200,7 @@ END {
         push @diffs, "changed: $k" if !defined($b) || $b ne $a;
     }
     for my $k (@before_keys) {
-        next if $k =~ m{/continuity/awake-sources/[^/]+\z};   # live producers prune these
+        next if $k =~ m{/continuity/(?:awake-sources|armed)/[^/]+\z};   # live producers prune these
         push @diffs, "removed: $k" unless exists $after->{$k};
     }
     if (@diffs) {
