@@ -70,6 +70,7 @@ require "$DIR/bp-remediate.pl";    # b07: auto-remediation engine (pure decision
 require "$DIR/bp-checkpoint.pl";   # b02: durable WIP checkpoint commits
 require "$DIR/bp-write-guard.pl";  # a01: BpWrite::guarded_write -- lock/re-read/read-back
 require "$DIR/BpAwakeConst.pm" unless defined &BpAwakeConst::AC_STALE;
+require "$DIR/BpAwakeIntent.pm" unless defined &BpAwakeIntent::want_awake;
 
 our $USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 our $USER_AGENT = $ENV{BP_USER_AGENT} // 'claude-code/2.1.170';
@@ -2496,26 +2497,22 @@ sub resume_ready {
 # a relaunch further out than that releases the machine, which may then sleep
 # and resumes the run when woken. Bug 20261101-171529-1dd7.
 #
-#   no pause / manual pause          -> 0 (manual waits on a human)
-#   timed pause, no relaunch_at      -> 1 (telemetry: cleared on recovery, short)
-#   timed pause, relaunch_at <= now + horizon -> 1
-#   timed pause, relaunch_at beyond the horizon -> 0
+# The decision table (fleet + solo) now lives above BpAwakeIntent::want_awake
+# (package 04, wake-and-pause-consolidation); this wrapper just calls it.
 sub pause_holds_awake {
     my ($paused, $now, $horizon) = @_;
-    return 0 unless ref $paused eq 'HASH';
-    return 0 if $paused->{manual};
-    my $at = $paused->{relaunch_at};
-    return 1 unless defined $at && !ref $at && $at =~ /^\d+(?:\.\d+)?$/;
     $horizon = BpAwakeConst::FLEET_PAUSE_HORIZON() unless defined $horizon && !ref $horizon && $horizon =~ /^\d+$/;
-    return ($at - $now <= $horizon) ? 1 : 0;
+    return BpAwakeIntent::want_awake({ scope => 'fleet', paused => $paused, now => $now, horizon => $horizon })->{awake};
 }
 
 # --- busy-lease (Decision #16): touch while work is active OR an auto-resume is
-# pending; never while shut down or only parked-for-human.
+# pending; never while shut down or only parked-for-human. `{}` stands for "an
+# auto-resuming pause with no relaunch time" -- the old resume_pending term of the OR.
 sub should_touch_busy {
     my ($c) = @_;
-    return 0 if $c->{shutdown};
-    return ($c->{any_running} || $c->{outstanding} || $c->{resume_pending}) ? 1 : 0;
+    return BpAwakeIntent::want_awake({ scope => 'fleet', running => $c->{any_running},
+        outstanding => $c->{outstanding}, shutdown => $c->{shutdown},
+        paused => ($c->{resume_pending} ? {} : undef) })->{awake};
 }
 
 # --- is there still progressable work? (a non-terminal package with no
@@ -4693,10 +4690,10 @@ sub run {
             # human, and holding the machine awake for an absent person is the
             # cost without the benefit. A timed pause keeps it — the entire
             # point is to still be awake when the window reopens.
-            # A timed pause beyond the horizon settles too (pause_holds_awake).
-            my $ka_phase = !$paused                                          ? 'active'
-                         : pause_holds_awake($paused, $now, $t->{pause_horizon}) ? 'pause-pending'
-                         :                                                     'settled';
+            # A timed pause beyond the horizon settles too (BpAwakeIntent::want_awake).
+            my $ka_phase = !$paused ? 'active'
+                         : BpAwakeIntent::want_awake({ scope => 'fleet', paused => $paused, now => $now, horizon => $t->{pause_horizon} })->{awake} ? 'pause-pending'
+                         : 'settled';
             BpKeepAwake::apply($ka_phase, $runs,
                 { log => sub { _log($log, 'keepawake', { detail => $_[0] }) } });
 
@@ -4884,9 +4881,9 @@ sub run {
                 } else {
                     # Only within the horizon: beyond it the lease goes stale and
                     # the host launcher releases its wake-lock.
-                    touch_busy($t->{busy_path}) if should_touch_busy({
-                        resume_pending => pause_holds_awake($paused, $now, $t->{pause_horizon}),
-                        shutdown => $shutdown });
+                    touch_busy($t->{busy_path}) if BpAwakeIntent::want_awake({
+                        scope => 'fleet', paused => $paused, now => $now, horizon => $t->{pause_horizon},
+                        shutdown => $shutdown })->{awake};
                     last if $opt->{once};
                     $sleep_fn->($t->{watch_tick});
                     next;
@@ -6366,10 +6363,15 @@ sub run {
             # the human). It IS part of the idle-exit gate (below): exiting would
             # strand the run on a dead orchestrator when the human answers.
             my $awaiting_human = (grep { _awaits_human($status->{$_}) } keys %$meta) ? 1 : 0;
-            touch_busy($t->{busy_path}) if should_touch_busy({
-                any_running => $any_running, outstanding => $outstanding,
-                resume_pending => $resume_pending, shutdown => $shutdown,
-            });
+            # paused => undef, not $paused: PAUSE GATING above has already either
+            # moved on or cleared the pause, so $paused is always undef here, and
+            # the pre-want_awake code at this site never consulted the pause at
+            # all. Spelling it out keeps the two identical even if that gate
+            # changes (package 04 red-team, LOW-1).
+            touch_busy($t->{busy_path}) if BpAwakeIntent::want_awake({
+                scope => 'fleet', running => $any_running, outstanding => $outstanding,
+                paused => undef, now => $now, horizon => $t->{pause_horizon},
+                shutdown => $shutdown })->{awake};
 
             if ($shutdown && !$any_running) {
                 _log($log, 'shutdown_complete', { detail => 'graceful-shutdown-all: no coordinators left' });

@@ -121,11 +121,20 @@ is(BpKeepAwake::should_be_on('nonsense'),      0, 'unknown phase -> released (fa
 
     # A manual pause is waiting on an absent human; holding the machine awake
     # for them is cost without benefit. Since 2026-11-01 the phase goes through
-    # pause_holds_awake, which also releases a timed pause past the 32 h horizon
-    # (fleet-pause-horizon.t pins that half).
-    like($fleet, qr/pause_holds_awake\(\$paused, \$now, \$t->\{pause_horizon\}\) \? 'pause-pending'\s*:\s*'settled'/,
-        'the fleet pause phase is decided by pause_holds_awake');
-    like($fleet, qr/sub pause_holds_awake \{.*?return 0 if \$paused->\{manual\};/s,
+    # BpAwakeIntent::want_awake, which also releases a timed pause past the 32 h
+    # horizon (fleet-pause-horizon.t pins that half).
+    my $awake_intent = '';
+    if (open my $f, '<', "$S/BpAwakeIntent.pm") { local $/; $awake_intent = <$f>; }
+    # Strip comment-only lines before matching: a comment can describe the manual
+    # release ("fleet releases ... on ->{manual}") without the regex below being able
+    # to tell that apart from the statement that actually reads it, which is exactly
+    # how reviewer-step6.md MAJOR-2 found this assertion vacuous (a comment alone
+    # satisfied it after the real code line was deleted).
+    my $awake_intent_code = join "\n", grep { !/^\s*#/ } split /\n/, $awake_intent;
+
+    like($fleet, qr/BpAwakeIntent::want_awake\(\{[^;]*\}\)->\{awake\} \? 'pause-pending'\s*:\s*'settled'/,
+        'the fleet pause phase is decided by want_awake');
+    like($awake_intent_code, qr/sub want_awake \{.*?\$paused->\{manual\};/s,
         'a MANUAL fleet pause releases the lock; a timed one keeps it');
 }
 
