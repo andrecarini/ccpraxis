@@ -6741,7 +6741,14 @@ sub enter_dashboard {
                 # every few seconds (20260915-230820-d33e). Pass the probe
                 # state through so the view can tell those apart.
                 lease_probe     => { state  => $cached_probe_result->{state},
-                                     detail => $cached_probe_result->{detail} },
+                                     detail => $cached_probe_result->{detail},
+                                     # package 05-intent-in-busy-lease (blueprint wake-and-pause-
+                                     # consolidation): the orchestrator's stated reason/until,
+                                     # carried through only when the last probe actually read an
+                                     # intent. Out of scope here -- nothing downstream of this
+                                     # gather acts on them yet (a later package will).
+                                     reason => $cached_probe_result->{reason},
+                                     until  => $cached_probe_result->{until} },
                 # What the wake-lock is ACTUALLY doing, as opposed to what this
                 # gather would like it to do. They diverge exactly when a probe
                 # failure is being held through, which is the case worth
@@ -6843,6 +6850,10 @@ sub enter_dashboard {
                     probe      => ($probe_state ne '' ? $probe_state : undef),
                     detail     => (ref $st->{lease_probe} eq 'HASH' ? $st->{lease_probe}{detail} : undef),
                     action     => $act,
+                    # package 05: reason/until, present only when the last probe
+                    # actually read an intent -- omitted entirely otherwise, so
+                    # today's key set is unchanged for an old orchestrator.
+                    KeepAwake::intent_log_fields($st->{lease_probe}),
                 });
             }
         },
@@ -7283,12 +7294,31 @@ sub _busy_lease_probe {
     #
     # Read mtime first, then the container's own clock, so the inter-exec gap
     # can't read negative (matches the prior host/container-clock-skew fix).
-    my $bm = `$PODMAN exec "$container" sh -c 'stat -c %Y $BUSY_LEASE_PATH' 2>&1`;
+    #
+    # package 05: the SAME `sh -c` also prints a pinned separator and then
+    # `cat`s the lease, so the orchestrator's intent travels alongside the
+    # mtime at no extra exec. The separator is only printed once `stat &&`
+    # succeeds, so "the separator is present" IS "stat succeeded" -- read
+    # below via KeepAwake::split_lease_probe_output rather than trusting $rc
+    # alone, because a `cat` failure AFTER a successful `stat` must still
+    # count as success (B9): the lease is there, we just couldn't read its
+    # content this time.
+    # redteam MAJOR-1: `cat` follows symlinks and streams whatever it finds
+    # with no bound -- a symlink to /dev/zero or a FIFO planted at the lease
+    # path turns this exec into an unbounded read or an indefinite block on
+    # the HOST sampler (measured: 9.2GB in 4s for the symlink case, a hang for
+    # the FIFO case). The guard reads the content only when the path is a
+    # regular, non-symlink file (`[ -f ] && [ ! -L ]`), and `head -c 4097`
+    # caps the read just past KeepAwake::parse_lease_intent's own 4096-byte
+    # cap -- a failure here still lands after a successful `stat &&`, so
+    # classify_lease_stat_failure's B9 case is unchanged.
+    my $bm = `$PODMAN exec "$container" sh -c 'stat -c %Y $BUSY_LEASE_PATH && printf __BUTLER_BUSY_INTENT__ && { [ -f $BUSY_LEASE_PATH ] && [ ! -L $BUSY_LEASE_PATH ] && head -c 4097 $BUSY_LEASE_PATH; }' 2>&1`;
     my $rc = $?;
-    if ($rc == 0) {
-        my ($lmt) = ($bm =~ /^(\d+)/);
+    my ($stat_out, $content) = KeepAwake::split_lease_probe_output($bm);
+    if ($rc == 0 || defined $content) {
+        my ($lmt) = ($stat_out =~ /^(\d+)/);
         unless (defined $lmt) {
-            return { state => 'probe-failed', detail => 'unparsable stat output: ' . _trim_err($bm) };
+            return { state => 'probe-failed', detail => 'unparsable stat output: ' . _trim_err($stat_out) };
         }
         my $cn = `$PODMAN exec "$container" sh -c 'date +%s' 2>/dev/null`;
         my ($cnow) = ($cn && $cn =~ /^(\d+)/) ? ($1) : ();
@@ -7296,14 +7326,30 @@ sub _busy_lease_probe {
             return { state => 'probe-failed', detail => 'could not read container clock' };
         }
         my $a = $cnow - $lmt;
-        return { state => 'ok', age => ($a < 0 ? 0 : $a) };
+        my $r = { state => 'ok', age => ($a < 0 ? 0 : $a) };
+        if (my $i = KeepAwake::parse_lease_intent($content)) {
+            # redteam MINOR-3: BpContinuityLease keeps bumping the lease's mtime
+            # after the orchestrator itself has stopped writing it (Decision 12:
+            # it never writes awake=>0, it just stops touching the file), so an
+            # intent whose own written_at has drifted far from the mtime `stat`
+            # just reported is stale and must not be reported as current.
+            my $written_at = KeepAwake::lease_content_written_at($content);
+            if (defined $written_at && abs($lmt - $written_at) <= 2) {
+                $r->{reason} = $i->{reason};
+                $r->{until}  = $i->{until} if defined $i->{until};
+            }
+        }
+        return $r;
     }
-    # Non-zero: is this "the lease file genuinely doesn't exist" (exec itself
-    # succeeded, `stat` just failed) or "could not even run the exec"?
-    # ...but only if the file it could not find is the one we ASKED for. The
-    # rule itself is pure and lives in KeepAwake so it can be exercised against
-    # the real measured strings; see classify_lease_stat_failure for why a
-    # rewritten path is a fact about us rather than about the container.
+    # Non-zero, AND no separator at all: stat genuinely did not succeed (the
+    # `&&` short-circuited before `printf`). Is this "the lease file genuinely
+    # doesn't exist" (exec itself succeeded, `stat` just failed) or "could not
+    # even run the exec"? ...but only if the file it could not find is the one
+    # we ASKED for. The rule itself is pure and lives in KeepAwake so it can be
+    # exercised against the real measured strings; see
+    # classify_lease_stat_failure for why a rewritten path is a fact about us
+    # rather than about the container. $bm, not $stat_out: no separator is
+    # present here, so they are the same text anyway.
     if (my $verdict = KeepAwake::classify_lease_stat_failure($bm, $BUSY_LEASE_PATH)) {
         return { state => 'lease-absent' } if $verdict eq 'lease-absent';
         return { state => 'probe-failed',

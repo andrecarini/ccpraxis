@@ -15,6 +15,7 @@ use warnings;
 
 use File::Basename ();
 use Cwd ();
+use JSON::PP ();
 BEGIN {
     my $d = File::Basename::dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
     require "$d/BpAwakeConst.pm" unless defined &BpAwakeConst::AC_STALE;
@@ -100,6 +101,35 @@ sub _solo_pause {
     }
     my $handoff = ($at =~ /\A-?\d+(?:\.\d+)?\z/ && gmtime(int $at) && (($at - $now) > $H)) ? 1 : 0;
     return { awake => 0, reason => 'pause-beyond-horizon', until => undef, handoff => $handoff };
+}
+
+# --- lease_line(\%intent, $written_at) -> $line | undef (package
+# 05-intent-in-busy-lease, blueprint wake-and-pause-consolidation).
+# PURE: no I/O, no $ENV, no time/sleep --
+# the caller supplies $written_at so this can be tested without a clock.
+# Decision 12 (never write awake=>0) is enforced at the FORMAT level: there is
+# no code path here that can produce a line whose decoded awake is not 1, so a
+# caller cannot defeat the decision by mis-threading a falsy intent through.
+sub lease_line {
+    my ($intent, $written_at) = @_;
+    return undef unless ref($intent) eq 'HASH' && $intent->{awake};
+    return undef unless defined($written_at) && !ref($written_at) && $written_at =~ /\A\d+\z/;
+
+    my $reason = $intent->{reason};
+    $reason = 'unknown' unless defined $reason && !ref($reason) && length($reason);
+
+    my $until;
+    my $raw_until = $intent->{until};
+    $until = 0 + $raw_until if defined($raw_until) && !ref($raw_until) && $raw_until =~ /\A\d+(?:\.\d+)?\z/;
+
+    my $obj = {
+        v          => 1,
+        awake      => 1,
+        reason     => $reason,
+        until      => $until,
+        written_at => 0 + $written_at,
+    };
+    return JSON::PP->new->canonical(1)->encode($obj) . "\n";
 }
 
 1;

@@ -22,6 +22,7 @@ package KeepAwake;
 use strict;
 use warnings;
 use File::Basename qw(dirname);
+use JSON::PP ();
 
 # blueprint wake-and-pause-consolidation, Decision 13: the sandbox plugin must
 # keep working with no butler plugin beside it, so LEASE_FRESH is read
@@ -302,6 +303,96 @@ sub filetime_ticks {
     my ($t) = @_;
     return undef unless defined($t) && !ref($t) && $t =~ /\A\d+(?:\.\d+)?\z/;
     return sprintf('%.0f', ($t + 11644473600) * 10_000_000);
+}
+
+# --- package 05-intent-in-busy-lease (blueprint wake-and-pause-consolidation):
+# the probe's `sh -c`
+# now reads the lease's CONTENT as well as its mtime, printing this literal
+# separator between `stat`'s output and `cat`'s, so the two can be told apart
+# even when the content is empty (old orchestrator / BpContinuityLease) or the
+# `cat` half fails after a successful `stat`. All four are pure and total.
+sub lease_intent_sep { return '__BUTLER_BUSY_INTENT__' }
+
+# split_lease_probe_output($raw) -> ($stat_out, $content)
+#   $content is defined iff the separator is present, which only happens once
+#   `stat` has already succeeded (it is printed by `printf`, after `stat &&`).
+#   So "content defined" IS "stat succeeded" -- callers use that, not rc alone.
+sub split_lease_probe_output {
+    my ($raw) = @_;
+    my $sep = lease_intent_sep();
+    return ('', undef) unless defined $raw;
+    my $idx = index($raw, $sep);
+    return ($raw, undef) if $idx < 0;
+    return (substr($raw, 0, $idx), substr($raw, $idx + length($sep)));
+}
+
+# parse_lease_intent($content) -> { reason => $str, until => $num|undef } | undef
+#   undef for anything that isn't a well-formed, well-typed intent line -- old-
+#   format/empty leases, garbage, oversized content, or a hostile reason all
+#   come back undef so the caller just carries no reason/until (never a crash,
+#   never a log line with an attacker-controlled string in it).
+sub parse_lease_intent {
+    my ($content) = @_;
+    return undef unless defined $content;
+    (my $trimmed = $content) =~ s/\s+\z//;
+    return undef unless length $trimmed;
+    return undef if length($content) > 4096;   # checked BEFORE decoding, on the raw bytes
+
+    my $decoded = eval { JSON::PP->new->decode($content) };
+    return undef if $@ || ref($decoded) ne 'HASH';
+
+    my $v = $decoded->{v};
+    return undef unless defined $v && $v =~ /\A-?\d+(?:\.\d+)?\z/ && $v == 1;
+    my $awake = $decoded->{awake};
+    return undef unless defined $awake && $awake =~ /\A-?\d+(?:\.\d+)?\z/ && $awake == 1;
+
+    my $reason = $decoded->{reason};
+    return undef unless defined($reason) && !ref($reason) && $reason =~ /\A[A-Za-z0-9_.-]{1,64}\z/;
+
+    my $until = $decoded->{until};
+    my $until_out;
+    if (defined $until) {
+        # redteam MAJOR-2: an unbounded digit string (e.g. 400 digits) turns into
+        # Inf via `0 + $until`, and JSON::PP then encodes that as a bare `Inf` --
+        # invalid JSON -- which corrupts every snapshot/log line downstream that
+        # tries to re-encode it. Cap the digit counts so 0+ can never overflow to
+        # a non-finite value; 15 integer digits is already far beyond any sane
+        # epoch, with headroom to spare before IEEE-754 double precision loses
+        # exactness.
+        return undef if ref($until) || $until !~ /\A\d{1,15}(?:\.\d{1,6})?\z/;
+        $until_out = 0 + $until;
+    }
+
+    return { reason => $reason, until => $until_out };
+}
+
+# lease_content_written_at($content) -> integer written_at | undef
+#   Pure; decodes the same JSON parse_lease_intent does, but returns ONLY
+#   written_at. parse_lease_intent's public return shape is pinned to
+#   {reason,until} (busy-lease-carries-intent.t's AC9 compares it with
+#   is_deeply), so written_at -- needed only by the probe to judge freshness
+#   against the lease's own mtime (redteam MINOR-3) -- travels through this
+#   separate helper instead of widening that shape.
+sub lease_content_written_at {
+    my ($content) = @_;
+    return undef unless defined $content;
+    return undef if length($content) > 4096;
+    my $decoded = eval { JSON::PP->new->decode($content) };
+    return undef if $@ || ref($decoded) ne 'HASH';
+    my $wa = $decoded->{written_at};
+    return undef unless defined $wa && !ref($wa) && $wa =~ /\A\d+\z/;
+    return 0 + $wa;
+}
+
+# intent_log_fields($probe) -> list of pairs, for splicing into a log_ev hash.
+#   (reason => R[, until => U]) when present; () otherwise. Never dies.
+sub intent_log_fields {
+    my ($probe) = @_;
+    return () unless ref($probe) eq 'HASH';
+    my @out;
+    push @out, (reason => $probe->{reason}) if defined $probe->{reason};
+    push @out, (until  => $probe->{until})  if defined $probe->{until};
+    return @out;
 }
 
 1;

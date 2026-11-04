@@ -3888,9 +3888,43 @@ sub release_marker {
     unlink $path if defined $path;
 }
 
+# touch_busy($path, \%intent) -> 1 | 0 -- package 05: the gate that used to live
+# at each call site (`if ...->{awake}`) now lives HERE, so there is exactly one
+# place IN THIS FILE that can write the lease (AC5's structural check relies on
+# that; BpContinuityLease::touch_busy writes it too, for continuity's own
+# arming -- see that module). No
+# I/O at all -- not even a stat -- unless the intent says to stay awake: a
+# falsy/missing/non-HASH intent returns 0 and never touches $path.
+#
+# Writes the intent as one JSON line (BpAwakeIntent::lease_line), atomically:
+# a temp file in the same directory, written/closed/renamed into place, then
+# utime'd so mtime == written_at (today's readers are mtime-only, and that
+# equality is what keeps them meaningful). Never dies. If the write/rename
+# fails for any reason (no such directory, a blocking entry at the temp name,
+# etc.), falls back to byte-for-byte TODAY's touch: create empty if absent,
+# then utime -- so an existing lease's content survives a transient failure
+# and an absent one still gets the fresh mtime readers rely on.
 sub touch_busy {
-    my ($path) = @_;
-    my $now = time;
+    my ($path, $intent) = @_;
+    return 0 unless ref($intent) eq 'HASH' && $intent->{awake};
+    my $now  = time;
+    my $line = BpAwakeIntent::lease_line($intent, $now);
+    my $tmp  = "$path.tmp.$$";
+    # No eval{} here: open/print/close/rename all return false on failure
+    # rather than die (no autodie is in effect), so a plain 0/1 falls through
+    # to the fallback below on its own; an eval guarded nothing.
+    my $wrote = 0;
+    if (open(my $fh, '>:raw', $tmp)) {
+        if (print({$fh} $line) && close($fh) && rename($tmp, $path)) {
+            $wrote = 1;
+        }
+    }
+    if ($wrote) {
+        utime $now, $now, $path;
+        return 1;
+    }
+    unlink $tmp if -f $tmp;
+    # FALLBACK = today's touch, byte-for-byte in effect.
     unless (-e $path) { open my $fh, '>', $path or return 0; close $fh; }
     utime $now, $now, $path;
     return 1;
@@ -4545,11 +4579,12 @@ sub run {
 
             # ---- BUSY-LEASE OBSERVED MTIME (package 03, host-wake-and-suspend) ----
             # Read-only: records what is ALREADY on disk from a PRIOR tick's touch_busy,
-            # before this tick's own touch_busy call (below, gated by should_touch_busy,
-            # unchanged) can update it. Never fatal -- a missing/unreadable lease file
-            # records as "not observed", mirroring the suspend marker's own eval{}||undef
-            # idiom immediately above. This does not change WHEN touch_busy runs or what
-            # should_touch_busy gates -- purely additive.
+            # before this tick's own touch_busy call (below, gated by want_awake INSIDE
+            # touch_busy itself -- package 05, not should_touch_busy) can update it.
+            # Never fatal -- a missing/unreadable lease file records as "not observed",
+            # mirroring the suspend marker's own eval{}||undef idiom immediately above.
+            # This does not change WHEN touch_busy runs or what it gates -- purely
+            # additive.
             {
                 my @st = eval { stat($t->{busy_path}) };
                 my $observed_mtime = (!$@ && @st) ? $st[9] : undef;
@@ -4881,9 +4916,9 @@ sub run {
                 } else {
                     # Only within the horizon: beyond it the lease goes stale and
                     # the host launcher releases its wake-lock.
-                    touch_busy($t->{busy_path}) if BpAwakeIntent::want_awake({
+                    touch_busy($t->{busy_path}, BpAwakeIntent::want_awake({
                         scope => 'fleet', paused => $paused, now => $now, horizon => $t->{pause_horizon},
-                        shutdown => $shutdown })->{awake};
+                        shutdown => $shutdown }));
                     last if $opt->{once};
                     $sleep_fn->($t->{watch_tick});
                     next;
@@ -6368,10 +6403,10 @@ sub run {
             # the pre-want_awake code at this site never consulted the pause at
             # all. Spelling it out keeps the two identical even if that gate
             # changes (package 04 red-team, LOW-1).
-            touch_busy($t->{busy_path}) if BpAwakeIntent::want_awake({
+            touch_busy($t->{busy_path}, BpAwakeIntent::want_awake({
                 scope => 'fleet', running => $any_running, outstanding => $outstanding,
                 paused => undef, now => $now, horizon => $t->{pause_horizon},
-                shutdown => $shutdown })->{awake};
+                shutdown => $shutdown }));
 
             if ($shutdown && !$any_running) {
                 _log($log, 'shutdown_complete', { detail => 'graceful-shutdown-all: no coordinators left' });

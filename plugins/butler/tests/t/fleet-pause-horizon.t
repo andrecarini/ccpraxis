@@ -49,7 +49,9 @@ is(holds({ reason => 'usage', relaunch_at => $now - 60 }, $now, $H), 1, 'AC1 an 
 my $src = do { open my $fh, '<:raw', "$Bin/../../scripts/bp-orchestrator.pl" or die $!; local $/; <$fh> };
 like($src, qr/my \$ka_phase = !\$paused\s+\? 'active'\s*: BpAwakeIntent::want_awake\(\{\s*scope => 'fleet',\s*paused => \$paused,\s*now => \$now,\s*horizon => \$t->\{pause_horizon\}\s*\}\)->\{awake\} \? 'pause-pending'\s*:\s*'settled';/,
      'AC3 the wake-lock phase settles a pause beyond the horizon');
-like($src, qr/touch_busy\(\$t->\{busy_path\}\) if BpAwakeIntent::want_awake\(\{\s*scope => 'fleet',\s*paused => \$paused,\s*now => \$now,\s*horizon => \$t->\{pause_horizon\},\s*shutdown => \$shutdown\s*\}\)->\{awake\};/,
-     'AC3 and the paused tick stops refreshing the busy lease beyond it, so the host launcher lets go too');
+# 05 (blueprint Decision 18): the awake gate moved inside touch_busy itself, so the call site no
+# longer tests ->{awake} externally; see spec 05-intent-in-busy-lease-spec.md section 6.3.
+like($src, qr/touch_busy\(\$t->\{busy_path\}, BpAwakeIntent::want_awake\(\{\s*scope => 'fleet',\s*paused => \$paused,\s*now => \$now,\s*horizon => \$t->\{pause_horizon\},\s*shutdown => \$shutdown\s*\}\)\);/,
+     'AC3 and the paused tick stops refreshing the busy lease beyond it, so the host launcher lets go too (05: touch_busy call shape per blueprint Decision 18)');
 
 done_testing();
