@@ -95,6 +95,8 @@ use File::Path qw(make_path);
 use Fcntl qw(:flock);
 use Cwd ();
 use JSON::PP ();
+use Encode qw(decode encode);
+use MIME::Base64 qw(encode_base64);
 
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
 require "$DIR/bp-keepawake.pl";
@@ -801,6 +803,42 @@ sub converge {
     return ('released', 'idle');
 }
 
+# holds_pending($dir, %o) -> 0|1                       (package 02-plan-hold-expiry)
+#
+# Is there a sandbox hold file -- fresh or stale -- that nothing has pruned
+# yet? Windows-only (a sandbox keeps itself alive through its own busy-lease,
+# never through a hold file it would be reading about itself), and only when
+# $dir resolves to the real store (store_root_for), the same guard any_active
+# already applies. BpPowerPlan is loaded lazily, with the same %INC-guard
+# idiom run_plan_step uses below -- not required at file scope, because that
+# would make THIS file require BpPowerPlan.pm unconditionally while
+# BpPowerPlan.pm already requires this one unconditionally (see its own
+# header), which is fine on its own but is simply never exercised off the one
+# path (a tick) that genuinely needs it.
+#
+# %o: skip => \%names, a hashref of hold names already known to be stuck
+# (prune failed in this process) -- a name in it never counts toward keeping
+# the refresher alive again (spec 2.3, B11).
+#
+# Never dies: a load failure, a missing root, or any other surprise all
+# answer 0 rather than propagate, same discipline as any_active/active_reason.
+sub holds_pending {
+    my ($dir, %o) = @_;
+    my $result = eval {
+        return 0 unless platform() eq 'windows';
+        my $root = store_root_for($dir);
+        return 0 unless defined $root && length $root;
+        require "$DIR/BpPowerPlan.pm" unless grep { m{(?:^|/)BpPowerPlan\.pm$} } keys %INC;
+        my $skip = (ref $o{skip} eq 'HASH') ? $o{skip} : {};
+        my $files = BpPowerPlan::sandbox_hold_files($root);
+        for my $f (@$files) {
+            return 1 unless exists $skip->{$f};
+        }
+        return 0;
+    };
+    return $@ ? 0 : ($result // 0);
+}
+
 # ---------------------------------------------------------------------------
 # ensure_daemon($dir, %opts) -> 'running' | 'spawned' | 'idle' | 'refused'
 #
@@ -819,7 +857,9 @@ sub converge {
 # daemon on every call — the precise shape of the 2026-08-13 leak. The heartbeat
 # answers the question that actually matters ("is something still refreshing
 # this?"), means the same thing on every platform, costs one stat, and is the
-# same signal stop-gate.sh reads from bash.
+# same signal this sub's own heartbeat check reads below -- the Stop gate never
+# reads lease.pid itself; it reaches this check through converge (addendum
+# A.3.5, reviewer NIT-1: stop-gate.sh mentions neither).
 sub ensure_daemon {
     my ($dir, %opts) = @_;
     return 'refused' unless defined $dir && length $dir;
@@ -831,12 +871,18 @@ sub ensure_daemon {
     # well would make the decision itself untestable.
     return 'refused' if $ENV{CCPRAXIS_NO_WAKELOCK};
 
-    # Nothing armed, nothing to refresh. Without this, the repair verb (`lease`)
-    # and `status` would each start a daemon whose entire life is to notice it
-    # has no reason to exist — harmless, but a process spawned per call on paths
-    # that run routinely, and a 'spawned' that reads as if something is now
-    # being held when nothing is.
-    return 'idle' unless any_active($dir);
+    # Nothing armed AND no sandbox hold pending, nothing to refresh. Without
+    # this, the repair verb (`lease`) and `status` would each start a daemon
+    # whose entire life is to notice it has no reason to exist — harmless, but
+    # a process spawned per call on paths that run routinely, and a 'spawned'
+    # that reads as if something is now being held when nothing is.
+    #
+    # holds_pending is the package 02-plan-hold-expiry half of its own
+    # mechanism: a launcher's `--hold` tick must be able to start a refresher
+    # with NO host arm live, or a crashed launcher's stale hold would never be
+    # reconciled again (nothing else re-runs reconcile without one). Short-
+    # circuited after any_active so an armed caller never loads BpPowerPlan.
+    return 'idle' unless any_active($dir) || holds_pending($dir);
 
     my $pf = daemon_pid_file($dir);
     if (-e $pf) {
@@ -859,6 +905,205 @@ sub ensure_daemon {
     return (!$@ && defined $pid) ? 'spawned' : 'refused';
 }
 
+# --- Addendum A (step 7, plan-hold-expiry spec): a console-detached spawn on
+# Windows. MEASURED on this host (driver, 2026-11-04): a plain fork+exec
+# child of Git-for-Windows perl, parented by the launcher's console, dies in
+# the same second the console is closed (CloseMainWindow) -- that held for a
+# plain child, one that called POSIX::setsid(), and one with
+# $SIG{HUP}='IGNORE'. CTRL_CLOSE is a console event, not a POSIX session or
+# signal matter, so none of those survive. A child started by
+# `powershell -NoProfile -NonInteractive -EncodedCommand ...` running
+# `Start-Process -WindowStyle Hidden` (its own hidden console) was measured
+# to survive 12s past the close and to inherit the caller's environment, so
+# it is the Windows branch below. posix and unsupported are unchanged: they
+# have no console to lose in the first place.
+#
+# The helpers below are split pure/orchestration/effector on purpose: the
+# pure ones (_spawn_method, _native_exe_path, _detached_spawn_argv,
+# _parse_spawned_pid) decide and build without ever spawning, so a test can
+# call them directly; _spawn_daemon_impl takes its spawners as arguments, so
+# a test can inject recorders in place of _run_detached/_fork_exec_daemon
+# without ever starting a real process; the real production path stays in
+# _spawn_daemon.
+# ---------------------------------------------------------------------------
+
+# _spawn_method(%a) -> 'detached' | 'fork' | 'fork-setsid' -- pure.
+# a: platform => 'windows'|'posix'|'unsupported', ps_available => 0|1,
+#    perl_win => string|undef.
+sub _spawn_method {
+    my (%a) = @_;
+    return 'fork-setsid' unless defined $a{platform} && $a{platform} eq 'windows';
+    return 'detached' if $a{ps_available} && defined $a{perl_win} && length $a{perl_win};
+    return 'fork';   # windows, but no powershell or no usable native perl path:
+                      # today's Windows behaviour, kept so this change can
+                      # never leave a host with NO refresher where it had one.
+}
+
+# _native_exe_path($path) -> 'X:/.../name.exe' | undef -- pure (apart from
+# whether Cygwin::posix_to_win_path exists). The Windows form of a perl
+# binary, for Start-Process -FilePath, which Windows (not MSYS) resolves.
+# Mirrors MountSpec::native_path's technique, restated here because butler
+# must not require anything from plugins/sandbox.
+sub _native_exe_path {
+    my ($path) = @_;
+    return undef unless defined $path && length $path;
+    (my $p = $path) =~ s{\\}{/}g;
+
+    my $win;
+    if ($p =~ m{\A[A-Za-z]:/}) {
+        $win = $p;
+    } elsif ($p =~ m{\A/}) {
+        if (defined &Cygwin::posix_to_win_path) {
+            my $converted = eval { Cygwin::posix_to_win_path($p, 1) };
+            return undef unless defined $converted;
+            (my $c = $converted) =~ s{\\}{/}g;
+            return undef unless $c =~ m{\A[A-Za-z]:/};
+            $win = $c;
+        } elsif ($p =~ m{\A/([A-Za-z])/(.*)\z}) {
+            $win = uc($1) . ':/' . $2;
+        } else {
+            return undef;
+        }
+    } else {
+        # A relative path or a bare "perl" is never handed to a native
+        # binary: Windows would resolve it against the current drive. A bare
+        # name is what $^X is when perl was started as `perl script` (the host
+        # hooks start it that way), so resolve it through the interpreter's
+        # own absolute install path instead of giving up on detaching
+        # (driver ruling, amending spec Addendum A.2 step 5).
+        require Config;
+        my $abs = $Config::Config{perlpath};
+        return undef unless defined $abs && $abs =~ m{\A(?:/|[A-Za-z]:[\\/])};
+        return _native_exe_path($abs);
+    }
+
+    $win .= '.exe' unless $win =~ /\.exe\z/i;
+    return $win;
+}
+
+# _q_escape($s) -- PowerShell single-quoted-literal escaping: every ' doubled.
+sub _q_escape { my ($s) = @_; (my $r = $s) =~ s/'/''/g; return $r }
+
+# _detached_spawn_argv($perl_win, $script) -> @argv | () -- pure. The exact
+# argv of the transient powershell, or the empty list when it refuses.
+sub _detached_spawn_argv {
+    my ($perl_win, $script) = @_;
+    return () unless defined $perl_win && length $perl_win;
+    return () unless defined $script && length $script;
+    return () unless $perl_win =~ m{\A[A-Za-z]:/};
+    for my $s ($perl_win, $script) {
+        return () if $s =~ /["\x00-\x1f]/;
+    }
+    my ($perl_u, $script_u);
+    {
+        local $@;
+        $perl_u   = eval { decode('UTF-8', $perl_win, Encode::FB_CROAK) };
+        return () if $@;
+        $script_u = eval { decode('UTF-8', $script,   Encode::FB_CROAK) };
+        return () if $@;
+    }
+
+    # $script is passed in the parent perl's own spelling (e.g. "/c/...") --
+    # the child is the same MSYS/Cygwin perl binary and resolves that form
+    # itself, so __FILE__/is_live_script see what they see today. Only
+    # -FilePath (read by Windows, not MSYS) gets the Windows form.
+    my $arglist = qq{"$script_u" lease --daemon};
+    my $text = "\$ErrorActionPreference = 'Stop'; \$p = Start-Process -FilePath '"
+        . _q_escape($perl_u) . "' -ArgumentList '" . _q_escape($arglist)
+        . "' -WindowStyle Hidden -PassThru; [Console]::Out.Write([string]\$p.Id)";
+
+    # -EncodedCommand, not a quoted -Command string: no element of this argv
+    # can be rewritten by MSYS2 argument conversion in either conversion
+    # state (none starts with /, none contains : or ;; base64 of UTF-16LE
+    # text beginning with $ begins with J). MSYS2_ARG_CONV_EXCL is therefore
+    # neither set nor cleared here -- the child inherits whatever the caller
+    # had, as it does today. It also carries non-ASCII and ' byte-exactly,
+    # with no Windows command-line quoting rules involved.
+    #
+    # No -WindowStyle on the transient itself: it shares the caller's
+    # console, and -WindowStyle Hidden there would hide/minimise the
+    # OPERATOR'S terminal (the bug-20261102 shape MountSpec's own comment
+    # records). Only the grandchild, through Start-Process, gets Hidden.
+    my $bytes = encode('UTF-16LE', $text);
+    my $b64   = encode_base64($bytes, '');
+    return ('powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', $b64);
+}
+
+# _parse_spawned_pid($out, $status) -> winpid | undef -- pure.
+sub _parse_spawned_pid {
+    my ($out, $status) = @_;
+    return undef unless defined $status && $status == 0;
+    return undef unless defined $out;
+    (my $t = $out) =~ s/\A\s+//;
+    $t =~ s/\s+\z//;
+    return $t =~ /\A[1-9]\d{0,9}\z/ ? $t : undef;
+}
+
+# _spawn_daemon_impl(%d) -> pid | undef -- orchestration, deps injected.
+# d: script, platform, ps_available, perl_win,
+#    run_detached => CODE(\@argv) -> pid|undef,
+#    fork_exec    => CODE($script, $setsid) -> pid   (may die, as today)
+sub _spawn_daemon_impl {
+    my (%d) = @_;
+    my $m = _spawn_method(platform => $d{platform}, ps_available => $d{ps_available}, perl_win => $d{perl_win});
+    if ($m eq 'detached') {
+        my @argv = _detached_spawn_argv($d{perl_win}, $d{script});
+        if (@argv) {
+            my $pid = eval { $d{run_detached}->(\@argv) };
+            return $pid if defined $pid && $pid =~ /\A[1-9]\d*\z/;
+        }
+        # The detached attempt failed (argv refused, powershell missing at
+        # run time, non-zero exit, no pid printed): fall back to today's
+        # attached fork+exec. A refresher that dies with its console is
+        # still better than none. If powershell DID start a child but its
+        # pid output was lost, this fallback spawn loses the existing flock
+        # and exits 'duplicate', so no double refresher results.
+        return $d{fork_exec}->($d{script}, 0);
+    }
+    return $d{fork_exec}->($d{script}, $m eq 'fork-setsid' ? 1 : 0);
+}
+
+# _run_detached(\@argv) -> winpid | undef -- production effector. A forking
+# pipe open: the transient powershell exits as soon as Start-Process has
+# returned (about a second), printing the grandchild's winpid to stdout; this
+# never waits on the refresher itself.
+sub _run_detached {
+    my ($argv) = @_;
+    require POSIX;
+    my $pid = open(my $ph, '-|');
+    return undef unless defined $pid;
+    if ($pid == 0) {
+        open(STDIN,  '<', '/dev/null');
+        open(STDERR, '>', '/dev/null');   # never NUL -- a hook's stderr must stay clean
+        exec(@$argv) or POSIX::_exit(127);
+    }
+    local $/;
+    my $out = <$ph>;
+    close $ph;
+    return _parse_spawned_pid($out, $?);
+}
+
+# _fork_exec_daemon($script, $setsid) -> pid -- production effector. Today's
+# _spawn_daemon fork body, unchanged in effect.
+sub _fork_exec_daemon {
+    my ($script, $setsid) = @_;
+    require POSIX;
+    my $pid = fork();
+    die "fork: $!\n" unless defined $pid;
+    if ($pid == 0) {
+        open(STDIN,  '<', '/dev/null');
+        open(STDOUT, '>', '/dev/null');
+        open(STDERR, '>', '/dev/null');
+        # Leave the caller's process group where we can: a Bash tool call that
+        # is interrupted must not take the wake-lock down with it. setsid is a
+        # no-op concept on the Windows side, where exec() already yields an
+        # independent process.
+        eval { POSIX::setsid() } if $setsid;
+        exec($^X, $script, 'lease', '--daemon') or POSIX::_exit(127);
+    }
+    return $pid;
+}
+
 # _spawn_daemon($dir) — detach a real, independent `lease --daemon` process.
 #
 # NOTHING IS PASSED ON THE COMMAND LINE ON PURPOSE. The registry directory is an
@@ -877,7 +1122,8 @@ sub _spawn_daemon {
     # test that made it and keeps the machine awake forever. There is no prove
     # on this host, so every test is a .t run directly and $0 identifies it.
     # Tests that legitimately exercise the spawn DECISION inject their own seam
-    # and never reach this sub.
+    # and never reach this sub. This stays the FIRST statement on purpose: a
+    # test can never start a transient powershell or a refresher.
     return undef if defined $0 && $0 =~ /\.t\z/;
 
     # Batch C (spec 16-cutover, 1.3 departure #7): the old CLI script is on
@@ -886,21 +1132,18 @@ sub _spawn_daemon {
     # `lease --daemon` argv it always used.
     my $script = "$DIR/BpContinuityLease.pm";
     die "continuity module missing: $script\n" unless -f $script;
-    require POSIX;
-    my $pid = fork();
-    die "fork: $!\n" unless defined $pid;
-    if ($pid == 0) {
-        open(STDIN,  '<', '/dev/null');
-        open(STDOUT, '>', '/dev/null');
-        open(STDERR, '>', '/dev/null');
-        # Leave the caller's process group where we can: a Bash tool call that
-        # is interrupted must not take the wake-lock down with it. setsid is a
-        # no-op concept on the Windows side, where exec() already yields an
-        # independent process.
-        eval { POSIX::setsid() } unless is_windows();
-        exec($^X, $script, 'lease', '--daemon') or POSIX::_exit(127);
-    }
-    return $pid;
+
+    my $perl_win = is_windows() ? _native_exe_path($^X) : undef;
+    $perl_win = undef if defined $perl_win && !-f $perl_win;
+
+    return _spawn_daemon_impl(
+        script       => $script,
+        platform     => platform(),
+        ps_available => (is_windows() ? BpKeepAwake::ps_available() : 0),
+        perl_win     => $perl_win,
+        run_detached => \&_run_detached,
+        fork_exec    => \&_fork_exec_daemon,
+    );
 }
 
 # _spawn_successor($script, $tick) — the default handover_spawn (package 04,
@@ -1270,6 +1513,15 @@ sub daemon_loop {
     my $next_handover_try = 0;
     my $did_replace = 0;
 
+    # Package 02-plan-hold-expiry: names whose stale-hold prune has already
+    # failed once IN THIS PROCESS (spec 2.3, B11). Passed to holds_pending as
+    # a skip set so a hold file this process cannot remove stops keeping it
+    # alive -- otherwise a permanently-unremovable file would pin the
+    # refresher forever instead of bounding its lifetime at the next IDLE
+    # exit. A fresh process (a handover successor, or the next launcher
+    # `--hold`) starts with an empty skip set and tries again.
+    my %unremovable;
+
     # Package 05: the power journal's per-process probe cache/seq counter,
     # and the JOURNAL-ERROR repeat-suppression state (spec 2.8: after two
     # consecutive identical JOURNAL-ERRORs, the same text logs no more than
@@ -1285,10 +1537,21 @@ sub daemon_loop {
     my $ok_loop = eval {
     while (1) {
         my $reason_data = active_reason($dir);
+        # Package 02-plan-hold-expiry: no host arm no longer means "exit" by
+        # itself -- a sandbox hold file (fresh or stale) is its own reason to
+        # keep ticking, so a launcher that crashed while holding still gets
+        # reconciled again (spec 2.2/2.3, B1/B13). %unremovable keeps a name
+        # this process already failed to prune from resurrecting hold mode
+        # forever (B11).
+        my $hold_mode = 0;
         unless (defined $reason_data) {
-            $log->('IDLE', 'reason=no-live-arm');
-            $exit_plan_step->('refresher-exit');
-            last;
+            if (holds_pending($dir, skip => \%unremovable)) {
+                $hold_mode = 1;
+            } else {
+                $log->('IDLE', 'reason=no-live-arm');
+                $exit_plan_step->('refresher-exit');
+                last;
+            }
         }
 
         if (time() >= $next_handover_try) {
@@ -1320,84 +1583,141 @@ sub daemon_loop {
             }
         }
 
-        # S3 (spec 2.3): on the successor's first live tick, replace the
-        # inherited helper so it is owned (and logged) by this process.
-        if ($handover_flag && !$did_replace) {
-            $did_replace = 1;
-            my $ka_pid_f = wakelock_pid_file($dir);
-            if (-e $ka_pid_f) {
-                my $old_h = BpKeepAwake::read_pid($ka_pid_f);
-                if (defined $old_h && BpKeepAwake::pid_alive($old_h)) {
-                    my $desc_now = _owner_desc_for($reason_data);
-                    my $r = BpKeepAwake::replace($dir, {
-                        owner_winpid => $owner_winpid, owner_desc => $desc_now, log => $ka_log,
-                    });
-                    if ($r eq 'replaced') {
-                        my $new_h = BpKeepAwake::read_pid($ka_pid_f);
-                        $log->('HELPER-REPLACED', "old=$old_h new=" . (defined $new_h ? $new_h : 'unknown'));
-                    } else {
-                        $log->('HELPER-REPLACE-FAILED', "old=$old_h reason=$r");
+        if ($hold_mode) {
+            # Hold-only tick (package 02-plan-hold-expiry spec 2.3). No arm is
+            # live, so there is no host helper for THIS session to own -- release
+            # whatever a now-gone arm left behind, the same release today's IDLE
+            # exit performs via $release, except this process keeps running.
+            # Never sync(active => 1): the sandbox's own launcher holds that
+            # machine's lock, not this refresher.
+            #
+            # Addendum A.3.3 (reviewer MINOR-1, red-team m3): a new host arm
+            # that lands while this tick is asleep waits for the next tick --
+            # up to $tick seconds -- before converge sees 'running' and starts
+            # its own helper. Accepted: hold mode exists only while a sandbox
+            # hold file exists, and a launcher writes one only while IT holds
+            # its own wake-lock, so the machine is already awake for that
+            # minute regardless. Fixing the gap would need a refresher-wake
+            # channel or sliced sleeps that poll arms -- new machinery for a
+            # window another lock already covers.
+            sync($dir, %opts, active => 0, log => $ka_log, owner_winpid => $owner_winpid, owner_desc => undef);
+
+            my $root = store_root_for($dir);
+            my $files = eval { BpPowerPlan::sandbox_hold_files($root) } || [];
+            my $fresh = eval { BpPowerPlan::sandbox_holds($root) } || [];
+            my $file_count = scalar grep { !exists $unremovable{$_} } @$files;
+            my $fresh_count = scalar @$fresh;
+            $log->('HOLD-TICK', sprintf('active=0 reason=sandbox-hold files=%d fresh=%d',
+                $file_count, $fresh_count));
+
+            $run_plan_step->('refresher-hold-tick');
+
+            # Prune AFTER the reconcile above, re-stat'd at this moment (spec
+            # 2.1) -- a hold refreshed between the reconcile's directory read
+            # and here survives (B10); one failed on purpose is logged once and
+            # added to %unremovable so it stops resurrecting hold mode (B11).
+            my $pr = eval { BpPowerPlan::prune_stale_sandbox_holds($root) };
+            if (ref $pr eq 'HASH') {
+                for my $r (@{ $pr->{removed} || [] }) {
+                    $log->('HOLD-PRUNED', sprintf('name=%s age=%ss', $r->{name}, $r->{age}));
+                }
+                for my $n (@{ $pr->{failed} || [] }) {
+                    unless (exists $unremovable{$n}) {
+                        $log->('HOLD-PRUNE-FAILED', "name=$n");
+                        $unremovable{$n} = 1;
                     }
                 }
             }
-        }
+        } else {
+            # S3 (spec 2.3): on the successor's first live tick, replace the
+            # inherited helper so it is owned (and logged) by this process.
+            if ($handover_flag && !$did_replace) {
+                $did_replace = 1;
+                my $ka_pid_f = wakelock_pid_file($dir);
+                if (-e $ka_pid_f) {
+                    my $old_h = BpKeepAwake::read_pid($ka_pid_f);
+                    if (defined $old_h && BpKeepAwake::pid_alive($old_h)) {
+                        my $desc_now = _owner_desc_for($reason_data);
+                        my $r = BpKeepAwake::replace($dir, {
+                            owner_winpid => $owner_winpid, owner_desc => $desc_now, log => $ka_log,
+                        });
+                        if ($r eq 'replaced') {
+                            my $new_h = BpKeepAwake::read_pid($ka_pid_f);
+                            $log->('HELPER-REPLACED', "old=$old_h new=" . (defined $new_h ? $new_h : 'unknown'));
+                        } else {
+                            $log->('HELPER-REPLACE-FAILED', "old=$old_h reason=$r");
+                        }
+                    }
+                }
+            }
 
-        my $desc = _owner_desc_for($reason_data);
-        sync($dir, %opts, active => 1, log => $ka_log, owner_winpid => $owner_winpid, owner_desc => $desc);
-        $log->('TICK', sprintf('active=1 reason=arm sid=%s basis=%s age=%ss arms=%d',
-            $reason_data->{sid}, $reason_data->{basis}, $reason_data->{age}, $reason_data->{arms}));
+            my $desc = _owner_desc_for($reason_data);
+            sync($dir, %opts, active => 1, log => $ka_log, owner_winpid => $owner_winpid, owner_desc => $desc);
+            $log->('TICK', sprintf('active=1 reason=arm sid=%s basis=%s age=%ss arms=%d',
+                $reason_data->{sid}, $reason_data->{basis}, $reason_data->{age}, $reason_data->{arms}));
 
-        # Package 06: the power plan follows arming, checked on every tick
-        # BEFORE the journal step so a probe spawned in the same tick sees
-        # the corrected plan.
-        $run_plan_step->('refresher-tick');
+            # Package 06: the power plan follows arming, checked on every tick
+            # BEFORE the journal step so a probe spawned in the same tick sees
+            # the corrected plan.
+            $run_plan_step->('refresher-tick');
 
-        # Package 05: the power journal. Windows-platform-only, inside an
-        # eval, so a journal failure (including a failed require) can never
-        # take the refresher down with it -- sync() already ran and the
-        # heartbeat pid file is touched below regardless of what happens here.
-        if (platform() eq 'windows' && (!exists $opts{journal} || $opts{journal})) {
-            my $jopts = (ref $opts{journal_opts} eq 'HASH') ? $opts{journal_opts} : {};
-            my $ok = eval {
-                require "$DIR/BpPowerJournal.pm" unless grep { m{(?:^|/)BpPowerJournal\.pm$} } keys %INC;
-                BpPowerJournal::tick($dir, tick_s => $tick, cache => \%journal_cache, %$jopts);
-                1;
-            };
-            unless ($ok) {
-                my $err = defined $@ && length $@ ? $@ : 'unknown error';
-                $err =~ s/\n.*//s;
-                $err =~ s/[^\x20-\x7e]/?/g;
-                $err = substr($err, 0, 200);
-                my $now_e = time();
-                if (defined $journal_err_text && $journal_err_text eq $err) {
-                    $journal_err_repeats++;
-                    if ($journal_err_repeats >= 2 && ($now_e - $journal_err_logged_at) < 3600) {
-                        # suppressed: same text logged less than an hour ago
+            # Package 05: the power journal. Windows-platform-only, inside an
+            # eval, so a journal failure (including a failed require) can never
+            # take the refresher down with it -- sync() already ran and the
+            # heartbeat pid file is touched below regardless of what happens here.
+            if (platform() eq 'windows' && (!exists $opts{journal} || $opts{journal})) {
+                my $jopts = (ref $opts{journal_opts} eq 'HASH') ? $opts{journal_opts} : {};
+                my $ok = eval {
+                    require "$DIR/BpPowerJournal.pm" unless grep { m{(?:^|/)BpPowerJournal\.pm$} } keys %INC;
+                    BpPowerJournal::tick($dir, tick_s => $tick, cache => \%journal_cache, %$jopts);
+                    1;
+                };
+                unless ($ok) {
+                    my $err = defined $@ && length $@ ? $@ : 'unknown error';
+                    $err =~ s/\n.*//s;
+                    $err =~ s/[^\x20-\x7e]/?/g;
+                    $err = substr($err, 0, 200);
+                    my $now_e = time();
+                    if (defined $journal_err_text && $journal_err_text eq $err) {
+                        $journal_err_repeats++;
+                        if ($journal_err_repeats >= 2 && ($now_e - $journal_err_logged_at) < 3600) {
+                            # suppressed: same text logged less than an hour ago
+                        } else {
+                            $log->('JOURNAL-ERROR', $err);
+                            $journal_err_logged_at = $now_e;
+                        }
                     } else {
+                        $journal_err_repeats = 0;
                         $log->('JOURNAL-ERROR', $err);
                         $journal_err_logged_at = $now_e;
                     }
-                } else {
-                    $journal_err_repeats = 0;
-                    $log->('JOURNAL-ERROR', $err);
-                    $journal_err_logged_at = $now_e;
+                    $journal_err_text = $err;
                 }
-                $journal_err_text = $err;
+            }
+
+            my $now = time;
+            if (($now - $last_gc) >= $GC_SESSIONS_INTERVAL) {
+                $last_gc = $now;
+                eval {
+                    require "$DIR/BpHook.pm" unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
+                    BpHook::gc_sessions();
+                };
             }
         }
 
-        my $now = time;
-        if (($now - $last_gc) >= $GC_SESSIONS_INTERVAL) {
-            $last_gc = $now;
-            eval {
-                require "$DIR/BpHook.pm" unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
-                BpHook::gc_sessions();
-            };
-        }
-        utime($now, $now, $pf);          # the heartbeat cheap readers rely on
+        # Shared, unchanged order: heartbeat, iteration bound, sleep -- for
+        # both an arm tick and a hold-only tick, so a hold-only refresher's
+        # pid file stays as fresh to ensure_daemon's cheap mtime check (the
+        # Stop gate's own reader, reached through converge; stop-gate.sh
+        # itself never reads lease.pid -- addendum A.3.5, reviewer NIT-1) as
+        # an armed one's.
+        my $hb_now = time;
+        utime($hb_now, $hb_now, $pf);    # the heartbeat cheap readers rely on
         $iter++;
         last if defined $opts{max_iterations} && $iter >= $opts{max_iterations};
-        sleep $tick;
+        # Package 02-plan-hold-expiry: a test seam (spec 2.3). Production never
+        # passes it, so this is CORE sleep exactly as before off a .t harness.
+        if (ref $opts{sleep} eq 'CODE') { $opts{sleep}->($tick) } else { sleep $tick }
     }
     1;
     };

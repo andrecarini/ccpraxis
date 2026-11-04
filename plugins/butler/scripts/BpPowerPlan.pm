@@ -613,6 +613,89 @@ sub set_sandbox_hold {
     return 1;
 }
 
+# sandbox_hold_files($root) -> [names], sorted. Every entry of
+# sandbox_hold_dir($root) that matches $HOLD_NAME_RE and is a regular file --
+# FRESH OR STALE, unlike sandbox_holds above. Content is never read and the
+# function never dies; [] on an undef/empty root or a missing/unopenable
+# directory, which is never created here (package 02-plan-hold-expiry spec
+# 2.1). The hold-only refresher tick is the only caller that cares about a
+# stale name, so the freshness filter that sandbox_holds applies for the plan
+# decision must not be baked into this one.
+sub sandbox_hold_files {
+    my ($root) = @_;
+    my @out;
+    return \@out unless defined $root && length $root;
+    my $d = sandbox_hold_dir($root);
+    opendir(my $dh, $d) or return \@out;
+    for my $e (readdir $dh) {
+        next unless $e =~ $HOLD_NAME_RE;
+        next unless -f "$d/$e";
+        push @out, $e;
+    }
+    closedir $dh;
+    return [ sort @out ];
+}
+
+# prune_stale_sandbox_holds($root, %o) -> { removed => [ {name,age} ... ], failed => [names] }
+#
+# Removes every hold file that is PRUNABLE at the moment of this call, re-
+# stat'd immediately before the unlink decision so a launcher that refreshes
+# the file between sandbox_hold_files' readdir and this re-stat is not
+# punished for a snapshot that is already out of date (package 02 spec 2.1,
+# edge case "rewritten during the tick"). A residual window remains between
+# the re-stat and the unlink itself: if a launcher's refresh lands exactly
+# there, its file is removed anyway, and the worst outcome is the no-hold
+# plan until that launcher's next --hold (at most 120 s), which re-creates
+# the file, reconciles, and re-ensures the refresher.
+#
+# A file is prunable when its mtime is more than $SANDBOX_HOLD_FRESH_SECONDS
+# away from now in EITHER direction (addendum A.3.2): the ordinary stale case
+# ($mt < now - FRESH), and a far-future mtime ($mt > now + FRESH), which a
+# clock jump or a corrupted stat could otherwise pin for years since a dead
+# launcher's file never self-heals. A near-future mtime (up to FRESH ahead)
+# is kept, same as sandbox_holds counts it in.
+#
+# `failed` is reported only when the unlink genuinely did not remove a file
+# that is STILL prunable afterwards (addendum A.3.1): a file that disappeared
+# on its own, or that a live launcher refreshed back to freshness between the
+# decision and this re-check, is neither removed nor failed -- it is a live
+# hold, not a stuck one. $o{unlink} is an optional seam, a CODE ref taking one
+# path and returning true/false, defaulting to CORE::unlink; production
+# callers (daemon_loop) pass no options.
+#
+# Never dies; does nothing when $root is undef/empty or the hold directory is
+# missing (and never creates it).
+sub prune_stale_sandbox_holds {
+    my ($root, %o) = @_;
+    my %out = (removed => [], failed => []);
+    return \%out unless defined $root && length $root;
+    my $d = sandbox_hold_dir($root);
+    return \%out unless -d $d;
+
+    my $unlink = (ref $o{unlink} eq 'CODE') ? $o{unlink} : sub { CORE::unlink($_[0]) };
+    my $prunable = sub {
+        my ($mt, $now) = @_;
+        return $mt < $now - $SANDBOX_HOLD_FRESH_SECONDS || $mt > $now + $SANDBOX_HOLD_FRESH_SECONDS;
+    };
+    for my $e (@{ sandbox_hold_files($root) }) {
+        my $f = "$d/$e";
+        my $mt = (stat($f))[9];
+        next unless defined $mt;              # stat failed: neither removed nor failed
+        next unless $prunable->($mt, time());  # fresh, or within FRESH either side: never touched
+
+        my $age = time() - $mt;
+        if ($unlink->($f)) {
+            push @{ $out{removed} }, { name => $e, age => $age };
+            next;                              # never also pushed to failed (B18)
+        }
+        my $mt2 = (stat($f))[9];
+        push @{ $out{failed} }, $e if defined $mt2 && $prunable->($mt2, time());
+    }
+    $out{removed} = [ sort { $a->{name} cmp $b->{name} } @{ $out{removed} } ];
+    $out{failed}  = [ sort @{ $out{failed} } ];
+    return \%out;
+}
+
 sub _prune_plan_checked {
     my ($dir) = @_;
     my $root = BpContinuityLease::store_root_for($dir);
@@ -679,6 +762,19 @@ sub cli_main {
     my %rc_opts;
     $rc_opts{why} = $opt{why} if defined $opt{why};
     my $outcome = reconcile($dir, %rc_opts);
+
+    # Package 02-plan-hold-expiry: every `--hold` call ensures a refresher
+    # exists, so a crashed launcher's hold is reconciled again without a
+    # host arm (spec 2.2). BEFORE anything is printed to STDOUT -- ensure_daemon
+    # may fork, and a forked child reopening STDOUT would flush the parent's
+    # buffered output a second time. Called by fully qualified name (never a
+    # cached coderef) so a test's `local *BpContinuityLease::ensure_daemon`
+    # stub is seen; the verdict is ignored and an exception swallowed, since
+    # neither ever changes this CLI's stdout/stderr/exit contract.
+    if (defined $opt{hold_name} && $opt{hold_on}) {
+        eval { BpContinuityLease::ensure_daemon($dir) };
+    }
+
     unless (ref $outcome eq 'HASH') {
         print STDERR "bp-power-plan: reconcile failed\n";
         return 1;
