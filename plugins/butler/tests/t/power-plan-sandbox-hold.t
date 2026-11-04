@@ -12,12 +12,18 @@
 # wake-lock tick and removes it with `--release`; reconcile counts fresh holds as arms.
 #
 # AC1  set_sandbox_hold / sandbox_holds: on, off, stale after the window, bad names refused
-# AC2  reconcile with no host arm but a fresh hold wants Continuous work; a stale one, Balanced
+# AC2  reconcile with no host arm but a fresh hold wants Continuous work; a stale one releases:
+#      with no switch record and no migration marker, Decision 9 restores Balanced once
 # AC3  the CLI's --hold / --release write and remove the hold, and reject bad usage
 # AC4  the launcher calls it on hold, release, refresh and exit
 #
 # powercfg is never run: reconcile gets an in-process `run` seam, and the CLI runs under
 # CCPRAXIS_NO_WAKELOCK, where powercfg_argv refuses.
+#
+# Decision 4 (wake-and-pause-consolidation): reconcile undoes only its own switch, so "nothing
+# held means Balanced" no longer holds; Decision 9: record-less Continuous work is restored to
+# Balanced once (package 03-plan-restores-prior). The AC2 second block below was edited to cite
+# this.
 use strict;
 use warnings;
 use Test::More;
@@ -93,6 +99,11 @@ sub setactive_to { my ($calls) = @_; my @s = grep { $_->[0] eq '/setactive' } @$
     is(setactive_to($calls), $CW, 'and the plan is switched to Continuous work');
 }
 {
+    # Decision 4 (wake-and-pause-consolidation): reconcile undoes only its own switch, so
+    # "nothing held means Balanced" no longer holds; Decision 9: record-less Continuous work is
+    # restored to Balanced once. This seam names every plan "(x)" (see run_seam above), so CW is
+    # recognised by the stored guid, which is exactly the is_cw guid clause -- with no switch
+    # record and no migration marker, this is a record-less migration, not a name/stock match.
     my (undef, $legacy, $root) = fresh_group();
     local $BpContinuityLease::PLATFORM = 'windows';
     BpPowerPlan::set_sandbox_hold($root, 'claude-acx-20f6a746', 1);
@@ -102,7 +113,8 @@ sub setactive_to { my ($calls) = @_; my @s = grep { $_->[0] eq '/setactive' } @$
     my ($run, $calls) = run_seam($CW);
     my $o = BpPowerPlan::reconcile($legacy, run => $run, why => 'manual');
     is($o->{armed}, 0, 'a stale hold does not count');
-    is(setactive_to($calls), $BAL, 'so the plan goes back to Balanced');
+    is(setactive_to($calls), $BAL,
+        'so the plan goes back to Balanced (Decision 9: no switch record, no migration marker)');
 }
 {
     my (undef, $legacy) = fresh_group();

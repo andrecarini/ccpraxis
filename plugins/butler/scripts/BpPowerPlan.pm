@@ -1,12 +1,22 @@
 package BpPowerPlan;
-# BpPowerPlan -- the Windows power plan follows arming (Decision 14).
+# BpPowerPlan -- the Windows power plan follows arming (Decision 14), and
+# (wake-and-pause-consolidation Decisions 4, 9, 15) reconcile undoes only
+# ITS OWN switch.
 # Spec: .ccpraxis-local-data/blueprints/host-wake-and-suspend/specs/06-plan-follows-arming-spec.md
+#       .ccpraxis-local-data/blueprints/wake-and-pause-consolidation/specs/03-plan-restores-prior-spec.md
 #
 # While at least one session is armed (BpContinuityLease::live_arms), the
 # plan wanted is "Continuous work" (resolved by name through the /list
 # verb, falling back to a stored GUID); otherwise it is "Balanced" (the
-# stock GUID). Every check reconciles: no record of the previous plan is
-# kept, and a manual switch gets no special case.
+# stock GUID). Decision 4: reconcile now RECORDS the plan it switches away
+# from (power-plan-switch.json in the continuity state root) and restores
+# exactly that plan once nothing holds any more -- a plan chosen by hand
+# while idle is left alone, because there is no record to restore from.
+# Decision 9: Continuous work left active by pre-03 code (no record at
+# all) is treated as reconcile's own doing and Balanced is restored once;
+# Decision 15 makes "once" mean once per machine, tracked by a migration
+# marker (power-plan-migrated.json) whose mere presence is the only thing
+# ever read from it.
 #
 # THE REAL PLAN IS NEVER TOUCHED BY A TEST. Every powercfg call goes through
 # powercfg_argv, which refuses under a .t file or CCPRAXIS_NO_WAKELOCK, and
@@ -17,6 +27,9 @@ use File::Basename qw(dirname);
 use Cwd ();
 use JSON::PP ();
 use Time::HiRes ();
+use Fcntl qw(:flock);
+use File::Path ();
+use Sys::Hostname ();
 
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
 # BpContinuityLease.pm is never checked via %INC: it is the module whose OWN
@@ -56,6 +69,151 @@ our $LIVE_ROOT;
 my $GUID_RE = qr/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/;
 
 # ---------------------------------------------------------------------------
+# state files (wake-and-pause-consolidation spec 2.1): the switch record,
+# the migration marker, and the plan lock -- all in the continuity state
+# root, never in $dir (the power journal's own home).
+# ---------------------------------------------------------------------------
+
+our $PLAN_LOCK_TIMEOUT_SECONDS = 20;
+
+# $_PLAN_LOCK_HELD -- re-entrant-within-one-process marker for the plan lock
+# (triage item 1, step-6 reviewer M1 / redteam F3). flock is per OPEN FILE
+# DESCRIPTION, so a reconcile() nested inside another reconcile() IN THE SAME
+# PROCESS -- exactly what the refresher's signal-exit restore does when a
+# TERM/INT lands mid-tick -- would open a SECOND handle on the same lock file
+# and spin out the full timeout contending with its OWN outer flock, then
+# return skipped/plan-locked and never restore anything. Cross-process
+# exclusion is already in force via the outer call's held flock, so a nested
+# call on this flag skips straight through; set via local() so it reverts the
+# instant the holding call returns, by any path (including a die).
+our $_PLAN_LOCK_HELD = 0;
+
+sub switch_record_path    { my ($root) = @_; return "$root/power-plan-switch.json" }
+sub migration_marker_path { my ($root) = @_; return "$root/power-plan-migrated.json" }
+sub plan_lock_path         { my ($root) = @_; return "$root/power-plan.lock" }
+
+# this_host() -> lc hostname, or '' if unavailable. Used only to tell a
+# record this host wrote from one a different host left behind.
+sub this_host {
+    my $h = eval { Sys::Hostname::hostname() };
+    if (defined $h && length $h) { return lc($h) }
+    my $env = $ENV{COMPUTERNAME};
+    return (defined $env && length $env) ? lc($env) : '';
+}
+
+# _atomic_write($path, $content) -> 1 | 0. Writes to "$path.tmp.$$" then
+# renames over $path; never dies, unlinks the tmp file on any failure.
+sub _atomic_write {
+    my ($path, $content) = @_;
+    return 0 unless defined $path && length $path;
+    my ($rootdir) = $path =~ m{\A(.*)/[^/]+\z};
+    if (defined $rootdir && length $rootdir && !-d $rootdir) {
+        eval { File::Path::make_path($rootdir) };
+    }
+    my $tmp = "$path.tmp.$$";
+    my $ok = eval {
+        open(my $fh, '>', $tmp) or die "open $tmp: $!";
+        print {$fh} $content or die "print $tmp: $!";
+        close($fh) or die "close $tmp: $!";
+        rename($tmp, $path) or die "rename $tmp -> $path: $!";
+        1;
+    };
+    unless ($ok) {
+        unlink $tmp;
+        return 0;
+    }
+    return 1;
+}
+
+# read_switch_record($root) -> {guid, name, written_at, host} | undef.
+# undef means "treat as absent": missing/unreadable, not a JSON object,
+# v != 1, a malformed guid, or a record a DIFFERENT host wrote (foreign).
+# Never deletes an invalid/foreign file -- only an H4 write replaces it.
+sub read_switch_record {
+    my ($root) = @_;
+    return undef unless defined $root && length $root;
+    my $path = switch_record_path($root);
+    return undef unless -f $path;
+    my $raw = do {
+        open(my $fh, '<:raw', $path) or return undef;
+        local $/;
+        my $c = <$fh>;
+        close $fh;
+        $c;
+    };
+    return undef unless defined $raw && length $raw;
+    my $d = eval { JSON::PP->new->utf8->decode($raw) };
+    return undef unless ref $d eq 'HASH';
+    return undef unless defined $d->{v} && $d->{v} eq '1';
+    return undef unless defined $d->{guid} && !ref $d->{guid} && $d->{guid} =~ /\A$GUID_RE\z/;
+    my $host = (defined $d->{host} && !ref $d->{host}) ? $d->{host} : '';
+    my $this = this_host();
+    return undef if length $host && length $this && lc($host) ne lc($this);
+    my $name = (defined $d->{name} && !ref $d->{name}) ? $d->{name} : '';
+    return {
+        guid => lc($d->{guid}), name => $name,
+        written_at => $d->{written_at}, host => $host,
+    };
+}
+
+# write_switch_record($root, $guid, $name) -> 1 | 0 (atomic).
+sub write_switch_record {
+    my ($root, $guid, $name) = @_;
+    return 0 unless defined $root && length $root && defined $guid && length $guid;
+    my %rec = (
+        guid => lc($guid), host => this_host(),
+        name => defined $name ? $name : '', v => 1, written_at => time(),
+    );
+    my $json = JSON::PP->new->utf8->canonical->encode(\%rec) . "\n";
+    return _atomic_write(switch_record_path($root), $json);
+}
+
+# remove_switch_record($root) -> 1 if the file is absent afterwards, else 0.
+sub remove_switch_record {
+    my ($root) = @_;
+    return 0 unless defined $root && length $root;
+    my $path = switch_record_path($root);
+    unlink $path;
+    return -e $path ? 0 : 1;
+}
+
+# write_migration_marker($root, $why) -> 1 | 0 (atomic; a no-op success if
+# the marker already exists -- presence alone is ever read, Decision 15).
+sub write_migration_marker {
+    my ($root, $why) = @_;
+    return 0 unless defined $root && length $root;
+    my $path = migration_marker_path($root);
+    return 1 if -e $path;
+    my %rec = (
+        host => this_host(), v => 1,
+        why => (defined $why ? $why : 'switch'), written_at => time(),
+    );
+    my $json = JSON::PP->new->utf8->canonical->encode(\%rec) . "\n";
+    return _atomic_write($path, $json);
+}
+
+# _norm_str($s) -> lc, trimmed | undef.
+sub _norm_str {
+    my ($s) = @_;
+    return undef unless defined $s;
+    my $t = lc($s);
+    $t =~ s/\A\s+//; $t =~ s/\s+\z//;
+    return $t;
+}
+
+# _is_cw($active, $active_name, $cw_guid, $cw_name) -> bool. Spec 2.3: by
+# guid, or by name (case/whitespace-insensitive). Used only in the unheld
+# rows; the held rows keep today's S-set (list membership) unchanged.
+sub _is_cw {
+    my ($active, $active_name, $cw_guid, $cw_name) = @_;
+    return 0 unless defined $active;
+    return 1 if lc($active) eq lc($cw_guid);
+    my $an = _norm_str($active_name);
+    my $cn = _norm_str($cw_name);
+    return (defined $an && defined $cn && $an eq $cn) ? 1 : 0;
+}
+
+# ---------------------------------------------------------------------------
 # pure parsers (spec 2.1)
 # ---------------------------------------------------------------------------
 
@@ -85,43 +243,102 @@ sub parse_active {
     return @$list ? $list->[0] : undef;
 }
 
-# decide(%in) -> \%d (spec 2.1's table).
+# decide(%in) -> \%d (spec 2.3's table: H1-H5 held, U1-U8 unheld). Pure --
+# never touches a file or runs powercfg. Every return carries action,
+# wanted_guid, wanted_name, wanted_basis, error, record_op, marker_op.
 sub decide {
     my (%in) = @_;
     my $armed = $in{armed};
     $armed = 0 unless defined $armed && $armed =~ /\A\d+\z/;
     my $active = defined $in{active} ? lc($in{active}) : undef;
+    my $active_name = $in{active_name};
     my $cw_name = defined $in{cw_name} ? $in{cw_name} : $CONTINUOUS_WORK_NAME;
     my $cw_guid = lc(defined $in{cw_guid} ? $in{cw_guid} : $CONTINUOUS_WORK_GUID);
     my $balanced_guid = lc(defined $in{balanced_guid} ? $in{balanced_guid} : $BALANCED_GUID);
+    my $migrated = $in{migrated} ? 1 : 0;
+    my $record = (ref $in{record} eq 'HASH') ? $in{record} : undef;
 
     if ($armed == 0) {
-        my $action = (defined $active && $active eq $balanced_guid) ? 'none' : 'set';
+        if (defined $record) {
+            my $rguid = lc($record->{guid});
+            my $rname = (defined $record->{name} && length $record->{name}) ? $record->{name} : 'unknown';
+            if (defined $active && $active eq $rguid) {
+                # U1
+                return {
+                    action => 'none', wanted_guid => $rguid, wanted_name => $rname,
+                    wanted_basis => 'record', error => '', record_op => 'remove', marker_op => 'none',
+                };
+            }
+            unless (_is_cw($active, $active_name, $cw_guid, $cw_name)) {
+                # U2
+                return {
+                    action => 'none', wanted_guid => $active, wanted_name => (defined $active_name ? $active_name : 'unknown'),
+                    wanted_basis => 'record-superseded', error => '', record_op => 'remove', marker_op => 'none',
+                };
+            }
+            my $list = $in{list};
+            unless (ref $list eq 'ARRAY' && @$list) {
+                # U3
+                return {
+                    action => 'error', wanted_guid => 'none', wanted_name => 'none',
+                    wanted_basis => 'none', error => 'list-failed', record_op => 'none', marker_op => 'none',
+                };
+            }
+            my $found = grep { ref $_ eq 'HASH' && defined $_->{guid} && lc($_->{guid}) eq $rguid } @$list;
+            if ($found) {
+                # U4
+                return {
+                    action => 'set', wanted_guid => $rguid, wanted_name => $rname,
+                    wanted_basis => 'record', error => '', record_op => 'remove', marker_op => 'none',
+                };
+            }
+            # U5
+            return {
+                action => 'set', wanted_guid => $balanced_guid, wanted_name => 'Balanced',
+                wanted_basis => 'record-missing', error => '', record_op => 'remove', marker_op => 'none',
+            };
+        }
+        # record undef
+        unless (_is_cw($active, $active_name, $cw_guid, $cw_name)) {
+            # U6
+            return {
+                action => 'none', wanted_guid => $active, wanted_name => (defined $active_name ? $active_name : 'unknown'),
+                wanted_basis => 'left', error => '', record_op => 'none', marker_op => 'none',
+            };
+        }
+        if ($migrated) {
+            # U7
+            return {
+                action => 'none', wanted_guid => $active, wanted_name => (defined $active_name ? $active_name : 'unknown'),
+                wanted_basis => 'left', error => '', record_op => 'none', marker_op => 'none',
+            };
+        }
+        # U8
         return {
-            action => $action, wanted_guid => $balanced_guid,
-            wanted_name => 'Balanced', wanted_basis => 'stock', error => '',
+            action => 'set', wanted_guid => $balanced_guid, wanted_name => 'Balanced',
+            wanted_basis => 'migration', error => '', record_op => 'none', marker_op => 'write',
         };
     }
 
+    # Held (H1-H5): today's S-set logic, unchanged, plus record/marker columns.
     my $list = $in{list};
     unless (ref $list eq 'ARRAY') {
+        # H1
         return {
             action => 'error', wanted_guid => 'none', wanted_name => 'none',
-            wanted_basis => 'none', error => 'list-failed',
+            wanted_basis => 'none', error => 'list-failed', record_op => 'none', marker_op => 'none',
         };
     }
 
-    my $cw_name_norm = lc($cw_name);
-    $cw_name_norm =~ s/\A\s+//; $cw_name_norm =~ s/\s+\z//;
+    my $cw_name_norm = _norm_str($cw_name);
 
     my (@S, %seen);
     for my $e (@$list) {
         next unless ref $e eq 'HASH';
         my $nm = $e->{name};
         next unless defined $nm;
-        my $t = lc($nm);
-        $t =~ s/\A\s+//; $t =~ s/\s+\z//;
-        next unless $t eq $cw_name_norm;
+        my $t = _norm_str($nm);
+        next unless defined $t && $t eq $cw_name_norm;
         next unless defined $e->{guid};
         my $g = lc($e->{guid});
         next if $seen{$g}++;
@@ -134,23 +351,40 @@ sub decide {
         if ($found) { @S = ($cw_guid); $basis = 'stored-guid' }
     }
     if (!@S) {
+        # H2
         return {
             action => 'error', wanted_guid => 'none', wanted_name => 'none',
-            wanted_basis => 'none', error => 'continuous-work-missing',
+            wanted_basis => 'none', error => 'continuous-work-missing', record_op => 'none', marker_op => 'none',
         };
     }
 
     my %inS = map { $_ => 1 } @S;
     if (defined $active && $inS{$active}) {
+        # H3
         return {
-            action => 'none', wanted_guid => $active,
-            wanted_name => $cw_name, wanted_basis => $basis, error => '',
+            action => 'none', wanted_guid => $active, wanted_name => $cw_name,
+            wanted_basis => $basis, error => '', record_op => 'none', marker_op => 'none',
         };
     }
     my $wanted_guid = $inS{$cw_guid} ? $cw_guid : $S[0];
+    if (defined $record) {
+        # H5 -- a record already exists; keep it as-is, re-ensure the marker.
+        return {
+            action => 'set', wanted_guid => $wanted_guid, wanted_name => $cw_name,
+            wanted_basis => $basis, error => '', record_op => 'none', marker_op => 'write',
+        };
+    }
+    # H4 -- this is reconcile's own first switch away from $active: record it
+    # to restore later -- UNLESS $active IS Continuous work itself, by the
+    # stored guid or by name, under a rename/duplicate that keeps it out of
+    # the name-matched S-set (triage item 3, step-6 reviewer m1). Recording
+    # CW as "the plan to restore" would pin the machine on CW forever once
+    # released, exactly the failure Decision 4 exists to prevent.
+    my $active_is_cw_itself = _is_cw($active, $active_name, $cw_guid, $cw_name);
     return {
-        action => 'set', wanted_guid => $wanted_guid,
-        wanted_name => $cw_name, wanted_basis => $basis, error => '',
+        action => 'set', wanted_guid => $wanted_guid, wanted_name => $cw_name,
+        wanted_basis => $basis, error => '',
+        record_op => ($active_is_cw_itself ? 'none' : 'write'), marker_op => 'write',
     };
 }
 
@@ -327,11 +561,21 @@ sub _detail_for {
     return '';
 }
 
-sub _ascii_sanitize {
+# _decode_once($s) -> $s, decoded from UTF-8 bytes into Perl's internal
+# Unicode representation if it is not already (same idiom as
+# BpPowerJournal::_decode_once / BpHook's _decode_maybe): a byte string read
+# from OUTSIDE this process -- here, powercfg's /getactivescheme output --
+# is decoded EXACTLY ONCE before it can ever reach a ->utf8 JSON encoder.
+# Triage item 6 (step-6 redteam F8): a non-ASCII plan name must round-trip
+# byte-exact through the switch record and the journal, not be replaced
+# byte-by-byte with '?' (the previous _ascii_sanitize). A string that is not
+# valid UTF-8, or already carries the utf8 flag, is left alone untouched.
+sub _decode_once {
     my ($s) = @_;
     return $s unless defined $s;
-    $s =~ s/[^\x20-\x7e]/?/g;
-    return $s;
+    return $s if utf8::is_utf8($s);
+    my $copy = $s;
+    return utf8::decode($copy) ? $copy : $s;
 }
 
 # ---------------------------------------------------------------------------
@@ -425,6 +669,50 @@ sub reconcile {
             journaled => $journaled, ms => $ms->(),
         );
     }
+    # Lock (spec 2.4 step 1): serialises the refresher hold tick against a
+    # launcher's --hold/--release CLI call, or continuity off against the
+    # refresher's own exit step, so an unheld restore can never remove the
+    # record out from under a concurrent held reconcile relying on it (H5).
+    # A lexical handle: it stays open (and the flock held) until reconcile
+    # returns by any path, including a die propagating from the run seam.
+    eval { File::Path::make_path($root) } unless -d $root;
+    my $lock_timeout = defined $o{lock_timeout} ? $o{lock_timeout} : $PLAN_LOCK_TIMEOUT_SECONDS;
+    my $lockfh;
+    if ($_PLAN_LOCK_HELD) {
+        # Triage item 1: this process already holds the lock (we are a
+        # reconcile nested inside another reconcile's run seam). Skip
+        # straight through -- see $_PLAN_LOCK_HELD's own comment.
+    } elsif (open($lockfh, '>>', plan_lock_path($root))) {
+        my $locked = 0;
+        my $deadline = Time::HiRes::time() + $lock_timeout;
+        until ($locked) {
+            $locked = 1, last if flock($lockfh, LOCK_EX | LOCK_NB);
+            last if Time::HiRes::time() >= $deadline;
+            Time::HiRes::sleep(0.1);
+        }
+        unless ($locked) {
+            # Triage item 5 (step-6 reviewer m3, fixed in BpPowerPlan's OWN
+            # journal rather than BpContinuityLease.pm's PLAN log, which is
+            # outside this package's write set): a genuinely-contended skip
+            # is now journaled, so it can be told apart from "nothing to
+            # do" -- superseding spec 2.4 step 1's "writes no journal" for
+            # this one case.
+            my $journaled = _write_plan_record(
+                dir => $dir, why => $why, armed => 0, arm_ids => [],
+                found_guid => 'unknown', found_name => 'unknown',
+                wanted_guid => 'none', wanted_name => 'none', wanted_basis => 'none',
+                action => 'none', result => 'error', error => 'plan-locked',
+                detail => '', rc => undef, ms => $ms->(),
+            );
+            return _outcome(outcome => 'skipped', reason => 'plan-locked', journaled => $journaled, ms => $ms->());
+        }
+    }
+    # If the open itself failed, proceed WITHOUT the lock (degraded case; no
+    # outcome changes) -- an ACL problem on the lock file must not block
+    # reconcile from doing its job.
+    local $_PLAN_LOCK_HELD = 1; # held for the rest of THIS call (including any
+        # nested reconcile() invoked from inside the run seam below).
+
     my $arms = BpContinuityLease::live_arms($root);
     $arms = [] unless ref $arms eq 'ARRAY';
     # A sandboxed run arms INSIDE its container, which this host never reads; what
@@ -442,7 +730,7 @@ sub reconcile {
         my $parsed = parse_active($r1->{out});
         if (ref $parsed eq 'HASH' && defined $parsed->{guid}) {
             $found_guid = lc($parsed->{guid});
-            $found_name = _ascii_sanitize($parsed->{name});
+            $found_name = _decode_once($parsed->{name});
         } else {
             $detail1 = 'unparseable';
         }
@@ -465,8 +753,23 @@ sub reconcile {
         );
     }
 
+    # Step 4: the switch record and migration marker -- read once, read-only
+    # until decide() tells us what (if anything) to do with them.
+    my $record = read_switch_record($root);
+    my $migrated = -e migration_marker_path($root) ? 1 : 0;
+
+    # Step 5: /list is run when armed (unchanged), OR when unheld with a
+    # record naming a plan other than the one active, AND that active plan
+    # is Continuous work (U3/U4/U5 need the list; U1/U2/U6/U7/U8 never do).
+    my $need_list = $armed > 0;
+    if (!$need_list && defined $record) {
+        my $rguid = lc($record->{guid});
+        $need_list = 1 if $found_guid ne $rguid
+            && _is_cw($found_guid, $found_name, $CONTINUOUS_WORK_GUID, $CONTINUOUS_WORK_NAME);
+    }
+
     my $list;
-    if ($armed > 0) {
+    if ($need_list) {
         my $r2 = run_powercfg(['/list'], %o);
         my $detail2 = _detail_for($r2);
         if (length $detail2) {
@@ -487,9 +790,30 @@ sub reconcile {
         }
         $last_rc = $r2->{rc};
         $list = parse_list($r2->{out});
+        if ($armed == 0 && !@$list) {
+            # spec 2.4 step 5: unheld, /list ok but unparseable -- same
+            # error path, record and marker untouched.
+            my $journaled = _write_plan_record(
+                dir => $dir, why => $why, armed => $armed, arm_ids => $arm_ids,
+                found_guid => $found_guid, found_name => $found_name,
+                wanted_guid => 'none', wanted_name => 'none', wanted_basis => 'none',
+                action => 'none', result => 'error', error => 'list-failed',
+                detail => 'unparseable', rc => $last_rc, ms => $ms->(),
+            );
+            return _outcome(
+                outcome => 'error', reason => 'list-failed', detail => 'unparseable',
+                armed => $armed, arm_ids => $arm_ids,
+                found_guid => $found_guid, found_name => $found_name,
+                wanted_guid => 'none', wanted_name => 'none', wanted_basis => 'none',
+                rc => $last_rc, journaled => $journaled, ms => $ms->(),
+            );
+        }
     }
 
-    my $d = decide(armed => $armed, active => $found_guid, list => $list);
+    my $d = decide(
+        armed => $armed, active => $found_guid, active_name => $found_name,
+        list => $list, record => $record, migrated => $migrated,
+    );
 
     if ($d->{action} eq 'error') {
         my $journaled = _write_plan_record(
@@ -510,7 +834,18 @@ sub reconcile {
 
     if ($d->{action} eq 'none') {
         my $journaled = 0;
-        if ($o{journal_noop}) {
+        if ($d->{record_op} eq 'remove') {
+            my $removed = remove_switch_record($root);
+            $journaled = _write_plan_record(
+                dir => $dir, why => $why, armed => $armed, arm_ids => $arm_ids,
+                found_guid => $found_guid, found_name => $found_name,
+                wanted_guid => $d->{wanted_guid}, wanted_name => $d->{wanted_name},
+                wanted_basis => $d->{wanted_basis},
+                action => 'none', result => 'ok', error => '',
+                detail => ($removed ? '' : 'record-remove-failed'),
+                rc => $last_rc, ms => $ms->(),
+            );
+        } elsif ($o{journal_noop}) {
             $journaled = _write_plan_record(
                 dir => $dir, why => $why, armed => $armed, arm_ids => $arm_ids,
                 found_guid => $found_guid, found_name => $found_name,
@@ -529,14 +864,35 @@ sub reconcile {
     }
 
     # action eq 'set'
+    my @detail_bits;
+    if ($d->{record_op} eq 'write') {
+        # The switch still happens even if this write fails -- keeping the
+        # machine awake wins; the failure is only journaled (spec 2.4 step 9.1).
+        push @detail_bits, 'record-write-failed' unless write_switch_record($root, $found_guid, $found_name);
+    }
     my $r3 = run_powercfg(['/setactive', $d->{wanted_guid}], %o);
     my $ok3 = (defined $r3->{status} && $r3->{status} eq 'ok' && defined $r3->{rc} && $r3->{rc} == 0);
     if ($ok3) {
+        if ($d->{record_op} eq 'remove') {
+            push @detail_bits, 'record-remove-failed' unless remove_switch_record($root);
+        }
+        # Triage item 2 (step-6 redteam F1, overriding spec section 5's
+        # acceptance that a record-write failure is "rare" and tolerable for
+        # the whole root -- the triage narrows it to this one file): the
+        # marker is written only when the switch record write (if any was
+        # due) actually succeeded. Writing it anyway would leave Continuous
+        # work pinned forever once the record is unreadable -- without the
+        # marker, the Decision 9 migration restore still fires on the next
+        # unheld reconcile.
+        if ($d->{marker_op} eq 'write' && !grep { $_ eq 'record-write-failed' } @detail_bits) {
+            my $marker_why = ($d->{wanted_basis} eq 'migration') ? 'migration' : 'switch';
+            push @detail_bits, 'marker-write-failed' unless write_migration_marker($root, $marker_why);
+        }
         my $journaled = _write_plan_record(
             dir => $dir, why => $why, armed => $armed, arm_ids => $arm_ids,
             found_guid => $found_guid, found_name => $found_name,
             wanted_guid => $d->{wanted_guid}, wanted_name => $d->{wanted_name}, wanted_basis => $d->{wanted_basis},
-            action => 'set', result => 'ok', error => '', detail => '',
+            action => 'set', result => 'ok', error => '', detail => join(',', @detail_bits),
             rc => $r3->{rc}, ms => $ms->(),
         );
         return _outcome(
@@ -546,13 +902,21 @@ sub reconcile {
             rc => $r3->{rc}, journaled => $journaled, ms => $ms->(),
         );
     }
+    # /setactive failed: no record removal and no marker write. A record
+    # written just above (record_op eq 'write') stays -- the next healthy
+    # reconcile performs the restore/migration (spec 2.4 step 9.4).
     my $detail3 = _detail_for($r3);
+    # Triage item 4 (step-6 reviewer m2): keep record-write-failed in the
+    # journaled detail even when /setactive ALSO failed -- previously only
+    # $detail3 was kept, silently dropping the diagnostic in exactly the
+    # degraded case it was added for.
+    my $detail_final = join(',', grep { length } ($detail3, @detail_bits));
     my $journaled = _write_plan_record(
         dir => $dir, why => $why, armed => $armed, arm_ids => $arm_ids,
         found_guid => $found_guid, found_name => $found_name,
         wanted_guid => $d->{wanted_guid}, wanted_name => $d->{wanted_name}, wanted_basis => $d->{wanted_basis},
         action => 'set', result => 'error', error => 'setactive-failed',
-        detail => $detail3, rc => $r3->{rc}, ms => $ms->(),
+        detail => $detail_final, rc => $r3->{rc}, ms => $ms->(),
     );
     return _outcome(
         outcome => 'error', reason => 'setactive-failed', detail => $detail3,

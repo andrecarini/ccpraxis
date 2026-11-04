@@ -1190,6 +1190,11 @@ sub _summary_for {
         my $found  = defined $e->{found_guid} ? $e->{found_guid} : '';
         my $wanted = defined $e->{wanted_guid} ? $e->{wanted_guid} : '';
         my $s = "why=$why action=$action result=$result found=$found wanted=$wanted";
+        # Package 03 (wake-and-pause-consolidation): a restore or migration
+        # carries wanted_basis (record|record-missing|migration); surface it
+        # right after wanted= so a read of the text report shows WHY the
+        # plan was chosen, not just what it was.
+        $s .= " basis=$e->{wanted_basis}" if defined $e->{wanted_basis} && length $e->{wanted_basis};
         if ($result eq 'error') {
             my $err    = defined $e->{error}  ? $e->{error}  : '';
             my $detail = defined $e->{detail} ? $e->{detail} : '';

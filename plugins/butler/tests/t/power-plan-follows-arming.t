@@ -27,6 +27,12 @@
 # The last-resort guard (powercfg_argv's own $0=~/\.t\z/ and
 # CCPRAXIS_NO_WAKELOCK refusals) is exercised directly by AC-10 and never
 # defeated elsewhere in this file.
+#
+# Decision 4 (wake-and-pause-consolidation): reconcile undoes only its own switch, so "nothing held
+# means Balanced" no longer holds; Decision 9: record-less Continuous work is restored to Balanced
+# once. This supersedes host-wake-and-suspend Decision 14's no-record rule for the unarmed side
+# (package 03-plan-restores-prior); the AC-3, AC-4b and AC6-decide() assertions below were edited
+# to match.
 use strict;
 use warnings;
 use Test::More;
@@ -277,9 +283,11 @@ ok(1, "sanity: harness loaded" . ($MODULE_LOAD_ERROR ? " (BpPowerPlan.pm not yet
 }
 
 # ===========================================================================
-# AC-3 (DC3) -- nothing armed, active cw: the refresher's final (IDLE) pass
-# sets Balanced; /list is never called; record has why:refresher-exit,
-# wanted_basis:stock, armed:0.
+# AC-3 (DC3) -- nothing armed, active CW, no switch record, no migration
+# marker: the refresher's final (IDLE) pass sets Balanced via Decision 9's
+# one-time migration (wake-and-pause-consolidation 03); /list is never
+# called; record has why:refresher-exit, wanted_basis:migration, armed:0,
+# and the migration marker is written.
 # ===========================================================================
 {
     my ($home, $legacy) = fresh_group();
@@ -303,20 +311,23 @@ ok(1, "sanity: harness loaded" . ($MODULE_LOAD_ERROR ? " (BpPowerPlan.pm not yet
     is(scalar(@list_calls), 0, 'AC3: /list is never called when nothing is armed');
     my @setactive_calls = grep { $_->[0] eq '/setactive' } @$calls;
     is(scalar(@setactive_calls), 1, 'AC3: exactly one /setactive call') or diag(explain_undef());
-    is($setactive_calls[0][1], $BAL_GUID, 'AC3: /setactive is called with the Balanced (stock) guid') if @setactive_calls;
+    is($setactive_calls[0][1], $BAL_GUID, 'AC3: /setactive is called with the Balanced guid') if @setactive_calls;
 
     my @recs = plan_records($legacy);
     is(scalar(@recs), 1, 'AC3: exactly one kind:plan journal record');
     if (@recs) {
         is($recs[0]{why}, 'refresher-exit', 'AC3: why is refresher-exit');
-        is($recs[0]{wanted_basis}, 'stock', 'AC3: wanted_basis is stock');
+        is($recs[0]{wanted_basis}, 'migration', 'AC3: wanted_basis is migration (Decision 9)');
         is($recs[0]{armed}, 0, 'AC3: armed count is 0');
     }
+    my $marker_path = PP('migration_marker_path', BpContinuityLease::store_root_for($legacy));
+    ok(defined $marker_path && -e $marker_path,
+        'AC3: the migration marker exists after this one-time migration (Decision 9)') or diag(explain_undef());
 }
 
 # ===========================================================================
-# AC-4 (DC4) -- a manual switch is corrected on the next check, both while
-# armed (-> cw) and while unarmed (-> Balanced). One record each.
+# AC-4 (DC4) -- a manual switch is corrected on the next check while armed
+# (-> cw). One record.
 # ===========================================================================
 {
     my ($home, $legacy) = fresh_group();
@@ -344,6 +355,10 @@ ok(1, "sanity: harness loaded" . ($MODULE_LOAD_ERROR ? " (BpPowerPlan.pm not yet
     is(scalar(@recs), 1, 'AC4a: one plan record written for the armed manual switch') or diag(explain_undef());
 }
 {
+    # Decision 4 (wake-and-pause-consolidation): reconcile undoes only its own switch, so "nothing
+    # held means Balanced" no longer holds; Decision 9: record-less Continuous work is restored to
+    # Balanced once. Unarmed on a THIRD plan (never Balanced, never CW) with no switch record is
+    # now left alone -- it was never reconcile's own switch to undo.
     my ($home, $legacy) = fresh_group();
     local $BpContinuityLease::PLATFORM = 'windows';
     # nothing armed
@@ -356,13 +371,15 @@ ok(1, "sanity: harness loaded" . ($MODULE_LOAD_ERROR ? " (BpPowerPlan.pm not yet
     my $outcome = PP('reconcile', $legacy, run => $run, why => 'manual');
     SKIP: {
         skip 'AC4b: reconcile not implemented yet', 3 unless ref $outcome eq 'HASH';
-        is($outcome->{outcome}, 'corrected', 'AC4b: unarmed manual switch is corrected');
+        is($outcome->{outcome}, 'correct', 'AC4b: unarmed, no record, third plan: left alone (Decision 4)');
         my @sc = grep { $_->[0] eq '/setactive' } @$calls;
-        is(scalar(@sc), 1, 'AC4b: exactly one /setactive call');
-        is($sc[0][1], $BAL_GUID, 'AC4b: /setactive targets Balanced while unarmed') if @sc;
+        is(scalar(@sc), 0, 'AC4b: zero /setactive calls');
+        my @lc = grep { $_->[0] eq '/list' } @$calls;
+        is(scalar(@lc), 0, 'AC4b: zero /list calls');
     }
     my @recs = plan_records($legacy);
-    is(scalar(@recs), 1, 'AC4b: one plan record written for the unarmed manual switch') or diag(explain_undef());
+    is(scalar(@recs), 0, 'AC4b: zero plan records written for the unarmed, record-less third plan')
+        or diag(explain_undef());
 }
 
 # ===========================================================================
@@ -567,15 +584,27 @@ subtest 'AC6: parse_active / parse_list' => sub {
 
 subtest 'AC6: decide() branches (spec 2.1)' => sub {
     my $d;
+    # Decision 4/9 (wake-and-pause-consolidation 03): with no switch record and no migration
+    # marker, record-less Continuous work is restored to Balanced once (basis migration, not
+    # stock), and the migration marker is written.
     $d = PP('decide', armed => 0, active => $CW_GUID_STORED);
     SKIP: {
-        skip 'decide not implemented yet', 2 unless ref $d eq 'HASH';
-        is($d->{action}, 'set', 'decide: N=0, active != balanced -> set');
-        is($d->{wanted_basis}, 'stock', 'decide: N=0 basis is stock');
+        skip 'decide not implemented yet', 4 unless ref $d eq 'HASH';
+        is($d->{action}, 'set', 'decide: N=0, active != balanced, no record, no marker -> set');
+        is($d->{wanted_basis}, 'migration', 'decide: N=0 basis is migration (Decision 9)');
+        is($d->{wanted_guid}, $BAL_GUID, 'decide: N=0 migration wants Balanced');
+        is($d->{marker_op}, 'write', 'decide: N=0 migration writes the marker');
     }
+    # Decision 15: once the marker is present, a hand-picked CW is left alone -- no further
+    # migration.
+    $d = PP('decide', armed => 0, active => $CW_GUID_STORED, migrated => 1);
+    SKIP: { skip 'decide not implemented yet', 2 unless ref $d eq 'HASH';
+        is($d->{action}, 'none', 'decide: N=0, active=cw, migrated=1 -> none (Decision 15)');
+        is($d->{wanted_basis}, 'left', 'decide: N=0, migrated=1 basis is left'); }
     $d = PP('decide', armed => 0, active => $BAL_GUID);
-    SKIP: { skip 'decide not implemented yet', 1 unless ref $d eq 'HASH';
-        is($d->{action}, 'none', 'decide: N=0, active == balanced -> none'); }
+    SKIP: { skip 'decide not implemented yet', 2 unless ref $d eq 'HASH';
+        is($d->{action}, 'none', 'decide: N=0, active == balanced -> none');
+        is($d->{wanted_basis}, 'left', 'decide: N=0, active == balanced -> basis left'); }
 
     $d = PP('decide', armed => 1, active => $BAL_GUID, list => undef);
     SKIP: { skip 'decide not implemented yet', 2 unless ref $d eq 'HASH';

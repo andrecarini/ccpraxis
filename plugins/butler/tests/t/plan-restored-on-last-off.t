@@ -15,6 +15,12 @@
 # (reconcile's/daemon_loop's plan_opts.run), and $ENV{CCPRAXIS_POWERCFG} (an
 # absolute path to a small fixture script) for the subprocess (`off`) tests.
 # AC16 below re-exercises the last-resort guard directly.
+#
+# Decision 4 (wake-and-pause-consolidation): reconcile undoes only its own switch, so "nothing held
+# means Balanced" no longer holds; Decision 9: record-less Continuous work is restored to Balanced
+# once (package 03-plan-restores-prior). The seams below report CW throughout with no switch
+# record ever written, so the AC3/AC11 restores to Balanced go through Decision 9's migration, not
+# the old "stock" rule; AC15 additionally checks that a failed migration writes no marker.
 use strict;
 use warnings;
 use Test::More;
@@ -333,6 +339,10 @@ ok(1, "sanity: harness loaded" . ($MODULE_LOAD_ERROR ? " (BpPowerPlan.pm failed 
         is($recs[0]{action}, 'set', 'AC3: action is set');
         is($recs[0]{wanted_guid}, $BAL_GUID, 'AC3: wanted_guid is Balanced');
         is($recs[0]{armed}, 0, 'AC3: armed is 0 (the arm was removed before TERM)');
+        # Decision 4/9 (wake-and-pause-consolidation 03): no switch record is ever written here
+        # (the seam reports CW throughout), so Balanced is reached through Decision 9's one-time
+        # migration, not the old "nothing held means Balanced" rule.
+        is($recs[0]{wanted_basis}, 'migration', 'AC3: wanted_basis is migration (Decision 9)');
     }
     my @sc = grep { $_->[0] eq '/setactive' } read_call_log($call_log);
     is(scalar(@sc), 1, 'AC3: exactly one /setactive call recorded by the forked child\'s seam')
@@ -831,7 +841,19 @@ sub off_env {
         is($recs[0]{why}, 'continuity-off', 'AC11: why is continuity-off');
         is($recs[0]{action}, 'set', 'AC11: action is set');
         is($recs[0]{armed}, 0, 'AC11: armed is 0');
+        # Decision 4/9 (wake-and-pause-consolidation 03): same reasoning as AC3 -- no switch
+        # record is ever written here, so Balanced is reached through Decision 9's migration.
+        is($recs[0]{wanted_basis}, 'migration', 'AC11: wanted_basis is migration (Decision 9)');
     }
+    # m5: a positive check that the migration marker IS written after a
+    # successful migration, so the path AC15's negative check relies on is
+    # proven to be the right one (the test-writer's own caveat at step 3:
+    # "cannot fail today" for a wrong path, since AC15 only asserted absence).
+    local $BpContinuityLease::STATE_ROOT = BpHook::state_dir();
+    my $root = BpContinuityLease::store_root_for($fx->{legacy});
+    my $marker_path = PP('migration_marker_path', $root);
+    ok((defined $marker_path && -e $marker_path),
+        'AC11: the migration marker DOES exist after a successful migration (m5)') or diag(explain_undef());
 }
 {
     # AC12 -- plan already Balanced: one noop record, no /setactive.
@@ -944,6 +966,12 @@ sub off_env {
         is($recs[0]{result}, 'error', 'AC15: result is error');
         is($recs[0]{error}, 'setactive-failed', 'AC15: error is setactive-failed');
     }
+    # Decision 4/9 (wake-and-pause-consolidation 03): a failed migration writes no marker.
+    local $BpContinuityLease::STATE_ROOT = BpHook::state_dir();
+    my $root = BpContinuityLease::store_root_for($fx->{legacy});
+    my $marker_path = PP('migration_marker_path', $root);
+    ok(!(defined $marker_path && -e $marker_path), 'AC15: no migration marker after a failed migration')
+        or diag(explain_undef());
 }
 
 # ===========================================================================
