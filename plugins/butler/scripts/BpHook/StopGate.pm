@@ -38,10 +38,20 @@ eval {
     require "$SELF_DIR/../BpContinuityLease.pm"
         unless grep { m{(?:^|/)BpContinuityLease\.pm$} } keys %INC;
 };
+# 06-far-pause-session-handoff: far_paused_fleets' only question to
+# BpAwakeIntent. A load failure disables far-pause detection -- G11 falls
+# back to the RUNNING text, never to a denial of its own.
+eval { require "$SELF_DIR/../BpAwakeIntent.pm" unless defined &BpAwakeIntent::want_awake; };
 
 # Break-glass constants (see the BREAK GLASS section below run()).
 our $REFUSAL_CAP         = 5;    # consecutive refusals, nothing succeeding, before the gate yields
 our $BREAK_GLASS_HINT_AT = 2;    # refusals in a row before the Write-tool escape is offered
+
+# Addendum A (06-far-pause-session-handoff, step 7): the far-pause offer
+# record's own constants, `our` so a test reads them instead of hard-coding.
+our $FAR_OFFER_TTL          = 1800;          # seconds an offer record stays valid (A.2.1)
+our $FAR_RELAUNCH_MAX_AHEAD = 366 * 86400;   # sanity cap on relaunch_at - now
+our $FAR_REASON_MAX_BYTES   = 200;           # butler-continuity off's --reason cap
 
 my %BREAK_GLASS_ACTION = (off => 1);
 my %SHELL_TOOL         = (Bash => 1, PowerShell => 1);
@@ -120,6 +130,14 @@ sub run {
     # (harmless: nothing reads it to decide a stop), never a
     # changed verdict.
     eval { BpHook::clear_running_snapshot($sid) };
+
+    # Addendum A (06-far-pause-session-handoff, step 7): every armed
+    # interactive Stop also sweeps this session's own far-pause offer record
+    # (a new far branch below writes a fresh one after this point) and any
+    # other session's expired one, immediately after the running-work
+    # snapshot is cleared and before G8 decides the stop. Best-effort: never
+    # changes the verdict.
+    eval { _clear_far_offers($sid, $p, time()) };
 
     # G8: a live own holder allows.
     if (BpHook::holder_live($sid, $p)) {
@@ -206,6 +224,46 @@ sub run {
         my @ids  = map { $_->{id} } @work;
         my @shown = @ids > 8 ? @ids[0 .. 7] : @ids;
         my $more  = @ids > 8 ? ', and ' . (@ids - 8) . ' more' : '';
+
+        # Decision 5/10/14: the session's only running work may be watching a
+        # fleet paused beyond the fleet horizon -- then a hold is pointless
+        # (it would just re-hold every 50 minutes for days), so offer the
+        # off path instead. far_paused_fleets never dies and fails toward
+        # today's RUNNING text (undef) rather than toward allowing the stop.
+        #
+        # Addendum A (step 7): the off is only ever offered once the gate has
+        # left a trace of it -- a compact reason that fits butler-continuity
+        # off's 200-byte cap, and an offer record under the project data dir
+        # the judge can Read by the reason's own offer id (A.2.3). Either
+        # step failing (reason too long, record write failing) falls back to
+        # today's RUNNING text rather than offering an off the judge would
+        # have nothing to check against.
+        my $now = time();
+        my $far = eval { far_paused_fleets($p, \@work, $now) };
+        if (ref $far eq 'ARRAY' && @$far) {
+            my $reason = far_pause_reason($t, $far);
+            my $ok = defined $reason
+                  && eval { _write_far_offer($sid, $p, $t, $reason, $far, $now) };
+            if ($ok) {
+                my $handoff = join(' ', map {
+                    "fleet $_->{name} resumes at " . _fp_ts($_->{relaunch_at})
+                        . "; come back with /butler:reporter $_->{name}."
+                } @$far);
+                my $log_text = join(' ', map { "$_->{name}=$_->{relaunch_at}" } @$far);
+                eval { BpHook::log_reason($sid, 'gate', 'far-pause', $log_text, $p->{cwd}) };
+                return BpHook::deny(
+                    "Continuity is on for this session and its only running work watches a fleet paused beyond the fleet horizon: "
+                        . join(', ', @shown) . "$more. Stop token: $t",
+                    "Handoff: $handoff",
+                    "Do not hold it. Hand off instead: turn continuity off (two steps: off mints an OTP, then off-confirm with it), as a Bash tool call:",
+                    "  butler-continuity off --reason '$reason' --token $t",
+                    "Once off-confirm succeeds, stop the watcher with the TaskStop tool ("
+                        . join(', ', @shown) . "$more): left running, it keeps waking this session.",
+                    "End your turn with the Handoff line above.",
+                    @glass,
+                );
+            }
+        }
         return BpHook::deny(
             "Continuity is on for this session and work is still running: " . join(', ', @shown) . "$more. Stop token: $t",
             "Hold it, as a background Bash tool call; the holder wakes this session when the work finishes:",
@@ -225,6 +283,372 @@ sub run {
         "  butler-continuity off --reason '<what is done>' --token $t", "(Genuine ccpraxis/Claude-Code defect, not just finished work? butler-continuity emergency-stop --reason '<the actual defect>' instead -- not a normal option.)",
         @glass,
     );
+}
+
+# ---------------------------------------------------------------------------
+# far_paused_fleets($p, \@work, $now) -- 06-far-pause-session-handoff,
+# amended by Addendum A (step 7, A.2.2).
+# -> arrayref of { name, runs, relaunch_at }, sorted by relaunch_at ascending
+# then name, ONLY when every work item names a resolvable bp-wait-for-
+# escalation watcher, every distinct runs dir among them IS THIS PROJECT'S
+# OWN <data_dir>/blueprints/<name>/runs (never an arbitrary --runs/--bp-dir
+# elsewhere, never a launch whose command carries its own CCPRAXIS_DATA_DIR=),
+# every fleet's relaunch_at is a plain sane integer, and every one of them is
+# paused beyond the fleet horizon (BpAwakeIntent::want_awake's handoff, never
+# a horizon comparison of this module's own); else undef. Public so a test
+# can call it with a fixed clock. Never dies: the whole body is wrapped in
+# eval, which also makes a BpAwakeIntent load failure (want_awake undefined)
+# degrade to undef -- the RUNNING text -- rather than to a denial of its own.
+# ---------------------------------------------------------------------------
+sub far_paused_fleets {
+    my ($p, $work, $now) = @_;
+    my $far = eval { _far_paused_fleets($p, $work, $now) };
+    return $@ ? undef : $far;
+}
+
+sub _far_paused_fleets {
+    my ($p, $work, $now) = @_;
+    return undef unless ref $work eq 'ARRAY' && @$work;
+    return undef unless defined &BpAwakeIntent::want_awake;
+    return undef unless defined $now && !ref($now) && $now =~ /\A[0-9]+\z/;
+
+    my $dd = eval { BpHook::data_dir($p) };
+    return undef unless defined $dd && length $dd;
+    my $dd_norm = _norm_dir($dd);
+    return undef unless defined $dd_norm;
+
+    my $W = _watcher_launches($p);
+    return undef unless ref $W eq 'HASH' && %$W;
+
+    my %by_runs;    # runs dir -> name (first watcher's name)
+    for my $item (@$work) {
+        return undef unless ref $item eq 'HASH' && defined $item->{id} && !ref($item->{id});
+        my $info = $W->{ $item->{id} };
+        return undef unless ref $info eq 'HASH' && defined $info->{runs} && defined $info->{name};
+        # A.2.2 condition 3: the watcher's runs dir must be THIS project's
+        # own <data_dir>/blueprints/<name>/runs -- any other --runs/--bp-dir
+        # target (another project, a temp dir, a mismatched blueprint name)
+        # is rejected rather than trusted.
+        my $expect = _norm_dir("$dd_norm/blueprints/$info->{name}/runs");
+        my $got    = _norm_dir($info->{runs});
+        return undef unless defined $expect && defined $got && $expect eq $got;
+        $by_runs{ $info->{runs} } = $info->{name} unless exists $by_runs{ $info->{runs} };
+    }
+    return undef unless %by_runs;
+
+    my @entries;
+    for my $runs (sort keys %by_runs) {
+        my $pf = "$runs/.paused";
+        return undef unless -f $pf;
+        open(my $fh, '<:raw', $pf) or return undef;
+        local $/;
+        my $raw = <$fh>;
+        close $fh;
+        my $doc = eval { JSON::PP->new->utf8->decode($raw) };
+        return undef unless ref $doc eq 'HASH';
+        my $verdict = BpAwakeIntent::want_awake(
+            { scope => 'fleet', paused => $doc, now => $now, horizon => BpAwakeConst::FLEET_PAUSE_HORIZON() });
+        return undef unless ref $verdict eq 'HASH' && $verdict->{handoff};
+
+        # A.2.2 condition 5: only a plain, sane integer relaunch_at counts --
+        # want_awake's own regex also accepts a fractional number (telemetry
+        # for pause-pending, not meant to reach handoff logic unvalidated),
+        # and nothing here revisits the horizon itself.
+        my $at_raw = $doc->{relaunch_at};
+        return undef if ref $at_raw;
+        return undef unless defined $at_raw;
+        my $at_str = "$at_raw";
+        return undef unless $at_str =~ /\A[1-9][0-9]{0,10}\z/;
+        my $at = $at_str + 0;
+        return undef if $at > $now + $FAR_RELAUNCH_MAX_AHEAD;
+
+        push @entries, { name => $by_runs{$runs}, runs => $runs, relaunch_at => $at };
+    }
+    return undef unless @entries;
+
+    @entries = sort { $a->{relaunch_at} <=> $b->{relaunch_at} || $a->{name} cmp $b->{name} } @entries;
+    return \@entries;
+}
+
+# _norm_dir($d) -> normalised string | undef -- Addendum A (A.2.2), pure.
+# Folds backslashes to '/', a leading posix drive form ('/c/x') and a bare
+# drive-letter form ('c:/x') both to 'C:/x', collapses repeated slashes and
+# a trailing one, and refuses a path carrying a '.' or '..' segment. Byte-
+# wise comparison only -- no case folding beyond the drive letter.
+sub _norm_dir {
+    my ($d) = @_;
+    return undef unless defined $d && !ref($d) && length $d;
+    my $v = $d;
+    $v =~ s{\\}{/}g;
+    $v =~ s{^/([A-Za-z])(?=/|\z)}{uc($1) . ':'}e;
+    $v =~ s{^([a-z]):}{uc($1) . ':'}e;
+    $v =~ s{/{2,}}{/}g;
+    $v =~ s{/+\z}{};
+    for my $seg (split m{/}, $v) {
+        return undef if $seg eq '.' || $seg eq '..';
+    }
+    return $v;
+}
+
+# far_pause_reason($t, \@far) -> string | undef -- Addendum A (A.2.4), pure.
+# The compact --reason butler-continuity off/the offer record both carry:
+# "far pause, offer <t>: <name>@<relaunch_at>, ...". undef for an empty
+# fleet list or when the result would exceed $FAR_REASON_MAX_BYTES (every
+# byte here is ASCII, so length() in characters is length() in bytes).
+sub far_pause_reason {
+    my ($t, $far) = @_;
+    return undef unless ref $far eq 'ARRAY' && @$far;
+    my $r = "far pause, offer $t: " . join(', ', map { "$_->{name}\@$_->{relaunch_at}" } @$far);
+    return undef if length($r) > $FAR_REASON_MAX_BYTES;
+    return $r;
+}
+
+# _fp_utc($epoch) -> 'YYYY-MM-DDTHH:MM:SSZ' -- Addendum A, pure.
+sub _fp_utc {
+    my ($epoch) = @_;
+    my @t = gmtime($epoch);
+    return sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ', $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
+}
+
+# _write_far_offer($sid, $p, $t, $reason, $far, $now) -> 1|0 -- Addendum A
+# (A.2.3). Never dies (callers wrap it in eval anyway); writes
+# DD/butler-far-pause/<t>.json atomically (temp+rename), DD from
+# BpHook::data_dir($p). Returns 0 on any failure, leaving no partial file.
+sub _write_far_offer {
+    my ($sid, $p, $t, $reason, $far, $now) = @_;
+    return 0 unless defined $t && $t =~ /\A[0-9a-f]{8}\z/;
+    my $dd = eval { BpHook::data_dir($p) };
+    return 0 unless defined $dd && length $dd;
+    my $dir = "$dd/butler-far-pause";
+    unless (-d $dir) {
+        eval { require File::Path; File::Path::make_path($dir) };
+    }
+    return 0 unless -d $dir;
+
+    my @fleets = map {
+        { name => $_->{name}, relaunch_at => $_->{relaunch_at}, relaunch_at_utc => _fp_utc($_->{relaunch_at}) }
+    } @$far;
+    my $doc = {
+        v => 1, session_id => $sid, offer => $t, reason => $reason,
+        written_at => $now, written_at_utc => _fp_utc($now),
+        valid_until_utc => _fp_utc($now + $FAR_OFFER_TTL),
+        fleets => \@fleets,
+    };
+    my $json = eval { JSON::PP->new->utf8->canonical->encode($doc) };
+    return 0 unless defined $json;
+
+    my $path = "$dir/$t.json";
+    my $tmp  = "$path.tmp.$$";
+    my $ok   = 0;
+    if (open(my $fh, '>:raw', $tmp)) {
+        if (print({$fh} $json) && close($fh) && rename($tmp, $path)) {
+            $ok = 1;
+        }
+    }
+    unless ($ok) { unlink $tmp if -f $tmp; return 0; }
+    return 1;
+}
+
+# _clear_far_offers($sid, $p, $now) -- Addendum A (A.2.3). Called on every
+# armed, interactive, non-coordinator Stop (right after G7b's
+# clear_running_snapshot, before G8), so at most one live record per session
+# survives: the far branch above writes its own AFTER this runs. Removes an
+# entry when it does not decode to a HASH, names this session, or is
+# expired ($FAR_OFFER_TTL past its own written_at); a *.tmp.* file is never
+# touched. No-op when DD is undefined or the dir does not exist. Never dies
+# (callers wrap it in eval anyway).
+sub _clear_far_offers {
+    my ($sid, $p, $now) = @_;
+    my $dd = eval { BpHook::data_dir($p) };
+    return unless defined $dd && length $dd;
+    my $dir = "$dd/butler-far-pause";
+    return unless -d $dir;
+    opendir(my $dh, $dir) or return;
+    my @entries = readdir($dh);
+    closedir $dh;
+    for my $e (@entries) {
+        next unless $e =~ /\A[0-9a-f]{8}\.json\z/;
+        my $path = "$dir/$e";
+        my $doc = eval {
+            open(my $fh, '<:raw', $path) or return undef;
+            local $/;
+            my $raw = <$fh>;
+            close $fh;
+            JSON::PP->new->utf8->decode($raw);
+        };
+        my $remove = 0;
+        if (ref $doc ne 'HASH') { $remove = 1 }
+        elsif (defined $doc->{session_id} && !ref($doc->{session_id}) && $doc->{session_id} eq $sid) { $remove = 1 }
+        elsif (!defined $doc->{written_at} || ref($doc->{written_at}) || $doc->{written_at} !~ /\A\d+\z/) { $remove = 1 }
+        elsif ($doc->{written_at} + $FAR_OFFER_TTL < $now) { $remove = 1 }
+        unlink $path if $remove;
+    }
+    return;
+}
+
+# _fp_ts($epoch) -> 'YYYY-MM-DD HH:MM UTC', zero-padded.
+sub _fp_ts {
+    my ($epoch) = @_;
+    my @t = gmtime($epoch);
+    return sprintf('%04d-%02d-%02d %02d:%02d UTC', $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1]);
+}
+
+# _watcher_launches($p) -> { task_id => { runs => <dir>, name => <blueprint> } },
+# read from the transcript the same way BpHook::holder_launches reads
+# butler-hold launches -- a StopGate.pm sub using only BpHook's public API
+# (BpHook.pm is not in this package's write set).
+my $WATCHER_SCAN_BYTES = 2 * 1024 * 1024;
+
+sub _watcher_launches {
+    my ($p) = @_;
+    my %out;
+    return \%out unless ref $p eq 'HASH';
+    my $tp = $p->{transcript_path};
+    return \%out unless defined $tp && !ref($tp) && length $tp;
+    my $tpb = $tp;
+    utf8::encode($tpb) if utf8::is_utf8($tpb);
+    open(my $fh, '<:raw', $tpb) or return \%out;
+    my $size = -s $fh;
+    if ($size && $size > $WATCHER_SCAN_BYTES) {
+        seek($fh, $size - $WATCHER_SCAN_BYTES, 0);
+        <$fh>;    # drop the partial first line
+    }
+    my %watch_use;    # tool_use_id -> argv (arrayref of word hashrefs)
+    while (my $line = <$fh>) {
+        next unless $line =~ /"tool_(?:use|result)"/;
+        next unless $line =~ /bp-wait-for-escalation|backgroundTaskId|background with ID/;
+        my $rec = eval { JSON::PP->new->utf8->decode($line) };
+        next unless ref $rec eq 'HASH' && ref $rec->{message} eq 'HASH';
+        my $content = $rec->{message}{content};
+        next unless ref $content eq 'ARRAY';
+        for my $c (@$content) {
+            next unless ref $c eq 'HASH' && defined $c->{type} && !ref($c->{type});
+            if ($c->{type} eq 'tool_use') {
+                next unless defined $c->{id} && !ref($c->{id})
+                    && defined $c->{name} && !ref($c->{name}) && $c->{name} eq 'Bash';
+                my $in = $c->{input};
+                next unless ref $in eq 'HASH' && $in->{run_in_background}
+                    && defined $in->{command} && !ref($in->{command});
+                # Addendum A (A.2.2 condition 4): a launch that carries its
+                # own CCPRAXIS_DATA_DIR= env-prefix reads a different data
+                # dir than the gate resolves, so it is left out of W
+                # entirely -- its task id then simply isn't a key, and
+                # _far_paused_fleets' condition 2 of the base spec fails.
+                next if $in->{command} =~ /(?<![A-Za-z0-9_])CCPRAXIS_DATA_DIR=/;
+                my $argv = eval { BpHook::sole_invocation($in->{command}, 'bp-wait-for-escalation') };
+                $watch_use{ $c->{id} } = $argv if ref $argv eq 'ARRAY';
+            }
+            elsif ($c->{type} eq 'tool_result') {
+                next unless defined $c->{tool_use_id} && !ref($c->{tool_use_id})
+                    && exists $watch_use{ $c->{tool_use_id} };
+                my $argv = $watch_use{ $c->{tool_use_id} };
+                my $task;
+                my $tur = $rec->{toolUseResult};
+                if (ref $tur eq 'HASH' && defined $tur->{backgroundTaskId} && !ref($tur->{backgroundTaskId})) {
+                    $task = $tur->{backgroundTaskId};
+                }
+                else {
+                    my $text = ref $c->{content} eq 'ARRAY'
+                        ? join("\n", map { (ref $_ eq 'HASH' && defined $_->{text} && !ref($_->{text})) ? $_->{text} : () } @{ $c->{content} })
+                        : ((defined $c->{content} && !ref($c->{content})) ? $c->{content} : '');
+                    ($task) = $text =~ /background with ID: ([A-Za-z0-9_-]+)/;
+                }
+                next unless defined $task && $task =~ /\A[A-Za-z0-9_-]{1,64}\z/;
+                my $resolved = _resolve_watcher($argv, $p);
+                $out{$task} = $resolved if defined $resolved;
+            }
+        }
+    }
+    close $fh;
+    return \%out;
+}
+
+# _resolve_watcher($argv, $p) -> { runs, name } | undef. $argv is the
+# arrayref of plain-string literals (undef for an unpredictable word)
+# sole_invocation returned (the words AFTER the matched
+# bp-wait-for-escalation(.pl) command word).
+my %WATCHER_CONSUMERS = map { $_ => 1 } qw(runs bp-dir seen timeout poll category);
+
+sub _resolve_watcher {
+    my ($argv, $p) = @_;
+    return undef unless ref $argv eq 'ARRAY';
+
+    my (%opt, @positional);
+    my $n = scalar @$argv;
+    my $i = 0;
+    while ($i < $n) {
+        my $lit = $argv->[$i];
+        if (defined $lit && $lit =~ /^--(.+)\z/ && $WATCHER_CONSUMERS{$1}) {
+            my $key  = $1;
+            my $vlit = $argv->[ $i + 1 ];
+            $opt{$key} = $vlit;    # may be undef: an unpredictable value is
+                                    # caught by the resolution below, which
+                                    # fails closed rather than guessing.
+            $i += 2;
+            next;
+        }
+        if (defined $lit && $lit =~ /^--/) { $i++; next }
+        push @positional, $lit;
+        $i++;
+    }
+    my $bp = $positional[0];
+
+    my $cwd = (ref $p eq 'HASH' && defined $p->{cwd} && !ref($p->{cwd})) ? $p->{cwd} : undef;
+    my $runs = _resolve_watcher_runs(\%opt, $bp, $cwd);
+    return undef unless defined $runs && length $runs;
+
+    my $name;
+    if (defined $bp) {
+        $name = $bp;
+    }
+    else {
+        (my $parent = $runs) =~ s{/[^/]*/?\z}{};
+        ($name) = $parent =~ m{([^/]+)\z};
+    }
+    return undef unless defined $name && $name =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/;
+
+    return { runs => $runs, name => $name };
+}
+
+# _resolve_watcher_runs(\%opt, $bp, $cwd) -> the runs dir, or undef when the
+# value a chosen branch needs is missing/unpredictable. First branch that
+# APPLIES (its flag was given) wins -- it is never allowed to fall through
+# to a later branch just because its own value could not be resolved.
+sub _resolve_watcher_runs {
+    my ($opt, $bp, $cwd) = @_;
+    if (exists $opt->{runs}) {
+        my $v = $opt->{runs};
+        return undef unless defined $v;
+        $v =~ s{\\}{/}g;
+        return _resolve_watcher_path($v, $cwd);
+    }
+    if (exists $opt->{'bp-dir'}) {
+        my $v = $opt->{'bp-dir'};
+        return undef unless defined $v;
+        $v =~ s{\\}{/}g;
+        my $base = _resolve_watcher_path($v, $cwd);
+        return undef unless defined $base;
+        return "$base/runs";
+    }
+    if (defined $bp) {
+        my $dd = eval { BpHook::data_dir({ cwd => $cwd }) };
+        return undef unless defined $dd && length $dd;
+        return "$dd/blueprints/$bp/runs";
+    }
+    return undef;
+}
+
+# _resolve_watcher_path($v, $cwd) -> $v itself when absolute (posix '/' or a
+# Windows drive 'C:/'), else $v resolved against $cwd when THAT is absolute,
+# else undef.
+sub _resolve_watcher_path {
+    my ($v, $cwd) = @_;
+    return $v if $v =~ m{^/} || $v =~ m{^[A-Za-z]:/};
+    return undef unless defined $cwd && !ref($cwd) && length $cwd;
+    (my $c = $cwd) =~ s{\\}{/}g;
+    return undef unless $c =~ m{^/} || $c =~ m{^[A-Za-z]:/};
+    $c =~ s{/+\z}{};
+    return "$c/$v";
 }
 
 # ---------------------------------------------------------------------------

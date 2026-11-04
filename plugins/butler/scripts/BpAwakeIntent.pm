@@ -103,6 +103,15 @@ sub _solo_pause {
     return { awake => 0, reason => 'pause-beyond-horizon', until => undef, handoff => $handoff };
 }
 
+# --- arm_intent() -> {awake=>1, reason=>'armed', until=>undef, handoff=>0}
+# (package 06-far-pause-session-handoff). PURE: no args, no I/O, no $ENV, no
+# clock. Returns a FRESH hashref on every call -- callers (touch_busy below,
+# bp-orchestrator.pl's own touch_busy) may not share one, since each writer
+# stamps its own written_at through lease_line.
+sub arm_intent {
+    return { awake => 1, reason => 'armed', until => undef, handoff => 0 };
+}
+
 # --- lease_line(\%intent, $written_at) -> $line | undef (package
 # 05-intent-in-busy-lease, blueprint wake-and-pause-consolidation).
 # PURE: no I/O, no $ENV, no time/sleep --

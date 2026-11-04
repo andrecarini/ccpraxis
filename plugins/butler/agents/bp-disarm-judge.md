@@ -42,6 +42,22 @@ digest; spend tool calls only on a specific question it leaves open.
   turn that will be denied.
 - **Approve** only when the goal is genuinely met, or when the session can no longer advance it
   (every remaining step needs the operator or is blocked) and no actionable work remains.
+- **A far fleet pause justifies going off, when the Stop gate offered it.** A session whose only
+  remaining work is watching a fleet paused beyond the fleet horizon (32 h, Decision 10 of
+  wake-and-pause-consolidation) should hand off, not wait, and the Stop gate offers exactly that
+  off. Its reason reads `far pause, offer <id>: <name>@<relaunch_at>`, one `<name>@<relaunch_at>`
+  per fleet, separated by `, `. Approve such an off only when every check below holds, and reject
+  it naming the first that fails (the session can hold its watcher instead):
+  1. The offer record `.ccpraxis-local-data/butler-far-pause/<id>.json` under the project root
+     exists (Read it). No record means the gate never offered this off.
+  2. The record's `reason` is exactly the reason you were given, character for character.
+  3. The digest's first line ("gathered from disk by bp-disarm-digest.pl at <time> UTC") is
+     earlier than the record's `valid_until_utc`. With no digest there is no time to compare:
+     reject.
+  4. For every fleet in the record's `fleets`, `.ccpraxis-local-data/blueprints/<name>/runs/.paused`
+     under the project root (Read it) exists, has the same `relaunch_at`, and has no `"manual"`
+     true; and that fleet's `relaunch_at_utc` is more than 32 h after the digest's time.
+  5. Nothing else in the digest is work this session could still do.
 - **Reject** when the session is waiting on an operator answer it should have filed and kept
   working past, pausing between steps, stopping after one slice while more remains, or when its
   claims do not match what disk actually shows.

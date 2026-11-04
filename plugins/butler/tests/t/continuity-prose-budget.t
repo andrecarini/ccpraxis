@@ -447,6 +447,11 @@ my %SKILLS = (
             'butler-hold',
             'butler-continuity off --reason',
             'no thread',   # package 04-continuity-threads (spec 2.10)
+            # package 06-far-pause-session-handoff (wake-and-pause-consolidation,
+            # spec 2.6): the new Far pause handoff line, within the same budget.
+            'beyond the fleet horizon',
+            'Handoff line',
+            '/butler:reporter <blueprint>',
         ],
         file_required => [
             'for debugging',        # package 04-continuity-threads (spec 2.10)

@@ -101,6 +101,11 @@ use MIME::Base64 qw(encode_base64);
 my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
 require "$DIR/bp-keepawake.pl";
 require "$DIR/BpAwakeConst.pm" unless defined &BpAwakeConst::AC_STALE;
+# Addendum A (06-far-pause-session-handoff, step 7, A.2.6): wrapped in eval
+# so a broken BpAwakeIntent.pm degrades touch_busy to 05's bare empty touch
+# (see touch_busy below) rather than taking the whole module down -- the
+# Windows keep-awake path, the daemon and butler-continuity keep loading.
+eval { require "$DIR/BpAwakeIntent.pm" unless defined &BpAwakeIntent::lease_line; };
 # Batch C (spec 16-cutover, criterion C-6): the BpSession require is gone --
 # it existed solely for _marker_is_live's BpSession::find_transcript call,
 # and _marker_is_live (with the legacy registry it served) is deleted below.
@@ -675,14 +680,15 @@ sub state {
 }
 
 # ---------------------------------------------------------------------------
-# refresh($dir) -> 0|1   — THE CHEAP PATH. Stats and utimes only; it starts no
+# refresh($dir) -> 0|1 — THE CHEAP PATH: stats, utimes and, in a container,
+# one small atomic rewrite of the busy lease (touch_busy); it starts no
 # process and kills none.
 #
-# Called from anywhere that is already awake and knows an arm is live: the Stop
-# gate on every turn end, and every 60s slice of a `hold`. It re-asserts the
-# heartbeat of whatever is already running; it never decides to start or stop
-# anything. That separation is why the gate can refresh on every single Stop
-# without paying the tasklist/powershell process cost that sync() can incur.
+# Its only caller is converge()'s armed branch; converge runs from the Stop
+# gate's G7 and from butler-continuity. It re-asserts the heartbeat of
+# whatever is already running; it never decides to start or stop anything.
+# That separation is why the gate can refresh on every single Stop without
+# paying the tasklist/powershell process cost that sync() can incur.
 sub refresh {
     my ($dir, %opts) = @_;
     my $did = 0;
@@ -704,24 +710,57 @@ sub refresh {
         my $pf = wakelock_pid_file($dir);
         if (-s $pf) { utime($now, $now, $pf); $did = 1 }
     } else {
+        # In a container this rewrites the small lease file (see touch_busy
+        # below); it still starts and kills no process.
         $did = touch_busy($opts{busy_path} // busy_path()) ? 1 : $did;
     }
     return $did;
 }
 
-# touch_busy($path) — create-if-absent then bump mtime. Identical semantics to
-# bp-orchestrator.pl's own touch_busy, against the same file.
+# touch_busy($path) — writes the arm's intent
+# ({"v":1,"awake":1,"reason":"armed","until":null,"written_at":<epoch>})
+# through BpAwakeIntent::lease_line/arm_intent, with the same temp+rename+
+# utime write and fallback as bp-orchestrator.pl's own touch_busy (against
+# the same file: last writer's reason wins, both always write awake=1). It
+# is only ever called while an arm is live (sync's $active branch, refresh
+# via converge's armed branch) — Decision 12 (never write awake=0) never
+# needs enforcing here because lease_line cannot produce such a line.
 sub touch_busy {
     my ($path) = @_;
     return 0 unless defined $path && length $path;
-    unless (-e $path) {
-        my $d = dirname($path);
-        make_path($d) unless -d $d;
-        open my $fh, '>', $path or return 0;
-        close $fh;
-    }
+    my $d = dirname($path);
+    make_path($d) unless -d $d;
     my $now = time;
-    utime($now, $now, $path);
+
+    # Addendum A (A.2.6): BpAwakeIntent may have failed to load (eval-guarded
+    # require above) -- then neither sub exists, $line stays undef, and step
+    # 4 below is skipped outright (no temp file is even attempted) straight
+    # to the fallback.
+    my $line;
+    if (defined &BpAwakeIntent::lease_line && defined &BpAwakeIntent::arm_intent) {
+        $line = eval { BpAwakeIntent::lease_line(BpAwakeIntent::arm_intent(), $now) };
+    }
+
+    if (defined $line) {
+        my $tmp   = "$path.tmp.$$";
+        my $wrote = 0;
+        if (open(my $fh, '>:raw', $tmp)) {
+            if (print({$fh} $line) && close($fh) && rename($tmp, $path)) {
+                $wrote = 1;
+            }
+        }
+        if ($wrote) {
+            utime $now, $now, $path;
+            return 1;
+        }
+        unlink $tmp if -f $tmp;
+    }
+    # FALLBACK = today's touch, byte-for-byte in effect: create-if-absent
+    # EMPTY (never truncates existing content), then bump mtime. Reached
+    # either from a failed temp write above or directly when BpAwakeIntent
+    # could not supply a line at all.
+    unless (-e $path) { open my $fh, '>', $path or return 0; close $fh; }
+    utime $now, $now, $path;
     return 1;
 }
 
