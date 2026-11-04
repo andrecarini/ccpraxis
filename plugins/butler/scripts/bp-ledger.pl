@@ -37,6 +37,10 @@
 # (task 25's "a widened test file also joins test_paths" behaviour is unchanged
 # without the flag).
 #
+# `tick-step --skipped|--na --reason R [--force-remark]` ticks a step that was skipped
+# or did not apply and records that on the step line as a fixed marker (grammar at
+# parse_pipeline_skip_marker), plus an attempt-log entry, in the same atomic write.
+#
 # Exit codes (an interface, fixed): 0 success, 2 validation rejection (byte-identical
 # file), 3 usage/argument error (nothing read), 4 I/O/lock/atomicity failure
 # (byte-identical), 5 target region not found (byte-identical).
@@ -877,6 +881,99 @@ sub splice_tick_step {
     return (undef, "no line matching '- [ ] $N.' (or [x]/[X]) found in ## Pipeline");
 }
 
+# =====================================================================================
+# Pipeline skip markers (tick-step --skipped / --na).
+#
+# A skipped or not-applicable step is still TICKED -- the box stays `[x]`, so every
+# reader that only asks "is this step ticked?" (claim-check's PIPELINE_STEP_UNTICKED,
+# the orchestrator's ledger_checkboxes progress count, statusline.pl, almanac's
+# counters, sandbox RunState.pm) keeps its answer unchanged. WHY it was ticked is
+# recorded on the step line itself, as a fixed suffix only this script writes:
+#
+#   - [x] <N>.<original step text> — skipped: <reason>
+#   - [x] <N>.<original step text> — n/a: <reason>
+#
+# The separator is SPACE, U+2014 EM DASH (UTF-8 E2 80 94), SPACE; then the literal
+# keyword `skipped` or `n/a`, a colon, one space, and a non-empty reason that runs to
+# end of line. A scanner takes the FIRST occurrence of " — skipped: " / " — n/a: " in
+# the text after "<N>." -- the template's own step text never contains either
+# sequence ("— record the skip)" is not "— skipped: "), and a reason that happens to
+# contain one is harmless because everything after the first marker is the reason.
+# The step's first word (what statusline/RunState call the step word) is never
+# touched. Reasons are single-line, whitespace-collapsed, and capped at
+# PIPELINE_SKIP_REASON_MAX bytes so the line stays far below the 1024-byte cap those
+# readers skip lines over. A line with no marker is a step that was done.
+# =====================================================================================
+use constant PIPELINE_SKIP_REASON_MAX => 200;
+our %PIPELINE_SKIP_KIND_WORD = ('skipped' => 'skipped', 'n/a' => 'not applicable');
+
+# parse_pipeline_skip_marker($text_after_N_dot) -> ($base, $kind, $reason) when the
+# text carries a marker, else ($text, undef, undef).
+sub parse_pipeline_skip_marker {
+    my ($text) = @_;
+    return ($text, undef, undef) unless defined $text;
+    if ($text =~ /\A(.*?) \Q$EMDASH\E (skipped|n\/a): (.*?\S)\s*\z/s) {
+        return ($1, $2, $3);
+    }
+    return ($text, undef, undef);
+}
+
+# Normalise a --reason: collapse every whitespace run (newlines included) to one
+# space and trim. Returns (normalised, undef) or (undef, refusal message).
+sub normalize_skip_reason {
+    my ($r) = @_;
+    $r = '' unless defined $r;
+    $r =~ s/\s+/ /g;
+    $r =~ s/\A //;
+    $r =~ s/ \z//;
+    return (undef, 'requires a non-empty --reason') unless length $r;
+    return (undef, '--reason contains a control byte') if $r =~ /[\x00-\x1F\x7F]/;
+    return (undef, '--reason is ' . length($r) . ' bytes; the cap is ' . PIPELINE_SKIP_REASON_MAX
+                 . ' (put the longer story in append-attempt)')
+        if length($r) > PIPELINE_SKIP_REASON_MAX;
+    return ($r, undef);
+}
+
+# splice_mark_step($B, $N, $kind, $reason, $force) -> ($new, undef, undef) on
+# success (byte-identical $B when the same marker is already present), (undef,
+# $notfound, undef) when the step line is absent, (undef, undef, $refusal) when the
+# step is already ticked as done or carries a different marker and $force is unset.
+# Also returns a 4th value: 1 when the step line actually changed (so the caller
+# appends the attempt-log entry exactly once).
+sub splice_mark_step {
+    my ($B, $N, $kind, $reason, $force) = @_;
+    my $loc = locate_section($B, qr/^##\s+Pipeline\b/m);
+    return (undef, '## Pipeline section not found', undef, 0) unless $loc;
+
+    my $infence = 0;
+    my $target_re = qr/^(\s*-\s*\[)([ xX])(\]\s*\Q$N\E\.)(.*?)(\r?)$/s;
+    my $result;
+    each_line_with_offset($B, $loc->{body_start}, $loc->{body_end}, sub {
+        my ($line, $off, $len, $has_nl) = @_;
+        if (is_fence_line($line)) { $infence = !$infence; return undef }
+        return undef if $infence;
+        return undef unless $line =~ $target_re;
+        my ($pre, $box, $num, $rest, $cr) = ($1, $2, $3, $4, $5);
+        $rest =~ s/\s+\z//;
+        my ($base, $old_kind, $old_reason) = parse_pipeline_skip_marker($rest);
+        my $ticked = ($box eq 'x' || $box eq 'X') ? 1 : 0;
+        if ($ticked && defined $old_kind && $old_kind eq $kind && $old_reason eq $reason) {
+            $result = [$B, undef, undef, 0];
+            return 1;
+        }
+        if ($ticked && !$force) {
+            my $was = defined $old_kind ? "already marked '$old_kind: $old_reason'" : 'already ticked as done';
+            $result = [undef, undef, "step $N is $was; pass --force-remark to re-mark it as '$kind'", 0];
+            return 1;
+        }
+        my $new_line = $pre . 'x' . $num . $base . " $EMDASH $kind: $reason" . $cr;
+        $result = [substr($B, 0, $off) . $new_line . substr($B, $off + $len), undef, undef, 1];
+        return 1;
+    });
+    return @$result if $result;
+    return (undef, "no line matching '- [ ] $N.' (or [x]/[X]) found in ## Pipeline", undef, 0);
+}
+
 sub splice_set_next_action {
     my ($B, $body) = @_;
     my $head_re = qr/^## Next action/m;
@@ -1482,8 +1579,12 @@ sub ledger_pipeline_items {
             my $conditional = (grep { $_ == $n } @PIPELINE_CONDITIONAL_STEPS) ? 1 : 0;
             my $na          = ($text =~ /(?<![A-Za-z0-9])N\/A(?![A-Za-z0-9])/i) ? 1 : 0;
             my $satisfied   = ($ticked || ($conditional && $na)) ? 1 : 0;
+            # A skip marker never changes satisfaction: only a TICKED box counts, and
+            # tick-step --skipped/--na always ticks. The marker is reported as data.
+            my (undef, $skip, $skip_reason) = parse_pipeline_skip_marker($text);
             push @items, { step => $n, ticked => $ticked, conditional => $conditional,
-                           na => $na, satisfied => $satisfied, text => $text };
+                           na => $na, satisfied => $satisfied, text => $text,
+                           skip => $skip, skip_reason => $skip_reason };
         }
         return undef;
     });
@@ -1740,7 +1841,8 @@ sub op_tick_step {
     my $ok;
     { local $SIG{__WARN__} = sub { };
       $ok = GetOptionsFromArray(\@args, \%opt, 'ledger=s', 'step=s',
-                                 'reaccept-oracle=s@', 'reaccept-reason=s'); }
+                                 'reaccept-oracle=s@', 'reaccept-reason=s',
+                                 'skipped', 'na', 'reason=s', 'force-remark'); }
     arg_error('tick-step', 'unrecognised option') unless $ok;
     arg_error('tick-step', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
     arg_error('tick-step', 'missing required --ledger') unless defined $opt{ledger};
@@ -1759,6 +1861,28 @@ sub op_tick_step {
         arg_error('tick-step', '--reaccept-reason requires at least one --reaccept-oracle');
     }
 
+    # --skipped / --na: tick the step AND record why it was not done, as a marker on
+    # the step line (grammar above parse_pipeline_skip_marker) plus an attempt-log
+    # entry, in one atomic write.
+    my $skip_kind;
+    if ($opt{skipped} && $opt{na}) {
+        arg_error('tick-step', 'specify at most one of --skipped or --na');
+    }
+    $skip_kind = 'skipped' if $opt{skipped};
+    $skip_kind = 'n/a'     if $opt{na};
+    my $skip_reason;
+    if (defined $skip_kind) {
+        my $flag = $opt{skipped} ? '--skipped' : '--na';
+        arg_error('tick-step', "$flag requires --reason '<why>'") unless defined $opt{reason};
+        my $why;
+        ($skip_reason, $why) = normalize_skip_reason($opt{reason});
+        arg_error('tick-step', "$flag $why") unless defined $skip_reason;
+    }
+    else {
+        arg_error('tick-step', '--reason is only valid with --skipped or --na') if defined $opt{reason};
+        arg_error('tick-step', '--force-remark is only valid with --skipped or --na') if $opt{'force-remark'};
+    }
+
     # Set inside the splice callback below when the sidecar write fails (Decision 11):
     # printed by the $post_cb, under the same lock discipline append-attempt's own
     # budget notice uses, so it can never race a concurrent invocation.
@@ -1773,7 +1897,25 @@ sub op_tick_step {
 
     run_op('tick-step', $opt{ledger}, sub {
         my ($B) = @_;
-        my ($ticked, $notfound) = splice_tick_step($B, $opt{step});
+        my ($ticked, $notfound);
+        if (defined $skip_kind) {
+            my ($marked, $nf, $refusal, $changed) =
+                splice_mark_step($B, $opt{step}, $skip_kind, $skip_reason, $opt{'force-remark'});
+            reject_error('tick-step', $opt{ledger}, $refusal) if defined $refusal;
+            return (undef, $nf) unless defined $marked;
+            if ($changed) {
+                my $entry = '- ' . iso_now() . " $EMDASH Step $opt{step} "
+                          . $PIPELINE_SKIP_KIND_WORD{$skip_kind} . ": $skip_reason";
+                ($ticked, $notfound) = splice_insert_entry($marked, qr/^##\s+Decisions & attempt log\b/m, $entry);
+                return (undef, $notfound) unless defined $ticked;
+            }
+            else {
+                $ticked = $marked;
+            }
+        }
+        else {
+            ($ticked, $notfound) = splice_tick_step($B, $opt{step});
+        }
         return (undef, $notfound) unless defined $ticked;
 
         # Fail-silent mandate (spec §5): recording may never subtract availability.
@@ -2820,6 +2962,7 @@ sub op_claim_check {
                   conditional => ($_->{conditional} ? JSON::PP::true : JSON::PP::false),
                   na => ($_->{na} ? JSON::PP::true : JSON::PP::false),
                   satisfied => ($_->{satisfied} ? JSON::PP::true : JSON::PP::false),
+                  skip => $_->{skip}, skip_reason => $_->{skip_reason},
                   text => $_->{text} }
             } @items ],
             unsatisfied => [ sort { $a <=> $b } @unsatisfied ],

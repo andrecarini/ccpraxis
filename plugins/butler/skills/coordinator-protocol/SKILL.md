@@ -60,7 +60,7 @@ The eight operations:
 
 ```
 bp-ledger.pl set-status       --ledger P --status S
-bp-ledger.pl tick-step        --ledger P --step N
+bp-ledger.pl tick-step        --ledger P --step N [(--skipped | --na) --reason R [--force-remark]]
 bp-ledger.pl append-attempt   --ledger P (--text T | --text-file F | --text -)
 bp-ledger.pl set-next-action  --ledger P --body B
 bp-ledger.pl add-output       --ledger P --text T
@@ -76,7 +76,7 @@ Exit codes are meaningful and you should branch on them: **0** ok · **2** the w
 Why each op exists rather than an `Edit`:
 
 - **`append-attempt`** inserts at the end of `## Decisions & attempt log`, always as exactly one line, always outside any fenced code block. The one-line rule is not cosmetic — it is what makes two forgeries structurally impossible: the entry starts `- <ISO>` so it can never open a fence (which would break the fence-scoped `MEANS-DEVIATION:` guard below), and its `-` is followed by a digit so it can never forge a `- [x]` checkbox.
-- **`tick-step`** only ever ticks inside `## Pipeline`, so no op can emit a `- [x]` anywhere else. `tick-step --step 5` additionally takes `--reaccept-oracle <path> --reaccept-reason '<why>'` (repeatable `--reaccept-oracle`) to record an intended change to a test file's oracle since step 3. Tick step 5 now prints a notice naming any unaccepted change. A SHRINK — fewer assertions, or any test description that vanished (a renamed description counts as vanished) — gates the package at harvest unless that step-5 reaccept was recorded against the shrunk file, so it names every vanished description; a removal made after the reaccept still gates. Say in `--reaccept-reason` why each description went.
+- **`tick-step`** only ever ticks inside `## Pipeline`, so no op can emit a `- [x]` anywhere else. `tick-step --step 5` additionally takes `--reaccept-oracle <path> --reaccept-reason '<why>'` (repeatable `--reaccept-oracle`) to record an intended change to a test file's oracle since step 3. Tick step 5 now prints a notice naming any unaccepted change. A SHRINK — fewer assertions, or any test description that vanished (a renamed description counts as vanished) — gates the package at harvest unless that step-5 reaccept was recorded against the shrunk file, so it names every vanished description; a removal made after the reaccept still gates. Say in `--reaccept-reason` why each description went. `--skipped --reason '<why>'` (judged unnecessary, e.g. a scout over inputs that already map the terrain) and `--na --reason '<why>'` (does not apply, e.g. the UI pass in a package with no UI) tick the step AND record the skip as data on its line, `- [x] N.<step text> — skipped: <why>` or `— n/a: <why>`, plus a `Step N skipped: <why>` / `Step N not applicable: <why>` attempt entry, in one write. The reason is required, one line, at most 200 bytes. A step already ticked as done, or already carrying a different marker, is refused (exit 2) unless you pass `--force-remark`; repeating the identical call is a no-op.
 - **`set-next-action`** replaces the `## Next action` body wholesale — the one section that is meant to be rewritten.
 - **`add-output`** appends to `## Outputs`, replacing a `_(none yet)_` placeholder if that is all that is there.
 - **`set-escalation`** replaces the `## Escalation` body: what decision or re-scope a `blocked` or `parked` package needs. The orchestrator, the escalation resolver and the reporter read it.
@@ -451,7 +451,7 @@ mechanism (the write-set guard) adds prose, not detection.
 
 Workers are dispatched via Task with `subagent_type` set to the **plugin-namespaced** form `butler:bp-<name>` — i.e. `butler:bp-scout`, `butler:bp-architect`, `butler:bp-test-writer`, `butler:bp-implementer`, `butler:bp-reviewer`, `butler:bp-redteam`, `butler:bp-ui-prober`. (Confirmed working 2026-06-11 in a real installed-plugin coordinator run. A bare `bp-<name>` may also resolve, but the namespaced form is authoritative — use it directly so you never spend a turn on an "unknown agent type" retry.)
 
-1. **Scout** (`bp-scout`, optional). Skip when the package inputs already map the terrain — record the skip and why. Otherwise dispatch with the specific questions you need answered.
+1. **Scout** (`bp-scout`, optional). Skip when the package inputs already map the terrain — record the skip and why with `tick-step --step 1 --skipped --reason '<why>'`. Otherwise dispatch with the specific questions you need answered.
 2. **Spec** (`bp-architect`). Output: `$BP_DIR/specs/$BP_PACKAGE-spec.md`. Gate it yourself: every package done-criterion must map to at least one acceptance criterion in the spec; conflicts with blueprint Decisions are escalations, not silent resolutions.
 3. **Tests** (`bp-test-writer`). Sees the spec, not your implementation files. Sanity-check the returned mapping (criterion → test) against the spec yourself — a cheap read that prevents an expensive convergence on wrong tests. Tests should fail for the right reason before implementation exists.
 4. **Implementation loop** (`bp-implementer`). Tests are the immutable oracle (hook-enforced). After each return: validate from disk, feed back the *exact* failing output excerpts with file:line, redispatch. **Cap: 4 attempts on the same failure → `status: blocked`** with a precise escalation; thrashing burns the budget that monitoring is protecting.
@@ -475,7 +475,7 @@ Workers are dispatched via Task with `subagent_type` set to the **plugin-namespa
 7. **Fix-batch.** Consolidate ALL findings from both reports into **one** implementer dispatch — never a sequence of single-finding fixes. Re-validate after. Filing is consolidated the same way: when reviewer and red-team independently name the same tooling defect, file it once — one `TOOLING-BUG-FILED:` marker, never one report per source.
 8. **UI pass** (`bp-ui-prober`), only if the package touches UI. Screenshots get read, the visual checklist applied, findings folded into a final fix-batch if needed.
 
-Check off pipeline steps in the ledger as you go. Steps may be skipped only with a recorded reason, and a skipped step is still ticked: record why in the attempt log, then `tick-step --step <N>`. Harvest reads the checkbox, not the prose, so an unticked step fails as `PIPELINE_STEP_UNTICKED` even when the log says it was skipped. Step 8 in a package with no UI is the usual case.
+Check off pipeline steps in the ledger as you go. Steps may be skipped only with a recorded reason, and a skipped step is still ticked: `tick-step --step <N> --skipped --reason '<why>'` for a step you judged unnecessary, `--na --reason '<why>'` for one that does not apply. Either ticks the box, writes the marker on the step line and appends the attempt-log entry itself, so do not also `append-attempt` the same reason. Never skip with a plain `tick-step`: that records the step as done. Harvest reads the checkbox, not the prose, so an unticked step fails as `PIPELINE_STEP_UNTICKED` even when the log says it was skipped. Step 8 in a package with no UI is the usual case (`--step 8 --na --reason 'no UI in this package'`).
 
 ## Worker dispatch contract
 
