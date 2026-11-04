@@ -603,6 +603,10 @@ sub _write_plan_record {
         detail => defined $f{detail} ? $f{detail} : '',
         rc => $f{rc}, ms => $f{ms},
     );
+    # Package 09: override is emitted only when the caller passed one
+    # (battery_releases said release) -- every pre-09 record, and every
+    # non-battery reconcile, stays byte-for-byte as before.
+    $rec{override} = $f{override} if defined $f{override};
     return BpPowerJournal::append_record($dir, \%rec) ? 1 : 0;
 }
 
@@ -732,6 +736,31 @@ sub reconcile {
         require "$DIR/HostAwake.pm" unless defined &HostAwake::counting_ids;
         push @$arms, map { { sid => "source:$_" } } @{ HostAwake::counting_ids($root, time()) };
     };
+
+    # Package 09-battery-for-every-source: battery past grace overrides
+    # EVERY source above (arms, sandbox/solo/fleet entries, old holds) into
+    # an empty arm set, so every reconcile caller agrees -- the CLI, the
+    # refresher's own hold tick, "butler-continuity off", and the AC
+    # monitor all restore the same way instead of fighting each other. A
+    # load or call failure leaves $override undef, so the arm set and every
+    # caller's behaviour are unchanged (fail-open, AC12(c)).
+    my $override;                                   # undef | 'battery'
+    eval {
+        require "$DIR/HostAwake.pm" unless defined &HostAwake::battery_releases;
+        # review n1/m7: Time::HiRes here is for the probe-interval TEST SEAM
+        # only (see HostAwake::battery_step's own header), not a correctness
+        # requirement of this call -- battery_verdict's V2 check already
+        # carries a 1s tolerance on the future-dated comparison (BpAcWatch.pm,
+        # battery_verdict's own header) specifically so that an integer "now"
+        # a few ms behind a fractional probed_at never misreads as a clock
+        # step-back. An integer time() here would cost nothing real; HiRes is
+        # kept only so this call's own sub-second precision matches every
+        # other battery_releases/battery_step caller, not because it is
+        # needed to avoid a false flip.
+        $override = 'battery' if HostAwake::battery_releases($root, Time::HiRes::time());
+    };
+    $arms = [] if defined $override;
+
     my $armed = scalar @$arms;
     my $arm_ids = [ map { $_->{sid} } @$arms ];
 
@@ -755,7 +784,7 @@ sub reconcile {
             found_guid => 'unknown', found_name => 'unknown',
             wanted_guid => 'none', wanted_name => 'none', wanted_basis => 'none',
             action => 'none', result => 'error', error => 'getactive-failed',
-            detail => $detail1, rc => $last_rc, ms => $ms->(),
+            detail => $detail1, rc => $last_rc, ms => $ms->(), override => $override,
         );
         return _outcome(
             outcome => 'error', reason => 'getactive-failed', detail => $detail1,
@@ -790,7 +819,7 @@ sub reconcile {
                 found_guid => $found_guid, found_name => $found_name,
                 wanted_guid => 'none', wanted_name => 'none', wanted_basis => 'none',
                 action => 'none', result => 'error', error => 'list-failed',
-                detail => $detail2, rc => $r2->{rc}, ms => $ms->(),
+                detail => $detail2, rc => $r2->{rc}, ms => $ms->(), override => $override,
             );
             return _outcome(
                 outcome => 'error', reason => 'list-failed', detail => $detail2,
@@ -810,7 +839,7 @@ sub reconcile {
                 found_guid => $found_guid, found_name => $found_name,
                 wanted_guid => 'none', wanted_name => 'none', wanted_basis => 'none',
                 action => 'none', result => 'error', error => 'list-failed',
-                detail => 'unparseable', rc => $last_rc, ms => $ms->(),
+                detail => 'unparseable', rc => $last_rc, ms => $ms->(), override => $override,
             );
             return _outcome(
                 outcome => 'error', reason => 'list-failed', detail => 'unparseable',
@@ -833,7 +862,7 @@ sub reconcile {
             found_guid => $found_guid, found_name => $found_name,
             wanted_guid => 'none', wanted_name => 'none', wanted_basis => 'none',
             action => 'none', result => 'error', error => $d->{error},
-            detail => '', rc => $last_rc, ms => $ms->(),
+            detail => '', rc => $last_rc, ms => $ms->(), override => $override,
         );
         return _outcome(
             outcome => 'error', reason => $d->{error}, detail => '',
@@ -855,7 +884,7 @@ sub reconcile {
                 wanted_basis => $d->{wanted_basis},
                 action => 'none', result => 'ok', error => '',
                 detail => ($removed ? '' : 'record-remove-failed'),
-                rc => $last_rc, ms => $ms->(),
+                rc => $last_rc, ms => $ms->(), override => $override,
             );
         } elsif ($o{journal_noop}) {
             $journaled = _write_plan_record(
@@ -864,7 +893,7 @@ sub reconcile {
                 wanted_guid => $d->{wanted_guid}, wanted_name => $d->{wanted_name},
                 wanted_basis => $d->{wanted_basis},
                 action => 'none', result => 'ok', error => '', detail => '',
-                rc => $last_rc, ms => $ms->(),
+                rc => $last_rc, ms => $ms->(), override => $override,
             );
         }
         return _outcome(
@@ -905,7 +934,7 @@ sub reconcile {
             found_guid => $found_guid, found_name => $found_name,
             wanted_guid => $d->{wanted_guid}, wanted_name => $d->{wanted_name}, wanted_basis => $d->{wanted_basis},
             action => 'set', result => 'ok', error => '', detail => join(',', @detail_bits),
-            rc => $r3->{rc}, ms => $ms->(),
+            rc => $r3->{rc}, ms => $ms->(), override => $override,
         );
         return _outcome(
             outcome => 'corrected', armed => $armed, arm_ids => $arm_ids,
@@ -928,7 +957,7 @@ sub reconcile {
         found_guid => $found_guid, found_name => $found_name,
         wanted_guid => $d->{wanted_guid}, wanted_name => $d->{wanted_name}, wanted_basis => $d->{wanted_basis},
         action => 'set', result => 'error', error => 'setactive-failed',
-        detail => $detail_final, rc => $r3->{rc}, ms => $ms->(),
+        detail => $detail_final, rc => $r3->{rc}, ms => $ms->(), override => $override,
     );
     return _outcome(
         outcome => 'error', reason => 'setactive-failed', detail => $detail3,

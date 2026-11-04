@@ -253,6 +253,15 @@ sub enabled {
 # probe_source(%o) -- 2.4.
 # ---------------------------------------------------------------------------
 
+# %_PROBE_CACHE -- shared across every probe_source() call in this process
+# (red-team m8, fix-batch): run_bounded's own SHOULD-FIX-5 comment names an
+# unreaped timed-out child as "a slow zombie leak" in a long-lived caller.
+# Before package 09, probe_source ran only in short-lived holders and
+# monitors; 09 puts it inside the refresher's own tick, so the daemon now
+# lives for days across this call. One shared cache lets run_bounded sweep
+# its own prior zombies (if any) on every subsequent call.
+my %_PROBE_CACHE;
+
 sub _norm_reading {
     my ($v) = @_;
     return 'unknown' unless defined $v && !ref($v);
@@ -285,7 +294,10 @@ sub probe_source {
     return 'unknown' unless $ok;
     my $argv = eval { BpPowerJournal::probe_argv() };
     return 'unknown' unless ref $argv eq 'ARRAY';
-    my $r = eval { BpPowerJournal::run_bounded($argv, $BpPowerJournal::PROBE_TIMEOUT_SECONDS) };
+    # red-team m8 / fix-batch: pass the shared zombie cache so a prior call's
+    # timed-out (unreaped) child gets swept here, instead of leaking one
+    # process slot per timeout for the life of a multi-day refresher.
+    my $r = eval { BpPowerJournal::run_bounded($argv, $BpPowerJournal::PROBE_TIMEOUT_SECONDS, \%_PROBE_CACHE) };
     return 'unknown' unless ref $r eq 'HASH' && defined $r->{status} && $r->{status} eq 'ok';
     my $parsed = eval { BpPowerJournal::parse_probe($r->{out}) };
     return 'unknown' unless ref $parsed eq 'HASH';
@@ -307,7 +319,32 @@ sub _default_state {
         v => 1, phase => 'ac', source => 'unknown', probed_at => 0,
         dc_since => undef, grace_until => undef,
         reconnected_at => undef, reconnect_basis => undef, updated_at => 0,
+        # Decision 29(a) (fix-batch): both the host-wide instance's
+        # consecutive-unknown-probe counter and its last-ANNOUNCED battery
+        # verdict live HERE, on disk under this state's own lock, rather than
+        # in a per-process package hash. A per-process cache duplicated a
+        # "released" journal record on every refresher restart (a cold
+        # process always started believing "hold") and lost a "held" edge
+        # when the daemon idle-exited mid-outage (review M1, red-team m3).
+        # Persisting both here means any process, at any time, agrees with
+        # whatever the LAST process already announced or counted.
+        unknown_count => 0, announced => 'hold',
     };
+}
+
+# _KNOWN_PHASES -- every phase this state machine ever writes. Shared by
+# host_step's step 2 (Decision 29(b)) so "a phase this code does not
+# recognise" is named once rather than inferred from what it is NOT.
+my %_KNOWN_PHASES = map { $_ => 1 } qw(ac grace expired standing-down monitoring reconnected);
+sub _is_known_phase { my ($phase) = @_; return (defined $phase && $_KNOWN_PHASES{$phase}) ? 1 : 0 }
+
+# _is_release_phase($phase) -> 0|1 -- "release phases" per spec 09 section 2.1's
+# notation: expired, standing-down, monitoring. Shared by battery_verdict and
+# host_step so the rule is named once.
+sub _is_release_phase {
+    my ($phase) = @_;
+    return 0 unless defined $phase;
+    return ($phase eq 'expired' || $phase eq 'standing-down' || $phase eq 'monitoring') ? 1 : 0;
 }
 
 sub _read_state {
@@ -327,6 +364,76 @@ sub _write_state {
     _mkpath(_dsdir($data_dir));
     $state->{updated_at} = time();
     return _write_json_atomic(_state_path($data_dir), $state);
+}
+
+# read_state($data_dir) -> \%state (package 09, spec 2.1). A public copy of
+# _read_state for a caller outside this file (HostAwake::battery_releases)
+# that must never probe, lock or write -- just see what is on disk right now.
+# Same no-die, defaults-on-missing-or-garbled contract as _read_state itself.
+sub read_state { my ($data_dir) = @_; return _read_state($data_dir) }
+
+# mark_announced($data_dir, $verdict, %o) -> 0|1 (package 09, Decision 29(a)
+# fix-batch). The host-ac state's own record of the verdict a caller has
+# just finished journaling -- written under the state's own lock, so every
+# process (not just the one that happened to make the last call) agrees on
+# what was last announced. The ONLY caller is HostAwake::battery_step, and
+# ONLY after BpPowerJournal::append_record has already returned success:
+# never mark a verdict as announced before the record describing it is
+# safely on disk, or a failed append would permanently drop that edge
+# (review M1).
+sub mark_announced {
+    my ($data_dir, $verdict, %o) = @_;
+    my $lock_timeout = defined $o{lock_timeout} ? $o{lock_timeout} : 10;
+    my $saved = 0;
+    _with_state_lock($data_dir, $lock_timeout, sub {
+        my $state = _read_state($data_dir);
+        $state->{announced} = (defined $verdict && length $verdict) ? $verdict : 'hold';
+        $saved = _write_state($data_dir, $state) ? 1 : 0;
+    });
+    return $saved;
+}
+
+# battery_verdict(\%state, $now) -> { verdict => release|hold, basis => WORD }
+# (package 09, spec 2.1). PURE: no I/O, no clock read when $now is given, no
+# %ENV. Rows V1-V3, first match wins. A non-HASH $state is V1's bogus-phase
+# case (basis unknown-phase), so a caller that hands this a corrupt value
+# fails open to hold rather than dying.
+sub battery_verdict {
+    my ($state, $now) = @_;
+    $now = time() unless defined $now;
+    return { verdict => 'hold', basis => 'unknown-phase' } unless ref $state eq 'HASH';
+
+    my $phase = $state->{phase};
+    unless (_is_release_phase($phase)) {
+        # V1: not released -- ac/grace/reconnected name themselves; anything
+        # else (a bogus or missing phase) is unknown-phase.
+        my $basis = (defined $phase && ($phase eq 'ac' || $phase eq 'grace' || $phase eq 'reconnected'))
+            ? $phase : 'unknown-phase';
+        return { verdict => 'hold', basis => $basis };
+    }
+
+    # V2: released, but the last probe is untrustworthy -- future-dated (the
+    # clock stepped back), not a plain number, or older than AC_STALE. Any of
+    # these means the override has gone unverified too long, so the machine
+    # stays held rather than released on stale information.
+    my $probed_at = $state->{probed_at};
+    # L2-style future-dated check (same rule as observe()'s own), but with a
+    # 1s tolerance: probed_at and $now both round-trip through JSON (written
+    # by one host_step call, read back by the next battery_verdict check) at
+    # sub-second precision, and a double that close to a whole-second
+    # boundary can decode a handful of microseconds HIGHER than the exact
+    # value that was encoded. Without slack, that rounding noise alone reads
+    # as "the clock stepped back" and wrongly holds a release that is
+    # actually fresh. A real clock step-back is seconds or minutes, never
+    # microseconds, so 1s of slack costs nothing real (AC1's own
+    # probed_at=now+5 fixture is still well past it).
+    my $stale = (!defined $probed_at || ref($probed_at) || "$probed_at" !~ /\A\d+(?:\.\d+)?\z/)
+        || $probed_at > $now + 1
+        || ($now - $probed_at) > BpAwakeConst::AC_STALE();
+    return { verdict => 'hold', basis => 'stale' } if $stale;
+
+    # V3: released and fresh.
+    return { verdict => 'release', basis => 'expired' };
 }
 
 # clear($data_dir, $reason) -> 1 -- the `clear` CLI verb's full reset, as one
@@ -574,6 +681,181 @@ sub observe {
         dc_since => $out->{dc_since}, grace_until => $out->{grace_until},
         transitions => ($saved ? [ map { $_->[0] } @pending ] : []),
     };
+}
+
+# host_step($data_dir, %o) -> \%v (package 09, spec 2.1). The host-wide
+# counterpart of observe(): one probe-or-not tick of the SAME state machine,
+# plus the two safety nets observe() alone does not have (a stale-state
+# reset, and a fail-open lift after ten unknown readings) and the resume log
+# line host_step owns outright. Never dies; any internal failure degrades to
+# hold/error with no transitions, so a caller's reconcile/decide path always
+# gets a usable hash back.
+sub host_step {
+    my ($data_dir, %o) = @_;
+    my $result = eval {
+        my $now = defined $o{now} ? $o{now} : time();
+        my $src = (defined $o{src} && length $o{src}) ? $o{src} : 'host-awake';
+        my $lock_timeout = defined $o{lock_timeout} ? $o{lock_timeout} : 10;
+        my @t;   # event names this call logged, in order.
+
+        # Step 2: reset any state this code cannot interpret back to ac,
+        # fail-open, logging once. Three cases, all handled the same way
+        # (red-team m1, Decision 29(b)):
+        #  - a released phase whose last probe is too old (or missing, or
+        #    future-dated) to trust -- otherwise a long-dead host-ac state
+        #    (the machine was off for days) would read as a fresh release
+        #    the moment anything asks again;
+        #  - a phase this code does not even recognise (a future/past code
+        #    version, a manual edit, or an operator-run verb pointed at
+        #    host-ac) -- left alone, battery_verdict's V1 holds on it
+        #    forever with nothing to notice or heal it (red-team m1
+        #    scenario A);
+        #  - `grace` with a non-numeric/missing `grace_until` -- observe()
+        #    substitutes `now + grace` on EVERY tick in that case, so grace
+        #    never expires (red-team m1 scenario B).
+        # Decision 29(c)/red-team m6: the log line is written only after
+        # _write_state actually succeeds, never unconditionally -- a write
+        # failure must not claim a reset that did not happen.
+        _with_state_lock($data_dir, $lock_timeout, sub {
+            my $state = _read_state($data_dir);
+            my $phase = $state->{phase};
+            my $unknown_phase = !_is_known_phase($phase);
+            my $bad_grace = (!$unknown_phase && defined $phase && $phase eq 'grace')
+                && (!defined $state->{grace_until} || ref($state->{grace_until})
+                    || "$state->{grace_until}" !~ /\A\d+(?:\.\d+)?\z/);
+            my $stale_release = 0;
+            if (!$unknown_phase && !$bad_grace && _is_release_phase($phase)) {
+                my $probed_at = $state->{probed_at};
+                # 1s tolerance on the future-dated check -- see
+                # battery_verdict's own header for why (sub-second JSON
+                # round-trip rounding, not a real clock step-back).
+                $stale_release = (!defined $probed_at || ref($probed_at) || "$probed_at" !~ /\A\d+(?:\.\d+)?\z/)
+                    || $probed_at > $now + 1
+                    || ($now - $probed_at) > BpAwakeConst::AC_STALE();
+            }
+            # red-team m5: a clock stepped BACK while in grace is caught
+            # here too -- grace_until was set to (dc_since + GRACE) at the
+            # time grace started, so a *numeric* grace_until sitting more
+            # than one grace period ahead of `now` can only mean the clock
+            # moved backwards since. Restart grace from `now` rather than a
+            # full reset to ac -- the machine really is still on battery.
+            my $grace_clock_back = 0;
+            if (!$unknown_phase && !$bad_grace && !$stale_release
+                    && defined $phase && $phase eq 'grace') {
+                my $gu = $state->{grace_until};
+                $grace_clock_back = (defined $gu) && ("$gu" =~ /\A\d+(?:\.\d+)?\z/)
+                    && ($gu > $now + _grace_seconds() + 1);
+            }
+            return unless $unknown_phase || $bad_grace || $stale_release || $grace_clock_back;
+
+            if ($grace_clock_back) {
+                $state->{dc_since} = $now;
+                $state->{grace_until} = $now + _grace_seconds();
+                my $saved = _write_state($data_dir, $state);
+                if ($saved) {
+                    log_event($data_dir, $src, 'GRACE-START',
+                        { until => _iso_utc($state->{grace_until}), basis => 'clock-step' },
+                        'grace restarted after the clock stepped back; the previous grace_until could not be trusted');
+                    push @t, 'GRACE-START';
+                }
+                return;
+            }
+
+            my $saved = _write_state($data_dir, _default_state());
+            if ($saved) {
+                log_event($data_dir, $src, 'WATCH-ERROR', { basis => 'stale-reset' },
+                    'host battery state was stale; restarting from ac');
+                push @t, 'WATCH-ERROR';
+            }
+        });
+
+        # Step 3: one observe() call, not forced -- it probes at most once
+        # per _probe_interval(), same as every other observe() caller.
+        my %obs_opts = (src => $src, now => $now, lock_timeout => $lock_timeout);
+        $obs_opts{probe} = $o{probe} if ref $o{probe} eq 'CODE';
+        my $obs = observe($data_dir, %obs_opts);
+        push @t, @{ $obs->{transitions} } if ref $obs eq 'HASH' && ref $obs->{transitions} eq 'ARRAY';
+
+        # Step 4: unknown run (fail-open), mirroring monitor_loop's own
+        # UNKNOWN_LIMIT -- ten consecutive unknown readings WHILE released
+        # lift the override, because a probe that cannot tell ac from dc
+        # must never be trusted to keep holding the override indefinitely.
+        # Decision 29(a) (fix-batch): the counter lives in the host-ac state
+        # itself, under its own lock, rather than in a per-process package
+        # hash -- a per-process counter restarts at 0 on every refresher
+        # handover, so the fail-open window could repeat across restarts
+        # with no bound (red-team m3).
+        if (ref $obs eq 'HASH' && $obs->{probed}) {
+            my $should_count = (($obs->{source} // '') eq 'unknown' && _is_release_phase($obs->{phase})) ? 1 : 0;
+            my $tripped = 0;
+            _with_state_lock($data_dir, $lock_timeout, sub {
+                my $state = _read_state($data_dir);
+                my $cnt = $should_count ? (($state->{unknown_count} // 0) + 1) : 0;
+                if ($cnt >= UNKNOWN_LIMIT && _is_release_phase($state->{phase})) {
+                    $state->{phase} = 'reconnected';
+                    $state->{reconnected_at} = $now;
+                    $state->{reconnect_basis} = 'probe-failed';
+                    $state->{unknown_count} = 0;
+                    $tripped = _write_state($data_dir, $state) ? 1 : 0;
+                }
+                else {
+                    $state->{unknown_count} = $cnt;
+                    _write_state($data_dir, $state);
+                }
+            });
+            if ($tripped) {
+                log_event($data_dir, $src, 'WATCH-ERROR', { basis => 'probe-failed' },
+                    'ten consecutive unknown probe readings while released for battery; holding again fail-open');
+                push @t, 'WATCH-ERROR';
+            }
+        }
+
+        # Step 5: lift. A "reconnected" phase (set either by observe() just
+        # above, seeing a real `ac` reading, or by step 4's fail-open) is
+        # cleared back to ac here, and ONLY here -- this never calls
+        # resume_director_side, never touches ac-standdown.json and never
+        # mirrors to _alt_data_dir, because this is the host-wide instance,
+        # not any project's drive-solo stand-down (spec 09 2.1 step 5).
+        # red-team m6: RESUME is logged only after the write succeeds (it
+        # used to log first), so a write failure never claims a lift that
+        # left the state sitting at "reconnected" on the very next tick.
+        my $lift_basis;
+        _with_state_lock($data_dir, $lock_timeout, sub {
+            my $state = _read_state($data_dir);
+            return unless ($state->{phase} // '') eq 'reconnected';
+            my $basis = $state->{reconnect_basis} // 'ac';
+            my $outage = defined $state->{dc_since} ? ($now - $state->{dc_since}) : undef;
+            $state->{phase} = 'ac';
+            $state->{dc_since} = undef;
+            $state->{grace_until} = undef;
+            $state->{reconnected_at} = undef;
+            $state->{reconnect_basis} = undef;
+            my $saved = _write_state($data_dir, $state);
+            return unless $saved;
+            log_event($data_dir, $src, 'RESUME', {
+                basis => $basis, marker => 'absent',
+                outage_s => (defined $outage ? int($outage) : '-'),
+            }, 'host battery override lifted; holding by intent again');
+            push @t, 'RESUME';
+            $lift_basis = $basis;
+        });
+
+        # Step 6.
+        my $st = read_state($data_dir);
+        my $v = battery_verdict($st, $now);
+        # review m4: battery_verdict's own basis for phase "ac" is correctly
+        # just "ac" (V1, pinned by AC1) -- but a journal record for THIS
+        # tick, the one that just lifted the override, is more useful
+        # naming WHY it lifted (probe-failed / stale-reset) than the
+        # post-lift phase name. Only this returned hash gets the override;
+        # battery_verdict() itself stays exactly as specified.
+        $v->{basis} = $lift_basis if defined $lift_basis;
+        return {
+            %$v, phase => $st->{phase}, source => $st->{source}, probed_at => $st->{probed_at},
+            dc_since => $st->{dc_since}, grace_until => $st->{grace_until}, transitions => \@t,
+        };
+    };
+    return (ref $result eq 'HASH') ? $result : { verdict => 'hold', basis => 'error', transitions => [] };
 }
 
 # ---------------------------------------------------------------------------
@@ -857,6 +1139,34 @@ sub _default_arms {
     return [ map { substr(($_->{sid} // ''), 0, 8) } @$arms ];
 }
 
+# _default_sources() -> [ids] (package 09, spec 2.1 monitor additions). The
+# other half of the arm set reconcile already builds (counting_ids) -- so the
+# monitor's own may-sleep message names everything a battery override would
+# have to beat, not just host arms. Same test guard as HostAwake::publish:
+# under a direct .t run with no BUTLER_STATE_DIR, this is never pointed at a
+# real registry under the operator's HOME.
+sub _default_sources {
+    my $bsd = $ENV{BUTLER_STATE_DIR};
+    return [] if defined $0 && $0 =~ /\.t\z/ && !(defined $bsd && length $bsd);
+    my $root = eval { BpContinuityLease::store_root_for(_legacy_dir()) };
+    my $ids = eval {
+        require "$DIR/HostAwake.pm" unless defined &HostAwake::counting_ids;
+        HostAwake::counting_ids($root, time());
+    };
+    my @out = (ref $ids eq 'ARRAY') ? @$ids : ();
+    # review m3: reconcile and decide both count a fresh OLD-style sandbox
+    # hold (sandbox_holds -- a pre-08 launcher's --hold file) alongside
+    # counting_ids. While a pre-08 launcher is alive (Decision 7's exemption
+    # window), omitting it here would under-count what a battery override
+    # actually has to beat.
+    my $holds = eval {
+        require "$DIR/BpPowerPlan.pm" unless defined &BpPowerPlan::sandbox_holds;
+        BpPowerPlan::sandbox_holds($root);
+    };
+    push @out, map { "hold:$_" } @$holds if ref $holds eq 'ARRAY';
+    return \@out;
+}
+
 sub _default_reconcile {
     my (@args) = @_;
     my $ok = eval {
@@ -909,6 +1219,7 @@ sub monitor_loop {
     my $now_cb        = $o{now}            // sub { time() };
     my $sleep_cb      = $o{sleep}          // sub { select(undef, undef, undef, $_[0]) };
     my $arms_cb       = $o{arms}           // sub { _default_arms() };
+    my $sources_cb    = $o{sources}        // sub { _default_sources() };
     my $wakelock_cb   = $o{wakelock_state}  // sub { _default_wakelock_state() };
     my $reconcile_cb  = $o{reconcile}       // \&_default_reconcile;
     my $out_cb        = $o{out}            // sub { print STDOUT $_[0], "\n" };
@@ -945,11 +1256,21 @@ sub monitor_loop {
     $live_arms = [] unless ref $live_arms eq 'ARRAY';
     my $n_arms = scalar @$live_arms;
     my $arm_sids = $n_arms ? join(',', @$live_arms) : '-';
+    # Package 09: the same arm set reconcile now builds for everyone --
+    # host arms plus every counting registry entry (sandbox/fleet/solo) --
+    # so the monitor's own text names everything a battery override has to
+    # beat, not just host arms.
+    my $src_ids = eval { $sources_cb->() } // [];
+    $src_ids = [] unless ref $src_ids eq 'ARRAY';
+    $src_ids = [ map { "$_" } grep { defined $_ && !ref $_ } @$src_ids ];
+    my $n_sources = scalar @$src_ids;
+    my $source_ids_str = $n_sources ? join(',', @$src_ids) : '-';
     my $wl = eval { $wakelock_cb->() };
     $wl = 'unknown' unless defined $wl && length $wl;
     my $dsl = _drive_solo_lock_state($data_dir);
     log_event($data_dir, 'monitor', 'STANDDOWN-VERIFY',
-        { live_arms => $n_arms, arm_sids => $arm_sids, wake_lock => $wl, drive_solo_lock => $dsl },
+        { live_arms => $n_arms, arm_sids => $arm_sids, wake_lock => $wl, drive_solo_lock => $dsl,
+          sources => $n_sources, source_ids => $source_ids_str },
         'verifying stand-down state before the AC poll');
 
     if ($n_arms == 0) {
@@ -959,8 +1280,13 @@ sub monitor_loop {
         my $outcome = $res->{outcome} // 'error';
         my $found = $res->{found_guid} // '-';
         my $wanted = $res->{wanted_guid} // '-';
-        my $reason = $outcome eq 'corrected' ? 'switched to Balanced'
-                   : $outcome eq 'correct'   ? 'already Balanced'
+        # Since package 03, reconcile restores the RECORDED prior plan, not
+        # always the battery saver scheme -- the old fixed "Balanced" wording
+        # was wrong the moment that landed. $name names whatever plan
+        # reconcile actually chose.
+        my $name = $res->{wanted_name} // $res->{wanted_guid} // 'unknown';
+        my $reason = $outcome eq 'corrected' ? "restored $name"
+                   : $outcome eq 'correct'   ? "left $name"
                    : ($res->{reason} // $outcome);
         log_event($data_dir, 'monitor', 'POWER-PLAN',
             { result => $outcome, found => $found, wanted => $wanted, reason => $reason },
@@ -971,7 +1297,15 @@ sub monitor_loop {
             'another armed session is still live; leaving the power plan alone');
     }
 
-    $out_cb->(sprintf('%s ac-monitor watching for AC every %ss; the host may sleep', _hhmm_local($now_cb->()), $tick));
+    # Package 09: when anything (a host arm or a counting source) would
+    # survive a battery override, the may-sleep line names it -- otherwise
+    # byte-identical to the pre-09 text.
+    my @holders = ((map { "arm:$_" } @$live_arms), @$src_ids);
+    my $sleep_line = @holders
+        ? sprintf('%s ac-monitor watching for AC every %ss; the host may sleep: battery overrides %d awake source(s): %s',
+            _hhmm_local($now_cb->()), $tick, scalar(@holders), join(',', @holders))
+        : sprintf('%s ac-monitor watching for AC every %ss; the host may sleep', _hhmm_local($now_cb->()), $tick);
+    $out_cb->($sleep_line);
 
     my $unknown_count = 0;
     my $prev_tick_time = $now_cb->();

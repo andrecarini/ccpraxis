@@ -36,6 +36,7 @@ use Digest::MD5 ();
 use File::Path ();
 use File::Basename ();
 use Cwd ();
+use Time::HiRes ();
 
 my $DIR = File::Basename::dirname(
     do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
@@ -114,9 +115,23 @@ sub host_side {
 sub registry_dir { my ($root) = @_; return "$root/awake-sources" }
 
 # _resolve_root(%o) -> ($root, $guarded). $guarded is true iff the root came
-# from state_root() (no explicit seam) AND this is a .t run with no
-# BUTLER_STATE_DIR set -- the test guard (spec 2.2) that keeps a direct .t
-# run from ever publishing into a real registry under the operator's HOME.
+# from state_root() (no explicit seam, no BUTLER_STATE_DIR -- i.e. the
+# DEFAULT root) AND either this is a direct .t run, or CCPRAXIS_NO_WAKELOCK
+# is set (Decision 30, fix-batch).
+#
+# Why the second clause: the original .t-only guard cannot see a
+# SUBPROCESS a test harness spawns (its own $0 is a scratch .pl, never a
+# .t). Measured since 08 (32c0328): test runs that spawn producers as
+# subprocesses wrote 14 solo- entries into the real
+# ~/.claude/butler-state/continuity/awake-sources between 14:17 and 15:50
+# on 2026-11-04, and after promotion each leaked entry would hold the
+# machine awake for up to 15 minutes. CCPRAXIS_NO_WAKELOCK is already the
+# operator's or a harness's own "no wake-lock" instruction (BpAcWatch's
+# _default_wakelock_state and every GuardHarness-based test already set
+# it), so refusing to publish under it is correct in production too, not
+# only a test-safety measure. It applies only to the DEFAULT root -- an
+# explicit {root} or BUTLER_STATE_DIR is always honoured, exactly as
+# before, because that is the caller deliberately naming where to write.
 sub _resolve_root {
     my (%o) = @_;
     return ($o{root}, 0) if exists $o{root};
@@ -124,7 +139,10 @@ sub _resolve_root {
     my $bsd = $ENV{BUTLER_STATE_DIR};
     my $from_env = defined $bsd && length $bsd;
     my $root = state_root();
-    my $guard = (!$from_env && defined $0 && $0 =~ /\.t\z/) ? 1 : 0;
+    my $default_root = !$from_env;
+    my $t_guard = ($default_root && defined $0 && $0 =~ /\.t\z/) ? 1 : 0;
+    my $nwl_guard = ($default_root && $ENV{CCPRAXIS_NO_WAKELOCK}) ? 1 : 0;
+    my $guard = ($t_guard || $nwl_guard) ? 1 : 0;
     return ($root, $guard);
 }
 
@@ -354,6 +372,15 @@ sub prune_registry {
 }
 
 # decide(\%in) -> \%d. PURE: no I/O, no clock, no %ENV (spec 2.2, B5).
+#
+# Package 09 (D0): battery past grace overrides every other source -- arms,
+# counting registry entries, fresh sandbox holds, old holds -- into hold,
+# which releases the helper and lets reconcile restore the plan. D0 fires
+# only while something would otherwise hold (D1-D4 unchanged, including the
+# "battery release but nothing holding" rows, which fall straight through to
+# whatever D1-D4 already say). Any $in->{battery} value other than the exact
+# string "release" (absent included) means hold, so a caller that never asks
+# the battery question behaves exactly as before 09.
 sub decide {
     my ($in) = @_;
     die "HostAwake::decide: not a HASH\n" unless ref $in eq 'HASH';
@@ -361,18 +388,115 @@ sub decide {
     my $arms = (defined $in->{arms} && $in->{arms} =~ /\A\d+\z/) ? $in->{arms} : 0;
     my $fresh_holds = (defined $in->{fresh_holds} && $in->{fresh_holds} =~ /\A\d+\z/) ? $in->{fresh_holds} : 0;
     my $pending = $in->{pending} ? 1 : 0;
+    my $battery_release = (defined $in->{battery} && $in->{battery} eq 'release') ? 1 : 0;
+
+    if ($battery_release && ($arms > 0 || @$counting > 0 || $fresh_holds > 0)) {
+        return { mode => 'hold', lock => 0, plan_hold => 0, why => 'refresher-hold-tick',
+                 counting => $counting, battery => 1 };
+    }
 
     if ($arms > 0) {
-        return { mode => 'arm', lock => 1, plan_hold => 1, why => 'refresher-tick', counting => $counting };
+        return { mode => 'arm', lock => 1, plan_hold => 1, why => 'refresher-tick',
+                 counting => $counting, battery => 0 };
     }
     if (@$counting > 0) {
-        return { mode => 'source', lock => 1, plan_hold => 1, why => 'refresher-source-tick', counting => $counting };
+        return { mode => 'source', lock => 1, plan_hold => 1, why => 'refresher-source-tick',
+                 counting => $counting, battery => 0 };
     }
     if ($pending) {
         return { mode => 'hold', lock => 0, plan_hold => ($fresh_holds > 0 ? 1 : 0),
-                 why => 'refresher-hold-tick', counting => $counting };
+                 why => 'refresher-hold-tick', counting => $counting, battery => 0 };
     }
-    return { mode => 'idle', lock => 0, plan_hold => 0, why => 'refresher-exit', counting => $counting };
+    return { mode => 'idle', lock => 0, plan_hold => 0, why => 'refresher-exit', counting => $counting, battery => 0 };
+}
+
+# host_ac_dir($root) -> "$root/host-ac" | undef (package 09, spec 2.2). undef
+# for an undef or empty root. BpAcWatch's own helpers append /.drive-solo, so
+# the actual state file sits at host_ac_dir($root) . '/.drive-solo/ac-state.json'.
+sub host_ac_dir {
+    my ($root) = @_;
+    return (defined $root && length $root) ? "$root/host-ac" : undef;
+}
+
+# battery_releases($root, $now) -> 0|1 (package 09, spec 2.2). No probe, no
+# write, never dies. This is the ONLY battery question reconcile asks --
+# every other caller goes through gather/decide instead. Fail-open: 0 (hold)
+# for an undef root, any load/call failure, or a missing/garbled state.
+sub battery_releases {
+    my ($root, $now) = @_;
+    return 0 unless defined $root && length $root;
+    my $hdir = host_ac_dir($root);
+    return 0 unless defined $hdir;
+    my $v = eval {
+        require "$DIR/BpAcWatch.pm" unless defined &BpAcWatch::battery_verdict;
+        BpAcWatch::battery_verdict(BpAcWatch::read_state($hdir), defined $now ? $now : time());
+    };
+    return 0 unless ref $v eq 'HASH';
+    return (($v->{verdict} // '') eq 'release') ? 1 : 0;
+}
+
+# battery_step($dir, $root, %o) -> \%v (package 09, spec 2.2). One host_step
+# tick of the host-wide BpAcWatch instance under host_ac_dir($root), plus the
+# journal record a VERDICT CHANGE (not every tick) writes. Never dies; any
+# internal failure gives {verdict => hold, basis => error, journaled => 0}.
+#
+# Decision 29(a) (fix-batch): the "last announced" verdict this compares
+# against lives in the host-ac state itself (BpAcWatch::read_state's
+# `announced` key, under its own lock -- BpAcWatch::mark_announced), never
+# in a per-process cache. A per-process cache (keyed by dir, defaulting to
+# "hold" the first time a process sees it) duplicated a "released" record on
+# every refresher restart or handover, because the NEW process's cache
+# always started at "hold" even though the state on disk was already
+# release -- and it lost the "held" edge entirely when the daemon
+# idle-exited mid-outage, because the next process to run also started its
+# cache at "hold" (review M1). Reading `announced` from disk means any
+# process, cold-started or not, agrees with whatever the LAST process
+# actually got journaled -- and `mark_announced` is called ONLY after
+# `append_record` returns success, so a failed append leaves `announced`
+# unchanged and the very next tick retries rather than silently dropping
+# the edge forever.
+sub battery_step {
+    my ($dir, $root, %o) = @_;
+    my $result = eval {
+        require "$DIR/BpAcWatch.pm" unless defined &BpAcWatch::host_step;
+        my $hdir = host_ac_dir($root);
+        # Time::HiRes, not time(): a daemon tick's own test seam (no real
+        # sleep between iterations) can run two ticks within the same
+        # integer second, and observe()'s "has it been _probe_interval()
+        # seconds since the last probe" check needs sub-second resolution to
+        # tell those two ticks apart -- an integer $now would make the
+        # second tick's elapsed time read as 0 and skip the reprobe that a
+        # fast test seam (CCPRAXIS_AC_TICK_SECONDS) exists to force.
+        my $now = defined $o{now} ? $o{now} : Time::HiRes::time();
+        # Read the announced verdict from disk BEFORE stepping (spec 2.2
+        # step 2's own "prev = ... read before stepping"), so this call's
+        # own write (inside host_step) can never be mistaken for the
+        # previous tick's announcement.
+        my $prev_state = BpAcWatch::read_state($hdir);
+        my $prev_verdict = (ref $prev_state eq 'HASH' && defined $prev_state->{announced}
+            && length $prev_state->{announced}) ? $prev_state->{announced} : 'hold';
+        my %step_opts = (now => $now, src => 'host-awake');
+        $step_opts{probe} = $o{probe} if ref $o{probe} eq 'CODE';
+        my $cur = BpAcWatch::host_step($hdir, %step_opts);
+        die "HostAwake::battery_step: host_step returned a non-HASH\n" unless ref $cur eq 'HASH';
+        my $cur_verdict = $cur->{verdict} // 'hold';
+
+        my $journaled = 0;
+        if ($prev_verdict ne $cur_verdict) {
+            require "$DIR/BpPowerJournal.pm" unless defined &BpPowerJournal::awake_record;
+            my $rec = BpPowerJournal::awake_record(
+                now => $now,
+                state => (($cur->{verdict} // '') eq 'release' ? 'released' : 'held'),
+                basis => $cur->{basis}, phase => $cur->{phase}, power_source => $cur->{source},
+                on_battery_since => $cur->{dc_since}, grace_until => $cur->{grace_until},
+                arms => $o{arms}, sources => $o{counting}, fresh_holds => $o{fresh_holds},
+            );
+            $journaled = BpPowerJournal::append_record($dir, $rec) ? 1 : 0;
+            BpAcWatch::mark_announced($hdir, $cur_verdict) if $journaled;
+        }
+        return { %$cur, journaled => $journaled };
+    };
+    return (ref $result eq 'HASH') ? $result : { verdict => 'hold', basis => 'error', journaled => 0 };
 }
 
 # gather($dir, %o) -> \%in. Reads the inputs decide() needs (spec 2.2).
@@ -383,10 +507,12 @@ sub gather {
     my %in = (arms => $o{arms});
 
     if ((BpContinuityLease::platform() ne 'windows') || !defined $root || !length $root) {
-        $in{arms}        = 0 unless defined $in{arms};
-        $in{counting}    = [];
-        $in{fresh_holds} = 0;
-        $in{pending}     = 0;
+        $in{arms}          = 0 unless defined $in{arms};
+        $in{counting}      = [];
+        $in{fresh_holds}   = 0;
+        $in{pending}       = 0;
+        $in{battery}       = 'hold';
+        $in{battery_basis} = 'off-platform';
         return \%in;
     }
 
@@ -400,7 +526,12 @@ sub gather {
     }
 
     require "$DIR/BpPowerPlan.pm" unless defined &BpPowerPlan::sandbox_holds;
-    my $now = defined $o{now} ? $o{now} : time();
+    # Time::HiRes, not time(): see battery_step's own header for why -- the
+    # daemon tick path (the only caller that never passes {now}) needs
+    # sub-second resolution for the battery probe interval to behave right
+    # under a fast test seam; counting_ids/sandbox_holds only ever compare
+    # $now numerically, so the extra precision changes nothing for them.
+    my $now = defined $o{now} ? $o{now} : Time::HiRes::time();
     $in{counting}    = counting_ids($root, $now);
     $in{fresh_holds} = scalar @{ BpPowerPlan::sandbox_holds($root) };
 
@@ -410,6 +541,34 @@ sub gather {
         unless (exists $skip_sources->{$e->{id}}) { $reg_pending = 1; last }
     }
     $in{pending} = (BpContinuityLease::holds_pending($dir, skip => $o{skip_holds}) || $reg_pending) ? 1 : 0;
+
+    # Package 09: the battery question is only ever worth asking (a probe,
+    # a state file) when something could hold -- an arm, a counting source,
+    # or a fresh sandbox hold. With nothing that could hold, battery is moot
+    # (D0 never fires anyway: it requires one of those three to be
+    # nonzero), so no host-ac state is read, probed or created.
+    if ($in{arms} > 0 || @{ $in{counting} } > 0 || $in{fresh_holds} > 0) {
+        my $bres = eval {
+            battery_step($dir, $root, now => $now, probe => $o{ac_probe},
+                arms => $in{arms}, counting => $in{counting}, fresh_holds => $in{fresh_holds});
+        };
+        if (ref $bres eq 'HASH') {
+            $in{battery}       = $bres->{verdict} // 'hold';
+            $in{battery_basis} = $bres->{basis}   // 'error';
+        }
+        else {
+            # battery_step died (or a test stubbed it to die) or returned
+            # something unusable -- fail open to hold, never let a battery
+            # subsystem failure silently release every source (AC12(d)).
+            $in{battery}       = 'hold';
+            $in{battery_basis} = 'error';
+        }
+    }
+    else {
+        $in{battery}       = 'hold';
+        $in{battery_basis} = 'not-needed';
+    }
+
     return \%in;
 }
 

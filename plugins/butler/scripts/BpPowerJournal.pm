@@ -102,6 +102,41 @@ sub append_record {
     return $ok;
 }
 
+# awake_record(%f) -> \%rec (blueprint wake-and-pause-consolidation, package
+# 09-battery-for-every-source, spec 2.3). Pure apart from $$ -- every value
+# is read straight from %f, never from the clock or the filesystem, so the
+# caller (HostAwake::battery_step) controls exactly what gets journaled.
+sub awake_record {
+    my (%f) = @_;
+    my $now = defined $f{now} ? $f{now} : time();
+    my $ts  = int($now);
+    my $state = (defined $f{state} && ($f{state} eq 'released' || $f{state} eq 'held'))
+        ? $f{state} : 'held';
+    my $sources = (ref $f{sources} eq 'ARRAY') ? $f{sources} : [];
+    # review m5: spec 2.3 says <int|null> -- gather's $now is Time::HiRes,
+    # so observe() stores a fractional dc_since/grace_until, and these must
+    # be truncated to whole seconds here rather than copied as-is.
+    my $obs = (defined $f{on_battery_since} && "$f{on_battery_since}" =~ /\A-?\d+(?:\.\d+)?\z/)
+        ? int(0 + $f{on_battery_since}) : undef;
+    my $gu  = (defined $f{grace_until} && "$f{grace_until}" =~ /\A-?\d+(?:\.\d+)?\z/)
+        ? int(0 + $f{grace_until}) : undef;
+    return {
+        v => 1, kind => 'awake', ts => $ts,
+        utc => _utc_iso($ts), local => _local_iso($ts), pid => $$,
+        reason => 'battery',
+        state => $state,
+        basis => (defined $f{basis} && length $f{basis}) ? $f{basis} : 'unknown',
+        phase => (defined $f{phase} && length $f{phase}) ? $f{phase} : 'unknown',
+        power_source => (defined $f{power_source} && ($f{power_source} eq 'ac' || $f{power_source} eq 'dc'))
+            ? $f{power_source} : 'unknown',
+        on_battery_since => $obs,
+        grace_until => $gu,
+        arms => 0 + ($f{arms} // 0),
+        sources => $sources,
+        fresh_holds => 0 + ($f{fresh_holds} // 0),
+    };
+}
+
 # ---------------------------------------------------------------------------
 # time formatting
 # ---------------------------------------------------------------------------
@@ -869,7 +904,7 @@ sub build_timeline {
     my $since_ms      = $a{since_ms};
     my $until_ms      = $a{until_ms};
 
-    my (@ticks, @notes, @plans);
+    my (@ticks, @notes, @plans, @awakes);
     # SHOULD-FIX 1 (review) / spec B13: a line that cannot be decoded (a
     # truncated last line after a hard freeze) is skipped AND counted, never
     # silently dropped -- an all-zeros count would read identically to "the
@@ -885,6 +920,11 @@ sub build_timeline {
             # record renders as its own "plan" timeline entry rather than
             # falling through to an "unknown kind: plan" note.
             push @plans, $rec;
+        } elsif ($rec->{kind} eq 'awake') {
+            # Package 09-battery-for-every-source: likewise, a kind:awake
+            # record (HostAwake::battery_step's journal of a verdict change)
+            # renders as its own "awake" timeline entry, never a note.
+            push @awakes, $rec;
         } else {
             push @notes, $rec;
         }
@@ -1072,6 +1112,24 @@ sub build_timeline {
             wanted_basis => $p->{wanted_basis},
             action => $p->{action}, result => $p->{result},
             error => $p->{error}, detail => $p->{detail}, rc => $p->{rc}, ms => $p->{ms},
+            # Package 09: a battery-overridden reconcile's record carries
+            # override => 'battery' (BpPowerPlan::_write_plan_record); copied
+            # through only when present, so every pre-09 record (and every
+            # non-battery one) renders with no override key at all.
+            (defined $p->{override} ? (override => $p->{override}) : ()),
+        };
+    }
+
+    # n4 (review): never name this loop var $a -- sort's reserved $a/$b are
+    # used further down in this same function, outside this loop's scope,
+    # so a lexical $a here was safe only by accident.
+    for my $w (@awakes) {
+        push @entries, {
+            kind => 'awake', t_ms => (defined $w->{ts} ? $w->{ts} : 0) * 1000,
+            local => _local_iso(defined $w->{ts} ? $w->{ts} : 0),
+            reason => $w->{reason}, state => $w->{state}, basis => $w->{basis}, phase => $w->{phase},
+            power_source => $w->{power_source}, arms => $w->{arms}, sources => $w->{sources},
+            fresh_holds => $w->{fresh_holds},
         };
     }
 
@@ -1126,7 +1184,7 @@ sub build_timeline {
         @entries = @kept;
     }
 
-    my %rank = (event => 0, journal => 1, transcript => 2, plan => 3, note => 4, flag => 5);
+    my %rank = (event => 0, journal => 1, transcript => 2, plan => 3, awake => 3, note => 4, flag => 5);
     my $idx = 0;
     for my $e (@entries) { $e->{__idx} = $idx++ }
     @entries = sort {
@@ -1183,6 +1241,17 @@ sub _summary_for {
     if ($k eq 'journal')    { return "count=$e->{count} power=$e->{power_source} display=$e->{display}" }
     if ($k eq 'event')      { return "id=$e->{id} $e->{message}" }
     if ($k eq 'transcript') { return "count=$e->{count}" }
+    if ($k eq 'awake') {
+        my $srcs = (ref $e->{sources} eq 'ARRAY' && @{ $e->{sources} }) ? join(',', @{ $e->{sources} }) : '-';
+        # n5 (review): a hand-edited or future record missing a key must not
+        # emit "uninitialized" warnings -- same // defaults the plan branch
+        # below already uses.
+        my $reason = defined $e->{reason} ? $e->{reason} : '';
+        my $state  = defined $e->{state}  ? $e->{state}  : '';
+        my $basis  = defined $e->{basis}  ? $e->{basis}  : '';
+        my $arms   = defined $e->{arms}   ? $e->{arms}   : 0;
+        return "reason=$reason state=$state basis=$basis arms=$arms sources=$srcs";
+    }
     if ($k eq 'plan') {
         my $why    = defined $e->{why}        ? $e->{why}        : '';
         my $action = defined $e->{action}     ? $e->{action}     : '';
@@ -1195,6 +1264,10 @@ sub _summary_for {
         # right after wanted= so a read of the text report shows WHY the
         # plan was chosen, not just what it was.
         $s .= " basis=$e->{wanted_basis}" if defined $e->{wanted_basis} && length $e->{wanted_basis};
+        # Package 09: override=battery right after basis=, so a read of the
+        # text report shows a battery-forced reconcile apart from a normal
+        # arm-driven one.
+        $s .= " override=$e->{override}" if defined $e->{override} && length $e->{override};
         if ($result eq 'error') {
             my $err    = defined $e->{error}  ? $e->{error}  : '';
             my $detail = defined $e->{detail} ? $e->{detail} : '';
