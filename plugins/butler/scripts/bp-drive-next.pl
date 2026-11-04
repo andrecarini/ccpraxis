@@ -2603,12 +2603,8 @@ STATE  (<data>/.drive-solo/, all director-owned)
   announced.json  {"announced":[…]}   blueprints whose blueprint-done already fired
   inflight.json   {"packages":[{"blueprint":…,"package":…,"ledger":…,"since":<epoch>}],
                   "updated_at":<epoch>}   the project-level in-flight set: added on run-package, pruned once its ledger turns terminal. Concurrent hand-out (a further ready package disjoint from every in-flight write set) is unconditional.
-  keepawake.pid   pre-08 legacy: PID of drive-solo's own wake-lock helper,
-                  retired (killed and unlinked) on this session's first
-                  settle under package 08-host-awake-actuator.
-  <state root>/awake-sources/solo-<tag>.json   the registry entry that
-                  replaces it (package 08): this is what the host-side
-                  continuity refresher actually reads now.
+  keepawake.pid   pre-08 legacy: PID of drive-solo's own wake-lock helper, retired (killed and unlinked) on this session's first settle under package 08-host-awake-actuator.
+  <state root>/awake-sources/solo-<tag>.json   the registry entry that replaces it (package 08): this is what the host-side continuity refresher actually reads now.
   run.md          append-only structured run log
 END_HELP
 
