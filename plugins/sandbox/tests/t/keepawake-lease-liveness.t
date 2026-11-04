@@ -158,13 +158,25 @@ like($src, qr/OWNER-REPLACED/,
 }
 
 # ---------------------------------------------------------------------------
-# Decision 16 (c): launcher.pl's own keep-awake exec must pass -OwnerWinPid,
-# sourced from /proc/<pid>/winpid in the PARENT before it forks, and never
-# from the bare MSYS pid ($$). Static/source-level only -- this file's write
-# set is keep-awake.ps1 + this test, so launcher.pl itself is read-only here,
-# never edited or driven as a subprocess (that would collide with
-# test-wakelock-hygiene.t's actuator sweep and this file's own no-real-
-# wake-lock discipline stated in the header above).
+# Decision 16 (c): launcher.pl's own keep-awake exec must pass an owner pid
+# sourced from the launcher's own WINDOWS pid (self_winpid, the cygwin/MSYS
+# native-pid seam), and never from the bare MSYS pid ($$). Static/source-
+# level only -- this file's write set is keep-awake.ps1 + this test, so
+# launcher.pl itself is read-only here, never edited or driven as a
+# subprocess (that would collide with test-wakelock-hygiene.t's actuator
+# sweep and this file's own no-real-wake-lock discipline stated in the
+# header above).
+#
+# Rewritten for 07-one-keepawake-helper (blueprint wake-and-pause-
+# consolidation, Decision 21; reviewer-step6.md m1): package 07 moved the
+# real spawn out of launcher.pl's own `sub _keepawake_start` (deleted) and
+# into BpKeepAwake::spawn, called from the `start => sub { ... }` closure
+# launcher.pl now hands to KeepAwake->new(...). Looking for the deleted sub
+# name left this whole block skipping silently on every run, with none of
+# its coverage replaced elsewhere (m1). Re-pointed at the closure's own body
+# so this runs (not skips) again, and keeps checking the same requirement in
+# plain English: the owner pid is the launcher's own WINDOWS pid, obtained
+# through BpKeepAwake::self_winpid(), never the bare MSYS $$.
 # ---------------------------------------------------------------------------
 {
     my $LAUNCHER = "$Bin/../../scripts/launcher.pl";
@@ -179,46 +191,43 @@ like($src, qr/OWNER-REPLACED/,
         skip 'Decision 16(c): launcher.pl not found -- cannot check its keep-awake wiring', 4
             unless defined $lsrc;
 
-        # Isolate the keep-awake start routine's own body (up to the next
-        # top-level `sub `), so the "before fork()" ordering check below is
-        # anchored to the right function rather than the whole 9000-line file.
-        my ($start_sub_body) = ($lsrc =~ /sub\s+_keepawake_start\s*\{(.*?)\n\}\n/s);
+        # Isolate the start closure's own body: the text between `start    =>
+        # sub {` and the following `stop     =>` key of the same
+        # KeepAwake->new(...) call, so the ordering/never-$$ checks below are
+        # anchored to the right closure rather than the whole 9000-line file.
+        my ($start_sub_body) = ($lsrc =~ /start\s*=>\s*sub\s*\{(.*?)\n\s*\},\n\s*stop\s*=>/s);
 
         SKIP: {
-            skip 'Decision 16(c): no _keepawake_start subroutine found in launcher.pl -- the wiring this '
-               . 'decision requires may live under a different name/shape', 4
+            skip 'Decision 16(c): no start => sub { ... } closure found ahead of a stop => key in '
+               . 'launcher.pl -- the keep-awake start wiring this decision requires may live under a '
+               . 'different shape', 4
                 unless defined $start_sub_body;
 
-            like($start_sub_body, qr/-OwnerWinPid/,
-                "Decision 16(c): launcher.pl's keep-awake exec passes -OwnerWinPid");
+            like($start_sub_body, qr/BpKeepAwake::self_winpid\s*\(\s*\)/,
+                "Decision 16(c): launcher.pl's keep-awake start closure calls BpKeepAwake::self_winpid() "
+              . '(the owner pid is the launcher\'s own WINDOWS pid, not derived any other way)');
 
-            # The value must be sourced from /proc/<pid>/winpid, not a bare $$.
-            # Written loosely (no fixed variable name) since this is derived
-            # from the decision's plain-English requirement, not from reading
-            # the implementer's exact code.
-            like($lsrc, qr{/proc/\$\$/winpid},
-                'Decision 16(c): launcher.pl reads the owner WINPID via /proc/$$/winpid '
-              . '(the cygwin/MSYS native-pid seam), not by any other means');
+            like($start_sub_body, qr/owner_winpid\s*=>/,
+                'Decision 16(c): the start closure passes owner_winpid => to the real spawn call');
 
-            # Ordering: the /proc/.../winpid read must happen textually BEFORE
-            # fork() is called inside _keepawake_start's own body -- "read in
-            # the parent... before forking".
-            my $proc_read_pos = ($start_sub_body =~ /\/proc\/\$\$\/winpid|_keepawake_owner_winpid\s*\(/) ? $-[0] : undef;
-            my $fork_pos      = ($start_sub_body =~ /\bfork\s*\(/) ? $-[0] : undef;
-            ok(defined($proc_read_pos) && defined($fork_pos) && $proc_read_pos < $fork_pos,
-                'Decision 16(c): the owner WINPID is read before fork() is called, i.e. in the PARENT, '
-              . 'never re-derived in the child after forking')
-                or diag(sprintf('proc_read_pos=%s fork_pos=%s',
-                    defined($proc_read_pos) ? $proc_read_pos : 'undef',
-                    defined($fork_pos)      ? $fork_pos      : 'undef'));
+            # Ordering: the self_winpid() read must happen textually BEFORE
+            # BpKeepAwake::spawn( is called inside the closure's own body --
+            # "read in the parent... before forking" (spawn() does the fork).
+            my $self_winpid_pos = ($start_sub_body =~ /BpKeepAwake::self_winpid\s*\(\s*\)/) ? $-[0] : undef;
+            my $spawn_pos       = ($start_sub_body =~ /BpKeepAwake::spawn\s*\(/) ? $-[0] : undef;
+            ok(defined($self_winpid_pos) && defined($spawn_pos) && $self_winpid_pos < $spawn_pos,
+                'Decision 16(c): BpKeepAwake::self_winpid() is called before BpKeepAwake::spawn(, i.e. the '
+              . 'owner WINPID is read in the PARENT before the helper is forked')
+                or diag(sprintf('self_winpid_pos=%s spawn_pos=%s',
+                    defined($self_winpid_pos) ? $self_winpid_pos : 'undef',
+                    defined($spawn_pos)       ? $spawn_pos       : 'undef'));
 
-            # The value handed to -OwnerWinPid must never be the bare MSYS pid
+            # The value handed to owner_winpid must never be the bare MSYS pid
             # ($$) itself -- forbid the exact shape of passing it directly as
-            # that flag's argument (list form or an interpolated command
-            # string), which is precisely the CLAUDE.md MSYS-pid/WINPID
-            # landmine this decision exists to avoid.
-            unlike($start_sub_body, qr/-OwnerWinPid['"]?\s*,\s*\$\$\b/,
-                'Decision 16(c): -OwnerWinPid is never handed the bare MSYS pid ($$) directly');
+            # that key's value, which is precisely the CLAUDE.md MSYS-pid/
+            # WINPID landmine this decision exists to avoid.
+            unlike($start_sub_body, qr/owner_winpid\s*=>\s*\$\$\b/,
+                'Decision 16(c): owner_winpid is never handed the bare MSYS pid ($$) directly');
         }
     }
 }

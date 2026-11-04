@@ -24,14 +24,17 @@ open(my $fh, '<', $launcher) or die "read $launcher: $!";
 my $src = do { local $/; <$fh> };
 close $fh;
 
-# The keep-awake spawn translates every path it hands powershell.exe through
-# native_path, never winify_path.
-my ($start) = $src =~ /(sub _keepawake_start \{.*?\n\})/s;
-ok(defined $start, '_keepawake_start found');
-like($start, qr/my \$win_ps1 = native_path\(\$ps1\)/,     '-File goes through native_path');
-like($start, qr/my \$win_pid = native_path\(\$pidfile\)/, '-PidFile goes through native_path');
-like($start, qr/'-LogFile', native_path\(\$logfile\)/,    '-LogFile goes through native_path');
-unlike($start, qr/winify_path\(/, 'no winify_path left in the keep-awake spawn');
+# 07-one-keepawake-helper (Decision 19, spec section 7(2)): the real keep-awake
+# spawn -- and therefore the native-path translation this file exists to
+# guard -- moved out of launcher.pl's own _keepawake_start (DC1 deletes it)
+# and into BpKeepAwake::winify/winify_out (bp-keepawake.pl), which carry the
+# same 137a741 guarantee restated for the Cygwin::posix_to_win_path rule.
+# one-keepawake-helper.t's AC12 now pins that guarantee directly against
+# BpKeepAwake; this file keeps only the launcher-side regression guard (the
+# sub must be gone) and the native_path unit checks below, which stay in
+# scope here regardless of which caller uses them.
+unlike($src, qr/\bsub _keepawake_start\b/,
+    '_keepawake_start is gone from launcher.pl -- its native-path guarantee now lives in BpKeepAwake (see one-keepawake-helper.t AC12)');
 
 is(native_path(undef), undef, 'undef passes through');
 is(native_path(''),    '',    'empty passes through');

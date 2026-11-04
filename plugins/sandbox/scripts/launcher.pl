@@ -6223,22 +6223,58 @@ sub enter_dashboard {
     my $bp_appr_file      = "$LAUNCHER_DIR/backpack-approvals.json";
 
     # B5 keep-awake: hold a wake-lock only while the orchestrator's busy-lease is
-    # fresh (active work / pending auto-resume). Reap any helper orphaned by a
-    # previously-crashed launcher first, then build the seam-driven holder.
+    # fresh (active work / pending auto-resume). The real spawn/liveness/stop/
+    # reap of the helper live in BpKeepAwake (bp-keepawake.pl, butler), loaded
+    # here by path, inside eval: the sandbox plugin must keep working with no
+    # butler plugin beside it (Decision 13). A failed load is logged ONCE and
+    # the dashboard runs with no wake-lock at all, never a die.
     # Keep-awake holds the host awake while the busy-lease was touched within this
     # window. 10 min (matching the loosened heartbeat HB) so a brief gap / slow
     # tick never releases the lock mid-run; the host only sleeps once the run has
     # been genuinely idle or parked this long. Env-overridable.
     my $BUSY_STALE   = ($ENV{BUSY_STALE_SECS} && $ENV{BUSY_STALE_SECS} =~ /^\d+$/)
                        ? $ENV{BUSY_STALE_SECS} : KeepAwake::lease_fresh();
-    my $ka_helper    = "$SANDBOX_PLUGIN/scripts/keep-awake.ps1";
-    my $ka_pidfile   = "$SAMPLER_TMPDIR/keepawake.pid";
+    my $ka_pidfile   = "$SAMPLER_TMPDIR/keepawake.pid";     # literal line kept (idle-footprint.t pins it)
     my $ka_logfile   = "$SAMPLER_TMPDIR/keepawake.log";
-    _keepawake_reap_orphan($ka_pidfile);
+    # NIT-1 (redteam-step6.md): pass the ABSOLUTE $INSTALL_ROOT-based path
+    # rather than letting load_bp_keepawake default to a path built from
+    # KeepAwake.pm's own __FILE__. A relative launcher invocation plus the
+    # first-setup chdir (above, before enter_dashboard) would otherwise
+    # resolve that default relative to the wrong directory and silently lose
+    # the wake-lock, logging keepawake_unavailable once and nothing else.
+    my ($ka_ok, $ka_why) = KeepAwake::load_bp_keepawake("$INSTALL_ROOT/plugins/butler/scripts/bp-keepawake.pl");
+    log_ev('keepawake_unavailable', { reason => $ka_why }) unless $ka_ok;
+    if ($ka_ok) {
+        my ($r, $w) = eval { BpKeepAwake::reap_orphan($ka_pidfile, wait_seconds => 2) };
+        # n1 (reviewer-step6.md): log only a REAL reap, not every outcome --
+        # 'not-ours' and 'still-alive' are cases where nothing of ours was
+        # touched, which is not a reap event worth an entry in the launch log.
+        log_ev('keepawake_orphan_reaped', { pid => $w, result => $r }) if defined $r && $r eq 'gone';
+    }
     $KEEPAWAKE = KeepAwake->new(
-        start    => sub { _keepawake_start($ka_helper, $ka_pidfile, $ka_logfile) },
-        stop     => sub { _keepawake_stop($_[0], $ka_pidfile) },
-        alive    => \&_keepawake_alive,
+        start    => sub {
+            return undef unless $ka_ok;
+            # Named by its WINDOWS pid, so the helper can tell a quiet owner
+            # from a gone one (keep-awake.ps1 -OwnerWinPid, Decision 16); the
+            # owner-started bound is computed inside BpKeepAwake::spawn,
+            # before its own fork, from this same owner_winpid.
+            my $owner = eval { BpKeepAwake::self_winpid() };
+            my $pid = eval { BpKeepAwake::spawn($ka_pidfile,
+                                                 { owner_winpid => $owner },
+                                                 { lease_seconds => 0 }) };
+            if (!defined $pid) {
+                log_ev('keepawake_start_failed',
+                       { reason => ($@ ? _trim_err($@) : 'declined (not Windows, or CCPRAXIS_NO_WAKELOCK)') });
+                return undef;
+            }
+            log_ev('keepawake_started', { pid => $pid, owner_winpid => ($owner // 'none') });
+            return $pid;
+        },
+        stop     => sub {
+            return unless $ka_ok;
+            log_ev('keepawake_stopped', { pid => $_[0] }) if BpKeepAwake::stop_child($_[0], $ka_pidfile);
+        },
+        alive    => ($ka_ok ? \&BpKeepAwake::child_alive : undef),
         on_event => sub {
             my (%e) = @_;
             return unless ($e{kind} // '') eq 'died';
@@ -6246,7 +6282,7 @@ sub enter_dashboard {
             # which is exactly what was missing when bug 4eca was found.
             log_ev('keepawake_died', { pid => $e{handle}, restarting => $e{restarting},
                                        pidfile_present => (-e $ka_pidfile ? 1 : 0),
-                                       helper_last => _keepawake_log_tail($ka_logfile) });
+                                       helper_last => BpKeepAwake::log_tail($ka_logfile) });
         },
     );
 
@@ -7396,95 +7432,11 @@ sub _trim_err {
 }
 
 # ---------------------------------------------------------------------
-# B5 keep-awake helpers — the real spawn/kill seams for the KeepAwake holder.
-# The host perl is Git-for-Windows (cygwin) perl with no Win32::API, so the
-# wake-lock is a dedicated PowerShell child (keep-awake.ps1) whose lifetime IS
-# the lock's lifetime. NOTE: the actual spawn/kill + whether the machine really
-# stays awake is verified on a real desktop (attended); the decision + lifecycle
-# logic is unit-tested in KeepAwake.pm / t/28.
+# B5 keep-awake: the real spawn/liveness/stop/reap of the helper now live in
+# BpKeepAwake (bp-keepawake.pl, butler) -- see enter_dashboard's wiring and
+# KeepAwake::load_bp_keepawake. This launcher only keeps the holder's
+# lifecycle (revive, [r] release) and the host power plan below.
 # ---------------------------------------------------------------------
-
-# _keepawake_start($ps1, $pidfile) -> child pid | undef. fork+exec the PowerShell
-# helper detached (stdio to /dev/null so it can't touch the dashboard alt-screen).
-# Returns the cygwin child pid (the holder's handle, used by _keepawake_stop).
-# The helper self-reports its WINDOWS pid into $pidfile for cross-crash reaping.
-sub _keepawake_start {
-    my ($ps1, $pidfile, $logfile) = @_;
-    unless (-f $ps1) {
-        log_ev('keepawake_start_failed', { reason => "helper missing: $ps1" });
-        return undef;
-    }
-    my $win_ps1 = native_path($ps1);
-    my $win_pid = native_path($pidfile);
-    # The helper logs every state change and a HOLD line a minute. Without a log
-    # its RELEASE reason was lost, and a helper that vanished mid-run could not
-    # be explained (bug 20261031-225228-4eca). Rotated here, at start, past 1 MB
-    # (a HOLD line a minute is ~115 KB/day), keeping one previous file.
-    my @log_args;
-    if (defined $logfile && length $logfile) {
-        my $sz = -s $logfile;
-        rename($logfile, "$logfile.1") if defined $sz && $sz > 1024 * 1024;
-        @log_args = ('-LogFile', native_path($logfile));
-    }
-    # The helper's owner is THIS launcher, named by its WINDOWS pid so the helper
-    # can tell a quiet owner from a gone one (keep-awake.ps1 -OwnerWinPid,
-    # Decision 16). Read in the parent, before fork: $$ is an MSYS pid, a
-    # different namespace that keep-awake.ps1 must never be handed. When it
-    # cannot be read, omit the flag -- the helper then runs on its bounded
-    # fallback lease rather than trusting a wrong identity.
-    my $owner_winpid = _keepawake_owner_winpid();
-    my @owner_args = defined $owner_winpid ? ('-OwnerWinPid', $owner_winpid) : ();
-    # -OwnerStartedBeforeTicks: our own clock, read now, while we (the owner)
-    # are certainly alive and before the fork. If we die before the helper
-    # pins our WINPID and Windows hands it to a new process, that process was
-    # created after this reading and the helper rejects it (keep-awake.ps1,
-    # started-after-spawn) instead of pinning an impostor. Pure arithmetic --
-    # no process is spawned for it.
-    require Time::HiRes;   # core
-    my $owner_ticks = defined $owner_winpid ? KeepAwake::filetime_ticks(Time::HiRes::time()) : undef;
-    push @owner_args, '-OwnerStartedBeforeTicks', $owner_ticks if defined $owner_ticks;
-    my $pid = fork();
-    if (!defined $pid) {
-        log_ev('keepawake_start_failed', { reason => "fork: $!" });
-        return undef;
-    }
-    if ($pid == 0) {
-        # child: detach stdio, then exec the helper. _exit (not exit) on failure
-        # so the parent's END handlers don't run in the child.
-        open(STDIN,  '<', '/dev/null');
-        open(STDOUT, '>', '/dev/null');
-        open(STDERR, '>', '/dev/null');
-        local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
-        exec('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-             '-WindowStyle', 'Hidden', '-File', $win_ps1, '-PidFile', $win_pid,
-             @owner_args, @log_args)
-            or do { POSIX::_exit(127); };
-    }
-    log_ev('keepawake_started', { pid => $pid,
-        owner_winpid => (defined $owner_winpid ? $owner_winpid : 'none'),
-        owner_started_before => (defined $owner_ticks ? $owner_ticks : 'none') });
-    return $pid;
-}
-
-
-# _keepawake_owner_winpid() -> positive WINDOWS pid of this process | undef.
-# Cygwin/MSYS exposes the native pid at /proc/<msys-pid>/winpid (measured on
-# this host: MSYS 1183523 -> WINPID 99496). Anything that is not a positive
-# integer -- no /proc, unreadable, garbage -- is undef, never a guess.
-# _keepawake_alive($pid) -> 1 | 0 | undef. The helper is this launcher's own
-# forked child (MSYS pid; the exec'd powershell.exe keeps it), so a non-blocking
-# waitpid answers exactly: 0 still running, the pid once it has exited (which
-# also reaps it). -1 means it is not ours to wait for (already reaped
-# elsewhere); then a signal-0 probe in the same namespace decides. undef for no
-# handle at all: nothing to judge.
-sub _keepawake_alive {
-    my ($pid) = @_;
-    return undef unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
-    my $w = waitpid($pid, POSIX::WNOHANG());
-    return 1 if $w == 0;
-    return 0 if $w == $pid;
-    return kill(0, $pid) ? 1 : 0;
-}
 
 # _power_plan_hold($on, $why) -- tell the host power plan that this launcher
 # holds (1) or released (0) the wake-lock for its container. Decision 14: the
@@ -7514,65 +7466,6 @@ sub _power_plan_hold {
     }
     waitpid($pid, 0);
     log_ev('power_plan_hold', { on => ($on ? 1 : 0), why => $why });
-}
-
-# _keepawake_log_tail($logfile) -> the helper log's last line (<= 200 chars), or undef.
-sub _keepawake_log_tail {
-    my ($f) = @_;
-    return undef unless defined $f && -s $f;
-    open(my $fh, '<:raw', $f) or return undef;
-    my $size = -s $fh;
-    seek($fh, $size > 4096 ? $size - 4096 : 0, 0);
-    my @l = grep { /\S/ } <$fh>;
-    close $fh;
-    return undef unless @l;
-    (my $last = $l[-1]) =~ s/[\r\n]+\z//;
-    return substr($last, 0, 200);
-}
-
-sub _keepawake_owner_winpid {
-    my $f = "/proc/$$/winpid";
-    return undef unless -r $f;
-    open(my $fh, '<', $f) or return undef;
-    my $v = <$fh>;
-    close $fh;
-    return undef unless defined $v;
-    $v =~ s/\s+//g;
-    return ($v =~ /^\d+$/ && $v > 0) ? $v : undef;
-}
-
-# _keepawake_stop($child_pid, $pidfile) — kill our helper child (releases the
-# wake-lock: process death drops ES_CONTINUOUS) and clear the pidfile. SIGKILL so
-# it's immediate; waitpid reaps the zombie (it's a direct fork of ours).
-sub _keepawake_stop {
-    my ($pid, $pidfile) = @_;
-    if (defined $pid && $pid =~ /^\d+$/ && $pid > 0) {
-        kill('KILL', $pid);
-        waitpid($pid, 0);
-        log_ev('keepawake_stopped', { pid => $pid });
-    }
-    unlink $pidfile if defined $pidfile && -f $pidfile;
-}
-
-# _keepawake_reap_orphan($pidfile) — on dashboard entry, kill a helper left
-# running by a previously-CRASHED launcher (its wake-lock would persist forever).
-# Uses the helper's self-reported WINDOWS pid + taskkill, guarded by a cmdline
-# check (KeepAwake::orphan_is_ours) that confirms the process is our keep-awake.ps1
-# so a recycled pid that now belongs to something else is left alone.
-sub _keepawake_reap_orphan {
-    my ($pidfile) = @_;
-    return unless defined $pidfile && -f $pidfile;
-    my $wpid = _read_file($pidfile);
-    chomp $wpid if defined $wpid;
-    unlink $pidfile;
-    return unless defined $wpid && $wpid =~ /^\d+$/;
-    local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
-    my $cmdline = `powershell.exe -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \\"ProcessId=$wpid\\" -ErrorAction SilentlyContinue).CommandLine" 2>/dev/null`;
-    chomp $cmdline if defined $cmdline;
-    if (KeepAwake::orphan_is_ours($cmdline, 'keep-awake.ps1')) {
-        system('taskkill.exe', '/PID', $wpid, '/F', '/T');
-        log_ev('keepawake_orphan_reaped', { pid => $wpid });
-    }
 }
 
 # ---------------------------------------------------------------------
@@ -8180,13 +8073,15 @@ sub _gather_resources {
 }
 
 # _resources_sampler_start($pidfile, $container) -> child pid | undef.
-# Follows _keepawake_start (:4333-4359) construct for construct: fork, then
-# log-and-degrade with NO retry if fork fails (a real, documented hazard on
-# this platform -- "Can't fork, trying again in 5 seconds" -- the panel must
-# degrade honestly, never fabricate a value), child reopens STDIN/STDOUT/
-# STDERR on /dev/null, sets MSYS2_ARG_CONV_EXCL locally, then exec's. Re-execs
-# $SELF_PL (this same file), NOT $LAUNCHER_PL -- see $SELF_PL's own comment.
-# $pidfile is accepted for call-site symmetry with _keepawake_start / for the
+# Follows the former _keepawake_start's shape construct for construct (that
+# sub is gone; the wake-lock spawn now lives in BpKeepAwake::spawn,
+# bp-keepawake.pl): fork, then log-and-degrade with NO retry if fork fails
+# (a real, documented hazard on this platform -- "Can't fork, trying again
+# in 5 seconds" -- the panel must degrade honestly, never fabricate a
+# value), child reopens STDIN/STDOUT/STDERR on /dev/null, sets
+# MSYS2_ARG_CONV_EXCL locally, then exec's. Re-execs $SELF_PL (this same
+# file), NOT $LAUNCHER_PL -- see $SELF_PL's own comment.
+# $pidfile is accepted for call-site symmetry with that former sub / for the
 # stop/reap pairing below; the pidfile itself is written every round by
 # _resources_sampler_main via the global $RESOURCES_SAMPLER_PID, not here.
 sub _resources_sampler_start {
@@ -8325,10 +8220,11 @@ sub _sampler_child_alive {
     return 1;
 }
 
-# _resources_sampler_stop($child_pid, $pidfile) — mirrors _keepawake_stop
-# (:4364-4372). SIGKILL is immediate; waitpid reaps the zombie (it's a direct
-# fork of ours). Invoked from $SIG{INT}, $SIG{TERM} and END via
-# _resources_sampler_release_global.
+# _resources_sampler_stop($child_pid, $pidfile) — mirrors the former
+# _keepawake_stop's shape (that sub is gone; the wake-lock's own stop is now
+# BpKeepAwake::stop_child, bp-keepawake.pl). SIGKILL is immediate; waitpid
+# reaps the zombie (it's a direct fork of ours). Invoked from $SIG{INT},
+# $SIG{TERM} and END via _resources_sampler_release_global.
 sub _resources_sampler_stop {
     my ($pid, $pidfile) = @_;
     if (defined $pid && $pid =~ /^\d+$/ && $pid > 0) {
@@ -8339,9 +8235,10 @@ sub _resources_sampler_stop {
     unlink $pidfile if defined $pidfile && -f $pidfile;
 }
 
-# _resources_sampler_reap_orphan($pidfile, $now) — mirrors
-# _keepawake_reap_orphan (:4379-4393), deliberately DEVIATING from its
-# cmdline-verification step (spec E3): our sampler is a cygwin perl child
+# _resources_sampler_reap_orphan($pidfile, $now) — mirrors the former
+# _keepawake_reap_orphan's shape (that sub is gone; the wake-lock's own reap
+# is now BpKeepAwake::reap_orphan, bp-keepawake.pl), deliberately DEVIATING
+# from its cmdline-verification step (spec E3): our sampler is a cygwin perl child
 # with no self-reported WINDOWS pid to verify against, so the anti-PID-
 # recycling defence is Resources::sampler_reap_decision's pure
 # stamp-freshness check instead -- a record whose stamp has not been
@@ -9158,10 +9055,11 @@ sub _relaunch_self {
     eval { _resources_sampler_stop($RESOURCES_SAMPLER_CHILD, $RESOURCES_SAMPLER_PID) };
     eval { _spend_sampler_stop($SPEND_SAMPLER_CHILD) };
     eval { _container_sampler_stop($CONTAINER_SAMPLER_CHILD) };
-    # Through the holder, which knows the helper's pid: calling _keepawake_stop
-    # bare (it takes the pid and pidfile) was a silent no-op, so every [r] left the old helper running
-    # beside the new process's own. The power-plan hold is left alone; the new
-    # process re-asserts it on its first keep-awake tick.
+    # Through the holder, which knows the helper's pid: the former
+    # keep-awake stop sub, called bare with just a pid and pidfile, was a
+    # silent no-op here, so every [r] left the old helper running beside the
+    # new process's own. The power-plan hold is left alone; the new process
+    # re-asserts it on its first keep-awake tick.
     eval { $KEEPAWAKE->release if $KEEPAWAKE };
 
     _restore_terminal(1);

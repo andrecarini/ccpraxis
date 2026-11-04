@@ -245,10 +245,19 @@ subtest 'S6 bp-keepawake.pl:-LeaseSeconds (AC-8)' => sub {
     my $path = "$BUTLER_SCRIPTS/bp-keepawake.pl";
     my $src = slurp($path);
     if (!defined $src) { fail("could not read $path"); done_testing(); return }
-    like($src, qr/'-LeaseSeconds',\s*BpAwakeConst::HELPER_LEASE\(\)/,
-        'AC-8: -LeaseSeconds is followed by BpAwakeConst::HELPER_LEASE()');
+    like($src, qr/'-LeaseSeconds',\s*lease_seconds\(/,
+        'AC-8: -LeaseSeconds is followed by lease_seconds(...)');
     unlike($src, qr/'-LeaseSeconds',\s*'?\d+'?/,
         'AC-8: no literal-number -LeaseSeconds argument remains');
+
+    my ($lease_seconds_body) = $src =~ /(sub lease_seconds \{.*?\n\})/s;
+    ok(defined $lease_seconds_body, 'AC-8 precondition: sub lease_seconds is extractable');
+    if (defined $lease_seconds_body) {
+        my @defaults = $lease_seconds_body =~ /return\s+BpAwakeConst::HELPER_LEASE\(\)\s*unless/g;
+        ok(scalar(@defaults) >= 1,
+            'AC-8: lease_seconds() defaults to BpAwakeConst::HELPER_LEASE() when no override is given')
+            or diag("sub lease_seconds body: $lease_seconds_body");
+    }
     done_testing();
 };
 

@@ -13,14 +13,19 @@
 # died, so after that reading; the helper rejects it (started-after-spawn).
 #
 # This file pins:
-#   1. KeepAwake::filetime_ticks / BpKeepAwake::owner_started_before (pure)
-#   2. both production callers (launcher.pl _keepawake_start, bp-keepawake.pl
-#      spawn) pass the bound, computed before fork() -- static only, launcher.pl
-#      is never loaded
+#   1. BpKeepAwake::owner_started_before (pure)
+#   2. both production callers (launcher.pl's start closure, via
+#      BpKeepAwake::spawn; bp-keepawake.pl's own spawn) pass the bound,
+#      computed before fork() -- static only, launcher.pl is never loaded
 #   3. on Windows, a REAL helper: a current bound pins this process as owner;
 #      a bound older than this process's own start is rejected with
 #      reason=started-after-spawn. Each helper runs with a 60s lease and is
 #      killed by this file (END + signals).
+#
+# 07-one-keepawake-helper, Decision 19 (spec section 7(1)): KeepAwake.pm's
+# filetime_ticks is deleted by that package's DC2 and launcher.pl's own
+# _keepawake_start (DC1) is deleted too, so every assertion here was moved
+# onto BpKeepAwake -- see the per-section notes below for exactly what changed.
 
 use strict;
 use warnings;
@@ -41,20 +46,32 @@ require "$BUTLER_SCRIPTS/bp-keepawake.pl";
 sub slurp { my ($f) = @_; open(my $fh, '<:raw', $f) or return undef; local $/; my $s = <$fh>; close $fh; $s }
 
 # ---------------------------------------------------------------- part 1: pure
+#
+# 07-one-keepawake-helper, Decision 19 / spec section 7(1): KeepAwake::filetime_ticks
+# is deleted by that package's DC2, so every call here goes through
+# BpKeepAwake::owner_started_before (self-owned: owner_winpid == self) instead of
+# comparing against the sub that is about to disappear.
 {
-    is(KeepAwake::filetime_ticks(0), '116444736000000000', 'filetime_ticks(0) is the 1601->1970 offset');
-    is(KeepAwake::filetime_ticks(1), '116444736010000000', 'one second is 10^7 ticks');
-    my $t = KeepAwake::filetime_ticks(1_792_674_309.5);
+    is(BpKeepAwake::owner_started_before({ owner_winpid => 900 }, 900, 0), '116444736000000000',
+       'owner_started_before(..,0) is the 1601->1970 offset');
+    is(BpKeepAwake::owner_started_before({ owner_winpid => 900 }, 900, 1), '116444736010000000',
+       'one second is 10^7 ticks');
+    my $t = BpKeepAwake::owner_started_before({ owner_winpid => 900 }, 900, 1_792_674_309.5);
     ok(defined $t && abs($t - 134_371_479_095_000_000) < 1000, 'fractional seconds kept (to within a double\'s precision)')
         or diag($t // 'undef');
-    for my $bad (undef, '', -1, 'x', '1e9', [1]) {
-        is(KeepAwake::filetime_ticks($bad), undef, 'filetime_ticks refuses ' . (defined $bad ? "'$bad'" : 'undef'));
+    # undef is deliberately NOT in this list: owner_started_before's own,
+    # unchanged contract (spec 2.2: "no behaviour change") defaults an undef
+    # $now to Time::HiRes::time() for the one-argument production call shape
+    # -- it is not a refusal case, unlike every other malformed value here.
+    for my $bad ('', -1, 'x', '1e9', [1]) {
+        is(BpKeepAwake::owner_started_before({ owner_winpid => 900 }, 900, $bad), undef,
+           "owner_started_before refuses a bad clock: '$bad'");
     }
 
     is(BpKeepAwake::owner_started_before({ owner_winpid => 900 }, 900, 0), '116444736000000000',
        'owner == self: our clock, as FILETIME');
-    is(BpKeepAwake::owner_started_before({ owner_winpid => 900 }, 900, 1_000_000_000),
-       KeepAwake::filetime_ticks(1_000_000_000), 'same arithmetic as KeepAwake::filetime_ticks');
+    is(BpKeepAwake::owner_started_before({ owner_winpid => 900 }, 900, 1_000_000_000), '126444736000000000',
+       'pinned literal (what filetime_ticks(1_000_000_000) computed, before its deletion)');
     is(BpKeepAwake::owner_started_before({ owner_winpid => 901 }, 900, 0), undef,
        'owner != self: no bound (our clock says nothing about a foreign pid)');
     is(BpKeepAwake::owner_started_before({}, 900, 0), undef, 'no owner -> no bound');
@@ -69,16 +86,19 @@ sub slurp { my ($f) = @_; open(my $fh, '<:raw', $f) or return undef; local $/; m
     like($ps1, qr/reason=started-after-spawn/, 'keep-awake.ps1 logs the started-after-spawn rejection');
     ok($ps1 !~ /[^\x00-\x7f]/, 'keep-awake.ps1 stays pure ASCII');
 
+    # 07-one-keepawake-helper, Decision 19 / spec section 7(1), part 2: the real
+    # spawn (and therefore the real -OwnerStartedBeforeTicks bound) moved from
+    # launcher.pl's own _keepawake_start into BpKeepAwake::spawn. The launcher
+    # now only passes owner_winpid => through to BpKeepAwake::spawn( and
+    # computes no bound of its own.
     my $lsrc = slurp("$SANDBOX_SCRIPTS/launcher.pl") // '';
-    my ($body) = $lsrc =~ /\nsub\s+_keepawake_start\s*\{(.*?)\n\}\n/s;
-    ok(defined $body, 'launcher.pl has _keepawake_start');
-    $body //= '';
-    like($body, qr/'-OwnerStartedBeforeTicks'/, 'launcher _keepawake_start passes -OwnerStartedBeforeTicks');
-    my $b_pos = $body =~ /KeepAwake::filetime_ticks\s*\(/ ? $-[0] : undef;
-    my $f_pos = $body =~ /\bfork\s*\(/ ? $-[0] : undef;
-    ok(defined $b_pos && defined $f_pos && $b_pos < $f_pos, 'launcher reads the bound in the PARENT, before fork()');
-    unlike(defined $f_pos ? substr($body, 0, $f_pos) : $body, qr/powershell|`/,
-           'launcher computes it without spawning anything before the fork (no powershell, no backticks)');
+    ok(length($lsrc), 'launcher.pl is readable');
+    my $spawn_pos = $lsrc =~ /BpKeepAwake::spawn\s*\(/ ? $-[0] : undef;
+    ok(defined $spawn_pos, "launcher.pl's start closure calls BpKeepAwake::spawn(");
+    my $spawn_window = defined $spawn_pos ? substr($lsrc, $spawn_pos, 400) : '';
+    like($spawn_window, qr/owner_winpid\s*=>/, '...passing owner_winpid => in the same call');
+    unlike($lsrc, qr/-OwnerStartedBeforeTicks/,
+        "launcher.pl contains no '-OwnerStartedBeforeTicks' of its own -- the bound is now computed inside BpKeepAwake::spawn");
 
     my $bsrc = slurp("$BUTLER_SCRIPTS/bp-keepawake.pl") // '';
     my ($spawn) = $bsrc =~ /\nsub\s+spawn\s*\{(.*?)\n\}\n/s;
@@ -144,7 +164,9 @@ SKIP: {
 
     # A bound an hour before now is earlier than this process's own start
     # (plus the 2s slack) -- exactly what a reused WINPID looks like.
-    my $old_bound = KeepAwake::filetime_ticks(int(time()) - 3600);
+    # 07-one-keepawake-helper, Decision 19: via BpKeepAwake::owner_started_before,
+    # not the deleted KeepAwake::filetime_ticks.
+    my $old_bound = BpKeepAwake::owner_started_before({ owner_winpid => $self }, $self, int(time()) - 3600);
     $log = $run->($old_bound);
     like($log, qr/OWNER-UNVERIFIABLE winpid=\Q$self\E reason=started-after-spawn/,
          'an owner created after the bound is rejected: started-after-spawn');

@@ -7,144 +7,296 @@
 # held=1 every two minutes for a machine with no wake-lock: KeepAwake set `running` at start and
 # never looked again. The helper also ran with no -LogFile, so why it went is unknowable.
 #
-# AC1  revive() restarts a dead helper while the lock is wanted, and reports the death once
-# AC2  it leaves a live helper, a released lock, and an unjudgeable probe alone
-# AC3  at most one restart per $REVIVE_GAP_SECONDS, without spawning through sync(1) meanwhile
-# AC4  _keepawake_alive (extracted from launcher.pl) tells a running child from an exited one
-# AC5  the launcher wires it: revive on every tick, the died event logged with the helper's last
-#      line, and -LogFile always passed with rotation
+# Rewritten for 07-one-keepawake-helper (blueprint wake-and-pause-consolidation): the real
+# spawn/liveness/stop/reap of the helper moved into BpKeepAwake (bp-keepawake.pl); the launcher
+# only wires KeepAwake's revive/[r]-release lifecycle to BpKeepAwake's seams. This file now drives
+# that lifecycle through BpKeepAwake, not through launcher.pl's own (deleted) helpers. Derived from
+# .ccpraxis-local-data/blueprints/wake-and-pause-consolidation/specs/07-one-keepawake-helper-spec.md
+# section 4, AC6-AC10 (the rest of the acceptance table lives in one-keepawake-helper.t):
 #
-# No helper is spawned and no wake-lock is touched: seams and a plain forked perl child only.
+# AC6  B8: revive() restarts a dead helper while the lock is wanted, reports the death once, waits
+#      out $REVIVE_GAP_SECONDS, and never loops on a declined start -- all driven through
+#      KeepAwake->new(alive => \&BpKeepAwake::child_alive, ...) with real forked sleepers and a
+#      fixture clock.
+# AC7  B6: BpKeepAwake::log_tail returns the helper's last log line, CRLF stripped; plus the
+#      launcher logs a death with BpKeepAwake::log_tail's own value.
+# AC8  the launcher's BpKeepAwake wiring (static, text-level): the alive seam, the revive-before-
+#      probe-failed-gate ordering, the start closure's BpKeepAwake::spawn(lease_seconds=>0,
+#      owner_winpid=>...) call, the stop closure's BpKeepAwake::stop_child(, and
+#      load_bp_keepawake(...reap_orphan(...KeepAwake->new( ordering.
+# AC9  [r] release goes through the holder ($KEEPAWAKE->release), never a bare _keepawake_stop().
+# AC10 B3: BpKeepAwake::rotate_log rotates a log past 1 MB (every caller), plus bp-keepawake.pl's
+#      own spawn() rotates before fork() and passes -LeaseSeconds via lease_seconds(...).
+#
+# No real keep-awake.ps1 helper is spawned and no wake-lock is touched: seams and plain forked perl
+# sleepers only, killed in END/INT/TERM.
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use strict;
 use warnings;
 use FindBin qw($Bin);
 use POSIX ();
 use Test::More;
+use File::Temp qw(tempdir);
 use lib "$Bin/../../scripts";
 use KeepAwake ();
 
-sub holder {
-    my (%o) = @_;
-    my (@starts, @events);
-    my $n = 100;
-    my $alive = $o{alive} // {};
-    my $clock = $o{clock} // \(my $t = 1000);
-    my $ka = KeepAwake->new(
-        start    => sub { push @starts, ++$n; $alive->{$n} = 1; $n },
-        stop     => sub { delete $alive->{ $_[0] } },
-        alive    => exists $o{alive_seam} ? $o{alive_seam} : sub { $alive->{ $_[0] } ? 1 : 0 },
-        on_event => sub { push @events, { @_ } },
-        now      => sub { $$clock },
-    );
-    return ($ka, \@starts, \@events, $alive, $clock);
+my $SANDBOX_SCRIPTS = "$Bin/../../scripts";
+my $BUTLER_SCRIPTS  = "$Bin/../../../butler/scripts";
+my $LAUNCHER        = "$SANDBOX_SCRIPTS/launcher.pl";
+my $BP_KEEPAWAKE    = "$BUTLER_SCRIPTS/bp-keepawake.pl";
+
+sub slurp {
+    my ($f) = @_;
+    open(my $fh, '<:raw', $f) or return undef;
+    local $/;
+    my $s = <$fh>;
+    close $fh;
+    return $s;
 }
 
-# --- AC1 ---------------------------------------------------------------------------------------------
+my $LSRC = slurp($LAUNCHER);
+ok(defined $LSRC, "precondition: $LAUNCHER is readable") or BAIL_OUT("cannot read launcher.pl");
+
+require "$BP_KEEPAWAKE";
+
+my @ALL_KIDS;
+sub reap_all_kids {
+    local $?;
+    for my $pid (@ALL_KIDS) {
+        next unless defined $pid;
+        kill('KILL', $pid);
+        waitpid($pid, 0);
+    }
+    @ALL_KIDS = ();
+}
+END { reap_all_kids() }
+$SIG{INT}  = sub { reap_all_kids(); exit 1 };
+$SIG{TERM} = sub { reap_all_kids(); exit 1 };
+
+# =====================================================================
+# AC6 [B8]: revive() through BpKeepAwake::child_alive, real forked sleepers,
+# a fixture clock.
+# =====================================================================
 {
-    my ($ka, $starts, $events, $alive) = holder();
-    is($ka->sync(1), 'start', 'precondition: the lock is taken');
-    is($ka->handle, 101, 'precondition: helper 101');
-    delete $alive->{101};                                   # the helper dies behind our back
-    is($ka->revive, 'restart', 'THE BUG: a dead helper under a held lock is restarted');
-    is($ka->handle, 102, 'a new helper replaces it');
-    ok($ka->running, 'the lock is still held');
-    my @died = grep { $_->{kind} eq 'died' } @$events;
-    is(scalar @died, 1, 'the death is reported');
-    is($died[0]{handle}, 101, 'naming the helper that died');
-    is($died[0]{restarting}, 1, 'and that it is being restarted');
+    my $has = defined &BpKeepAwake::child_alive;
+    ok($has, 'AC6 precondition: BpKeepAwake::child_alive is defined');
+    SKIP: {
+        skip 'BpKeepAwake::child_alive not defined yet', 16 unless $has;
+
+        my @events;
+        my $clock = \(my $t = 1000);
+        my $ka = KeepAwake->new(
+            start => sub {
+                my $pid = fork();
+                die "fork: $!" unless defined $pid;
+                if ($pid == 0) { sleep 60; POSIX::_exit(0) }
+                push @ALL_KIDS, $pid;
+                return $pid;
+            },
+            stop     => sub { },
+            alive    => \&BpKeepAwake::child_alive,
+            on_event => sub { push @events, { @_ } },
+            now      => sub { $$clock },
+        );
+
+        is($ka->sync(1), 'start', 'AC6 precondition: the lock is taken');
+        my $first = $ka->handle;
+        ok(defined $first, 'AC6 precondition: a real child pid is the handle');
+
+        kill('KILL', $first);
+        my $deadline = time() + 10;
+        my $result;
+        while (time() < $deadline) {
+            $result = $ka->revive;
+            last if defined $result && $result eq 'restart';
+            select(undef, undef, undef, 0.2);
+        }
+        is($result, 'restart', 'AC6 (1): revive restarts once child_alive reports the old child dead');
+        my $second = $ka->handle;
+        ok(defined $second && $second != $first, 'AC6 (1): the handle changes to a new child');
+        my @died = grep { $_->{kind} eq 'died' } @events;
+        is(scalar @died, 1, 'AC6 (1): the death is reported once');
+        is($died[0]{handle}, $first, 'AC6 (1): naming the old pid');
+        is($died[0]{restarting}, 1, 'AC6 (1): and that it is being restarted');
+
+        kill('KILL', $second);
+        # Wait for child_alive to actually see it dead before advancing the fixture
+        # clock -- otherwise the "second death inside the gap" below would be timing
+        # against a child that has not exited yet.
+        $deadline = time() + 10;
+        while (time() < $deadline) {
+            my $v = BpKeepAwake::child_alive($second);
+            last if defined $v && $v == 0;
+            select(undef, undef, undef, 0.2);
+        }
+        $$clock += 10;
+        is($ka->revive, 'died', 'AC6 (2): a second death inside the gap is recorded, not restarted');
+        is($ka->revive, 'died', 'AC6 (2): still inside the gap');
+        is($ka->sync(1), 'noop', 'AC6 (2): sync(1) does not spawn behind the gap');
+        is(scalar(grep { $_->{kind} eq 'died' && $_->{handle} == $second } @events), 1,
+           'AC6 (2): the second death is reported once, not every tick');
+
+        $$clock += $KeepAwake::REVIVE_GAP_SECONDS;
+        is($ka->revive, 'restart', 'AC6 (3): after the gap, revive restarts');
+        my $third = $ka->handle;
+        ok(defined $third && $third != $second, 'AC6 (3): a fresh handle replaces it');
+        if (defined $third) {
+            kill('KILL', $third);
+            my $wait_deadline = time() + 10;
+            while (time() < $wait_deadline) {
+                my $r = waitpid($third, POSIX::WNOHANG());
+                last if $r == $third;
+                select(undef, undef, undef, 0.2);
+            }
+            @ALL_KIDS = grep { !defined $_ || $_ != $third } @ALL_KIDS;
+        }
+
+        # AC6 (4): a declined start (undef handle) is unjudgeable -- revive never
+        # loops respawning it.
+        my @events2;
+        my @start_calls;
+        my $ka2 = KeepAwake->new(
+            start    => sub { push @start_calls, 1; return undef },
+            stop     => sub { },
+            alive    => \&BpKeepAwake::child_alive,
+            on_event => sub { push @events2, { @_ } },
+            now      => sub { $$clock },
+        );
+        $ka2->sync(1);
+        is($ka2->revive, 'noop', 'AC6 (4): an undef handle from a declined start is unjudgeable -- revive is noop');
+        is($ka2->revive, 'noop', 'AC6 (4): and stays noop on a second call');
+        is(scalar(@start_calls), 1, 'AC6 (4): start is never called again (no respawn loop)');
+    }
 }
 
-# --- AC2 ---------------------------------------------------------------------------------------------
+# =====================================================================
+# AC7 [B6]: BpKeepAwake::log_tail, plus the launcher's died-event wiring.
+# =====================================================================
 {
-    my ($ka, $starts) = holder();
-    $ka->sync(1);
-    is($ka->revive, 'noop', 'a live helper is left alone');
-    is(scalar @$starts, 1, 'no extra spawn');
-    $ka->sync(0);
-    is($ka->revive, 'noop', 'a released lock is not revived');
-
-    my ($ka2, $starts2) = holder(alive_seam => sub { die "probe broke\n" });
-    $ka2->sync(1);
-    is($ka2->revive, 'noop', 'a probe that dies proves nothing: no restart');
-    my ($ka3, $starts3) = holder(alive_seam => sub { undef });
-    $ka3->sync(1);
-    is($ka3->revive, 'noop', 'an undef probe proves nothing either');
-    my ($ka4) = holder(alive_seam => undef);
-    $ka4->sync(1);
-    is($ka4->revive, 'noop', 'without an alive seam revive does nothing (old callers unchanged)');
+    my $has = defined &BpKeepAwake::log_tail;
+    ok($has, 'AC7 precondition: BpKeepAwake::log_tail is defined');
+    SKIP: {
+        skip 'BpKeepAwake::log_tail not defined yet', 2 unless $has;
+        # m4 (reviewer-step6.md): a fixture under $Bin stays behind in the
+        # source tree if anything dies between open and unlink. A
+        # File::Temp tempdir (CLEANUP => 1) is removed even on a mid-test
+        # death, and never lands in plugins/sandbox/tests/t/.
+        my $dir = tempdir(CLEANUP => 1);
+        my $f = "$dir/keepawake-revive-tail.log";
+        open my $o, '>:raw', $f or die $!;
+        print $o "2026-10-31 22:30:07 pid=1 ASSERTED x\r\n2026-10-31 22:41:07 pid=1 RELEASE reason=pidfile-gone (deliberate release)\r\n";
+        close $o;
+        is(BpKeepAwake::log_tail($f),
+           '2026-10-31 22:41:07 pid=1 RELEASE reason=pidfile-gone (deliberate release)',
+           "AC7: log_tail is the helper's last line, CRLF stripped");
+        unlink $f;
+        is(BpKeepAwake::log_tail("$f.none"), undef, 'AC7: a missing log gives undef');
+    }
 }
+like($LSRC, qr/log_ev\('keepawake_died', .{0,300}?helper_last => BpKeepAwake::log_tail\(/s,
+     "AC7: a death is logged with BpKeepAwake::log_tail's own last line");
 
-# --- AC3 ---------------------------------------------------------------------------------------------
+# =====================================================================
+# AC8: launcher.pl's BpKeepAwake wiring (static, text-level).
+# =====================================================================
+like($LSRC, qr/alive\s*=>[^\n]*\\&BpKeepAwake::child_alive/,
+     'AC8: the launcher hands KeepAwake the BpKeepAwake::child_alive seam');
+like($LSRC, qr/my \$rv = \$KEEPAWAKE->revive;/, 'AC8: and revives on every tick');
 {
-    my ($ka, $starts, $events, $alive, $clock) = holder();
-    $ka->sync(1);                                           # helper 101
-    delete $alive->{101};
-    is($ka->revive, 'restart', 'first death: restarted');   # helper 102 at t=1000
-    $$clock += 10;
-    delete $alive->{102};                                   # dies again 10 s later
-    is($ka->revive, 'died', 'second death inside the gap: recorded, not restarted');
-    is($ka->revive, 'died', 'still inside the gap');
-    ok($ka->running, 'the holder stays running on the dead handle');
-    is($ka->sync(1), 'noop', 'so sync(1) does not spawn behind the gap');
-    is(scalar @$starts, 2, 'only two spawns so far');
-    is(scalar(grep { $_->{kind} eq 'died' && $_->{handle} == 102 } @$events), 1,
-       'the second death is reported once, not every tick');
-    $$clock += $KeepAwake::REVIVE_GAP_SECONDS;
-    is($ka->revive, 'restart', 'after the gap: restarted');
-    is($ka->handle, 103, 'helper 103');
-    $ka->sync(0);
-    ok(!$ka->running, 'a later release still releases');
-}
-
-# --- AC4 ---------------------------------------------------------------------------------------------
-my $LAUNCHER = "$Bin/../../scripts/launcher.pl";
-my $SRC = do { open my $fh, '<:raw', $LAUNCHER or die $!; local $/; <$fh> };
-my ($alive_sub) = $SRC =~ /(sub _keepawake_alive \{.*?\n\})/s;
-my ($tail_sub)  = $SRC =~ /(sub _keepawake_log_tail \{.*?\n\})/s;
-ok(defined $alive_sub && defined $tail_sub, 'precondition: both launcher helpers are extractable')
-    or do { done_testing(); exit };
-ok(eval "package KaUnderTest; use strict; use warnings; use POSIX (); $alive_sub $tail_sub 1;", 'they compile alone')
-    or diag($@);
-{
-    my $pid = fork() // die "fork: $!";
-    if ($pid == 0) { sleep 30; POSIX::_exit(0) }
-    is(KaUnderTest::_keepawake_alive($pid), 1, 'a running child reads alive');
-    kill 'KILL', $pid;
-    my $deadline = time + 10;
-    my $v;
-    while (time < $deadline) { $v = KaUnderTest::_keepawake_alive($pid); last unless $v; select(undef, undef, undef, 0.1) }
-    is($v, 0, 'once it has exited, it reads dead');
-    is(KaUnderTest::_keepawake_alive(undef), undef, 'no handle: undef (nothing to judge)');
+    my ($tick) = $LSRC =~ /(my \$rv = \$KEEPAWAKE->revive;.*?if \(\$probe_state ne 'probe-failed'\))/s;
+    ok(defined $tick, 'AC8: the revive call is before the probe-failed gate (a held-through probe failure is covered too)');
 }
 {
-    my $f = "$Bin/keepawake-tail-$$.log";
-    open my $o, '>:raw', $f or die $!;
-    print $o "2026-10-31 22:30:07 pid=1 ASSERTED x\r\n2026-10-31 22:41:07 pid=1 RELEASE reason=pidfile-gone (deliberate release)\r\n";
-    close $o;
-    is(KaUnderTest::_keepawake_log_tail($f), '2026-10-31 22:41:07 pid=1 RELEASE reason=pidfile-gone (deliberate release)',
-       'the log tail is the helper\'s last line, CRLF stripped');
-    unlink $f;
-    is(KaUnderTest::_keepawake_log_tail("$f.none"), undef, 'no log: undef');
+    my $spawn_pos = $LSRC =~ /BpKeepAwake::spawn\s*\(/ ? $-[0] : undef;
+    ok(defined $spawn_pos, 'AC8: the start closure calls BpKeepAwake::spawn(');
+    my $window = defined $spawn_pos ? substr($LSRC, $spawn_pos, 400) : '';
+    like($window, qr/lease_seconds\s*=>\s*0/, 'AC8: ...with lease_seconds => 0 in the same call');
+    like($window, qr/owner_winpid\s*=>/, 'AC8: ...and owner_winpid => in the same call');
+}
+like($LSRC, qr/BpKeepAwake::stop_child\(/, 'AC8: the stop closure calls BpKeepAwake::stop_child(');
+{
+    my $load_pos = $LSRC =~ /KeepAwake::load_bp_keepawake\(/ ? $-[0] : undef;
+    my $reap_pos = $LSRC =~ /BpKeepAwake::reap_orphan\(/     ? $-[0] : undef;
+    my $new_pos  = $LSRC =~ /KeepAwake->new\(/                ? $-[0] : undef;
+    ok(defined($load_pos) && defined($reap_pos) && defined($new_pos)
+        && $load_pos < $reap_pos && $reap_pos < $new_pos,
+       'AC8: KeepAwake::load_bp_keepawake precedes BpKeepAwake::reap_orphan, which precedes KeepAwake->new')
+        or diag(sprintf('load=%s reap=%s new=%s',
+            map { defined $_ ? $_ : 'undef' } ($load_pos, $reap_pos, $new_pos)));
 }
 
-# --- AC5 ---------------------------------------------------------------------------------------------
-like($SRC, qr/alive\s*=>\s*\\&_keepawake_alive/, 'the launcher hands KeepAwake the alive seam');
-like($SRC, qr/my \$rv = \$KEEPAWAKE->revive;/, 'and revives on every tick');
-my ($tick) = $SRC =~ /(my \$rv = \$KEEPAWAKE->revive;.*?if \(\$probe_state ne 'probe-failed'\))/s;
-ok(defined $tick, 'before the probe-failed gate, so a held-through probe failure is covered too');
-like($SRC, qr/log_ev\('keepawake_died', .{0,300}?helper_last => _keepawake_log_tail/s,
-     'a death is logged with the helper\'s own last line');
-my ($start) = $SRC =~ /(sub _keepawake_start \{.*?\n\})/s;
-like($start // '', qr/\@log_args = \('-LogFile', native_path\(\$logfile\)\)/, 'the helper always gets -LogFile');
-like($start // '', qr/rename\(\$logfile, "\$logfile\.1"\) if defined \$sz && \$sz > 1024 \* 1024/, 'rotated past 1 MB');
-like($start // '', qr/\@owner_args, \@log_args\)/, 'and the log args reach the exec');
+# =====================================================================
+# AC9: [r] release goes through the holder, never a bare _keepawake_stop().
+# =====================================================================
+{
+    my ($relaunch) = $LSRC =~ /(sub _relaunch_self \{.*?\n\})/s;
+    ok(defined $relaunch, 'AC9 precondition: _relaunch_self is extractable');
+    like($relaunch // '', qr/\$KEEPAWAKE->release if \$KEEPAWAKE/,
+         'AC9: [r] releases the helper through the holder');
+    unlike($LSRC, qr/_keepawake_stop\(/, 'AC9: no _keepawake_stop( call survives anywhere in launcher.pl');
+}
 
-# --- [r] re-exec -------------------------------------------------------------------------------------
-# _relaunch_self used to call _keepawake_stop() with no arguments, a silent no-op: every [r] left the
-# old helper running beside the new process's own (found 2026-11-02).
-my ($relaunch) = $SRC =~ /(sub _relaunch_self \{.*?\n\})/s;
-ok(defined $relaunch, '_relaunch_self is extractable');
-like($relaunch // '', qr/\$KEEPAWAKE->release if \$KEEPAWAKE/, '[r] releases the helper through the holder');
-unlike($relaunch // '', qr/_keepawake_stop\(\s*\)/, 'no argument-less _keepawake_stop() left');
+# =====================================================================
+# AC10 [B3]: BpKeepAwake::rotate_log, plus spawn()'s own rotation/lease wiring.
+# =====================================================================
+{
+    my $has = defined &BpKeepAwake::rotate_log;
+    ok($has, 'AC10 precondition: BpKeepAwake::rotate_log is defined');
+    SKIP: {
+        skip 'BpKeepAwake::rotate_log not defined yet', 7 unless $has;
+
+        my $dir = tempdir(CLEANUP => 1);
+
+        my $big = "$dir/big.log";
+        open(my $fh, '>', $big) or die $!;
+        print {$fh} ('x' x (1024 * 1024 + 1));
+        close $fh;
+        is(BpKeepAwake::rotate_log($big), 1, 'AC10: a 1,048,577-byte log is rotated (returns 1)');
+        ok(!-e $big, 'AC10: the original path no longer exists');
+        ok((-s "$big.1") == 1024 * 1024 + 1, 'AC10: the content is preserved at .1');
+
+        my $old1 = "$dir/old.log.1";
+        open(my $ofh, '>', $old1) or die $!;
+        print {$ofh} "stale\n";
+        close $ofh;
+        my $fresh = "$dir/old.log";
+        open(my $ffh, '>', $fresh) or die $!;
+        print {$ffh} ('y' x (1024 * 1024 + 1));
+        close $ffh;
+        is(BpKeepAwake::rotate_log($fresh), 1, 'AC10: an existing .1 is replaced');
+        open(my $rfh, '<', $old1) or die $!;
+        my $content = do { local $/; <$rfh> };
+        close $rfh;
+        unlike($content, qr/stale/, 'AC10: ...the stale .1 content is gone');
+
+        my $exact = "$dir/exact.log";
+        open(my $efh, '>', $exact) or die $!;
+        print {$efh} ('z' x (1024 * 1024));
+        close $efh;
+        is(BpKeepAwake::rotate_log($exact), 0, 'AC10: a log of exactly 1,048,576 bytes is left alone (returns 0)');
+
+        is(BpKeepAwake::rotate_log("$dir/does-not-exist.log"), 0, 'AC10: a missing log returns 0');
+    }
+}
+{
+    my $has = defined &BpKeepAwake::rotate_log;
+    SKIP: {
+        skip 'BpKeepAwake::rotate_log not defined yet', 1 unless $has;
+        is(BpKeepAwake::rotate_log(undef), 0, 'AC10: undef returns 0');
+    }
+}
+{
+    my $BPSRC = slurp($BP_KEEPAWAKE);
+    my ($spawn_body) = $BPSRC =~ /\nsub\s+spawn\s*\{(.*?)\n\}\n/s;
+    ok(defined $spawn_body, 'AC10 precondition: bp-keepawake.pl has sub spawn');
+    $spawn_body //= '';
+    my $rot_pos  = $spawn_body =~ /rotate_log\s*\(/ ? $-[0] : undef;
+    my $fork_pos = $spawn_body =~ /\bfork\s*\(/      ? $-[0] : undef;
+    ok(defined($rot_pos) && defined($fork_pos) && $rot_pos < $fork_pos,
+       'AC10: spawn() rotates the log before fork()');
+    like($spawn_body, qr/'-LogFile'/, 'AC10: spawn() still passes -LogFile');
+    like($spawn_body, qr/'-LeaseSeconds',\s*lease_seconds\(/,
+         'AC10: -LeaseSeconds is the lease_seconds(...) value');
+}
 
 done_testing();

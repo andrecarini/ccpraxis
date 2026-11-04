@@ -39,14 +39,27 @@
 # was measured on 2026-08-13: 52 orphaned keep-awake PowerShells, ~52 MB each,
 # holding 2.7 GB and 52 simultaneous ES_CONTINUOUS wake-locks.
 #
-# On Git-for-Windows perl, fork() is EMULATED with threads and returns a
-# PSEUDO-process id (447298, say) that is meaningful only inside the perl
-# process that created it. Every `bp-drive-next.pl next` is a FRESH perl
-# process, so its `kill(0, $pid)` against a pseudo-pid written by some earlier
-# process always fails. The idempotency check therefore never fired: each
-# invocation concluded "no live lock" and spawned another one, and the release
-# path could not kill the old one either, for the same reason. The mechanism
-# leaked one PowerShell per invocation, forever.
+# FORK MEASUREMENT (ledger 07-one-keepawake-helper, 2026-11-04): on this host's
+# Git-for-Windows perl ($^O cygwin), fork() gives a REAL MSYS child that
+# waitpid reaps with the correct exit status, also after that child execs a
+# native binary (powershell.exe). It is a real, independent OS process id,
+# not a value confined to the forking process.
+#
+# What stayed true in 2026-08-13, and still matters: the fork return value is
+# an MSYS pid, and everything that later reads keepawake.pid back -- tasklist
+# in _pid_alive, stop_helper's image/cmdline checks, taskkill, and the
+# helper's own pid-file identity -- works exclusively in WINPIDs (reviewer
+# M1, step6: measured, a FRESH perl's kill(0, <another MSYS fork pid>) DOES
+# return a true/false answer across processes; it is only waitpid that is
+# limited to the forking process). An MSYS pid written to that file would be
+# a number none of those WINPID-only readers could ever use, which is why
+# the parent writes nothing (see spawn's closing comment below) regardless
+# of which fork model is in play. Writing it into keepawake.pid produced 52
+# orphaned keep-awake PowerShells, ~52 MB each, holding 2.7 GB and 52
+# simultaneous ES_CONTINUOUS wake-locks. Each invocation concluded "no live
+# lock" and spawned another one, and the release path could not kill the old
+# one either, for the same reason. The mechanism leaked one PowerShell per
+# invocation, forever.
 #
 # The helper's own $PID is a REAL Windows pid, valid across processes, and
 # keep-awake.ps1 removes the file on exit — so a stale file means a dead helper
@@ -65,7 +78,24 @@ use Fcntl qw(O_WRONLY O_CREAT O_EXCL);
 use Errno ();
 use Cwd ();
 
-my $DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_path($f) // $f });
+# __FILE__ in drive-letter form (the claude-sandbox shim starts launcher.pl,
+# and therefore KeepAwake.pm's require of THIS file, by a C:\ path) is
+# rewritten to MSYS form (lower-cased drive letter, forward slashes) BEFORE
+# Cwd::abs_path ever sees it, rather than trusting abs_path to do that
+# translation itself. (Measured on this host, redteam-step6.md NIT-4:
+# abs_path of an EXISTING forward-slash drive-letter string already resolves
+# correctly, e.g. abs_path('C:/Development/ccpraxis') ->
+# '/c/Development/ccpraxis' -- so this rewrite is cheap insurance against an
+# unmeasured input shape, not a response to a reproduced failure.) Getting
+# this wrong would leave helper_path() pointing at a path that does not
+# exist (07-one-keepawake-helper spec 2.1).
+my $DIR = dirname(do {
+    (my $f = __FILE__) =~ s{\\}{/}g;
+    if ($f =~ m{^([A-Za-z]):/(.*)$} && -d '/' . lc($1)) {
+        $f = '/' . lc($1) . '/' . $2;
+    }
+    Cwd::abs_path($f) // $f;
+});
 require "$DIR/BpAwakeConst.pm" unless defined &BpAwakeConst::AC_STALE;
 
 # STARTING_GRACE_SECONDS — how long a pid file with no pid in it counts as "a
@@ -100,38 +130,157 @@ sub should_be_on {
     return (defined $phase && ($phase eq 'active' || $phase eq 'pause-pending')) ? 1 : 0;
 }
 
-sub helper_path { return "$DIR/../../sandbox/scripts/keep-awake.ps1" }
-
-# POSIX -> forward-slash Windows form ("/c/x" -> "C:/x").
+# helper_path() -> the keep-awake.ps1 path, canonical (no ".." segment).
 #
-# Hand-translated on purpose. powershell.exe accepts this form whether or not
-# MSYS2 path conversion is active, so the result is correct under EITHER
-# conversion state — the technique CLAUDE.md prefers, because it cannot be
-# broken by a caller's environment. Do NOT "simplify" this by setting
-# MSYS2_ARG_CONV_EXCL instead: the opt-out and the translation are one
-# technique, and splitting them is how paths end up created at the drive root.
+# m2 (reviewer-step6.md): without this, the joined path carries
+# "butler/scripts/../../sandbox/scripts/keep-awake.ps1" verbatim into every
+# caller -- PowerShell resolves the ".." fine, but it changes the shape of
+# every helper's -File argument from what a pre-07 caller produced, and
+# stop_helper's cmdline match compares that argument AS STRING. Resolving it
+# here, once, keeps every caller's -File (and any comparison against it)
+# identical to the canonical form a pre-07 helper already carries.
+# Cwd::abs_path returning undef (the usual "doesn't exist yet" case, though
+# not expected here) falls back to the raw joined path rather than losing it.
+sub helper_path {
+    my $raw = "$DIR/../../sandbox/scripts/keep-awake.ps1";
+    my $abs = Cwd::abs_path($raw);
+    return defined $abs ? $abs : $raw;
+}
+
+# POSIX -> Windows form, for every path handed to powershell.exe.
+#
+# Hand-translated where possible, on purpose: powershell.exe accepts
+# forward-slash drive-letter form whether or not MSYS2 path conversion is
+# active, so that result is correct under EITHER conversion state — the
+# technique CLAUDE.md prefers, because it cannot be broken by a caller's
+# environment. Do NOT "simplify" this by setting MSYS2_ARG_CONV_EXCL instead:
+# the opt-out and the translation are one technique, and splitting them is how
+# paths end up created at the drive root.
+#
+# THE /tmp HOLE (137a741, restated here for the sandbox's launcher.pl, which
+# this package -- 07-one-keepawake-helper, moving the launcher's own
+# wake-lock spawn onto these two subs -- now lets us drop in favour of them):
+# the hand-translation above only ever rewrote a `/<drive>/` prefix. A path
+# under an MSYS mount such as /tmp (File::Spec->tmpdir()) is not
+# `/<drive>/`-shaped, so it passed through unrewritten, reached
+# powershell.exe bare, and Windows resolved the leading `/` against the
+# current drive -- C:\tmp\..., a directory that usually does not exist. The
+# helper could not write its pidfile, exited, and was respawned once a
+# minute. Cygwin::posix_to_win_path is the MSYS runtime's own answer for
+# "where does this MSYS path actually live", so step 5 below asks it for
+# anything that isn't already handled by steps 2-4, and falls back to the
+# untranslated POSIX string -- never a guess at a translation we have not
+# measured -- when it has none.
+#
+# _winify_translate($abs) -> the Windows form of an already-absolute path.
+# Steps 4-6 of the header's rule: a /<drive>/... prefix is hand-translated
+# (unchanged from today); any other leading-/ path (an MSYS mount such as
+# /tmp) is handed to Cygwin::posix_to_win_path when available, falling back
+# to the untranslated absolute path when that isn't defined or returns
+# nothing; a relative/unresolvable input is returned as-is (today's result).
+sub _winify_translate {
+    my ($abs) = @_;
+    $abs =~ s{\\}{/}g;
+    if ($abs =~ s{^/([a-zA-Z])/}{\u$1:/}) { return $abs }   # /<drive>/... -> X:/...
+    if ($abs =~ m{^/[a-zA-Z]$}) {                            # bare drive root, e.g. "/c"
+        (my $d = $abs) =~ s{^/([a-zA-Z])$}{\u$1:/};
+        return $d;
+    }
+    if ($abs =~ m{^/} && defined &Cygwin::posix_to_win_path) {
+        my $w = Cygwin::posix_to_win_path($abs, 1);
+        if (defined $w && length $w) {
+            $w =~ s{\\}{/}g;
+            return $w;
+        }
+    }
+    return $abs;
+}
+
 sub winify {
     my ($p) = @_;
-    $p = Cwd::abs_path($p) // $p;
-    $p =~ s{\\}{/}g;
-    $p =~ s{^/([a-zA-Z])/}{\u$1:/};
-    return $p;
+    return $p unless $^O =~ /^(MSWin32|msys|cygwin)$/;
+    (my $slashed = $p) =~ s{\\}{/}g;
+    # A POSIX-absolute input (/tmp/..., /c/..., any MSYS mount) is translated
+    # AS GIVEN, never re-resolved through abs_path first: abs_path can rewrite
+    # a path through its MOUNT TABLE (this host's /tmp maps onto a real
+    # Windows directory), and feeding Cygwin's own translator the
+    # mount-relative form vs. the resolved form picks a DIFFERENT (8.3 vs
+    # long) component name for the SAME file -- measured on this host.
+    # native_path (MountSpec.pm) never abs_path's its input either, so leaving
+    # an absolute $p untouched here is what keeps the two in agreement (same
+    # rule; butler does not load MountSpec).
+    return _winify_translate($slashed) if $slashed =~ m{^/};
+    # A drive-letter or relative input IS resolved through abs_path: this is
+    # the only way an 8.3 short name (a real caller can hand one in -- this
+    # host's own $ENV{TEMP} is short-form) resolves to the long form a
+    # cmdline-matching caller (stop_helper's reused-pid guard) needs to
+    # compare against. abs_path returning undef happens only when the path
+    # does not exist, which leaves $slashed as-is. When it DOES exist,
+    # abs_path resolves even an already-correct drive-letter string to its
+    # POSIX form (measured, redteam-step6.md NIT-4:
+    # abs_path('C:/Development/ccpraxis') -> '/c/Development/ccpraxis'), and
+    # _winify_translate below converts that straight back to the SAME
+    # drive-letter string -- which is why an already-correct 'C:/x/y' still
+    # comes back unchanged.
+    my $abs = Cwd::abs_path($slashed);
+    return _winify_translate(defined $abs ? $abs : $slashed);
 }
 
 # winify for a path that does NOT exist yet (an output file). abs_path returns
-# undef for a missing leaf, which would leave a POSIX "/c/..." string to hand a
-# native binary — and Windows resolves a leading "/" against the current drive,
-# creating it at the DRIVE ROOT. That is the 576-stray incident in CLAUDE.md, so
-# resolve the parent directory (which does exist) and re-attach the basename.
+# undef for a missing leaf, which would leave a POSIX "/c/..." or "/tmp/..."
+# string to hand a native binary — and Windows resolves a leading "/" against
+# the current drive, creating it at the DRIVE ROOT. That is the 576-stray
+# incident in CLAUDE.md, so resolve the parent directory (which does exist)
+# and re-attach the basename -- the translation itself then runs on that
+# FULL joined path, never on the parent alone (a drive-root parent such as
+# "/c" has no trailing slash for the /<drive>/ rule to match).
 sub winify_out {
     my ($p) = @_;
+    return $p unless $^O =~ /^(MSWin32|msys|cygwin)$/;
     $p =~ s{\\}{/}g;
     my ($dir, $leaf) = $p =~ m{^(.*)/([^/]+)$} ? ($1, $2) : ('.', $p);
-    my $abs = Cwd::abs_path($dir);
-    return winify($p) unless defined $abs;   # parent missing too: best effort
-    $abs =~ s{\\}{/}g;
-    $abs =~ s{^/([a-zA-Z])/}{\u$1:/};
-    return "$abs/$leaf";
+    my $abs_dir = Cwd::abs_path($dir);
+    return winify($p) unless defined $abs_dir;   # parent missing too: best effort, as today
+    # The parent's existence is only a GATE here (so a bogus directory still
+    # falls back above). A POSIX-absolute $p is translated AS GIVEN -- see
+    # winify's header on why re-resolving through abs_path first can change
+    # which 8.3-vs-long component Cygwin's own translator picks for the SAME
+    # file, which would stop this from matching MountSpec::native_path for
+    # the identical input. A drive-letter or relative $p uses the RESOLVED
+    # parent instead, so a short (8.3) name a real caller hands in (this
+    # host's own $ENV{TEMP} is short-form) resolves to the long form a
+    # cmdline-matching caller needs (stop_helper's reused-pid guard,
+    # lease-refresher-hygiene.t's regression case).
+    return _winify_translate($p) if $p =~ m{^/};
+    $abs_dir =~ s{\\}{/}g;
+    return _winify_translate("$abs_dir/$leaf");
+}
+
+# lease_seconds(\%opts?) -> non-negative integer. Pure. $opts->{lease_seconds}
+# when it is a non-negative integer (as a string, /^\d+$/ -- "-1" and "x" are
+# refused, not parsed); BpAwakeConst::HELPER_LEASE() otherwise, including when
+# $opts is undef or not a HASH ref. Existing two-argument spawn() callers pass
+# no %opts at all, so they keep today's 900s lease unchanged.
+sub lease_seconds {
+    my ($opts) = @_;
+    return BpAwakeConst::HELPER_LEASE() unless ref $opts eq 'HASH';
+    my $v = $opts->{lease_seconds};
+    return BpAwakeConst::HELPER_LEASE() unless defined $v && $v =~ /^\d+$/;
+    return 0 + $v;
+}
+
+# rotate_log($log_f, $max_bytes?) -> 1|0. Never dies. Renames $log_f to
+# "$log_f.1" (replacing any existing .1) when its size exceeds $max_bytes
+# (default 1 MiB), so a live helper's -LogFile stays bounded regardless of
+# caller (spec B3). Anything that isn't "a file bigger than the ceiling" --
+# missing, undef, exactly at the ceiling -- is left alone and returns 0.
+sub rotate_log {
+    my ($log_f, $max_bytes) = @_;
+    $max_bytes = 1024 * 1024 unless defined $max_bytes && $max_bytes =~ /^\d+$/ && $max_bytes > 0;
+    return 0 unless defined $log_f && length $log_f;
+    my $sz = -s $log_f;
+    return 0 unless defined $sz && $sz > $max_bytes;
+    return rename($log_f, "$log_f.1") ? 1 : 0;
 }
 
 # Detect whether powershell.exe is resolvable.
@@ -170,12 +319,20 @@ sub ps_available {
     return $_PS_AVAILABLE = 0;
 }
 
-# spawn($pid_file, \%owner?) -> pid | undef. DIES if the helper is missing or
-# fork fails. %owner keys: owner_winpid, owner_desc -- see owner_desc_clean and
-# winpid_of. Never pass $$, getppid() or a fork return value as owner_winpid:
-# those are MSYS pids/pseudo-pids, meaningless to the helper's -OwnerWinPid.
+# spawn($pid_file, \%owner?, \%opts?) -> pid | undef. DIES if the helper is
+# missing or fork fails. %owner keys: owner_winpid, owner_desc -- see
+# owner_desc_clean and winpid_of. Never pass $$, getppid() or a fork return
+# value as owner_winpid: those are MSYS pids, meaningless to the helper's
+# -OwnerWinPid (a WINPID namespace). %opts: lease_seconds (see lease_seconds()).
+#
+# The return value is the fork() return value itself: a real MSYS pid of the
+# child this process just created. waitpid works only in the calling process
+# -- the OS only lets a process reap ITS OWN child -- but kill and kill(0,
+# $pid) work from ANY MSYS process against this same pid (07-one-keepawake-
+# helper fork measurement, header above, and reviewer-step6.md's
+# cross-process kill(0) probe). It is never a WINPID.
 sub spawn {
-    my ($pid_f, $owner) = @_;
+    my ($pid_f, $owner, $opts) = @_;
     $owner //= {};
     return undef unless $^O =~ /^(MSWin32|msys|cygwin)$/;
 
@@ -203,6 +360,21 @@ sub spawn {
     my $ps1 = helper_path();
     unless (-f $ps1) { die "keep-awake helper missing: $ps1\n" }
     require POSIX;
+    # -LogFile: sits beside the pid file, so it lands in .drive-solo/ with the
+    # rest of the run's state and is found by anyone already looking there.
+    #
+    # It answers the one question the previous instrumentation could not. When
+    # the machine sleeps mid-run, either the wake-lock was held and Windows
+    # slept anyway, or the lock had already been reaped and the sleep proves
+    # nothing about ES_SYSTEM_REQUIRED. Nothing on disk distinguished those:
+    # run.md has no timestamps, and the pid file's mtime is overwritten by the
+    # very heartbeat whose history we would need. A RELEASE line now says
+    # which, and a gap in HOLD lines is itself evidence.
+    my $log_f = $pid_f;
+    $log_f =~ s{keepawake\.pid$}{keepawake.log};
+    # Rotated in the PARENT, before fork -- every caller's log is kept bounded
+    # (a HOLD line a minute is ~115 KB/day), not just the launcher's own.
+    rotate_log($log_f);
     # Read in the PARENT, before fork: see owner_started_before.
     my $owner_ticks = owner_started_before($owner);
     my $pid = fork();
@@ -218,19 +390,7 @@ sub spawn {
         # within the lease instead of holding the display awake until reboot.
         #
         # The lease is opt-in precisely because launcher.pl's dashboard holder
-        # does NOT refresh; it passes no lease and keeps hold-until-killed.
-        # -LogFile: sits beside the pid file, so it lands in .drive-solo/ with the
-        # rest of the run's state and is found by anyone already looking there.
-        #
-        # It answers the one question the previous instrumentation could not. When
-        # the machine sleeps mid-run, either the wake-lock was held and Windows
-        # slept anyway, or the lock had already been reaped and the sleep proves
-        # nothing about ES_SYSTEM_REQUIRED. Nothing on disk distinguished those:
-        # run.md has no timestamps, and the pid file's mtime is overwritten by the
-        # very heartbeat whose history we would need. A RELEASE line now says
-        # which, and a gap in HOLD lines is itself evidence.
-        my $log_f = $pid_f;
-        $log_f =~ s{keepawake\.pid$}{keepawake.log};
+        # passes lease_seconds => 0 and keeps hold-until-killed.
         my @extra;
         if (defined $owner->{owner_winpid} && $owner->{owner_winpid} =~ /^[1-9]\d*$/) {
             push @extra, '-OwnerWinPid', $owner->{owner_winpid};
@@ -241,16 +401,105 @@ sub spawn {
         exec('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
              '-WindowStyle', 'Hidden', '-File', winify($ps1),
              '-PidFile', winify_out($pid_f),
-             '-LeaseSeconds', BpAwakeConst::HELPER_LEASE(),
+             '-LeaseSeconds', lease_seconds($opts),
              '-LogFile', winify_out($log_f),
              @extra)
             or POSIX::_exit(127);
     }
-    # The parent writes NOTHING. Writing perl's fork return value here is the
-    # leak described in the header: it is a pseudo-pid no other process can
-    # validate, so every later invocation respawns. The helper writes its own
+    # The parent writes NOTHING. The pid namespaces don't match: the fork
+    # return value is an MSYS pid, while -OwnerWinPid, tasklist and taskkill
+    # all take WINPIDs -- so writing the MSYS pid here would give later
+    # invocations a value none of those WINPID-only readers can validate
+    # against, the leak described in the header. The helper writes its own
     # real Windows pid into $pid_f a moment from now, and removes it on exit.
     return $pid;
+}
+
+# child_alive($pid) -> 1 | 0 | undef. Liveness of a helper THIS PROCESS
+# forked -- the pid spawn() just returned, never a WINPID. undef when $pid is
+# undef, non-numeric or <= 0 (nothing to judge). waitpid(..., WNOHANG) answers
+# exactly: 0 still running, == $pid once it has exited (reaping it in the same
+# call). -1 means it is not ours to wait for any more (already reaped, or it
+# never was our child); a signal-0 probe in the same MSYS namespace as the
+# handle decides then. Never calls tasklist, CIM or any external process --
+# that liveness question is answered elsewhere (stop_helper), for a WINPID.
+sub child_alive {
+    my ($pid) = @_;
+    return undef unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
+    require POSIX;
+    my $w = waitpid($pid, POSIX::WNOHANG());
+    return 1 if $w == 0;
+    return 0 if $w == $pid;
+    return kill(0, $pid) ? 1 : 0;
+}
+
+# stop_child($pid, $pid_f) -> 1|0. Kills a helper THIS PROCESS forked (SIGKILL
+# so it's immediate; waitpid reaps it, since it's a direct fork of ours) and
+# clears the pid file. Returns 1 only when a kill was attempted (a positive
+# integer pid); either way the pid file is unlinked if it exists. No logging
+# here -- the caller logs, same as launcher.pl's _keepawake_stop did.
+sub stop_child {
+    my ($pid, $pid_f) = @_;
+    my $killed = 0;
+    if (defined $pid && $pid =~ /^\d+$/ && $pid > 0) {
+        kill('KILL', $pid);
+        waitpid($pid, 0);
+        $killed = 1;
+    }
+    unlink $pid_f if defined $pid_f && -f $pid_f;
+    return $killed;
+}
+
+# log_tail($log_f) -> the helper's own log's last non-blank line (<= 200
+# chars, CR/LF stripped), read from the last 4096 bytes in :raw mode. undef
+# for undef, a missing file, an empty file, or no non-blank line.
+#
+# MINOR-2 (redteam-step6.md): a graceful shutdown appends POWER-REQUEST-
+# RELEASED and EXIT after its own RELEASE reason=... line, so the literal
+# last line is never the interesting one -- every graceful exit would report
+# "EXIT wake-lock released" as its cause in keepawake_died, burying the
+# actual reason (owner-gone, pidfile-gone, ...) that survives in the file.
+# When a RELEASE line is present in this window, prefer the LAST one over
+# whatever (if anything) follows it; otherwise fall back to the literal last
+# non-blank line, unchanged for a log with no RELEASE at all (a SIGKILL stop,
+# per redteam-step6.md NIT-3).
+sub log_tail {
+    my ($log_f) = @_;
+    return undef unless defined $log_f && -s $log_f;
+    open(my $fh, '<:raw', $log_f) or return undef;
+    my $size = -s $fh;
+    seek($fh, $size > 4096 ? $size - 4096 : 0, 0);
+    my @l = grep { /\S/ } <$fh>;
+    close $fh;
+    return undef unless @l;
+    my @release = grep { /\bRELEASE\b/ } @l;
+    my $last = @release ? $release[-1] : $l[-1];
+    $last =~ s/[\r\n]+\z//;
+    return substr($last, 0, 200);
+}
+
+# reap_orphan($pid_f, %seams) -> ($result, $winpid) | (). On dashboard/driver
+# entry, stop a helper left running by a previously-crashed process (its
+# wake-lock would otherwise persist forever). %seams forward unchanged to
+# stop_helper (image_of, taskkill, cmdline_of, wait_seconds).
+#
+# Off the Windows family there is no helper mechanism at all: just clear a
+# stale pid file, if any, with no external calls.
+sub reap_orphan {
+    my ($pid_f, %seams) = @_;
+    unless ($^O =~ /^(MSWin32|msys|cygwin)$/) {
+        unlink $pid_f if defined $pid_f && -e $pid_f;
+        return ();
+    }
+    return () unless defined $pid_f && -f $pid_f;
+    my $winpid = read_pid($pid_f);
+    unless (defined $winpid && $winpid =~ /^[1-9]\d*$/) {
+        unlink $pid_f;
+        return ();
+    }
+    my $result = stop_helper($winpid, pid_f => $pid_f, %seams);
+    unlink $pid_f;
+    return ($result, $winpid);
 }
 
 # winpid_of($msys_pid) -> positive int | undef -- reads /proc/<pid>/winpid, the
@@ -294,8 +543,10 @@ sub owner_started_before {
     return undef unless defined $self && "$self" eq "$w";
     unless (defined $now) { require Time::HiRes; $now = Time::HiRes::time() }
     return undef unless !ref($now) && $now =~ /\A\d+(?:\.\d+)?\z/;
-    # Same arithmetic as KeepAwake::filetime_ticks (sandbox); restated rather
-    # than required across plugins for one line.
+    # UTC FILETIME ticks (100ns units since 1601-01-01). This used to be
+    # restated rather than shared with KeepAwake.pm's own filetime_ticks
+    # (sandbox); that sub is gone (07-one-keepawake-helper DC2 deletes it),
+    # so this is now the only copy of the arithmetic.
     return sprintf('%.0f', ($now + 11644473600) * 10_000_000);
 }
 
@@ -517,9 +768,17 @@ sub replace {
 # _pid_alive($pid) -> 0|1
 #
 # perl's kill(0,$pid) is NOT a usable liveness test on Windows for a process
-# perl did not create. Git-for-Windows perl can signal its own children and
-# pseudo-processes; against an unrelated native pid — which is exactly what the
-# keep-awake helper is — it reports "dead" for a perfectly healthy process.
+# perl did not create. $pid here is normally a WINPID (read back from a pid
+# file keep-awake.ps1 wrote), and Git-for-Windows perl's kill/waitpid operate
+# in the MSYS pid namespace -- a different numbering (CLAUDE.md: a pid is only
+# meaningful in the namespace that produced it). Asking the MSYS namespace
+# about a WINPID can return a true/false answer by coincidence (pid reuse
+# across namespaces) but it is never proof either way for an unrelated native
+# pid, which is exactly what the keep-awake helper is: a hit here is honoured
+# below as a short-circuit (it is cheap and correct for OUR OWN forked
+# children, kept live by keepawake-shared.t/keepawake-no-process-storm.t
+# which pin it), but a miss falls through to asking Windows, never to a
+# negative conclusion.
 #
 # That was the second half of the 2026-08-13 leak, and it hid behind the first:
 # fixing the recorded pid alone changed nothing, because the CHECK was broken
@@ -533,7 +792,7 @@ sub _pid_alive {
     my ($pid) = @_;
     return 0 unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
     return kill(0, $pid) ? 1 : 0 unless $^O =~ /^(MSWin32|msys|cygwin)$/;
-    return 1 if kill(0, $pid);                 # own child / pseudo-process
+    return 1 if kill(0, $pid);                 # short-circuit: see header above
     # MSYS2 path conversion rewrites the SWITCHES: `/FI` arrives at tasklist as
     # `C:/Program Files/Git/FI` and it exits with "Invalid argument/option".
     # Measured, not guessed. Scope the opt-out to this one call (CLAUDE.md's

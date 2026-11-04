@@ -16,9 +16,12 @@ package KeepAwake;
 # seams so the lifecycle is testable.
 #
 # Split (mirrors Dashboard.pm / BackpackReview.pm): pure logic + seam-injected
-# lifecycle here (unit-tested); the real spawn/kill of the PS helper + the lease
-# read live in the launcher; whether the machine ACTUALLY stays awake is verified
-# on a real desktop (attended).
+# lifecycle here (unit-tested); the real spawn/liveness/stop/reap of the PS
+# helper live in BpKeepAwake (bp-keepawake.pl, butler), loaded at runtime by
+# load_bp_keepawake() below -- this module only WIRES those seams into the
+# holder (07-one-keepawake-helper, blueprint wake-and-pause-consolidation).
+# Whether the machine ACTUALLY stays awake is verified on a real desktop
+# (attended).
 use strict;
 use warnings;
 use File::Basename qw(dirname);
@@ -43,6 +46,44 @@ my $LEASE_FRESH = do {
     (defined $v && !ref $v && $v =~ /^\d+$/ && $v > 0) ? $v + 0 : $LEASE_FRESH_FALLBACK;
 };
 sub lease_fresh { return $LEASE_FRESH }
+
+# bp_keepawake_path() -> string. The same "../../butler/scripts" relative
+# layout LEASE_FRESH's loader above already relies on (both put butler/
+# beside sandbox/, in the clone, the live install, and the container
+# marketplace mount), restated here because the real spawn/liveness/stop/reap
+# of the helper now live in bp-keepawake.pl, not in this module.
+sub bp_keepawake_path {
+    (my $here = __FILE__) =~ s{\\}{/}g;
+    my $p = dirname($here) . '/../../butler/scripts/bp-keepawake.pl';
+    $p = "./$p" unless $p =~ m{^/} || $p =~ m{^[A-Za-z]:/};
+    return $p;
+}
+
+# load_bp_keepawake($path?) -> ($ok, $reason). Never dies, never prints.
+# $path defaults to bp_keepawake_path(). The launcher calls this once, at
+# dashboard entry, and logs the reason exactly once when $ok is false
+# (Decision 13: the sandbox plugin must keep working with no butler plugin
+# beside it -- no wake-lock, rather than a die, when BpKeepAwake can't load).
+sub load_bp_keepawake {
+    my ($path) = @_;
+    $path = bp_keepawake_path() unless defined $path;
+    return (0, "missing: $path") unless -f $path;
+    # The dashboard owns the terminal (alt-screen) while this runs, so a
+    # compile-time warning from `require` (a redefinition, say, on a second
+    # load) must never reach STDERR on its own -- it would splatter across
+    # the live frame. Silencing it here, not "never prints on its own" as a
+    # claim about require itself (NIT n6, reviewer-step6.md).
+    unless (eval { local $SIG{__WARN__} = sub { }; require $path; 1 }) {
+        my $err = $@ // 'unknown error';
+        ($err) = split /\n/, $err, 2;
+        return (0, "load failed: $err");
+    }
+    for my $name (qw(spawn child_alive stop_child reap_orphan log_tail self_winpid)) {
+        return (0, "incomplete: BpKeepAwake::${name} undefined")
+            unless defined &{"BpKeepAwake::$name"};
+    }
+    return (1, undef);
+}
 
 # should_stay_awake($lease_age_secs, $stale_secs) -> 1|0
 #   $lease_age_secs = seconds since the busy-lease's mtime, or undef if the lease
@@ -157,7 +198,24 @@ sub handle  { return $_[0]{handle} }
 our $REVIVE_GAP_SECONDS = 60;
 sub revive {
     my ($self) = @_;
-    return 'noop' unless $self->{running} && ref $self->{alive} eq 'CODE';
+    return 'noop' unless $self->{running};
+    if (!defined $self->{handle}) {
+        # start() returned undef: declined (CCPRAXIS_NO_WAKELOCK, not
+        # Windows) or failed outright (fork, missing helper). There is no
+        # handle to probe at all here -- child_alive(undef) is UNJUDGEABLE,
+        # not dead, so this is NOT the same case as a handle that WAS alive
+        # and then died, and there is nothing to retry in place. This is bug
+        # 4eca's own class the other way round: a holder stuck reporting
+        # running()==1 (and the launcher logging held=1) for a machine with
+        # no wake-lock at all, forever, because nothing ever told it
+        # otherwise. Stop claiming the lock is held so the next sync(1) call
+        # attempts start() again from scratch, exactly like any other
+        # not-yet-running state -- never a respawn loop from inside revive()
+        # itself (AC6(4) pins start() is not called again from here).
+        $self->{running} = 0;
+        return 'noop';
+    }
+    return 'noop' unless ref $self->{alive} eq 'CODE';
     my $alive = eval { $self->{alive}->($self->{handle}) };
     return 'noop' if !defined $alive || $alive;     # a failed probe proves nothing
     my $old = $self->{handle};
@@ -276,33 +334,15 @@ sub release { return $_[0]->sync(0) }
 # orphan_is_ours($cmdline, $marker) -> 1|0  (Decision #10)
 #   Returns 1 iff both arguments are defined and $marker is a case-insensitive
 #   substring of $cmdline; 0 otherwise. undef or empty $cmdline -> 0, no warning.
-#   Used by _keepawake_reap_orphan to confirm a recycled pid still owns our
-#   keep-awake.ps1 before sending taskkill.
+#   No production caller remains (07-one-keepawake-helper DC1 deletes
+#   launcher.pl's _keepawake_reap_orphan, the only one); reaping now lives in
+#   BpKeepAwake::reap_orphan, which uses its own guard (stop_helper's cmdline
+#   check). Kept here, unchanged, because keepawake-decision-core.t pins it.
 sub orphan_is_ours {
     my ($cmdline, $marker) = @_;
     return 0 unless defined $cmdline && defined $marker;
     return 0 unless length($cmdline) && length($marker);
     return index(lc($cmdline), lc($marker)) >= 0 ? 1 : 0;
-}
-
-# filetime_ticks($unix_seconds) -> decimal string | undef
-#   UTC FILETIME ticks (100ns units since 1601-01-01) for a Unix time, as
-#   keep-awake.ps1's -OwnerStartedBeforeTicks expects. Pure arithmetic: no
-#   process is spawned (asking Windows for the owner's exact start time costs a
-#   powershell.exe on the spawn path, measured to slow helper handover enough
-#   to break lease-refresher-hygiene.t under load). Fractional
-#   seconds are kept to 100ns resolution as far as a double allows; the helper
-#   applies a 2s slack, so the rounding never matters. undef for anything that
-#   is not a non-negative number.
-#
-#   CALLER CONTRACT: pass your own clock reading, taken while the owner is
-#   certainly alive and before forking the helper -- for a self-owned helper,
-#   simply "now" in the parent. A WINPID reused after the owner dies belongs to
-#   a process created after that reading, which the helper then rejects.
-sub filetime_ticks {
-    my ($t) = @_;
-    return undef unless defined($t) && !ref($t) && $t =~ /\A\d+(?:\.\d+)?\z/;
-    return sprintf('%.0f', ($t + 11644473600) * 10_000_000);
 }
 
 # --- package 05-intent-in-busy-lease (blueprint wake-and-pause-consolidation):
