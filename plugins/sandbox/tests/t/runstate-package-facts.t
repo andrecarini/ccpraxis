@@ -265,24 +265,31 @@ sub mk_ledger {
 # the two new keys to the closed set so this file's OWN AC1/AC28 assertions
 # (package 04/05's own done criteria, unrelated to package 13) keep meaning
 # what they always meant, rather than failing on an unrelated struct change.
+# Widened 19 -> 23 / 8 -> 10 by package 01-run-blocks (spec S2.1):
+# paused_window, relaunch_at, relaunch_local, next_package (run level) and
+# step_word, waits_on (package level). Same MECHANICAL-widening rationale as
+# the comment above: this file's own AC1/AC28 are unrelated to package
+# 01-run-blocks, so the lists are widened in lockstep rather than left to
+# fail on an unrelated struct change.
 my @SUMMARY_KEYS = qw(
     blueprint runs_dir state orchestrator_pid orchestrator_alive orchestrator_started_at
     paused_manual paused_reason packages_total packages_done current_package
     running_coordinators escalations_waiting inbox_waiting triage_waiting packages
     run_agents thread thread_events
+    paused_window relaunch_at relaunch_local next_package
 );
-my @PKG_KEYS = qw(name status attempt attempt_cap step steps_pending next_action agents);
+my @PKG_KEYS = qw(name status attempt attempt_cap step steps_pending next_action agents step_word waits_on);
 
 sub assert_summary_keys {
     my ($s, $label) = @_;
     ok(is_hashref($s), "$label: summary is a hashref") or return;
-    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS ], "$label: AC1 -- exactly the 19 S2.1+package-13 keys, no more, no fewer");
+    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS ], "$label: AC1 -- exactly the 23 S2.1+package-13+package-01-run-blocks keys, no more, no fewer");
 }
 
 sub assert_pkg_shape {
     my ($e, $label) = @_;
     ok(is_hashref($e), "$label: package entry is a hashref") or return;
-    is_deeply([ sort keys %$e ], [ sort @PKG_KEYS ], "$label: AC28 -- exactly the 8 S2.2 keys (package 05 adds 'agents')");
+    is_deeply([ sort keys %$e ], [ sort @PKG_KEYS ], "$label: AC28 -- exactly the 10 S2.2+package-01-run-blocks keys (package 05 adds 'agents'; package 01-run-blocks adds step_word/waits_on)");
 }
 
 sub assert_new_key_types {
@@ -327,7 +334,6 @@ use_ok('RunState');
         [ 'warn',                 qr/\bwarn\b/ ],
         [ 'die',                  qr/\bdie\b/ ],
         [ 'time(',                qr/\btime\s*\(/ ],
-        [ 'localtime',            qr/\blocaltime\b/ ],
         [ 'gmtime',               qr/\bgmtime\b/ ],
         [ 'Exporter/@EXPORT',     qr/\b(?:Exporter|\@EXPORT)\b/ ],
     );
@@ -335,6 +341,26 @@ use_ok('RunState');
         my ($label, $qr) = @$f;
         my $desc = "AC39: RunState.pm source (comments stripped) contains no $label -- no new clock read, no I/O";
         $have ? unlike($src, $qr, $desc) : fail("$desc [RunState.pm not on disk]");
+    }
+
+    # CHANGED by package 01-run-blocks (spec S2.1.6/S5.2, ruling C3):
+    # localtime is narrowed rather than forbidden outright -- RunState
+    # converts an on-disk relaunch_at epoch via localtime($var) in exactly
+    # one helper, _local_parts.
+    {
+        my $desc_count = 'AC39: RunState.pm source (comments stripped) contains exactly one localtime call';
+        my $count = () = ($src =~ /\blocaltime\b/g);
+        $have ? is($count, 1, $desc_count) : fail("$desc_count [RunState.pm not on disk]");
+
+        my $desc_shape = 'AC39: the one localtime call has the form localtime($var)';
+        $have ? like($src, qr/\blocaltime\(\s*\$\w+\s*\)/, $desc_shape) : fail("$desc_shape [RunState.pm not on disk]");
+
+        my $desc_loc = 'AC39: the localtime call lies between sub _local_parts and the next sub';
+        my $ok_loc = 0;
+        if ($have && $src =~ /\bsub\s+_local_parts\b(.*?)(?:\nsub\s|\z)/s) {
+            $ok_loc = ($1 =~ /\blocaltime\b/) ? 1 : 0;
+        }
+        $have ? ok($ok_loc, $desc_loc) : fail("$desc_loc [RunState.pm not on disk]");
     }
 }
 {

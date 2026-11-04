@@ -20,7 +20,11 @@ package RunState;
 # so a project path containing spaces or non-ASCII bytes (André) is safe.
 # Nothing is exported; callers use fully-qualified names
 # (RunState::summarize(...)), exactly as launcher.pl calls SessionFilter:: /
-# BackpackApproval::. No time()/localtime/gmtime/clock read.
+# BackpackApproval::. RunState reads no clock (no time(), no gmtime, no
+# argument-less localtime); package 01-run-blocks (spec S2.1.6) adds the
+# ONE exception -- _local_parts converts an on-disk `relaunch_at` EPOCH
+# (already read from .paused, not a clock read) to host-local parts via
+# localtime($var). Nowhere else in this file calls localtime.
 #
 # 04-run-panel-ledger-truth (Decision 3): RunState performs NO process probe
 # itself and contains no `kill` -- it delegates coordinator-PID liveness to a
@@ -64,11 +68,41 @@ our $MAX_THREAD_EVENTS = 10;          # mirrors launcher.pl's $ORCH_EVENTS_PER_L
 our $MAX_THREAD_RECORDS = 512;        # .md entries in almanac/thread/
 our $MAX_THREAD_TASKS = 512;          # .md entries in one thread-tasks-<name>/
 our $MAX_ALMANAC_RECORD_BYTES = 65536;   # bytes read from one almanac record file
+
+# package 01-run-blocks (spec S2.1): bounds for the two new on-disk reads
+# this package adds -- the orchestrator log TAIL read (_last_pause_window)
+# and the blueprint.md table read (_next_package). Same "read a bounded
+# amount, never the whole growing file" discipline as $MAX_LEDGER_BYTES.
+our $MAX_ORCH_LOG_TAIL_BYTES = 65536;         # per-chunk read size for the
+                                               # backward pause scan below
+our $MAX_ORCH_LOG_PAUSE_SCAN_BYTES = 4 * 1024 * 1024;   # fix-batch item 3
+# (reviewer MINOR-1 / redteam MAJOR-1): the orchestrator keeps appending
+# busy_lease_tick/usage_poll records to orchestrator.log for the WHOLE
+# duration of a pause (bp-orchestrator.pl:4700-4745) -- only the pause
+# record itself is written once. redteam's own measurement on a real log
+# found 423 KB accumulated during one weekly pause, and every pause long
+# enough pushed its own record out of a 64 KiB tail after ~1.4 h. 4 MiB
+# covers that measured worst case with headroom, and a regex/index scan of
+# 4 MiB is milliseconds (redteam: "a regex scan of 4 MB is milliseconds").
+our $MAX_BLUEPRINT_BYTES     = 262144;
 our $MAX_INDEX_LINK_RESOLUTIONS = 8192;  # redteam M2: global cap on linked-task
                                           # ledger lookups per _thread_index call
                                           # (worst case otherwise 512 threads x
                                           # 512 tasks); the per-call cache keeps
                                           # repeats of the same link free
+our $MAX_NEXT_PACKAGE_LINK_RESOLUTIONS = 2048;  # fix-batch item 5 (redteam
+                                          # MINOR-3): _next_package has no
+                                          # counterpart to the _thread_index
+                                          # M2 cap above -- a 278 KB
+                                          # blueprint.md with 9000 external-
+                                          # dep rows made one summarize_dir
+                                          # call take 9.8 s (redteam probe4
+                                          # case C). Same budget-decrement
+                                          # pattern as _thread_build's
+                                          # \$link_budget: once exhausted,
+                                          # further external deps resolve as
+                                          # 'invalid' (not done) rather than
+                                          # paying for another ledger read.
 our $FUTURE_EVENT_SLACK_SECONDS = 300;   # redteam M3: an `at:` more than this
                                           # far past its log file's mtime is
                                           # dropped rather than trusted, so a
@@ -388,24 +422,290 @@ sub _orchestrator_alive {
     return (defined $probe && !$probe) ? 0 : undef;
 }
 
-# _paused_info($path) -> ($paused_manual, $paused_reason) (private)
+# _paused_info($path) -> ($paused_manual, $paused_reason, $relaunch_at) (private)
 #
 # $paused_manual is 1 iff the (capped) file decodes as a HASH whose 'manual'
 # key is truthy; 0 otherwise (missing file, unreadable, over cap, malformed
 # JSON, non-HASH, or falsy 'manual'). $paused_reason is the 'reason' field
 # only when it is a defined, non-ref, non-empty scalar; else undef. Note
 # this is independent of `state` classification (S2.3 is existence-only).
+#
+# package 01-run-blocks (spec S2.1 table): $relaunch_at is the THIRD value,
+# read from the same decode -- the 'relaunch_at' field, accepted iff it is a
+# non-ref scalar matching /\A\d{1,12}(?:\.\d+)?\z/ (bare digits, optionally
+# a decimal tail -- no sign, no exponent) and is > 0; returned as int().
+# Anything else (negative, non-numeric, a ref, a 13+ digit run, missing) ->
+# undef.
 sub _paused_info {
     my ($path) = @_;
     my $blob = _read_capped($path, $MAX_MARKER_BYTES);
-    return (0, undef) unless defined $blob;
+    return (0, undef, undef) unless defined $blob;
     local $@;
     my $data = eval { JSON::PP->new->decode($blob) };
-    return (0, undef) unless ref($data) eq 'HASH';
+    return (0, undef, undef) unless ref($data) eq 'HASH';
     my $manual = $data->{manual} ? 1 : 0;
     my $reason = $data->{reason};
     $reason = (defined($reason) && !ref($reason) && length($reason)) ? $reason : undef;
-    return ($manual, $reason);
+    my $raw_relaunch = $data->{relaunch_at};
+    my $relaunch_at;
+    if (defined($raw_relaunch) && !ref($raw_relaunch) && $raw_relaunch =~ /\A\d{1,12}(?:\.\d+)?\z/) {
+        my $n = $raw_relaunch + 0;
+        $relaunch_at = int($n) if $n > 0;
+    }
+    return ($manual, $reason, $relaunch_at);
+}
+
+# ===========================================================================
+# package 01-run-blocks (spec S2.1): the pause-window/resume-time/next-
+# package helpers the new Blueprints block needs. _local_parts is the ONE
+# place in this file that calls localtime (S2.1.6) -- a timezone conversion
+# of an epoch already read from disk, never a clock read.
+# ===========================================================================
+
+# _local_parts($epoch) -> \%parts | undef (private, pinned name)
+#
+# Host-local civil parts of an epoch already on disk. undef unless $epoch is
+# a non-ref scalar matching /\A\d{1,12}\z/ and > 0, or localtime() itself
+# fails to return a full field list. Never caches anything -- callers change
+# $ENV{TZ} and call POSIX::tzset() between calls (spec S2.1.3).
+sub _local_parts {
+    my ($epoch) = @_;
+    return undef unless defined($epoch) && !ref($epoch) && $epoch =~ /\A\d{1,12}\z/ && $epoch > 0;
+    my @t = eval { localtime($epoch) };   # the ONE localtime in RunState.pm (C3)
+    return undef unless @t >= 7;
+    my @wdays = qw(Sun Mon Tue Wed Thu Fri Sat);
+    my @mons  = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    my $wday  = $wdays[$t[6]];
+    my $mon   = $mons[$t[4]];
+    return undef unless defined($wday) && defined($mon);
+    return { wday => $wday, hhmm => sprintf('%02d:%02d', $t[2], $t[1]),
+             day => sprintf('%02d', $t[3]), mon => $mon };
+}
+
+# _last_pause_window($runs_dir, $want_relaunch_at) -> Str | undef (private,
+# pinned name)
+#
+# spec S2.1.2, amended by the step-7 fix-batch (reviewer MINOR-1, redteam
+# MAJOR-1): the `window` field of the newest (nearest-to-EOF) `type:"pause"`
+# record in "$runs_dir/orchestrator.log" whose own `relaunch_at` agrees with
+# $want_relaunch_at -- the CURRENT .paused marker's relaunch_at, when it has
+# one (undef skips the cross-check and just takes the nearest record, as
+# before: a pause with no relaunch_at has nothing to disagree with).
+#
+# The read is a BACKWARD CHUNKED scan (never a single bounded tail): each
+# $MAX_ORCH_LOG_TAIL_BYTES-sized chunk is pulled in from EOF, prefiltered
+# with a cheap `index($line, '"pause"') >= 0` BEFORE any JSON::PP->decode
+# (redteam MINOR-1: decoding every one of ~480 tick lines in a 64 KiB tail
+# cost 73-114 ms per call, on the dashboard's own 10 s refresh loop), and
+# the whole scan is bounded at $MAX_ORCH_LOG_PAUSE_SCAN_BYTES so a pause
+# record is no longer silently lost once a long-enough pause pushes it past
+# the old single-chunk cap (redteam MAJOR-1: measured real pauses accumulate
+# hundreds of KB of later log records; "weekly limit" was silently
+# degrading to "usage limit" ~1.4 h into a real weekly pause).
+#
+# undef for a missing/non-plain/symlinked log, no pause record within the
+# scan budget, or every record found carrying an invalid/missing window or
+# (when $want_relaunch_at is defined) a disagreeing/missing relaunch_at.
+# Never dies, never warns.
+sub _last_pause_window {
+    my ($runs_dir, $want_relaunch_at) = @_;
+    return undef unless defined($runs_dir) && !ref($runs_dir) && length($runs_dir);
+    $want_relaunch_at = undef
+        unless defined($want_relaunch_at) && !ref($want_relaunch_at) && $want_relaunch_at =~ /\A\d+\z/;
+    my $path = "$runs_dir/orchestrator.log";
+    return undef unless -f $path && !-l $path;
+    my $size = -s $path;
+    return undef unless defined($size) && $size =~ /\A\d+\z/;
+    return undef if $size == 0;
+
+    open(my $fh, '<:raw', $path) or return undef;
+
+    my $chunk_bytes = $MAX_ORCH_LOG_TAIL_BYTES;
+    my $scan_cap    = $MAX_ORCH_LOG_PAUSE_SCAN_BYTES;
+    my $pos         = $size;    # unread-so-far boundary, counting down to 0
+    my $scanned     = 0;
+    my $buf         = '';       # accumulates only the still-unprocessed
+                                 # leading partial line between iterations --
+                                 # already-processed interior lines are
+                                 # dropped each pass, so this never regrows
+                                 # to the whole scanned range.
+    my $result;
+    my $decided = 0;
+
+    while ($pos > 0 && $scanned < $scan_cap) {
+        my $read_len = ($pos < $chunk_bytes) ? $pos : $chunk_bytes;
+        my $offset   = $pos - $read_len;
+        last unless seek($fh, $offset, 0);
+        my $piece = '';
+        my $n = read($fh, $piece, $read_len);
+        last unless defined $n;
+        $buf    = $piece . $buf;
+        $pos    = $offset;
+        $scanned += $read_len;
+
+        my @lines = split /\n/, $buf, -1;
+        # The first element may be a partial line continuing before $offset
+        # (mid-line chunk boundary); carry it forward unless we are already
+        # at byte 0 of the file, in which case it IS a complete first line.
+        my $leading = ($pos > 0) ? shift(@lines) : undef;
+
+        for my $line (reverse @lines) {
+            my $l = $line;
+            $l =~ s/\r\z//;
+            next unless length($l);
+            next if length($l) > 8192;
+            next if index($l, '"pause"') < 0;   # cheap prefilter before decode
+            local $@;
+            my $rec = eval { JSON::PP->new->decode($l) };
+            next unless ref($rec) eq 'HASH';
+            next unless defined($rec->{type}) && !ref($rec->{type}) && $rec->{type} eq 'pause';
+
+            if (defined $want_relaunch_at) {
+                my $raw_r = $rec->{relaunch_at};
+                next unless defined($raw_r) && !ref($raw_r) && $raw_r =~ /\A\d{1,12}(?:\.\d+)?\z/;
+                next unless int($raw_r + 0) == $want_relaunch_at;
+            }
+
+            my $w = $rec->{window};
+            $result  = (defined($w) && !ref($w) && $w =~ /\A[a-z0-9_]{1,32}\z/) ? $w : undef;
+            $decided = 1;
+            last;
+        }
+        last if $decided;
+        $buf = defined($leading) ? $leading : '';
+    }
+    close $fh;
+    return $result;
+}
+
+# _next_package($blueprint_dir, \%status_by_pkg) -> Str | undef (private,
+# pinned name)
+#
+# spec S2.1.4: the first package, in blueprint.md's own TABLE ORDER, whose
+# effective status is 'pending' and every one of whose depends_on edges is
+# done (a local dep via $status_by_pkg; an external "<bp>/<pkg>" dep via
+# _link_resolve against the project root). undef for no blueprint.md, no
+# recognisable table, or no qualifying row. Never consults any thread's own
+# `next` (ruling E). Never dies.
+sub _next_package {
+    my ($blueprint_dir, $status_by_pkg) = @_;
+    return undef unless defined($blueprint_dir) && !ref($blueprint_dir) && length($blueprint_dir);
+    $status_by_pkg = {} unless ref($status_by_pkg) eq 'HASH';
+
+    my $blob = _read_head("$blueprint_dir/blueprint.md", $MAX_BLUEPRINT_BYTES);
+    return undef unless defined($blob) && length($blob);
+    my @lines = split /\n/, $blob, -1;
+    for my $l (@lines) { $l =~ s/\r\z//; }
+
+    my $header_idx;
+    for my $i (0 .. $#lines) {
+        if ($lines[$i] =~ /\A\s*\|/ && $lines[$i] =~ /depends_on/) { $header_idx = $i; last; }
+    }
+    return undef unless defined $header_idx;
+
+    my $split_row = sub {
+        my ($row) = @_;
+        my @cells = split /\|/, $row;
+        shift @cells if @cells && $cells[0] =~ /\A\s*\z/;
+        pop @cells if @cells && $cells[-1] =~ /\A\s*\z/;
+        for my $c (@cells) { $c =~ s/\A\s+//; $c =~ s/\s+\z//; }
+        return @cells;
+    };
+
+    my @header_cells = $split_row->($lines[$header_idx]);
+    my ($pkg_idx, $dep_idx);
+    for my $i (0 .. $#header_cells) {
+        $pkg_idx = $i if !defined($pkg_idx) && $header_cells[$i] eq 'pkg';
+        $dep_idx = $i if !defined($dep_idx) && $header_cells[$i] eq 'depends_on';
+    }
+    return undef unless defined($pkg_idx) && defined($dep_idx);
+
+    my $parent = $blueprint_dir;
+    $parent =~ s{\\}{/}g;
+    $parent =~ s{/+\z}{};
+    $parent =~ s{/[^/]*\z}{};
+    my $project_root = _project_root($parent);
+
+    my %link_cache;
+    # fix-batch item 5 (redteam MINOR-3): a resolution BUDGET, the same
+    # decrement-before-call pattern as _thread_build's \$link_budget (no
+    # counterpart existed here for _link_resolve, so a hostile/badly
+    # generated blueprint.md with thousands of external-dep rows could cost
+    # seconds per summarize_dir call). Once exhausted, further external deps
+    # resolve 'invalid' (not done) instead of paying for another ledger read.
+    my $link_budget = $MAX_NEXT_PACKAGE_LINK_RESOLUTIONS;
+    my $i = $header_idx + 1;
+    while ($i <= $#lines && $lines[$i] =~ /\A\s*\|/) {
+        my $row = $lines[$i];
+        $i++;
+        next if $row =~ /\A\s*\|[\s:|-]+\|?\s*\z/;
+        my @cells = $split_row->($row);
+        my $pkg = $cells[$pkg_idx];
+        next unless defined($pkg) && length($pkg) && _safe_pkg_name($pkg);
+        next unless defined($status_by_pkg->{$pkg}) && $status_by_pkg->{$pkg} eq 'pending';
+
+        my $dep_cell = defined($cells[$dep_idx]) ? $cells[$dep_idx] : '';
+        my @raw_deps = split /[,\s]+/, $dep_cell;
+        my @deps = grep { length($_) && ($_ =~ m{/} || $_ =~ /\A[A-Za-z0-9][A-Za-z0-9_.-]*\z/) } @raw_deps;
+
+        my $all_done = 1;
+        for my $dep (@deps) {
+            if ($dep =~ m{/}) {
+                my $r;
+                if ($link_budget <= 0) {
+                    $r = { state => 'invalid', blueprint => undef, package => undef, status => undef, step => undef };
+                }
+                else {
+                    $link_budget--;
+                    $r = _link_resolve($project_root, $dep, \%link_cache);
+                }
+                unless (ref($r) eq 'HASH' && $r->{state} eq 'ok'
+                        && defined($r->{status}) && $r->{status} eq 'done') {
+                    $all_done = 0;
+                    last;
+                }
+            }
+            else {
+                # fix-batch item 4 (redteam MINOR-2): resolve the LOCAL dep
+                # token exactly as the orchestrator's own resolve_dep_token/
+                # deps_met would (bp-orchestrator.pl:1507-1559) -- exact
+                # match, then case-insensitive, then a UNIQUE "<tok>-" short-
+                # id prefix -- instead of accepting only an exact key. An
+                # ambiguous or unresolvable token is treated the same as
+                # today's "no match": the dep counts as unmet.
+                my $resolved = _resolve_local_dep_token($dep, $status_by_pkg);
+                unless (defined($resolved) && $status_by_pkg->{$resolved} eq 'done') {
+                    $all_done = 0;
+                    last;
+                }
+            }
+        }
+        return $pkg if $all_done;
+    }
+    return undef;
+}
+
+# _resolve_local_dep_token($tok, \%status_by_pkg) -> Str | undef (private)
+#
+# Restates bp-orchestrator.pl's resolve_dep_token (fix-batch item 4,
+# redteam MINOR-2) against $status_by_pkg's own keys: exact match, then a
+# unique case-insensitive match, then a unique "<tok>-" prefix match. undef
+# for no match OR an ambiguous one (multiple candidates) -- the caller
+# treats that exactly like today's "no such package", i.e. the dependency
+# counts as unmet rather than guessed.
+sub _resolve_local_dep_token {
+    my ($tok, $status_by_pkg) = @_;
+    return undef unless defined($tok) && !ref($tok) && length($tok);
+    return undef unless ref($status_by_pkg) eq 'HASH';
+    return $tok if exists $status_by_pkg->{$tok};
+    my $lt = lc $tok;
+    my @ci = sort grep { lc($_) eq $lt } keys %$status_by_pkg;
+    return $ci[0] if @ci == 1;
+    return undef if @ci > 1;
+    my $pfx = $lt . '-';
+    my @pf = sort grep { index(lc($_), $pfx) == 0 } keys %$status_by_pkg;
+    return $pf[0] if @pf == 1;
+    return undef;
 }
 
 # ===========================================================================
@@ -805,7 +1105,7 @@ sub _parse_next_action {
 # strict and unchanged.
 sub _ledger_facts {
     my ($blueprint_dir, $pkg) = @_;
-    my %facts = (step => undef, steps_pending => undef, next_action => undef);
+    my %facts = (step => undef, steps_pending => undef, next_action => undef, step_word => undef);
     return \%facts unless _safe_pkg_name($pkg);
     my $blob = _read_head("$blueprint_dir/packages/$pkg.md", $MAX_LEDGER_BYTES);
     return \%facts unless defined $blob && length $blob;
@@ -813,6 +1113,9 @@ sub _ledger_facts {
     $facts{step}          = $step;
     $facts{steps_pending} = $pending;
     $facts{next_action}   = _parse_next_action($blob);
+    # package 01-run-blocks (spec S2.1): step_word, from the SAME head read --
+    # no second file open.
+    $facts{step_word}     = _pipeline_step_word($blob);
     return \%facts;
 }
 
@@ -1552,6 +1855,7 @@ sub _thread_build {
             next => undef,
             owner => _build_owner($blueprints_root, $project_root, $fields),
             driven => \%driven_cap,
+            link_blocked_on => {},
         };
     }
 
@@ -1581,6 +1885,10 @@ sub _thread_build {
     my $next_label;
     my $done = 0;
     my $total = scalar(@parsed);
+    # package 01-run-blocks (spec S2.1.5): keyed "<blueprint>/<package>" ->
+    # the TASK's own blocked_on field, recorded only for a link that resolved
+    # 'ok'. Consumed by summarize_dir to populate a package's `waits_on`.
+    my %link_blocked_on;
 
     for my $t (@parsed) {
         my $f = $t->{fields};
@@ -1609,6 +1917,10 @@ sub _thread_build {
                     $class = _status_class($r->{status});
                     my $step = defined($r->{step}) ? $r->{step} : $r->{status};
                     $label = { class => $class, kind => 'link', blueprint => $r->{blueprint}, number => $number, step => $step };
+                    my $bo = _alm_text($f->{blocked_on});
+                    if (defined($bo) && length($bo) && defined($r->{blueprint}) && defined($r->{package})) {
+                        $link_blocked_on{"$r->{blueprint}/$r->{package}"} = $bo;
+                    }
                 }
                 else {   # missing
                     $class = 'pending';
@@ -1643,6 +1955,7 @@ sub _thread_build {
         name => $name, done => $done, total => $total,
         doing => \@doing, current => $current, next => $next_label,
         owner => $owner, driven => \%driven,
+        link_blocked_on => \%link_blocked_on,
     };
 }
 
@@ -1960,12 +2273,18 @@ sub summarize_dir {
     my $running_count  = 0;
     my $current_package;
     my @packages_out;   # 04-runstate-run-and-package-facts: ArrayRef[HashRef], ledger order
+    # package 01-run-blocks (spec S2.1.4): the effective status per package,
+    # built as the loop already computes it, for _next_package's own
+    # pending/done edges. Not the registry's own status (Decision 13) -- the
+    # SAME $status this loop already derives from the ledger.
+    my %status_by_pkg;
     for my $pkg (sort @pkgs) {
         my $entry = $reg_pkgs->{$pkg};
         # HIGH-2 governing rule: the registry is consulted only when the
         # package has NO ledger file at all ($ledger_mode true means every
         # $pkg here came from a real, present packages/<pkg>.md).
         my $status = _effective_status($blueprint_dir, $pkg, $entry, $ledger_mode);
+        $status_by_pkg{$pkg} = $status;
         $packages_done++ if $status eq 'done';
         if ($status eq 'running') {
             # MEDIUM-7: a per-package registry-recorded coordinator PID is
@@ -2031,6 +2350,11 @@ sub summarize_dir {
             steps_pending => $facts->{steps_pending},
             next_action   => $facts->{next_action},
             agents        => $agents,
+            # package 01-run-blocks (spec S2.1): step_word rides the same
+            # ledger-head read _ledger_facts already did; waits_on is filled
+            # below, once the chosen thread (if any) is known.
+            step_word     => $facts->{step_word},
+            waits_on      => undef,
         };
     }
 
@@ -2076,7 +2400,14 @@ sub summarize_dir {
       : $dead         ? undef
       :                 _mtime("$runs_dir/.orchestrator");
 
-    my ($paused_manual, $paused_reason) = _paused_info("$runs_dir/.paused");
+    my ($paused_manual, $paused_reason, $relaunch_at) = _paused_info("$runs_dir/.paused");
+
+    # package 01-run-blocks (spec S2.1): paused_window is computed ONLY when
+    # runs/.paused exists (the same gate $has_paused already captures) --
+    # not keyed to $state, which can still demote to 'stale' below.
+    my $paused_window = $has_paused ? _last_pause_window($runs_dir, $relaunch_at) : undef;
+    my $relaunch_local = defined($relaunch_at) ? _local_parts($relaunch_at) : undef;
+    my $next_package = _next_package($blueprint_dir, \%status_by_pkg);
 
     # t07: "the run is over" is exactly what $state already computes, so it is
     # read from there rather than re-derived. `idle` and `solo` mean nothing is
@@ -2153,6 +2484,15 @@ sub summarize_dir {
     my $thread_events_src = (ref($tidx) eq 'HASH' && ref($tidx->{events}) eq 'ARRAY') ? $tidx->{events} : [];
     my $thread_events_out = [ map { { %$_ } } @$thread_events_src ];
 
+    # package 01-run-blocks (spec S2.1.5): fill waits_on now that the chosen
+    # thread (if any) is known. Only the chosen thread's tasks count.
+    if (ref($chosen) eq 'HASH' && ref($chosen->{link_blocked_on}) eq 'HASH') {
+        for my $pkg_entry (@packages_out) {
+            my $bo = $chosen->{link_blocked_on}{"$bp_name/$pkg_entry->{name}"};
+            $pkg_entry->{waits_on} = (defined($bo) && !ref($bo) && $bo =~ /\A[A-Za-z0-9._-]{1,128}\z/) ? $bo : undef;
+        }
+    }
+
     return {
         blueprint               => $bp_name,
         runs_dir                => $runs_dir,
@@ -2173,6 +2513,11 @@ sub summarize_dir {
         run_agents              => $run_agents,
         thread                  => $thread_out,
         thread_events           => $thread_events_out,
+        # package 01-run-blocks (spec S2.1): the 20th-23rd run-level keys.
+        paused_window           => $paused_window,
+        relaunch_at             => $relaunch_at,
+        relaunch_local          => $relaunch_local,
+        next_package            => $next_package,
     };
 }
 

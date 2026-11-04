@@ -61,18 +61,20 @@ sub mk_run {
     return \%s;
 }
 
-# call_prl($s) -> ($result, $err). Never lets a die escape -- required
-# because tui::DashboardScreen::_paused_reason_line does not exist yet at
-# the time this oracle is written; an unguarded call would abort the whole
-# script rather than fail one assertion. $err is '' on success, so callers
-# that expect undef-on-success (e.g. AC2/AC3/AC4) can assert BOTH "no die"
-# and "result is undef" -- collapsing those into a single is($result,undef)
-# check would let "died, so $result happens to be undef" pass vacuously
-# before the sub exists, which is exactly the false-green this suite must
-# not produce.
-sub call_prl {
-    my ($s) = @_;
-    my $res = eval { tui::DashboardScreen::_paused_reason_line($s) };
+# RETARGETED by package 01-run-blocks (spec S5.1 table, ruling B/G):
+# _paused_reason_line is removed. The pause words now live on the
+# blueprint line itself (kind 'blueprint', lines[0]) built by _run_block.
+# blueprint_line_spans($s, $now) -> \@spans | undef, never dies.
+sub blueprint_line_spans {
+    my ($s, $now) = @_;
+    my $block = eval { tui::DashboardScreen::_run_block($s, $now, undef) };
+    return undef if $@;
+    return undef unless ref($block) eq 'HASH' && ref($block->{lines}) eq 'ARRAY' && ref($block->{lines}[0]) eq 'HASH';
+    return $block->{lines}[0]{spans};
+}
+sub call_block_line0 {
+    my ($s, $now) = @_;
+    my $res = eval { blueprint_line_spans($s, $now) };
     my $err = $@;
     $err = '' unless defined $err;
     return ($res, $err);
@@ -119,37 +121,46 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
     my $s = mk_run(blueprint => 'bp-ac1', state => 'paused', paused_reason => $reason,
                     current_package => 'ac1-current-pkg-marker', packages_done => 1, packages_total => 2);
 
-    my ($line, $err) = call_prl($s);
-    ok(!$err, 'AC1: _paused_reason_line is callable without dying') or diag("  \$\@ = $err");
-    ok(ref($line) eq 'ARRAY', 'AC1: _paused_reason_line returns an arrayref for state=>paused with a non-empty reason');
+    # RETARGETED by package 01-run-blocks (spec S5.1 table; ruling B/G,
+    # Decision 11 C4): _paused_reason_line is removed. The pause words
+    # live in the STATE slot of the blueprint line (lines[0]), prefixed by
+    # the thread.idle glyph (Decision 11 amends ruling G's title.paused to
+    # thread.idle -- identical bytes). PAUSE_WORDS for an unrecognised
+    # reason token is the reason verbatim (table row "any other non-empty
+    # string").
+    my ($spans, $err) = call_block_line0($s, undef);
+    ok(!$err, 'AC1: _run_block is callable without dying') or diag("  \$\@ = $err");
+    ok(ref($spans) eq 'ARRAY', 'AC1: _run_block returns a blueprint-line spans array for state=>paused with a non-empty reason');
   SKIP: {
-        skip('_paused_reason_line did not return an arrayref', 2) unless ref($line) eq 'ARRAY';
-        is($line->[0]{text}, '  paused ' . $reason, 'AC1: the span text is the literal "  paused " prefix plus the reason, verbatim');
-        is($line->[0]{role}, 'state.warn', 'AC1: the span role is state.warn');
+        skip('_run_block did not return a spans array', 2) unless ref($spans) eq 'ARRAY';
+        my $idle_glyph = Theme::glyph('thread.idle') // '';
+        my ($pause_span) = grep { ref($_) eq 'HASH' && defined($_->{text}) && index($_->{text}, $reason) >= 0 } @$spans;
+        ok($pause_span, 'AC1: a span carries the reason verbatim');
+        is($pause_span->{role}, 'state.warn', 'AC1: that span\'s role is state.warn') if $pause_span;
+        my $full = join('', map { $_->{text} // '' } @$spans);
+        ok(length($idle_glyph) && index($full, $idle_glyph . ' ' . $reason) >= 0,
+            'AC1: the blueprint line contains "<thread.idle glyph> " immediately before the reason, verbatim');
     }
 
-    my $state = base_state(runs => [$s]);
-    my $panels = tui::DashboardScreen::panels($state, 120);
-    my $bpp = panel_by_title($panels, 'Blueprints');
-    ok($bpp, 'AC1 precondition: a Blueprints panel exists');
+    # The current-package fallback line is now a PACKAGE-kind line of the
+    # same block, structurally guaranteed (by the line grammar, S2.3.9) to
+    # come strictly after the blueprint line -- so this is checked via
+    # _run_summary_lines's row order rather than a panel-text index lookup.
+    my ($rows, $rows_err) = (eval { tui::DashboardScreen::_run_summary_lines([$s], undef, 120, undef) }, $@);
+    ok(!$rows_err, 'AC1: _run_summary_lines does not die') or diag("  \$\@ = $rows_err");
   SKIP: {
-        skip('no Blueprints panel', 4) unless $bpp;
-        my $texts = panel_line_texts($bpp);
-        my ($row_idx)    = grep { $texts->[$_] =~ /bp-ac1\b/ } 0 .. $#$texts;
-        my ($reason_idx) = grep { $texts->[$_] =~ /\Q  paused $reason\E/ } 0 .. $#$texts;
-        my ($cur_idx)    = grep { $texts->[$_] =~ /ac1-current-pkg-marker/ } 0 .. $#$texts;
-        ok(defined $row_idx, 'AC1: the run\'s own table row is found in the panel');
-        ok(defined $reason_idx, 'AC1: a line containing the literal "  paused <reason>" is found in the panel');
-      SKIP: {
-            skip('a required line was not found', 2) unless defined($row_idx) && defined($reason_idx) && defined($cur_idx);
-            ok($reason_idx > $row_idx, 'AC1: the paused-reason line appears strictly AFTER the run\'s own table row');
-            ok($reason_idx < $cur_idx, 'AC1: the paused-reason line appears strictly BEFORE the current-package line');
-        }
+        skip('_run_summary_lines did not return rows', 2) unless ref($rows) eq 'ARRAY';
+        my ($row_idx)    = grep { ref($rows->[$_]) eq 'ARRAY' && tui::Frame::spans_text($rows->[$_]) =~ /bp-ac1\b/ } 0 .. $#$rows;
+        my ($cur_idx)    = grep { ref($rows->[$_]) eq 'ARRAY' && tui::Frame::spans_text($rows->[$_]) =~ /ac1-current-pkg-marker/ } 0 .. $#$rows;
+        ok(defined($row_idx) && defined($cur_idx) && $cur_idx > $row_idx,
+            'AC1: the current-package line appears strictly AFTER the blueprint line (same row carries the pause words, so "after the reason" is automatic)');
     }
 }
 
 # ===========================================================================
-# AC2 (done criterion 1; B2) -- paused_reason omitted/undef -> no line.
+# AC2 (done criterion 1; B2) -- paused_reason omitted/undef -> the STATE
+# slot renders "paused" (the undef/empty branch of the pause-words table),
+# never a fabricated reason.
 # ===========================================================================
 {
     for my $variant ('key omitted entirely', 'key present, value undef') {
@@ -157,62 +168,51 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
             ? mk_run(blueprint => 'bp-ac2', state => 'paused', packages_done => 1, packages_total => 2)
             : mk_run(blueprint => 'bp-ac2', state => 'paused', paused_reason => undef, packages_done => 1, packages_total => 2);
 
-        my ($line, $err) = call_prl($s);
-        ok(!$err, "AC2 ($variant): _paused_reason_line is callable without dying") or diag("  \$\@ = $err");
-        is($line, undef,
-            "AC2 ($variant): _paused_reason_line returns undef when paused_reason is absent, state=>paused");
-
-        my $state = base_state(runs => [$s]);
-        my $panels = tui::DashboardScreen::panels($state, 120);
-        my $bpp = panel_by_title($panels, 'Blueprints');
-        ok($bpp, "AC2 ($variant) precondition: a Blueprints panel exists");
+        my ($spans, $err) = call_block_line0($s, undef);
+        ok(!$err, "AC2 ($variant): _run_block is callable without dying") or diag("  \$\@ = $err");
       SKIP: {
-            skip('no Blueprints panel', 1) unless $bpp;
-            my $texts = panel_line_texts($bpp);
-            my ($row_idx) = grep { $texts->[$_] =~ /bp-ac2/ } 0 .. $#$texts;
-            my $next = defined($row_idx) ? $texts->[$row_idx + 1] : undef;
-            my $fabricated = defined($next) && $next =~ /^  paused /;
-            ok(!$fabricated, "AC2 ($variant): no fabricated 'paused ...' line follows the run's row");
+            skip('no spans', 2) unless ref($spans) eq 'ARRAY';
+            my $full = join('', map { $_->{text} // '' } @$spans);
+            ok(index($full, 'paused') >= 0, "AC2 ($variant): the STATE slot renders the bare word 'paused'");
+            unlike($full, qr/paused\s+\S/, "AC2 ($variant): no fabricated reason text follows 'paused'");
         }
     }
 }
 
 # ===========================================================================
-# AC3 (done criterion 1; B3) -- paused_reason eq '' -> no line, same as undef.
+# AC3 (done criterion 1; B3) -- paused_reason eq '' -> same as undef ("paused").
 # ===========================================================================
 {
     my $s = mk_run(blueprint => 'bp-ac3', state => 'paused', paused_reason => '', packages_done => 1, packages_total => 2);
-    my ($line, $err) = call_prl($s);
-    ok(!$err, 'AC3: _paused_reason_line is callable without dying') or diag("  \$\@ = $err");
-    is($line, undef,
-        "AC3: _paused_reason_line returns undef when paused_reason is the empty string, state=>paused");
-
-    my $state = base_state(runs => [$s]);
-    my $panels = tui::DashboardScreen::panels($state, 120);
-    my $bpp = panel_by_title($panels, 'Blueprints');
-    ok($bpp, 'AC3 precondition: a Blueprints panel exists');
+    my ($spans, $err) = call_block_line0($s, undef);
+    ok(!$err, 'AC3: _run_block is callable without dying') or diag("  \$\@ = $err");
   SKIP: {
-        skip('no Blueprints panel', 1) unless $bpp;
-        my $texts = panel_line_texts($bpp);
-        my ($row_idx) = grep { $texts->[$_] =~ /bp-ac3/ } 0 .. $#$texts;
-        my $next = defined($row_idx) ? $texts->[$row_idx + 1] : undef;
-        my $fabricated = defined($next) && $next =~ /^  paused /;
-        ok(!$fabricated, "AC3: no fabricated 'paused ...' line follows the run's row");
+        skip('no spans', 2) unless ref($spans) eq 'ARRAY';
+        my $full = join('', map { $_->{text} // '' } @$spans);
+        ok(index($full, 'paused') >= 0, "AC3: the STATE slot renders the bare word 'paused'");
+        unlike($full, qr/paused\s+\S/, 'AC3: no fabricated reason text follows \'paused\'');
     }
 }
-
 # ===========================================================================
-# AC4 (done criterion 1; B4) -- any non-'paused' state, reason set anyway
-# -> no line, for every listed state plus one unrecognised value.
+# AC4 (done criterion 1; B4) -- any non-'paused' state renders no pause
+# glyph/words at all (ruling G: the pause slot gates on state eq 'paused'),
+# even with paused_reason set anyway, for every listed state plus one
+# unrecognised value.
 # ===========================================================================
 {
     my $nonce = 'nonce-ac4-should-never-render';
+    my $idle_glyph = Theme::glyph('thread.idle') // '';
     for my $st (qw(running idle solo stale parked bogus)) {
         my $s = mk_run(blueprint => "bp-ac4-$st", state => $st, paused_reason => $nonce);
-        my ($line, $err) = call_prl($s);
-        ok(!$err, "AC4: state=>'$st' -- _paused_reason_line is callable without dying") or diag("  \$\@ = $err");
-        is($line, undef,
-            "AC4: state=>'$st' with a non-empty paused_reason set anyway -- _paused_reason_line returns undef");
+        my ($spans, $err) = call_block_line0($s, undef);
+        ok(!$err, "AC4: state=>'$st' -- _run_block is callable without dying") or diag("  \$\@ = $err");
+      SKIP: {
+            skip('no spans', 2) unless ref($spans) eq 'ARRAY';
+            my $full = join('', map { $_->{text} // '' } @$spans);
+            unlike($full, qr/\Q$nonce\E/, "AC4: state=>'$st' with a non-empty paused_reason set anyway -- the nonce never renders");
+            ok(!(length($idle_glyph) && index($full, $idle_glyph) >= 0),
+                "AC4: state=>'$st' -- no pause glyph is emitted");
+        }
     }
 }
 
@@ -221,21 +221,28 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
 # 2 spans; span0 '/^2 waiting$/' in state.warn/state.crit per state; span1
 # '/^, 1 triage$/' in text.muted; roles differ. Also asserted at panel level.
 # ===========================================================================
+# RETARGETED by package 01-run-blocks (spec S5.1 table, grammar S2.3.1):
+# the WAIT/TRIAGE slots now live on the same blueprint line, as
+# "G('icon.decisions').' '.n" (role state.crit while paused, else
+# state.warn) and "<n> triage" (role text.muted), each gated on n>0.
+my $DECISIONS = Theme::glyph('icon.decisions') // '';
+
 {
     for my $case (['running', 'state.warn'], ['paused', 'state.crit']) {
-        my ($st, $expect_role0) = @$case;
+        my ($st, $expect_role) = @$case;
         my $s = mk_run(blueprint => "bp-ac5-$st", state => $st, inbox_waiting => 2, triage_waiting => 1,
                         packages_done => 0, packages_total => 1);
-        my $cells = tui::DashboardScreen::_one_run_summary_cells($s);
-        my $cell = $cells->[4];
-        is(scalar(@$cell), 2, "AC5 (state=$st): cell index 4 has exactly 2 spans");
+        my ($spans, $err) = call_block_line0($s, undef);
+        ok(!$err, "AC5 (state=$st): _run_block does not die") or diag("  \$\@ = $err");
       SKIP: {
-            skip('cell did not have 2 spans', 5) unless scalar(@$cell) == 2;
-            like($cell->[0]{text}, qr/^2 waiting$/, "AC5 (state=$st): span0 text matches /^2 waiting\$/");
-            is($cell->[0]{role}, $expect_role0, "AC5 (state=$st): span0 role is $expect_role0");
-            like($cell->[1]{text}, qr/^, 1 triage$/, "AC5 (state=$st): span1 text matches /^, 1 triage\$/");
-            is($cell->[1]{role}, 'text.muted', "AC5 (state=$st): span1 role is text.muted");
-            isnt($cell->[0]{role}, $cell->[1]{role}, "AC5 (state=$st): the two spans' roles differ");
+            skip('no spans', 4) unless ref($spans) eq 'ARRAY';
+            my ($wait_span) = grep { ref($_) eq 'HASH' && defined($_->{text}) && length($DECISIONS) && index($_->{text}, $DECISIONS) == 0 } @$spans;
+            ok($wait_span, "AC5 (state=$st): a span carries the WAIT glyph");
+            is($wait_span->{text}, $DECISIONS . ' 2', "AC5 (state=$st): WAIT span text is exactly the glyph + ' 2'") if $wait_span;
+            is($wait_span->{role}, $expect_role, "AC5 (state=$st): WAIT span role is $expect_role") if $wait_span;
+            my ($triage_span) = grep { ref($_) eq 'HASH' && defined($_->{text}) && $_->{text} eq '1 triage' } @$spans;
+            ok($triage_span, "AC5 (state=$st): a span is exactly '1 triage'");
+            is($triage_span->{role}, 'text.muted', "AC5 (state=$st): TRIAGE span role is text.muted") if $triage_span;
         }
 
         my $state = base_state(runs => [$s]);
@@ -245,62 +252,69 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
       SKIP: {
             skip('no Blueprints panel', 2) unless $bpp;
             my $joined = join("\n", @{ panel_line_texts($bpp) });
-            like($joined, qr/2 waiting/, "AC5 (state=$st): panel-level rendered text contains '2 waiting'");
+            like($joined, qr/\Q$DECISIONS\E 2/, "AC5 (state=$st): panel-level rendered text contains the WAIT glyph + '2'") if length($DECISIONS);
             like($joined, qr/1 triage/,  "AC5 (state=$st): panel-level rendered text contains '1 triage'");
         }
     }
 }
 
 # ===========================================================================
-# AC6 (done criterion 2; B6) -- inbox_waiting=>0, triage_waiting=>3 ->
-# 2 spans, joined text exactly "3 triage" (no leading comma/space).
+# AC6 (done criterion 2; B6) -- inbox_waiting=>0 (defined, so n=0, WAIT
+# gated off since n>0 is false), triage_waiting=>3 -> TRIAGE renders alone,
+# text exactly "3 triage" with no WAIT glyph anywhere on the line.
 # ===========================================================================
 {
     my $s = mk_run(blueprint => 'bp-ac6', state => 'running', inbox_waiting => 0, triage_waiting => 3,
                     packages_done => 0, packages_total => 1);
-    my $cell = tui::DashboardScreen::_one_run_summary_cells($s)->[4];
-    is(scalar(@$cell), 2, 'AC6: cell index 4 has exactly 2 spans');
+    my ($spans, $err) = call_block_line0($s, undef);
+    ok(!$err, 'AC6: _run_block does not die') or diag("  \$\@ = $err");
   SKIP: {
-        skip('cell did not have 2 spans', 2) unless scalar(@$cell) == 2;
-        my $joined = join('', map { $_->{text} } @$cell);
-        is($joined, '3 triage', 'AC6: joined cell text is exactly "3 triage" (no leading ", ", no leading space)');
-        is($cell->[1]{role}, 'text.muted', 'AC6: the (non-empty) second span carries role text.muted');
+        skip('no spans', 2) unless ref($spans) eq 'ARRAY';
+        my $full = join('', map { $_->{text} // '' } @$spans);
+        ok((!length($DECISIONS)) || index($full, $DECISIONS) < 0, 'AC6: no WAIT glyph anywhere on the line (n=0)');
+        my ($triage_span) = grep { ref($_) eq 'HASH' && defined($_->{text}) && $_->{text} eq '3 triage' } @$spans;
+        ok($triage_span, 'AC6: a span is exactly "3 triage" (no leading glyph/comma/space)');
+        is($triage_span->{role}, 'text.muted', 'AC6: that span carries role text.muted') if $triage_span;
     }
 }
 
 # ===========================================================================
 # AC7 (done criterion 2; B7, non-vacuity pair to AC5/AC6) --
-# triage_waiting 0 or absent -> exactly 1 span, "N waiting", no "triage"
-# substring anywhere -- proves the AC5/AC6 detector is not vacuously true.
+# triage_waiting 0 or absent -> no "triage" substring anywhere on the line
+# -- proves the AC5/AC6 detector is not vacuously true.
 # ===========================================================================
 {
     for my $case (['triage_waiting=>0', { inbox_waiting => 4, triage_waiting => 0 }],
                   ['triage_waiting absent entirely', { inbox_waiting => 4 }]) {
         my ($label, $extra) = @$case;
         my $s = mk_run(blueprint => 'bp-ac7', state => 'running', packages_done => 0, packages_total => 1, %$extra);
-        my $cell = tui::DashboardScreen::_one_run_summary_cells($s)->[4];
-        is(scalar(@$cell), 1, "AC7 ($label): cell index 4 has exactly 1 span");
+        my ($spans, $err) = call_block_line0($s, undef);
+        ok(!$err, "AC7 ($label): _run_block does not die") or diag("  \$\@ = $err");
       SKIP: {
-            skip('cell did not have exactly 1 span', 2) unless scalar(@$cell) == 1;
-            is($cell->[0]{text}, '4 waiting', "AC7 ($label): the single span's text is '4 waiting'");
-            my @triage_hits = grep { defined($_->{text}) && $_->{text} =~ /triage/ } @$cell;
-            is(scalar(@triage_hits), 0, "AC7 ($label): no span text contains the substring 'triage'");
+            skip('no spans', 2) unless ref($spans) eq 'ARRAY';
+            my $full = join('', map { $_->{text} // '' } @$spans);
+            ok(length($DECISIONS) && index($full, $DECISIONS . ' 4') >= 0, "AC7 ($label): the WAIT glyph + ' 4' is present");
+            unlike($full, qr/triage/, "AC7 ($label): no text contains the substring 'triage'");
         }
     }
 }
 
 # ===========================================================================
 # AC8 (done criterion 2; B5/B6 fallback interplay) -- inbox_waiting
-# absent, escalations_waiting=>5, triage_waiting=>2 -> joined text is exactly
-# "5 waiting, 2 triage" (the pre-existing operator->waiting fallback composes
-# correctly with the new triage span).
+# absent, escalations_waiting=>5, triage_waiting=>2 -> WAIT falls back to
+# escalations_waiting (n=5) and composes with TRIAGE (n=2).
 # ===========================================================================
 {
     my $s = mk_run(blueprint => 'bp-ac8', state => 'running', escalations_waiting => 5, triage_waiting => 2,
                     packages_done => 0, packages_total => 1);
-    my $cell = tui::DashboardScreen::_one_run_summary_cells($s)->[4];
-    my $joined = join('', map { $_->{text} } @$cell);
-    is($joined, '5 waiting, 2 triage', 'AC8: joined cell text is exactly "5 waiting, 2 triage"');
+    my ($spans, $err) = call_block_line0($s, undef);
+    ok(!$err, 'AC8: _run_block does not die') or diag("  \$\@ = $err");
+  SKIP: {
+        skip('no spans', 2) unless ref($spans) eq 'ARRAY';
+        my $full = join('', map { $_->{text} // '' } @$spans);
+        ok(length($DECISIONS) && index($full, $DECISIONS . ' 5') >= 0, 'AC8: the WAIT glyph + \' 5\' (escalations_waiting fallback) is present');
+        ok(index($full, '2 triage') >= 0, 'AC8: "2 triage" is present');
+    }
 }
 
 # ===========================================================================
@@ -323,106 +337,75 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
     my $C = mk_run(blueprint => 'bp-golden-c', state => 'running', packages_done => 3, packages_total => 6,
                     running_coordinators => 2, inbox_waiting => 0, current_package => 'golden-current-pkg');
 
-    my $GOLDEN_CELLS_A = [
-        [ { role => 'accent',       text => 'bp-golden-a' } ],
-        [ { role => 'state.ok',     text => 'running' } ],
-        [ { role => 'text.primary', text => '2/5 pkg' } ],
-        [ { role => 'accent',       text => '1 coord' } ],
-        [ { role => 'state.warn',   text => '3 waiting' } ],
-    ];
-    my $GOLDEN_CELLS_B = [
-        [ { role => 'accent',       text => 'bp-golden-b' } ],
-        [ { role => 'state.warn',   text => 'paused' } ],
-        [ { role => 'text.primary', text => '1/4 pkg' } ],
-        [ { role => 'accent',       text => '' } ],
-        [ { role => 'state.crit',   text => '2 waiting' } ],
-    ];
-    my $GOLDEN_CELLS_C = [
-        [ { role => 'accent',       text => 'bp-golden-c' } ],
-        [ { role => 'state.ok',     text => 'running' } ],
-        [ { role => 'text.primary', text => '3/6 pkg' } ],
-        [ { role => 'accent',       text => '2 coord' } ],
-        [ { role => 'state.warn',   text => '' } ],
-    ];
+    # RETARGETED by package 01-run-blocks (spec S5.1 table): the table and
+    # _one_run_summary_cells are gone (ruling A). These are no longer
+    # "pre-package" captures of the OLD renderer -- they are freshly
+    # DERIVED golden text for the NEW block grammar (spec S2.3), built here
+    # from Theme::glyph and the grammar's own M()/pad formulas, not copied
+    # from any implementation. running_coordinators has nowhere to render
+    # without a thread/orchestrator_pid (ruling H: coord only ever appears
+    # on a driver line) -- fixtures A/C's running_coordinators is therefore
+    # correctly invisible in the new golden text, a real behaviour change
+    # from the old table column.
+    my $ICON_BP = Theme::glyph('icon.blueprints') // '';
+    my $GAUGE_FULL  = Theme::glyph('gauge.full')  // '';
+    my $GAUGE_EMPTY = Theme::glyph('gauge.empty') // '';
+    my $OK_GLYPH    = Theme::glyph('status.ok')   // '';
+    my $IDLE_GLYPH  = Theme::glyph('thread.idle') // '';
+    my $meter = sub {
+        my ($d, $t) = @_;
+        return '' unless $t;
+        my $f = ($d == 0) ? 0 : ($d >= $t ? 15 : int(($d * 15 + $t - 1) / $t));
+        $f = 14 if $f > 14 && !($d >= $t);
+        return ($GAUGE_FULL x $f) . ($GAUGE_EMPTY x (15 - $f));
+    };
 
-    is_deeply(tui::DashboardScreen::_one_run_summary_cells($A), $GOLDEN_CELLS_A,
-        'AC9: fixture A (neither new fact present) -- _one_run_summary_cells is byte-identical to the pre-package golden capture');
-    is_deeply(tui::DashboardScreen::_one_run_summary_cells($B), $GOLDEN_CELLS_B,
-        'AC9: fixture B (state=>paused, no paused_reason) -- _one_run_summary_cells is byte-identical to the pre-package golden capture');
-    is_deeply(tui::DashboardScreen::_one_run_summary_cells($C), $GOLDEN_CELLS_C,
-        'AC9: fixture C (current_package set) -- _one_run_summary_cells is byte-identical to the pre-package golden capture');
+    # Fixture A: one line (blueprint only -- no packages/thread/driver).
+    # W = dw('bp-golden-a') = 12.
+    my $GOLDEN_TEXT_A = $ICON_BP . ' bp-golden-a' . (' ' x 2) . $meter->(2, 5) . '  2/5' . '   ' . 'running'
+        . '   ' . $DECISIONS . ' 3';
 
-    my $GOLDEN_LINES_A = [
-        [
-            { role => 'accent',       text => 'bp-golden-a' },
-            { role => 'text.primary', text => '  ' },
-            { role => 'state.ok',     text => 'running' },
-            { role => 'text.primary', text => '  ' },
-            { role => 'text.primary', text => '2/5 pkg' },
-            { role => 'text.primary', text => '  ' },
-            { role => 'accent',       text => '1 coord' },
-            { role => 'text.primary', text => '  ' },
-            { role => 'state.warn',   text => '3 waiting' },
-        ],
-    ];
-    my $GOLDEN_LINES_B = [
-        [
-            { role => 'accent',       text => 'bp-golden-b' },
-            { role => 'text.primary', text => '  ' },
-            { role => 'state.warn',   text => 'paused' },
-            { role => 'text.primary', text => '  ' },
-            { role => 'text.primary', text => '1/4 pkg' },
-            { role => 'text.primary', text => '  ' },
-            { role => 'state.crit',   text => '2 waiting' },
-        ],
-    ];
-    my $GOLDEN_LINES_C = [
-        [
-            { role => 'accent',       text => 'bp-golden-c' },
-            { role => 'text.primary', text => '  ' },
-            { role => 'state.ok',     text => 'running' },
-            { role => 'text.primary', text => '  ' },
-            { role => 'text.primary', text => '3/6 pkg' },
-            { role => 'text.primary', text => '  ' },
-            { role => 'accent',       text => '2 coord' },
-        ],
-        [
-            { role => 'text.primary', text => '  cur golden-current-pkg' },
-        ],
-    ];
+    # Fixture B: one line. paused_reason absent -> PAUSE_WORDS 'paused'.
+    my $GOLDEN_TEXT_B = $ICON_BP . ' bp-golden-b' . (' ' x 2) . $meter->(1, 4) . '  1/4' . '   '
+        . $IDLE_GLYPH . ' paused' . '   ' . $DECISIONS . ' 2';
 
-    is_deeply(tui::DashboardScreen::_run_summary_lines([$A], undef, 120), $GOLDEN_LINES_A,
-        'AC9: fixture A -- _run_summary_lines is byte-identical to the pre-package golden capture');
-    is_deeply(tui::DashboardScreen::_run_summary_lines([$B], undef, 120), $GOLDEN_LINES_B,
-        'AC9: fixture B -- _run_summary_lines is byte-identical to the pre-package golden capture (the new paused-gate introduces no drift)');
-    is_deeply(tui::DashboardScreen::_run_summary_lines([$C], undef, 120), $GOLDEN_LINES_C,
-        'AC9: fixture C -- _run_summary_lines is byte-identical to the pre-package golden capture (interleave order is unaffected)');
+    # Fixture C: two lines. W = max(dw('bp-golden-c')=11, dw('golden-current-pkg')=18) = 18.
+    # inbox_waiting=>0 (defined, n=0) gates WAIT off entirely.
+    # Blueprint line pad = (W+2) - dw('bp-golden-c') = 20 - 11 = 9 spaces.
+    my $GOLDEN_TEXT_C_L1 = $ICON_BP . ' bp-golden-c' . (' ' x 9) . $meter->(3, 6) . '  3/6' . '   ' . 'running';
+    my $GOLDEN_TEXT_C_L2 = '  ' . $OK_GLYPH . ' golden-current-pkg' . (' ' x 2) . 'running';
+
+    my ($rows_a, $err_a) = (eval { tui::DashboardScreen::_run_summary_lines([$A], undef, undef, undef) }, $@);
+    ok(!$err_a, 'AC9: fixture A -- _run_summary_lines does not die') or diag("  \$\@ = $err_a");
+    is(ref($rows_a) eq 'ARRAY' ? tui::Frame::spans_text($rows_a->[0]) : undef, $GOLDEN_TEXT_A,
+        'AC9: fixture A -- the rendered blueprint line matches the new grammar\'s derived golden text exactly');
+
+    my ($rows_b, $err_b) = (eval { tui::DashboardScreen::_run_summary_lines([$B], undef, undef, undef) }, $@);
+    ok(!$err_b, 'AC9: fixture B -- _run_summary_lines does not die') or diag("  \$\@ = $err_b");
+    is(ref($rows_b) eq 'ARRAY' ? tui::Frame::spans_text($rows_b->[0]) : undef, $GOLDEN_TEXT_B,
+        'AC9: fixture B -- the rendered blueprint line matches the new grammar\'s derived golden text exactly (the paused-gate introduces no drift beyond the words themselves)');
+
+    my ($rows_c, $err_c) = (eval { tui::DashboardScreen::_run_summary_lines([$C], undef, undef, undef) }, $@);
+    ok(!$err_c, 'AC9: fixture C -- _run_summary_lines does not die') or diag("  \$\@ = $err_c");
+  SKIP: {
+        skip('fixture C rows missing', 2) unless ref($rows_c) eq 'ARRAY' && @$rows_c >= 2;
+        is(tui::Frame::spans_text($rows_c->[0]), $GOLDEN_TEXT_C_L1, 'AC9: fixture C -- blueprint line matches derived golden text');
+        is(tui::Frame::spans_text($rows_c->[1]), $GOLDEN_TEXT_C_L2, 'AC9: fixture C -- current_package fallback ACTIVE line matches derived golden text (interleave order unaffected)');
+    }
 
     # =======================================================================
     # AC10 (done criterion 3; B8, end-to-end) -- the SAME "neither fact"
     # fixture (A), captured at the panels() layer.
     # =======================================================================
-    my $GOLDEN_PANELS_LINES_A = [
-        [
-            { role => 'accent',       text => 'bp-golden-a' },
-            { role => 'text.primary', text => '  ' },
-            { role => 'state.ok',     text => 'running' },
-            { role => 'text.primary', text => '  ' },
-            { role => 'text.primary', text => '2/5 pkg' },
-            { role => 'text.primary', text => '  ' },
-            { role => 'accent',       text => '1 coord' },
-            { role => 'text.primary', text => '  ' },
-            { role => 'state.warn',   text => '3 waiting' },
-        ],
-    ];
     my $state = base_state(runs => [$A]);
     my $panels = tui::DashboardScreen::panels($state, 120);
     my $bpp = panel_by_title($panels, 'Blueprints');
     ok($bpp, 'AC10 precondition: a Blueprints panel exists');
   SKIP: {
         skip('no Blueprints panel', 1) unless $bpp;
-        is_deeply($bpp->{lines}, $GOLDEN_PANELS_LINES_A,
-            "AC10: panels(\$state,120)'s Blueprints panel's lines are byte-identical to the pre-package golden capture (fixture A, neither fact present)");
+        my ($bpline) = grep { line_text($_) =~ /bp-golden-a/ } @{ $bpp->{lines} };
+        is(defined($bpline) ? line_text($bpline) : undef, $GOLDEN_TEXT_A,
+            "AC10: panels(\$state,120)'s Blueprints panel line for fixture A matches the same derived golden text as AC9");
     }
 }
 
@@ -434,13 +417,14 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
 {
     my $reason = "Andr\xC3\xA9's escalation";
     my $s = mk_run(blueprint => 'bp-ac11', state => 'paused', paused_reason => $reason);
-    my $line = eval { tui::DashboardScreen::_paused_reason_line($s) };
-    ok(!$@, 'AC11: _paused_reason_line does not die on a non-ASCII paused_reason') or diag("  \$\@ = $@");
-    ok(ref($line) eq 'ARRAY', 'AC11: _paused_reason_line returns a defined arrayref for a non-ASCII paused_reason');
+    my ($spans, $err) = call_block_line0($s, undef);
+    ok(!$err, 'AC11: _run_block does not die on a non-ASCII paused_reason') or diag("  \$\@ = $err");
+    ok(ref($spans) eq 'ARRAY', 'AC11: _run_block returns a defined spans array for a non-ASCII paused_reason');
   SKIP: {
-        skip('no line returned', 1) unless ref($line) eq 'ARRAY';
-        ok(index($line->[0]{text}, "Andr\xC3\xA9") >= 0,
-            'AC11: the span text contains the literal bytes "Andr\xC3\xA9" verbatim');
+        skip('no spans returned', 1) unless ref($spans) eq 'ARRAY';
+        my $full = join('', map { $_->{text} // '' } @$spans);
+        ok(index($full, "Andr\xC3\xA9") >= 0,
+            'AC11: the blueprint line contains the literal bytes "Andr\xC3\xA9" verbatim');
     }
 }
 
@@ -452,13 +436,15 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
     my $long = ('A' x 200) . ('B' x 300);
     is(length($long), 500, 'AC12 precondition: the fixture reason is exactly 500 characters');
     my $s = mk_run(blueprint => 'bp-ac12', state => 'paused', paused_reason => $long);
-    my ($line, $err) = call_prl($s);
-    ok(!$err, 'AC12: _paused_reason_line is callable without dying') or diag("  \$\@ = $err");
-    ok(ref($line) eq 'ARRAY', 'AC12: _paused_reason_line returns an arrayref for a 500-char reason');
+    my ($spans, $err) = call_block_line0($s, undef);
+    ok(!$err, 'AC12: _run_block is callable without dying') or diag("  \$\@ = $err");
+    ok(ref($spans) eq 'ARRAY', 'AC12: _run_block returns a spans array for a 500-char reason');
   SKIP: {
-        skip('no line returned', 3) unless ref($line) eq 'ARRAY';
-        (my $stripped = $line->[0]{text}) =~ s/^  paused //;
-        is(length($stripped), 200, 'AC12: the rendered text (minus the "  paused " prefix) is exactly 200 characters');
+        skip('no spans returned', 3) unless ref($spans) eq 'ARRAY';
+        my $full = join('', map { $_->{text} // '' } @$spans);
+        my $idle_glyph = Theme::glyph('thread.idle') // '';
+        (my $stripped = $full) =~ s/\A.*\Q$idle_glyph\E //s;
+        is(length($stripped), 200, 'AC12: the rendered text (minus everything up to and incl. the pause glyph) is exactly 200 characters');
         is($stripped, 'A' x 200, 'AC12: the rendered text (minus the prefix) is exactly the first 200 characters of the input');
         isnt($stripped, $long, 'AC12: the rendered text is NOT the full 500-character input');
     }
@@ -474,17 +460,20 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
         my ($label, $reason) = @$case;
         my $s = mk_run(blueprint => 'bp-ac13', state => 'paused', paused_reason => $reason);
         my @warns;
-        my $line;
+        my $spans;
+        my $err;
         {
             local $SIG{__WARN__} = sub { push @warns, $_[0] };
-            $line = eval { tui::DashboardScreen::_paused_reason_line($s) };
+            $spans = eval { blueprint_line_spans($s, undef) };
+            $err = $@;
         }
-        ok(!$@, "AC13 ($label): _paused_reason_line does not die") or diag("  \$\@ = $@");
-        ok(!@warns, "AC13 ($label): _paused_reason_line does not warn") or diag('  warned: ' . join('; ', @warns));
-        ok(ref($line) eq 'ARRAY', "AC13 ($label): _paused_reason_line returns an arrayref");
+        ok(!$err, "AC13 ($label): _run_block does not die") or diag("  \$\@ = $err");
+        ok(!@warns, "AC13 ($label): _run_block does not warn") or diag('  warned: ' . join('; ', @warns));
+        ok(ref($spans) eq 'ARRAY', "AC13 ($label): _run_block returns a spans array");
       SKIP: {
-            skip('no line returned', 1) unless ref($line) eq 'ARRAY';
-            ok(index($line->[0]{text}, $reason) >= 0, "AC13 ($label): the raw byte(s) are present verbatim in the span text");
+            skip('no spans returned', 1) unless ref($spans) eq 'ARRAY';
+            my $full = join('', map { $_->{text} // '' } @$spans);
+            ok(index($full, $reason) >= 0, "AC13 ($label): the raw byte(s) are present verbatim in the blueprint line text");
         }
     }
 }
@@ -515,22 +504,28 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
     # AC12 (tests 74-78) already tests truncation. Kept long enough to wrap at w=40.
     my $words = join(' ', map { "reasonword$_" } 1 .. 14);
     my $s = mk_run(blueprint => 'bp-ac14', state => 'paused', paused_reason => $words);
-    my ($line, $err) = call_prl($s);
-    ok(!$err, 'AC14 precondition: _paused_reason_line is callable without dying') or diag("  \$\@ = $err");
-    ok(ref($line) eq 'ARRAY', 'AC14 precondition: _paused_reason_line returns an arrayref for a long, many-word reason');
+    # RETARGETED by package 01-run-blocks: _paused_reason_line/wrap_line is
+    # replaced by _run_block/_wrap_block_row (spec S2.4) -- the block's own
+    # `hang` (not a literal 2) is what a wrapped continuation indents by.
+    my $block = eval { tui::DashboardScreen::_run_block($s, undef, undef) };
+    my $err = $@;
+    ok(!$err, 'AC14 precondition: _run_block is callable without dying') or diag("  \$\@ = $err");
+    my $line0 = (ref($block) eq 'HASH' && ref($block->{lines}) eq 'ARRAY') ? $block->{lines}[0] : undef;
+    ok(ref($line0) eq 'HASH' && ref($line0->{spans}) eq 'ARRAY',
+        'AC14 precondition: _run_block returns a usable blueprint-line spans array for a long, many-word reason');
   SKIP: {
-        skip('no line to wrap', 3) unless ref($line) eq 'ARRAY';
+        skip('no line to wrap', 3) unless ref($line0) eq 'HASH' && ref($line0->{spans}) eq 'ARRAY';
         require tui::Frame;
         my $w = 40;
-        my $cells = eval { tui::Frame::wrap_line($line, 'state.warn', $w, 2) };
-        ok(!$@, 'AC14/wrap_line: does not die wrapping the paused-reason span at width 40') or diag("  \$\@ = $@");
+        my $cells = eval { tui::DashboardScreen::_wrap_block_row($line0->{spans}, $w, $block->{hang}) };
+        ok(!$@, 'AC14/_wrap_block_row: does not die wrapping the blueprint line at width 40') or diag("  \$\@ = $@");
       SKIP: {
-            skip('wrap_line died', 2) unless !$@;
-            cmp_ok(scalar(@$cells), '>', 1, 'AC14/wrap_line: the paused-reason span wraps into MORE THAN ONE physical line at width 40 (not truncated to one line)');
-            my $joined = join(' ', map { $_->{text} } @$cells);
+            skip('_wrap_block_row died', 2) unless !$@;
+            cmp_ok(scalar(@$cells), '>', 1, 'AC14/_wrap_block_row: the blueprint line wraps into MORE THAN ONE physical row at width 40 (not truncated to one line)');
+            my $joined = join(' ', map { tui::Frame::spans_text($_) } @$cells);
             my @found = ($joined =~ /reasonword(\d+)/g);
             is_deeply(\@found, [1 .. 14],
-                'AC14/wrap_line: reconstructing every wrapped cell recovers every original word, in order, none dropped or duplicated');
+                'AC14/_wrap_block_row: reconstructing every wrapped row recovers every original word, in order, none dropped or duplicated');
         }
     }
 }
@@ -583,9 +578,12 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
       SKIP: {
             skip('a row was not found', 4) unless defined($rowA_idx) && defined($rowB_idx) && defined($rowC_idx);
 
+            # Rulings B/G: the pause reason moves ONTO the blueprint line's
+            # own STATE slot (words), so run A's nonce shares run A's own
+            # row rather than occupying a separate line beneath it.
             my ($nonce_idx) = grep { $texts->[$_] =~ /\Q$nonceA\E/ } 0 .. $#$texts;
-            ok(defined($nonce_idx) && $nonce_idx > $rowA_idx && $nonce_idx < $rowB_idx,
-                'AC15: run A\'s nonce line sits strictly between run A\'s row and run B\'s row (under its own row only)');
+            ok(defined($nonce_idx) && $nonce_idx == $rowA_idx && $nonce_idx < $rowB_idx,
+                'AC15: run A\'s nonce renders on run A\'s own blueprint line, before run B\'s row (under its own row only)');
 
             my ($triage_idx) = grep { $texts->[$_] =~ /1 triage/ } 0 .. $#$texts;
             is($triage_idx, $rowB_idx, 'AC15: "1 triage" sits on run B\'s own table row (not a separate leaked line)');

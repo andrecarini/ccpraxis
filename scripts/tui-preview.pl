@@ -252,19 +252,26 @@ sub _synth_pkg_agents {
 sub _synth_packages {
     my ($i, $phase) = @_;
     my $n = 1 + (($i * 7 + $phase) % 4);   # 1..4 packages per running run
+    # package 01-run-blocks (spec S2.6, C5): step_word cycles a fixed word
+    # list; waits_on is undef except on one blocked package (j==1, when the
+    # run has at least 2 packages) -- never localtime/rand (AC48).
+    my @STEP_WORDS = qw(scout spec tests implementation validation review);
     my @packages;
     for my $j (0 .. $n - 1) {
         my $stuck = ($j == 0) ? 1 : 0;
+        my $blocked = ($j == 1) ? 1 : 0;
         my ($attempt, $cap) = $stuck ? (3, 3) : (1 + ($j % 2), 5);
         push @packages, {
             name          => sprintf('pkg-preview-%d-%02d', $i, $j),
-            status        => 'running',
+            status        => $blocked ? 'blocked' : 'running',
             attempt       => $attempt,
             attempt_cap   => $cap,
             step          => sprintf('%d/%d', 1 + ($j % 3), 3 + ($j % 5)),
             steps_pending => [ ($j + 1) .. ($j + 3) ],
             next_action   => undef,
             agents        => _synth_pkg_agents($i, $phase, $j, $stuck),
+            step_word     => $STEP_WORDS[ ($i + $phase + $j) % scalar(@STEP_WORDS) ],
+            waits_on      => $blocked ? '20261002-120000-abcd' : undef,
         };
     }
     return \@packages;
@@ -352,11 +359,13 @@ sub synth_localtime { return gmtime($_[0]) }
 # every row as "? running 0/0 pkg", a preview that looked plausible and
 # showed nothing (this file's own long-standing warning, package 07's own
 # repeat of it at ten times the struct size). EVERY element (running or not)
-# carries the full 19-key run-level struct (S2.10 + package 13) -- simpler than
+# carries the full run-level struct (S2.10 + package 13) -- simpler than
 # maintaining two shapes, and nothing downstream distinguishes them; a
-# non-running element's packages/run_agents are simply empty, which is what
-# the real gate (_tree_lines: state eq 'running') already requires for a
-# tree to render at all.
+# non-running element's packages/run_agents are simply empty, which is fine
+# because _run_block (ruling A's replacement for the deleted _tree_lines)
+# draws every state the same way -- it is _multiline_blocks (fix-batch item
+# 2, spec S2.2.1) that decides row-budget treatment, by actual line count,
+# never by state.
 sub synth_runs {
     my ($n, $phase) = @_;
     $n     = 0 unless defined($n)     && !ref($n)     && $n     =~ /^\d+$/;
@@ -386,9 +395,15 @@ sub synth_runs {
             orchestrator_alive       => (($i + $phase) % 4 == 0) ? 0 : 1,
             orchestrator_started_at  => SYNTH_NOW() - (600 + 300 * ($i % 5)),
             paused_manual            => ($state eq 'paused' && ($i % 2 == 0)) ? 1 : 0,
-            paused_reason            => ($state eq 'paused')
-                                       ? 'preview-synthetic pause: waiting on operator input'
-                                       : undef,
+            # fix-batch item 6 (reviewer MINOR-4): at least one paused run
+            # must carry paused_reason=>'usage' with a weekly paused_window
+            # (below) so _pause_words actually renders the "weekly limit"
+            # form Decision 10's target block shows -- the plain synthetic
+            # text never exercised the real reason/window -> words mapping,
+            # so the step-8 UI pass had nothing to check that against.
+            paused_reason            => ($state ne 'paused') ? undef
+                                       : ($i % 12 == 3) ? 'usage'
+                                       : 'preview-synthetic pause: waiting on operator input',
             packages_total           => 9,
             packages_done            => ($i * 3) % 9,
             current_package          => $current,
@@ -400,6 +415,15 @@ sub synth_runs {
             run_agents               => $run_agents,
             thread                   => $running ? synth_thread($i, $phase) : undef,
             thread_events            => synth_thread_events($phase),
+            # package 01-run-blocks (spec S2.6, C5): the 4 new run-level keys.
+            # relaunch_local is a LITERAL hash, never localtime (AC48 scans
+            # synth_runs's own body for that).
+            paused_window            => ($state eq 'paused') ? 'seven_day' : undef,
+            relaunch_at              => ($state eq 'paused') ? SYNTH_NOW() + 193_100 : undef,
+            relaunch_local           => ($state eq 'paused')
+                                       ? { wday => 'Mon', hhmm => '18:05', day => '03', mon => 'Nov' }
+                                       : undef,
+            next_package             => $running ? sprintf('pkg-preview-%d-%02d', $i, scalar(@$packages)) : undef,
         };
     }
     return \@out;
@@ -620,9 +644,14 @@ sub capture_report {
     # run unconditionally, reporting the WHOLE plan as hidden even though
     # the rendered frame carries no collapse notice at all (capacity 0 ==
     # no Blueprints body, S5's own documented "no collapse" edge case).
-    if (defined($bp_cap) && $bp_cap >= 1 && defined($bp_plan_n) && $bp_plan_n > 0
-        && tui::DashboardScreen::_tree_present($state)) {
-        my $bp_width = tui::DashboardScreen::_blueprints_table_width($main);
+    # package 01-run-blocks: _tree_present is gone (ruling A). Its
+    # replacement, _multiline_blocks, is NOT used as a gate here, mirroring
+    # _blueprints_body's own change (any state can now render a multi-line
+    # block, so the gate would wrongly suppress a real collapse -- see that
+    # sub's own comment) -- the `$bp_total <= $bp_cap` check below already
+    # supplies the correct "nothing to collapse" shortcut.
+    if (defined($bp_cap) && $bp_cap >= 1 && defined($bp_plan_n) && $bp_plan_n > 0) {
+        my $bp_width = tui::DashboardScreen::_blueprints_body_width($main);
         my $bp_total = 0;
         $bp_total += tui::DashboardScreen::_row_cost($_->{spans}, $bp_width) for @$bp_plan;
         if ($bp_total <= $bp_cap) {

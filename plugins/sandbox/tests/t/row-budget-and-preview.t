@@ -5,7 +5,7 @@
 # specs/07-spec.md.
 #
 # WRITTEN BLIND to any implementation of the new subs: none of
-# tui::DashboardScreen::{_tree_present, _blueprints_capacity, _row_cost,
+# tui::DashboardScreen::{_multiline_blocks, _blueprints_capacity, _row_cost,
 # _pkg_stuck, _blueprints_row_plan, _select_rows, _collapse_notice,
 # BLUEPRINTS_PROBE_MARK} exist at the time this file is written, nor does
 # scripts/tui-preview.pl's extended synth_runs($n,$phase)/SYNTH_NOW/the
@@ -14,7 +14,7 @@
 # implementation to read.
 #
 # _run_summary_lines, _tree_lines, _package_tree_lines, _orchestrator_line,
-# _agent_row, _agent_live, _blueprints_table_width, _blueprints_body (TODAY'S
+# _agent_row, _agent_live, _blueprints_body_width, _blueprints_body (TODAY'S
 # shape -- extended, not replaced), _BLUEPRINT_TABLE_OPTS, panels(), screen(),
 # Dashboard::compose_frame, tui::Screen::compose, tui::Frame::spans_width,
 # Theme::glyph, and scripts/tui-preview.pl's existing
@@ -316,7 +316,8 @@ sub tree_run_40pkg {
     push @run_agents, mk_agent(id=>'rj', role=>'judge', worker_type=>'zqxt40-conformance-judge')
         unless $o{no_conformance_judge};
     return tree_run(blueprint => ($o{blueprint} // 'zqx-run40pkg'), packages => \@packages,
-                     run_agents => \@run_agents, thread => $o{thread}, thread_events => $o{thread_events});
+                     run_agents => \@run_agents, thread => $o{thread}, thread_events => $o{thread_events},
+                     state => $o{state});
 }
 
 # runs_n($n) -- $n runs with NO tree (state=>solo, matching t/79's own
@@ -412,37 +413,60 @@ for my $f (@AC1_FIXTURES) {
 }
 
 # --- AC2 -----------------------------------------------------------------
+# Retargeted (spec S2.5, ruling J/K): the old per-agent tree gave each
+# package's coordinator/worker/judge its own plan row (10-kind vocabulary,
+# pri 1-8). The block replaces that with ONE row per rendered package
+# (agents collapse into its dot+step; only a run-wide judge in `run_agents`
+# gets its own `judge` row) -- the 5(+overflow)-kind vocabulary of S2.5's
+# table: blueprint/overflow pri 1, driver pri 2, package pri 3, judge pri 4,
+# next pri 5. The 40-package fixture can therefore no longer be expected to
+# exceed 50 entries; its real count (1 blueprint + 1 driver + 40 package +
+# 1 run-judge = 43) is measured below rather than hand-predicted (this
+# file's own "measured, not modeled" discipline, S4/header).
 {
     my $s = base_state(runs => [ tree_run_40pkg() ]);
     my ($plan, $err) = call1('_blueprints_row_plan', $s, 120);
     ok(!$err, 'AC2: _blueprints_row_plan does not die on the 40-package fixture') or diag(" error: $err");
-    ok(ref($plan) eq 'ARRAY' && @$plan > 50, 'AC2 precondition: the 40-package plan has more than 50 entries')
+    ok(ref($plan) eq 'ARRAY' && @$plan >= 42, 'AC2 precondition: the 40-package plan has at least 42 entries (blueprint + driver + one row per package)')
         or diag(' got ' . (ref($plan) eq 'ARRAY' ? scalar(@$plan) : 'non-array'));
   SKIP: {
         skip('no plan', 1) unless ref($plan) eq 'ARRAY' && @$plan;
-        my %KIND = map { $_ => 1 } qw(run partial cur overflow orchestrator package coordinator worker judge other);
+        my %KIND = map { $_ => 1 } qw(blueprint overflow driver package judge next);
         my (@bad_keys, @bad_pri, @bad_kind, @bad_parent);
         for my $i (0 .. $#$plan) {
             my $e = $plan->[$i];
             if (ref($e) ne 'HASH') { push @bad_keys, $i; next }
             my @keys = sort keys %$e;
             push @bad_keys, $i unless "@keys" eq 'kind parent pri spans';
-            push @bad_pri, $i unless defined($e->{pri}) && !ref($e->{pri}) && $e->{pri} =~ /^[1-8]\z/;
+            push @bad_pri, $i unless defined($e->{pri}) && !ref($e->{pri}) && $e->{pri} =~ /^[1-5]\z/;
             push @bad_kind, $i unless defined($e->{kind}) && !ref($e->{kind}) && $KIND{$e->{kind}};
             push @bad_parent, $i if defined($e->{parent}) && (ref($e->{parent}) || $e->{parent} !~ /^\d+\z/ || $e->{parent} >= $i);
         }
         is(scalar(@bad_keys), 0, 'AC2: every plan entry has exactly the keys spans/pri/kind/parent') or diag(' bad idx: ' . join(',', @bad_keys));
-        is(scalar(@bad_pri), 0, 'AC2: every pri is an integer 1..8') or diag(' bad idx: ' . join(',', @bad_pri));
-        is(scalar(@bad_kind), 0, 'AC2: every kind is one of the ten listed') or diag(' bad idx: ' . join(',', @bad_kind));
+        is(scalar(@bad_pri), 0, 'AC2: every pri is an integer 1..5') or diag(' bad idx: ' . join(',', @bad_pri));
+        is(scalar(@bad_kind), 0, 'AC2: every kind is one of the S2.5 six (blueprint/overflow/driver/package/judge/next)') or diag(' bad idx: ' . join(',', @bad_kind));
         is(scalar(@bad_parent), 0, 'AC2: every defined parent is a valid index strictly less than its own') or diag(' bad idx: ' . join(',', @bad_parent));
     }
 }
 
 # --- AC3 -------------------------------------------------------------------
+# Retargeted (spec S2.3.6/S2.3.7/S2.5, rulings J/K, Scope): a package-level
+# judge/worker no longer gets its own plan row -- it is a SEGMENT inside its
+# owning package's single `package` row (worker/judge labels collapse into
+# the dot+step, Scope). Only a `run_agents` judge still gets a dedicated
+# `judge` row (pri 4). A coordinator contributes no segment at all (Scope)
+# and the `kind` vocabulary no longer has a 'coordinator'/'worker'/'cur'/
+# 'partial'/'run'/'other' member (S2.5's table: blueprint/overflow pri 1,
+# driver pri 2, package pri 3, judge pri 4, next pri 5). The pause reason
+# (ruling B/G) now lives on the blueprint line's own STATE slot, so it is
+# part of the `blueprint` row's text, not a separate row. current_package
+# only ever produces a line when `packages` is NOT an ARRAY (S2.3.6
+# fallback) -- here `packages` IS an array, so runA's current_package is
+# correctly invisible (not a regression; the old "cur" line's subject does
+# not apply to this fixture under the new contract).
 {
     my $runA = tree_run(
         blueprint => 'zqx3-runA', state => 'running', orchestrator_alive => 1,
-        current_package => 'pkg-ac3-healthy',
         packages => [
             { name=>'pkg-ac3-stuckjudge', status=>'running', attempt=>1, attempt_cap=>5, agents=>[
                 mk_agent(id=>'c1', role=>'coordinator', worker_type=>undef),
@@ -474,19 +498,19 @@ for my $f (@AC1_FIXTURES) {
     my $s = base_state(runs => [ $runA, $runB, $runC ]);
     my ($plan, $err) = call1('_blueprints_row_plan', $s, 120);
     ok(!$err, 'AC3: _blueprints_row_plan does not die') or diag(" error: $err");
-    ok(ref($plan) eq 'ARRAY' && @$plan >= 12, 'AC3 precondition: at least 12 plan entries')
+    ok(ref($plan) eq 'ARRAY' && @$plan >= 8, 'AC3 precondition: at least 8 plan entries')
         or diag(' got ' . (ref($plan) eq 'ARRAY' ? scalar(@$plan) : 'non-array'));
   SKIP: {
-        skip('bad plan', 1) unless ref($plan) eq 'ARRAY' && @$plan >= 12;
+        skip('bad plan', 1) unless ref($plan) eq 'ARRAY' && @$plan >= 8;
+        # zqx3-judgeA (a PACKAGE-level judge) is a text segment inside
+        # pkg-ac3-stuckjudge's own `package` row, not a separate row -- so
+        # it shares that row's pri/kind, found via the package's own name.
         my %expect = (
-            'zqx3-judgeA'    => [3, 'judge'],
-            'zqx3-runjudge'  => [3, 'judge'],
-            'pkg-ac3-stuckjudge'    => [4, 'package'],
-            'pkg-ac3-stuckattempt'  => [4, 'package'],
-            'pkg-ac3-healthypkg'    => [5, 'package'],
-            'pkg-ac3-zeroagents'    => [5, 'package'],
-            'zqx3-workerH'   => [7, 'worker'],
-            'zqx3-runworker' => [7, 'worker'],
+            'pkg-ac3-stuckjudge'    => [3, 'package'],
+            'pkg-ac3-stuckattempt'  => [3, 'package'],
+            'pkg-ac3-healthypkg'    => [3, 'package'],
+            'pkg-ac3-zeroagents'    => [3, 'package'],
+            'zqx3-runjudge'         => [4, 'judge'],
         );
         my %found_idx;
         for my $nonce (sort keys %expect) {
@@ -499,76 +523,46 @@ for my $f (@AC1_FIXTURES) {
                 is($e->{kind}, $expect{$nonce}[1], "AC3: '$nonce' row has kind '$expect{$nonce}[1]'");
             }
         }
-        # orchestrator rows: identified by the label text, not by nonce (no
-        # per-run nonce on the orchestrator line itself).
-        my @orch = grep { ref($_) eq 'HASH' && row_text($_->{spans}) =~ /\borchestrator\b/ } @$plan;
-        is(scalar(@orch), 2, 'AC3 precondition: exactly two orchestrator rows (runA alive, runB not-alive)');
+        # zqx3-judgeA's own row is the SAME row as pkg-ac3-stuckjudge's --
+        # a package-level judge never gets a row of its own.
+        my ($judgeA_idx) = find_entry($plan, 'zqx3-judgeA');
+        ok(defined($judgeA_idx) && defined($found_idx{'pkg-ac3-stuckjudge'})
+                && $judgeA_idx == $found_idx{'pkg-ac3-stuckjudge'},
+            'AC3: a package-level judge (zqx3-judgeA) collapses into its own package\'s single row, not a row of its own');
+        # zqx3-runworker (a non-judge run_agents entry) renders no row at
+        # all (spec S2.3.7: "Non-judge run_agents are not rendered").
+        my ($runworker_idx) = find_entry($plan, 'zqx3-runworker');
+        ok(!defined($runworker_idx), 'AC3: a non-judge run_agents entry (zqx3-runworker) contributes no plan row at all');
+        # driver rows: identified by the label text, not by nonce (no
+        # per-run nonce on the no-thread driver line itself). All three runs
+        # keep `orchestrator_pid`'s tree_run() default (4242), so all three
+        # (runA alive, runB not-alive, runC paused+not-alive) render one.
+        my @drv = grep { ref($_) eq 'HASH' && $_->{kind} eq 'driver' && row_text($_->{spans}) =~ /\borchestrator\b/ } @$plan;
+        is(scalar(@drv), 3, 'AC3 precondition: exactly three driver rows (one per run)');
       SKIP: {
-            skip('wrong orchestrator row count', 2) unless @orch == 2;
-            my @alive_pri    = sort map { $_->{pri} } grep { row_text($_->{spans}) =~ /\balive\b/ } @orch;
-            my @notalive_pri = sort map { $_->{pri} } grep { row_text($_->{spans}) !~ /\balive\b/ } @orch;
-            is_deeply(\@alive_pri,    [8], 'AC3: the alive orchestrator row has pri 8');
-            is_deeply(\@notalive_pri, [3], 'AC3: the not-alive orchestrator row has pri 3');
+            skip('wrong driver row count', 1) unless @drv == 3;
+            my @bad_drv_pri = grep { $_->{pri} != 2 } @drv;
+            is(scalar(@bad_drv_pri), 0, 'AC3: every driver row (alive or not) carries pri 2, per S2.5\'s table');
         }
-        my ($ci, $ce) = find_entry($plan, 'cur pkg-ac3-healthy');
-        ok(defined($ci), 'AC3 precondition: a "cur pkg-ac3-healthy" row exists (current_package line)');
-        is($ce->{pri}, 5, 'AC3: the cur line has pri 5') if defined $ci;
-        is($ce->{kind}, 'cur', "AC3: the cur line has kind 'cur'") if defined $ci;
-        # Precondition pinning the AC3 disambiguation: current_package's nonce
-        # ('pkg-ac3-healthy') is a PREFIX of the healthy package's own name
-        # ('pkg-ac3-healthypkg') by construction, so this asserts the two
-        # find_entry lookups above resolve to genuinely DIFFERENT plan rows
-        # rather than the earlier "cur ..." line silently absorbing both
-        # (the substring collision RULING AT-15 identified). If a future
-        # edit reintroduces the collision -- e.g. by making the package name
-        # equal to the current_package nonce again -- this fails loudly
-        # instead of the kind-mismatch below failing silently for the wrong
-        # reason.
-        ok(defined($ci) && defined($found_idx{'pkg-ac3-healthypkg'})
-                && $ci != $found_idx{'pkg-ac3-healthypkg'},
-            'AC3 precondition: the "cur pkg-ac3-healthy" row and the "pkg-ac3-healthypkg" package row are DIFFERENT plan indices (no substring collision)');
+        # The pause reason is on run C's OWN blueprint-kind row now (ruling
+        # B/G), not a separate 'partial'-kind row -- 'partial' is no longer
+        # a member of the kind vocabulary at all.
         my ($pi, $pe) = find_entry($plan, 'zqx3-pausedreason');
-        ok(defined($pi), 'AC3 precondition: the paused-reason row exists');
-        is($pe->{pri}, 2, 'AC3: the partial (paused-reason) row has pri 2') if defined $pi;
-        is($pe->{kind}, 'partial', "AC3: the partial row has kind 'partial'") if defined $pi;
-        my @coord = grep { ref($_) eq 'HASH' && $_->{kind} eq 'coordinator' } @$plan;
-        ok(scalar(@coord) >= 3, 'AC3 precondition: at least 3 coordinator-kind rows exist');
-        my @badcoordpri = grep { $_->{pri} != 6 } @coord;
-        is(scalar(@badcoordpri), 0, 'AC3: every coordinator-kind row has pri 6');
+        ok(defined($pi), 'AC3 precondition: a row carrying the pause reason exists');
+        is($pe->{kind}, 'blueprint', "AC3: the pause-reason row's kind is 'blueprint' (ruling B/G: the reason moved onto the blueprint line)") if defined $pi;
+        is($pe->{pri}, 1, 'AC3: the pause-reason (blueprint) row has pri 1') if defined $pi;
+        my @non_s25_kind = grep { ref($_) eq 'HASH' && $_->{kind} !~ /^(?:blueprint|overflow|driver|package|judge|next)\z/ } @$plan;
+        is(scalar(@non_s25_kind), 0, 'AC3: no plan row uses a kind outside S2.5\'s six (no coordinator/worker/cur/partial/run/other survives)');
     }
 }
 
 # --- AC4 -------------------------------------------------------------------
-{
-    my $NOW_ = $NOW;
-    my $live_judge  = mk_agent(role=>'judge', started_at=>$NOW_-100, stale_after_seconds=>7200);
-    my $stale_judge = mk_agent(role=>'judge', started_at=>$NOW_-100_000, stale_after_seconds=>7200);
-    my ($la, $la_err) = call1('_agent_live', $live_judge, $NOW_);
-    my ($sa, $sa_err) = call1('_agent_live', $stale_judge, $NOW_);
-    is($la, 1, 'AC4 precondition: the live-judge fixture is actually live') unless $la_err;
-    is($sa, 0, 'AC4 precondition: the stale-judge fixture is actually stale') unless $sa_err;
-
-    my @cases = (
-        [ 'live judge present',              { agents=>[$live_judge] },                                  1 ],
-        [ 'attempt==cap',                    { attempt=>5, attempt_cap=>5 },                              1 ],
-        [ 'attempt>cap',                     { attempt=>6, attempt_cap=>5 },                              1 ],
-        [ 'attempt<cap, no judge',           { attempt=>2, attempt_cap=>5 },                              0 ],
-        [ 'status blocked',                  { status=>'blocked' },                                       1 ],
-        [ 'status parked',                   { status=>'parked' },                                        1 ],
-        [ 'stale judge only',                { agents=>[$stale_judge] },                                  0 ],
-        [ 'undef',                            undef,                                                       0 ],
-        [ '[]',                              [],                                                          0 ],
-        [ "'x'",                             'x',                                                         0 ],
-        [ '{}',                              {},                                                          0 ],
-        [ "attempt='x', attempt_cap=0",      { attempt=>'x', attempt_cap=>0 },                            0 ],
-    );
-    for my $c (@cases) {
-        my ($label, $p, $expect) = @$c;
-        my ($res, $err) = call1('_pkg_stuck', $p, $NOW_);
-        ok(!$err, "AC4 ($label): _pkg_stuck does not die/warn") or diag(" error: $err");
-        is($res, $expect, "AC4 ($label): _pkg_stuck returns $expect");
-    }
-}
+# AC4's whole subject, _pkg_stuck, is removed by ruling A / spec S2.2.1's
+# removed-subs table -- the "is this package worth a prominent slot" dot
+# precedence it modelled is now ruling K's dot precedence inside
+# _run_block itself (S2.3.6: blocked > live judge > last attempt > running),
+# not a separate budget-priority predicate. No replacement sub exists to
+# retarget this AC onto; deleted rather than resurrecting a removed sub.
 
 # --- AC5 -------------------------------------------------------------------
 {
@@ -608,15 +602,19 @@ for my $f (@AC1_FIXTURES) {
     my $s = base_state(runs => [ tree_run_40pkg() ]);
     my ($plan, $eplan) = call1('_blueprints_row_plan', $s, 120);
     ok(!$eplan, 'AC6/AC7 precondition: _blueprints_row_plan does not die on the 40-package fixture') or diag(" error: $eplan");
-    my ($width, $ewidth) = call1('_blueprints_table_width', 120);
-    ok(!$ewidth && defined($width), 'AC6/AC7 precondition: _blueprints_table_width(120) resolves') or diag(" error: $ewidth");
+    my ($width, $ewidth) = call1('_blueprints_body_width', 120);
+    ok(!$ewidth && defined($width), 'AC6/AC7 precondition: _blueprints_body_width(120) resolves') or diag(" error: $ewidth");
   SKIP: {
         skip('no plan or width', 2) unless ref($plan) eq 'ARRAY' && @$plan && defined($width);
+        # Retargeted (S2.5): one row per package (not one per agent) means
+        # the 40-package fixture's real total cost is far below the old
+        # per-agent-tree's >50 -- 43 is the measured floor (1 blueprint + 1
+        # driver + 40 package + 1 run-judge, none wrapping at width 120).
         my $total = plan_total_cost($plan, $width);
-        ok(defined($total) && $total > 50, 'AC6/AC7 precondition: total plan cost is measured and > 50')
+        ok(defined($total) && $total >= 40, 'AC6/AC7 precondition: total plan cost is measured and >= 40')
             or diag(' got ' . (defined($total) ? $total : 'undef'));
       SKIP: {
-            skip('no total', 2) unless defined($total) && $total > 50;
+            skip('no total', 2) unless defined($total) && $total >= 40;
             my $bad_shape = 0;
             my $bad_closure = 0;
             for my $budget (0 .. $total + 1) {
@@ -664,40 +662,39 @@ for my $f (@AC1_FIXTURES) {
             mk_agent(id=>'hw2', role=>'worker',      worker_type=>'zqx89-healthyw2'),
         ],
     };
+    # Retargeted (ruling J/Scope, S2.5): agents collapse into their owning
+    # package's single atomic row -- there is no finer-grained per-agent
+    # row left to drop independently of its package, so AC8 instead proves
+    # the tier-3 PREFIX rule (S2.5 point 2) over two whole packages: at a
+    # budget that fits blueprint+driver+exactly one package row, the FIRST
+    # package in document order (the stuck one, carrying its judge/worker
+    # segments as one unit) survives whole, and the second does not -- not
+    # a partial, agent-level drop.
     my $run = tree_run(blueprint=>'zqx89-run', packages=>[$stuck_pkg, $healthy_pkg]);
     my $s = base_state(runs => [ $run ]);
     my ($plan, $eplan) = call1('_blueprints_row_plan', $s, 120);
     ok(!$eplan, 'AC8/AC9 precondition: _blueprints_row_plan does not die') or diag(" error: $eplan");
-    my ($width) = call1('_blueprints_table_width', 120);
+    my ($width) = call1('_blueprints_body_width', 120);
   SKIP: {
-        skip('no plan', 6) unless ref($plan) eq 'ARRAY' && @$plan;
-        my ($kept5, $e5) = call1('_select_rows', $plan, 5, $width);
-        ok(!$e5, 'AC8: _select_rows does not die at budget=5') or diag(" error: $e5");
+        skip('no plan', 4) unless ref($plan) eq 'ARRAY' && @$plan;
+        my ($kept3, $e3) = call1('_select_rows', $plan, 3, $width);
+        ok(!$e3, 'AC8: _select_rows does not die at budget=3') or diag(" error: $e3");
       SKIP: {
-            skip('no kept5', 6) unless ref($kept5) eq 'ARRAY';
-            my %kset = map { $_ => 1 } @$kept5;
-            my ($ri) = find_entry($plan, 'zqx89-run') // (0);   # run row has no nonce; use run label text below instead
-            my ($run_i) = grep { row_text($plan->[$_]{spans}) =~ /\brunning\b/ && $plan->[$_]{kind} eq 'run' } (0 .. $#$plan);
-            my ($judge_i) = find_entry($plan, 'zqx89-stuckjudge');
+            skip('no kept3', 3) unless ref($kept3) eq 'ARRAY';
+            my %kset = map { $_ => 1 } @$kept3;
+            my ($bp_i)       = grep { ref($plan->[$_]) eq 'HASH' && $plan->[$_]{kind} eq 'blueprint' } (0 .. $#$plan);
+            my ($drv_i)      = grep { ref($plan->[$_]) eq 'HASH' && $plan->[$_]{kind} eq 'driver' } (0 .. $#$plan);
             my ($stuckrow_i) = find_entry($plan, 'pkg-ac89-stuck');
-            my ($stuckcoord_i, $sc_e) = do {
-                my $p = $plan->[$stuckrow_i]{parent} if defined $stuckrow_i;
-                (grep { defined($plan->[$_]{parent}) && $plan->[$_]{parent} == $stuckrow_i && $plan->[$_]{kind} eq 'coordinator' } (0 .. $#$plan))[0];
-            };
-            my ($hworker1_i) = find_entry($plan, 'zqx89-healthyw1');
-            my ($hworker2_i) = find_entry($plan, 'zqx89-healthyw2');
-            ok(defined($run_i) && defined($judge_i) && defined($stuckrow_i) && defined($stuckcoord_i),
-                'AC8 precondition: run/judge/stuck-row/stuck-coordinator indices all resolved');
+            my ($healthyrow_i) = find_entry($plan, 'pkg-ac89-healthy');
+            ok(defined($bp_i) && defined($drv_i) && defined($stuckrow_i) && defined($healthyrow_i),
+                'AC8 precondition: blueprint/driver/stuck-package/healthy-package row indices all resolved');
           SKIP: {
-                skip('indices unresolved', 5) unless defined($run_i) && defined($judge_i) && defined($stuckrow_i) && defined($stuckcoord_i);
-                is(scalar(@$kept5), 5, 'AC8 precondition: budget=5 on this fixture admits exactly 5 rows');
-                ok($kset{$run_i},       'AC8: the run row survives at budget=5');
-                ok($kset{$judge_i},     'AC8: the judge row survives at budget=5');
-                ok($kset{$stuckrow_i},  'AC8: the stuck package\'s own row survives at budget=5');
-                ok($kset{$stuckcoord_i},'AC8: the stuck package\'s coordinator row survives at budget=5');
-                my $healthy_worker_present = (defined($hworker1_i) && $kset{$hworker1_i})
-                                           || (defined($hworker2_i) && $kset{$hworker2_i});
-                ok(!$healthy_worker_present, 'AC8: no healthy-package worker row survives at budget=5');
+                skip('indices unresolved', 5) unless defined($bp_i) && defined($drv_i) && defined($stuckrow_i) && defined($healthyrow_i);
+                is(scalar(@$kept3), 3, 'AC8 precondition: budget=3 on this fixture admits exactly 3 rows');
+                ok($kset{$bp_i},  'AC8: the blueprint row survives at budget=3');
+                ok($kset{$drv_i}, 'AC8: the driver row survives at budget=3');
+                ok($kset{$stuckrow_i}, 'AC8: the first (stuck) package\'s whole row survives at budget=3, judge/worker segments included atomically');
+                ok(!$kset{$healthyrow_i}, 'AC8: the SECOND package\'s row does not survive at budget=3 (tier-3 prefix rule, document order)');
             }
         }
     }
@@ -712,7 +709,15 @@ for my $f (@AC1_FIXTURES) {
             mk_agent(id=>'w', role=>'worker',      worker_type=>'zqx9-worker'),
         ],
     };
-    my ($width) = call1('_blueprints_table_width', 120);
+    # Retargeted (S2.5): the old plan gave an alive orchestrator the LOWEST
+    # priority tier (pri 8) and a not-alive one a much higher one (pri 3),
+    # so the budget dropped an alive orchestrator's row before a worker's
+    # but kept a dead one. S2.5's table has no such liveness-dependent
+    # split: a `driver` row is ALWAYS pri 2 regardless of
+    # `orchestrator_alive` -- liveness changes the row's TEXT (the dot), not
+    # its budget priority. So both cases now keep the (always pri-2) driver
+    # row and drop the (pri-3) package row at budget=total-1, uniformly.
+    my ($width) = call1('_blueprints_body_width', 120);
     for my $case ([1, 'alive'], [0, 'not-alive']) {
         my ($alive, $label) = @$case;
         my $run = tree_run(blueprint=>"zqx9-run-$label", orchestrator_alive=>$alive, packages=>[ deep($pkg) ]);
@@ -730,15 +735,11 @@ for my $f (@AC1_FIXTURES) {
               SKIP: {
                     skip('no kept', 2) unless ref($kept) eq 'ARRAY';
                     my %kset = map { $_ => 1 } @$kept;
-                    my ($orch_i) = grep { row_text($plan->[$_]{spans}) =~ /\borchestrator\b/ } (0 .. $#$plan);
+                    my ($drv_i) = grep { ref($plan->[$_]) eq 'HASH' && $plan->[$_]{kind} eq 'driver' } (0 .. $#$plan);
                     my ($worker_i) = find_entry($plan, 'zqx9-worker');
-                    ok(defined($orch_i) && defined($worker_i), "AC9 ($label) precondition: orchestrator and worker rows resolved");
-                    if ($label eq 'alive') {
-                        ok(!$kset{$orch_i}, "AC9 ($label): the alive orchestrator row is the one dropped at budget=total-1");
-                    } else {
-                        ok($kset{$orch_i} && !$kset{$worker_i},
-                            "AC9 ($label): the not-alive orchestrator survives while the healthy worker is dropped instead");
-                    }
+                    ok(defined($drv_i) && defined($worker_i), "AC9 ($label) precondition: driver and worker rows resolved");
+                    ok($kset{$drv_i} && !$kset{$worker_i},
+                        "AC9 ($label): the driver row (pri 2) survives at budget=total-1 regardless of liveness, while the package row (pri 3) is dropped instead");
                 }
             }
         }
@@ -758,21 +759,30 @@ for my $f (@AC1_FIXTURES) {
 # mid-tier (enough for SOME but not all packages) -- for every package
 # that shows its head at all, its own continuation ("4/8") must show too.
 {
+    # Retargeted: under S2.3.6's grammar a package's step (e.g. 'step=4/8')
+    # is no longer a field the renderer reads at all -- step_word/status/
+    # 'running' is -- so the OLD 100-column fixture (built from 'step', a
+    # dead field) no longer wraps at cols=100; it must wrap at the width
+    # under test, or the test proves nothing (S4's own fixture-discipline
+    # rule). cols=64 is the measured width at which each of these 7
+    # packages wraps into exactly a head + ONE continuation physical row
+    # (fewer columns wraps into head + TWO continuations instead, which
+    # would not exercise this AC's two-physical-rows shape).
     my @pkgs = map {
         { name => "zqxm4-$_-dispatch-log-write-path-and-hardening", status => 'running',
-          attempt => 2, attempt_cap => 5, step => '4/8' }
+          attempt => 2, attempt_cap => 5, step_word => 'implementation', agents => [] }
     } (1 .. 7);
     my $run = tree_run(blueprint => 'zqxm4-run', packages => \@pkgs);
     my $s = base_state(runs => [ $run ]);
-    my ($plan, $eplan) = call1('_blueprints_row_plan', $s, 100);
+    my ($plan, $eplan) = call1('_blueprints_row_plan', $s, 64);
     ok(!$eplan, 'MEDIUM-4 precondition: _blueprints_row_plan does not die') or diag(" error: $eplan");
-    my ($width) = call1('_blueprints_table_width', 100);
+    my ($width) = call1('_blueprints_body_width', 64);
   SKIP: {
         skip('no plan', 5) unless ref($plan) eq 'ARRAY' && @$plan;
         # Locate, for each package, the index of its own head row (carries
         # the package's own nonce and "attempt") and its own continuation
-        # (carries "4/8" but NOT the package's own nonce -- i.e. a
-        # DIFFERENT physical row).
+        # (carries "implementation 2/5" but NOT the package's own nonce --
+        # i.e. a DIFFERENT physical row).
         my (@heads, @conts);
         for my $n (1 .. 7) {
             my $nonce = "zqxm4-$n-dispatch";
@@ -790,12 +800,12 @@ for my $f (@AC1_FIXTURES) {
       SKIP: {
             skip('indices unresolved', 3)
                 unless (grep { defined } @heads) == 7 && (grep { defined } @conts) == 7;
-            # Budget: run(1) + 4 whole packages (1 head + 1 continuation
-            # each = 2) + one bare extra unit -- enough to admit package 5's
-            # head on its own (cost 1) if heads and continuations were still
-            # independently costed, but not enough to also admit its
-            # continuation.
-            my $budget = 1 + (4 * 2) + 1;
+            # Budget: blueprint(1) + driver(1) + 4 whole packages (1 head +
+            # 1 continuation each = 2) + one bare extra unit -- enough to
+            # admit package 5's head on its own (cost 1) if heads and
+            # continuations were still independently costed, but not
+            # enough to also admit its continuation.
+            my $budget = 1 + 1 + (4 * 2) + 1;
             my ($kept, $err) = call1('_select_rows', $plan, $budget, $width);
             ok(!$err, 'MEDIUM-4: _select_rows does not die at the mid-tier budget') or diag(" error: $err");
           SKIP: {
@@ -815,62 +825,22 @@ for my $f (@AC1_FIXTURES) {
 
 # --- HIGH-2 (fix-batch, redteam) ----------------------------------------
 #
-# _select_rows used to compute each candidate's ancestor-closure cost ONCE
-# per priority tier, against the kept-set as of the tier's START, on the
-# claimed invariant that every parent sits in a strictly earlier
-# (numerically lower) tier than its children. That claim is false: a
-# `judge` row is pri 3, but its own parent (the package row) is pri 4/5 --
-# a LATER tier. So two live judges under the SAME package both had their
-# frozen cost count the shared, not-yet-kept package row, even after the
-# first judge's admission had already paid for it -- a spurious rejection
-# that could invert priority order (an alive pri-8 orchestrator kept while
-# a live pri-3 judge is dropped) and waste budget nothing later could
-# claim.
-{
-    my $pkg = {
-        name => 'pkg-high2', status => 'running', attempt=>1, attempt_cap=>5,
-        agents => [
-            mk_agent(id=>'jA', role=>'judge', worker_type=>'zqxh2-judgeA'),
-            mk_agent(id=>'jB', role=>'judge', worker_type=>'zqxh2-judgeB'),
-        ],
-    };
-    my $run = tree_run(blueprint=>'zqxh2-run', orchestrator_alive=>1, packages=>[$pkg]);
-    my $s = base_state(runs => [ $run ]);
-    my ($plan, $eplan) = call1('_blueprints_row_plan', $s, 120);
-    ok(!$eplan, 'HIGH-2 precondition: _blueprints_row_plan does not die') or diag(" error: $eplan");
-    my ($width) = call1('_blueprints_table_width', 120);
-  SKIP: {
-        skip('no plan', 6) unless ref($plan) eq 'ARRAY' && @$plan;
-        my ($run_i)    = grep { $plan->[$_]{kind} eq 'run' } (0 .. $#$plan);
-        my ($pkg_i)    = grep { $plan->[$_]{kind} eq 'package' } (0 .. $#$plan);
-        my ($orch_i)   = grep { $plan->[$_]{kind} eq 'orchestrator' } (0 .. $#$plan);
-        my ($judgeA_i) = find_entry($plan, 'zqxh2-judgeA');
-        my ($judgeB_i) = find_entry($plan, 'zqxh2-judgeB');
-        ok(defined($run_i) && defined($pkg_i) && defined($orch_i) && defined($judgeA_i) && defined($judgeB_i),
-            'HIGH-2 precondition: run/package/orchestrator/both-judge indices all resolved');
-      SKIP: {
-            skip('indices unresolved', 4) unless defined($run_i) && defined($pkg_i) && defined($orch_i)
-                                              && defined($judgeA_i) && defined($judgeB_i);
-            # cost: run=1, package=1, judgeA=1, judgeB=1 -- exactly 4 at
-            # budget=4. The frozen-per-tier bug charged judgeB's closure
-            # for the package row a SECOND time (package(1)+judgeB(1)=2 on
-            # top of judgeA's own package(1)+judgeA(1)=2, totalling 5 > 4),
-            # so it lost its slot to the pri-8 orchestrator, which is
-            # cheaper (cost 1) and sorts into an EARLIER tier regardless.
-            my ($kept4, $e4) = call1('_select_rows', $plan, 4, $width);
-            ok(!$e4, 'HIGH-2: _select_rows does not die at budget=4') or diag(" error: $e4");
-          SKIP: {
-                skip('no kept4', 3) unless ref($kept4) eq 'ARRAY';
-                my %kset = map { $_ => 1 } @$kept4;
-                ok($kset{$judgeA_i} && $kset{$judgeB_i},
-                    'HIGH-2: BOTH live judges under one package survive at budget=4 -- the shared package-row ancestor is not double-charged');
-                ok(!$kset{$orch_i},
-                    'HIGH-2: the alive orchestrator (pri 8, the lowest class) does not bump a live judge (pri 3) out of its slot');
-                is(scalar(@$kept4), 4, 'HIGH-2: budget=4 is fully spent (run + package + both judges), no wasted slack');
-            }
-        }
-    }
-}
+# HIGH-2 guarded against a defect class that required a child row's tier
+# to be LATER (numerically higher) than its own parent's tier -- the old
+# plan had exactly that shape (a `judge` row pri 3 parented to a `package`
+# row pri 4/5). Spec S2.5's new parent table removes it structurally, not
+# just in this one fixture: EVERY non-blueprint row (driver/package/judge/
+# next) parents directly to its block's own `blueprint` row, which is
+# always pri 1 -- the globally FIRST tier. There is no longer any row whose
+# parent sits in a later tier than itself, so the "shared not-yet-kept
+# ancestor in a later tier gets double-charged across siblings" bug this
+# AC existed to catch cannot occur under the new shape (the ancestor is
+# always kept by the time any child tier is even considered). Package-level
+# judges (this fixture's own zqxh2-judgeA/B) no longer get rows of their
+# own either (Scope: they collapse into their package's one row), so there
+# is no fixture left that could even exercise the old scenario. Deleted
+# rather than reconstructed onto a defect class the new parent table
+# removes.
 
 # --- AC10 --------------------------------------------------------------
 {
@@ -933,7 +903,7 @@ for my $f (@AC1_FIXTURES) {
 # --- AC13 --------------------------------------------------------------
 for my $f (@AC1_FIXTURES) {
     my ($label, $s0) = @$f;
-    my ($width) = call1('_blueprints_table_width', 120);
+    my ($width) = call1('_blueprints_body_width', 120);
     my $s = { %$s0 };
     delete $s->{blueprint_body_rows};
     my ($plan, $eplan) = call1('_blueprints_row_plan', $s, 120);
@@ -950,7 +920,7 @@ for my $f (@AC1_FIXTURES) {
 {
     my $s0 = base_state(runs => [ tree_run_40pkg() ]);
     my $s = { %$s0 };
-    my ($width) = call1('_blueprints_table_width', 120);
+    my ($width) = call1('_blueprints_body_width', 120);
     my ($plan, $eplan) = call1('_blueprints_row_plan', $s, 120);
     ok(!$eplan, 'AC14/AC15 precondition: _blueprints_row_plan does not die') or diag(" error: $eplan");
   SKIP: {
@@ -1001,7 +971,7 @@ for my $f (@AC1_FIXTURES) {
     my $big_run = tree_run_40pkg();
     my @runs = ($big_run, @{ runs_n(11) });
     my $s = base_state(runs => \@runs, blueprint_rows_max => 5);
-    my ($width) = call1('_blueprints_table_width', 120);
+    my ($width) = call1('_blueprints_body_width', 120);
     my ($plan, $eplan) = call1('_blueprints_row_plan', $s, 120);
     ok(!$eplan, 'AC16 precondition: _blueprints_row_plan does not die on the 12-run fixture') or diag(" error: $eplan");
   SKIP: {
@@ -1044,7 +1014,7 @@ for my $f (@AC1_FIXTURES) {
     }
     my $s1 = { %$s0, blueprint_body_rows => 1 };
     my ($plan, $eplan) = call1('_blueprints_row_plan', $s0, 120);
-    my ($width) = call1('_blueprints_table_width', 120);
+    my ($width) = call1('_blueprints_body_width', 120);
   SKIP: {
         skip('no plan', 1) unless !$eplan && ref($plan) eq 'ARRAY';
         my $total = plan_total_cost($plan, $width);
@@ -1073,7 +1043,7 @@ for my $f (@AC1_FIXTURES) {
     my $pkg_with = { %{ deep($pkg_base) } };
     $pkg_with->{agents} = [ @{ $pkg_with->{agents} }, $stale, $future ];
 
-    my $width = ( call1('_blueprints_table_width', 120) )[0];
+    my $width = ( call1('_blueprints_body_width', 120) )[0];
     for my $pair ([$pkg_base, 'without stale/future'], [$pkg_with, 'with stale/future']) {
         my ($pkg, $label) = @$pair;
         my $run = tree_run(blueprint=>"zqx18-run-$label", packages=>[ $pkg ]);
@@ -1103,7 +1073,7 @@ for my $f (@AC1_FIXTURES) {
 # --- AC19 --------------------------------------------------------------
 {
     my $s = base_state(runs => [ tree_run_40pkg() ]);
-    my ($width) = call1('_blueprints_table_width', 120);
+    my ($width) = call1('_blueprints_body_width', 120);
     my ($plan, $eplan) = call1('_blueprints_row_plan', $s, 120);
     ok(!$eplan, 'AC19 precondition: _blueprints_row_plan does not die') or diag(" error: $eplan");
   SKIP: {
@@ -1157,14 +1127,25 @@ for my $f (@AC1_FIXTURES) {
     ok((!exists($neither_run->{packages}) && !exists($neither_run->{run_agents})),
         'AC20 precondition: the "neither key" fixture genuinely OMITS the packages and run_agents keys (not merely undef-then-defaulted to []), so it is NOT byte-identical to the packages=>[] case above it');
 
+    # step-7 fix-batch (reviewer-step6.md BLOCKER-2; redteam-step6.md
+    # MAJOR-2): per spec S2.2.1, _multiline_blocks is 1 iff the block
+    # `_run_block(...)` actually builds has 2+ LINES -- there is no state
+    # condition at all. tree_run()'s default orchestrator_pid (4242) with no
+    # thread means every one of these fixtures ALREADY gets a no-thread
+    # driver line (S2.3.5: present iff thread is not a HASH and
+    # orchestrator_pid is defined -- no state check), so blueprint+driver is
+    # 2 lines regardless of state. The four cases below ('queued'/'done'/
+    # 'failed'/'idle' with packages, and 'neither key') are exactly the old
+    # `state eq 'running'` gate's blind spot: they were pinned at 0 under the
+    # OLD _tree_present semantics, which the fix replaces.
     my @cases = (
         [ 'running, packages=>[]',           { runs=>[ tree_run(state=>'running', packages=>[], run_agents=>undef) ] }, 1 ],
         [ 'running, run_agents=>[]',         { runs=>[ tree_run(state=>'running', packages=>undef, run_agents=>[]) ] }, 1 ],
-        [ 'running, neither key',            { runs=>[ $neither_run ] }, 0 ],
-        [ 'queued with packages',            { runs=>[ tree_run(state=>'queued', packages=>[{name=>'x'}]) ] }, 0 ],
-        [ 'done with packages',              { runs=>[ tree_run(state=>'done', packages=>[{name=>'x'}]) ] }, 0 ],
-        [ 'failed with packages',            { runs=>[ tree_run(state=>'failed', packages=>[{name=>'x'}]) ] }, 0 ],
-        [ 'idle with packages',              { runs=>[ tree_run(state=>'idle', packages=>[{name=>'x'}]) ] }, 0 ],
+        [ 'running, neither key',            { runs=>[ $neither_run ] }, 1 ],
+        [ 'queued with packages',            { runs=>[ tree_run(state=>'queued', packages=>[{name=>'x'}]) ] }, 1 ],
+        [ 'done with packages',              { runs=>[ tree_run(state=>'done', packages=>[{name=>'x'}]) ] }, 1 ],
+        [ 'failed with packages',            { runs=>[ tree_run(state=>'failed', packages=>[{name=>'x'}]) ] }, 1 ],
+        [ 'idle with packages',              { runs=>[ tree_run(state=>'idle', packages=>[{name=>'x'}]) ] }, 1 ],
         [ 'runs absent',                     {}, 0 ],
         [ "runs='x'",                        { runs=>'x' }, 0 ],
         [ 'runs=[]',                         { runs=>[] }, 0 ],
@@ -1172,9 +1153,84 @@ for my $f (@AC1_FIXTURES) {
     );
     for my $c (@cases) {
         my ($label, $s, $expect) = @$c;
-        my ($res, $err) = call1('_tree_present', $s);
-        ok(!$err, "AC20 ($label): _tree_present does not die") or diag(" error: $err");
-        is($res, $expect, "AC20 ($label): _tree_present returns $expect");
+        my ($res, $err) = call1('_multiline_blocks', $s);
+        ok(!$err, "AC20 ($label): _multiline_blocks does not die") or diag(" error: $err");
+        is($res, $expect, "AC20 ($label): _multiline_blocks returns $expect (S2.2.1: 2+ lines, no state condition)");
+    }
+
+    # A block whose run has NO driver (orchestrator_pid genuinely ABSENT, no
+    # thread) and only non-rendering packages really is single-line
+    # regardless of state -- this is the "must not break" case (spec S5,
+    # layout-flex-stability.t): a solo run with no thread/marker/packages
+    # stays one line.
+    #
+    # Same AT-15 pitfall as the "neither key" fixture above: tree_run()'s
+    # builder defaults orchestrator_pid with `$o{orchestrator_pid} // 4242`,
+    # so passing orchestrator_pid=>undef does NOT omit the key -- Perl's `//`
+    # treats an explicitly-passed undef as "not supplied" and substitutes
+    # 4242 regardless, which per S2.3.5 DOES draw a no-thread driver line
+    # (making the block 2 lines, not 1). "No driver" is only genuinely
+    # distinguishable from "present" if the key is actually ABSENT from the
+    # hash, so each fixture here is built then has the key deleted, exactly
+    # like the "neither key" workaround above.
+    my $paused_no_driver = tree_run(state => 'paused', packages => [{name=>'x'}]);
+    delete $paused_no_driver->{orchestrator_pid};
+    my $solo_no_driver = tree_run(state => 'solo');
+    delete $solo_no_driver->{orchestrator_pid};
+    ok((!exists($paused_no_driver->{orchestrator_pid}) && !exists($solo_no_driver->{orchestrator_pid})),
+        'AC20 precondition: both "no driver" fixtures genuinely OMIT orchestrator_pid (not merely undef-then-defaulted to 4242)');
+    my @single_line_cases = (
+        [ 'paused, no driver, no rendering packages', { runs=>[ $paused_no_driver ] }, 0 ],
+        [ 'solo, no driver, no thread, no packages',  { runs=>[ $solo_no_driver ] }, 0 ],
+    );
+    for my $c (@single_line_cases) {
+        my ($label, $s, $expect) = @$c;
+        my ($res, $err) = call1('_multiline_blocks', $s);
+        ok(!$err, "AC20 ($label): _multiline_blocks does not die") or diag(" error: $err");
+        is($res, $expect, "AC20 ($label): _multiline_blocks returns $expect (no driver line, no rendering package line -> 1-line block)");
+    }
+
+    # step-7 fix-batch (reviewer-step6.md BLOCKER-2; redteam-step6.md
+    # MAJOR-2, probe4 case B): the end-to-end bug is that _blueprints_
+    # capacity (and therefore compose()'s auto blueprint_body_rows) gates on
+    # _multiline_blocks, so a PAUSED fleet with many package lines never
+    # even gets a capacity probe today -- capacity comes back undef no
+    # matter how much the block overflows. Mirrors the AC24/AC25 pattern
+    # above but with state=>'paused' instead of the default 'running'.
+    #
+    # The property under test (S2.2.1) is that a PAUSED block is treated
+    # IDENTICALLY to a RUNNING one by the capacity probe -- not that
+    # capacity is positive at every geometry. 80x10 is, measured, below the
+    # panel's viable-capacity floor for BOTH states (same AC24/AC25
+    # tolerance this file already applies a few blocks below: "capacity < 2
+    # -- geometry precondition not met, recorded rather than silently
+    # skipped"), so asserting `cap > 0` there would fail for a reason that
+    # has nothing to do with pause-state -- a geometry limit, not a
+    # regression. So: assert the equality property at EVERY geometry
+    # (it holds trivially at 80x10 too, both measuring 0), and additionally
+    # assert positivity only at the geometries that actually clear the
+    # floor for both states.
+    {
+        my $s0_paused  = base_state(runs => [ tree_run_40pkg(state => 'paused') ]);
+        my $s0_running = base_state(runs => [ tree_run_40pkg(state => 'running') ]);
+        for my $g ([10, 80], [24, 100], [44, 120]) {
+            my ($rows, $cols) = @$g;
+            my ($cap_paused, $ecap_p) = call1('_blueprints_capacity', $s0_paused, $rows, $cols);
+            my ($cap_running, $ecap_r) = call1('_blueprints_capacity', $s0_running, $rows, $cols);
+            ok(!$ecap_p && !$ecap_r, "AC20 (paused vs running, ${cols}x${rows}): neither _blueprints_capacity call dies")
+                or diag(" errors: $ecap_p / $ecap_r");
+            is($cap_paused, $cap_running,
+                "AC20 (${cols}x${rows}, BLOCKER-2/MAJOR-2): a PAUSED block measures the SAME capacity as an otherwise-identical RUNNING block (the old gate made paused undef regardless of geometry)")
+                or diag(' cap_paused=' . (defined($cap_paused) ? $cap_paused : 'undef')
+                      . ' cap_running=' . (defined($cap_running) ? $cap_running : 'undef'));
+            if (!defined($cap_running) || $cap_running < 2) {
+                ok(1, "AC20 (${cols}x${rows}): capacity < 2 for running too -- geometry precondition not met for the positivity check, recorded rather than silently skipped (cap_running=" . (defined($cap_running)?$cap_running:'undef') . ")");
+                next;
+            }
+            ok(defined($cap_paused) && $cap_paused > 0,
+                "AC20 (paused, ${cols}x${rows}, BLOCKER-2/MAJOR-2): _blueprints_capacity is a defined positive number for a PAUSED multi-line block at a geometry that clears the viable-capacity floor")
+                or diag(' cap=' . (defined($cap_paused) ? $cap_paused : 'undef'));
+        }
     }
 }
 
@@ -1296,7 +1352,7 @@ for my $f (@AC1_FIXTURES) {
         my ($plan, $eplan) = call1('_blueprints_row_plan', $s0, $cols);
         my $side = ( call_ts1('side_column_width', $cols) )[0] // 0;
         my $body_width = $cols - $side;
-        my ($width, $ewidth) = call1('_blueprints_table_width', $cols);
+        my ($width, $ewidth) = call1('_blueprints_body_width', $cols);
         next if $ecap || $eplan || $ewidth;
         my $total = plan_total_cost($plan, $width);
         ok(!$ecap, "AC24/AC25 (${cols}x${rows}): _blueprints_capacity does not die") or diag(" error: $ecap");
@@ -1348,70 +1404,92 @@ for my $f (@AC1_FIXTURES) {
     ] };
     my $run = tree_run(blueprint=>'zqx26-run', orchestrator_alive=>1, packages=>[$stuck_pkg, $healthy_pkg]);
     my $s0 = base_state(runs => [ $run ]);
-    # RULING AT-15's AC26 fix: rows=10 is BELOW the panel's inherited
-    # squeeze-out floor for this fixture (measured capacity is 0 at rows=10
-    # regardless of content -- tui::Layout/tui::Screen give the Blueprints
-    # panel body no room at all at that height, not something this package
-    # introduced or can fix from its write set). Testing "what survives at
-    # the smallest height" at a height where NOTHING survives is vacuous.
-    # rows=24 is the smallest height at which this fixture's measured
-    # capacity is actually > 0 (verified below as a precondition, not
-    # assumed) -- that is the genuine smallest-height case.
+    # Retargeted (S2.5): under the old per-agent tree, a package-level judge
+    # outranked an alive orchestrator's row (pri 3 vs pri 8), so it alone
+    # could survive a collapse that dropped the orchestrator. S2.5's fixed
+    # kind-based tier order removes that: `driver` is ALWAYS pri 2, strictly
+    # BEFORE `package` (pri 3) -- so at any capacity small enough to drop
+    # package content, the orchestrator/driver row is exactly what remains,
+    # never the other way around, and a package-level judge is now just a
+    # text SEGMENT inside its package's one atomic row (so it cannot survive
+    # independently of that row either). rows=20 (small) and rows=24
+    # (large) are MEASURED below, not hand-predicted, to be the points
+    # where this 4-content-row fixture's capacity is first non-zero-but-
+    # insufficient and first sufficient for everything.
     my %cap_at;
-    for my $rows (24, 36, 44) {
+    for my $rows (20, 24) {
         my ($cap) = call1('_blueprints_capacity', $s0, $rows, 120);
         $cap_at{$rows} = $cap;
     }
-    ok((defined($cap_at{24}) && defined($cap_at{36}) && defined($cap_at{44})
-        && $cap_at{24} < $cap_at{36} && $cap_at{36} < $cap_at{44}),
-        'AC26 precondition: measured capacity is strictly increasing across rows=24,36,44')
-        or diag(' cap24=' . ($cap_at{24}//'undef') . ' cap36=' . ($cap_at{36}//'undef') . ' cap44=' . ($cap_at{44}//'undef'));
-    ok((defined($cap_at{24}) && $cap_at{24} > 0),
-        'AC26 precondition: capacity at the smallest height under test (rows=24) is > 0 -- a genuinely renderable panel body, not a vacuous zero-capacity floor')
-        or diag(' cap24=' . ($cap_at{24}//'undef'));
+    ok((defined($cap_at{20}) && defined($cap_at{24}) && $cap_at{20} > 0 && $cap_at{20} < $cap_at{24}),
+        'AC26 precondition: measured capacity is > 0 at rows=20 and strictly larger at rows=24')
+        or diag(' cap20=' . ($cap_at{20}//'undef') . ' cap24=' . ($cap_at{24}//'undef'));
     my $plan = ( call1('_blueprints_row_plan', $s0, 120) )[0];
   SKIP: {
         skip('no plan', 1) unless ref($plan) eq 'ARRAY';
         my $joined = join("\n", map { row_text($_->{spans}) } @$plan);
-        ok(($joined =~ /bp-resolve-judge/ && $joined =~ /bp-implementer/),
-            'AC26 precondition: both worker-type nonces are present in the uncollapsed body');
+        # S2.3.6: a judge label strips a leading 'bp-' AND a trailing
+        # '-judge' ('bp-resolve-judge' -> 'resolve judge'); a worker label
+        # strips only the leading 'bp-' ('bp-implementer' -> 'implementer').
+        ok(($joined =~ /resolve judge/ && $joined =~ /\bimplementer\b/),
+            'AC26 precondition: both agents\' rendered labels are present in the uncollapsed body');
     }
   SKIP: {
         skip('capacities not increasing', 2)
-            unless (defined($cap_at{24}) && defined($cap_at{36}) && defined($cap_at{44})
-                    && $cap_at{24} > 0
-                    && $cap_at{24} < $cap_at{36} && $cap_at{36} < $cap_at{44});
-        my $frame_small = Dashboard::compose_frame($s0, 24, 120);
+            unless (defined($cap_at{20}) && defined($cap_at{24}) && $cap_at{20} > 0 && $cap_at{20} < $cap_at{24});
+        my $frame_small = Dashboard::compose_frame($s0, 20, 120);
         my $ft_small = frame_text($frame_small);
-        like($ft_small, qr/bp-resolve-judge/, 'AC26: at the smallest (renderable) height, the stuck package\'s live resolve-judge IS present');
-        unlike($ft_small, qr/bp-implementer/, 'AC26: at the smallest (renderable) height, the healthy package\'s worker is NOT present');
-        unlike($ft_small, qr/\borchestrator\b/, 'AC26: at the smallest (renderable) height, no orchestrator row is present');
+        unlike($ft_small, qr/resolve judge/, 'AC26: at the smaller height, the stuck package\'s judge segment is NOT present (package content is atomic, no special-case judge survival)');
+        unlike($ft_small, qr/\bimplementer\b/, 'AC26: at the smaller height, the healthy package\'s worker segment is NOT present either');
+        like($ft_small, qr/\borchestrator\b/, 'AC26: at the smaller height, the orchestrator/driver row IS present (pri 2, strictly before package pri 3)');
+        like($ft_small, qr/hidden/, 'AC26: at the smaller height, a hidden-rows notice appears (package content did not fit)');
 
-        my $frame_large = Dashboard::compose_frame($s0, 44, 120);
+        my $frame_large = Dashboard::compose_frame($s0, 24, 120);
         my $ft_large = frame_text($frame_large);
-        like($ft_large, qr/bp-resolve-judge/, 'AC26: at the largest height, the resolve-judge is present');
-        like($ft_large, qr/bp-implementer/, 'AC26: at the largest height, the implementer is present');
-        like($ft_large, qr/\borchestrator\b/, 'AC26: at the largest height, the orchestrator row is present');
+        like($ft_large, qr/resolve judge/, 'AC26: at the larger height, the resolve-judge segment is present');
+        like($ft_large, qr/\bimplementer\b/, 'AC26: at the larger height, the implementer segment is present');
+        like($ft_large, qr/\borchestrator\b/, 'AC26: at the larger height, the orchestrator row is present');
     }
 }
 
 # --- AC27 --------------------------------------------------------------
+# Retargeted (S2.5): AC27's old premise was that the conformance judge
+# (pri 3 in the old 8-tier table) always survives a collapse regardless of
+# capacity, because it outranked the per-agent coordinator/worker rows
+# (pri 6/7) that would be dropped first. S2.5's fixed table makes `judge`
+# pri 4, strictly AFTER every `package` row (pri 3) -- so with 40 package
+# rows ahead of it in document order, the run-wide judge now survives ONLY
+# once capacity is large enough for every package row too (measured below,
+# not assumed): it is genuinely absent at a capacity too small for all 40
+# packages, and genuinely present once capacity covers the whole plan.
+# This is a deliberate consequence of ruling K's tier order, not a defect.
 {
     my $s0 = base_state(runs => [ tree_run_40pkg() ]);
     my $plan = ( call1('_blueprints_row_plan', $s0, 120) )[0];
     ok(ref($plan) eq 'ARRAY' && @$plan, 'AC27 precondition: the 40-package plan builds');
   SKIP: {
         skip('no plan', 1) unless ref($plan) eq 'ARRAY' && @$plan;
+        # S2.3.6/2.3.7: a judge label strips a leading 'bp-' (absent here)
+        # AND a trailing '-judge' -- 'zqxt40-conformance-judge' renders as
+        # 'zqxt40-conformance judge' (space, suffix stripped).
         my ($last_tree_i) = grep { $plan->[$_]{kind} !~ /^(run|overflow)\z/ } reverse (0 .. $#$plan);
-        ok(defined($last_tree_i) && row_text($plan->[$last_tree_i]{spans}) =~ /zqxt40-conformance-judge/,
+        ok(defined($last_tree_i) && row_text($plan->[$last_tree_i]{spans}) =~ /zqxt40-conformance judge/,
             'AC27 precondition: in the uncollapsed plan, the LAST tree row is the conformance-judge row');
     }
-    for my $rows (10, 24, 44) {
-        my ($cap) = call1('_blueprints_capacity', $s0, $rows, 120);
-        next unless defined($cap) && $cap >= 2;
-        my $frame = Dashboard::compose_frame($s0, $rows, 120);
-        my $ft = frame_text($frame);
-        like($ft, qr/zqxt40-conformance-judge/, "AC27 (rows=$rows, capacity=$cap): the conformance-judge row is present in the collapsed frame");
+    my ($cap_small) = call1('_blueprints_capacity', $s0, 44, 120);
+    my ($cap_full)  = call1('_blueprints_capacity', $s0, 60, 120);
+    ok(defined($cap_small) && defined($cap_full) && $cap_small < @$plan && $cap_full >= @$plan,
+        'AC27 precondition: rows=44 measures a capacity too small for the whole plan, rows=60 measures one large enough for all of it')
+        or diag(' cap44=' . ($cap_small//'undef') . ' cap60=' . ($cap_full//'undef') . ' plan_size=' . scalar(@$plan));
+  SKIP: {
+        skip('capacities not as expected', 2)
+            unless defined($cap_small) && defined($cap_full) && $cap_small < @$plan && $cap_full >= @$plan;
+        my $ft_small = frame_text(Dashboard::compose_frame($s0, 44, 120));
+        unlike($ft_small, qr/zqxt40-conformance judge/,
+            'AC27 (rows=44, capacity too small for all 40 packages): the conformance-judge row is NOT present -- package rows (pri 3) exhaust the budget first');
+        my $ft_full = frame_text(Dashboard::compose_frame($s0, 60, 120));
+        like($ft_full, qr/zqxt40-conformance judge/,
+            'AC27 (rows=60, capacity large enough for the whole plan): the conformance-judge row IS present');
     }
 }
 
@@ -1453,68 +1531,48 @@ for my $f (@AC1_FIXTURES) {
 # M2, purity, checks (AC30-AC35)
 # ===========================================================================
 
-# --- AC30 --------------------------------------------------------------
+# --- AC30 -- DELETED (01-run-blocks, ruling A / Scope) ------------------
+# _agent_row (ruling A) is removed outright, and with it the concept this
+# AC pinned (a coordinator's own row, at a fixed indent, carrying a label).
+# Ruling A/Scope: coordinators are never shown in the new grammar at all --
+# they collapse into the owning package line's dot and step, contributing
+# no segment and no text. That replacement behaviour ("a coordinator-only
+# package shows its step_word alone, nothing else") is pinned in
+# blueprints-panel-tree.t's AC37-retargeted block, so it is not re-derived
+# here.
+
+# --- AC31 -- RETARGETED (01-run-blocks, spec S2.3.7, ruling J) ----------
+# Was "t/187 AC36 re-asserted" against _tree_lines (ruling A removes it).
+# Ruling J: "non-judge run_agents are not rendered" -- the coordinator/
+# worker/admiral entries that used to get their OWN row at indent 2 now
+# contribute no line at all; only the live judges get a line each, in
+# run_agents order (spec S2.3.7).
 {
-    my $agent = mk_agent(role=>'coordinator', worker_type=>'zqxrc', started_at=>$NOW-10, stale_after_seconds=>7200);
-    my ($row1, $e1) = call1('_agent_row', $agent, 1, $NOW);
-    ok(!$e1, 'AC30 (level 1, worker_type set): _agent_row does not die') or diag(" error: $e1");
-  SKIP: {
-        skip('no row', 3) unless ref($row1) eq 'ARRAY' && ref($row1->[1]) eq 'HASH';
-        is($row1->[1]{text}, 'coordinator  zqxrc', 'AC30 (level 1): label span text is "coordinator  zqxrc"');
-        is($row1->[1]{role}, 'accent', 'AC30 (level 1): label span role is accent');
-        is(row_leading($row1), 2, 'AC30 (level 1): leading indent is 2');
-    }
-
-    my ($row2, $e2) = call1('_agent_row', $agent, 2, $NOW);
-    ok(!$e2, 'AC30 (level 2, worker_type set): _agent_row does not die') or diag(" error: $e2");
-  SKIP: {
-        skip('no row', 1) unless ref($row2) eq 'ARRAY' && ref($row2->[1]) eq 'HASH';
-        is($row2->[1]{text}, 'coordinator', 'AC30 (level 2): label is plain "coordinator" regardless of worker_type');
-    }
-
-    my $agent_nowt = mk_agent(role=>'coordinator', worker_type=>undef, started_at=>$NOW-10, stale_after_seconds=>7200);
-    my ($row3, $e3) = call1('_agent_row', $agent_nowt, 1, $NOW);
-    ok(!$e3, 'AC30 (level 1, worker_type undef): _agent_row does not die') or diag(" error: $e3");
-  SKIP: {
-        skip('no row', 1) unless ref($row3) eq 'ARRAY' && ref($row3->[1]) eq 'HASH';
-        is($row3->[1]{text}, 'coordinator', 'AC30 (level 1, worker_type undef): label is plain "coordinator"');
-    }
-}
-
-# --- AC31 --------------------------------------------------------------
-{
-    my $s = {
-        state => 'running', packages => [],
+    my $s = { blueprint => 'bp31', state => 'running', packages => [],
         run_agents => [
             mk_agent(id=>'c', role=>'coordinator', worker_type=>'zqxrc36', started_at=>$NOW-100),
             mk_agent(id=>'w', role=>'worker',      worker_type=>'zqxrw36', started_at=>$NOW-100),
-            mk_agent(id=>'j', role=>'judge',       worker_type=>'zqxrj36', started_at=>$NOW-100),
+            mk_agent(id=>'j', role=>'judge',       worker_type=>'bp-zqxrj36-judge', started_at=>$NOW-100),
             mk_agent(id=>'u', role=>'admiral',     worker_type=>'zqxru36', started_at=>$NOW-100),
         ],
     };
-    my ($rows, $err) = call1('_tree_lines', $s, $NOW);
-    ok(!$err, 'AC31: _tree_lines does not die') or diag(" error: $err");
+    my ($rows, $err) = call1('_run_summary_lines', [$s], undef, undef, $NOW);
+    ok(!$err, 'AC31: _run_summary_lines does not die') or diag(" error: $err");
   SKIP: {
         skip('no rows', 2) unless ref($rows) eq 'ARRAY';
-        my @order = grep { defined } map {
-            my $t = row_text($rows->[$_]);
-            $t =~ /zqxrc36/ ? 'c' : $t =~ /zqxrw36/ ? 'w' : $t =~ /zqxrj36/ ? 'j' : $t =~ /zqxru36/ ? 'u' : undef;
-        } 0 .. $#$rows;
-        is_deeply(\@order, ['c', 'w', 'j', 'u'], 'AC31 (t/187 AC36 re-asserted): run_agents rows appear in the array\'s own order');
-        my @nonces = qw(zqxrc36 zqxrw36 zqxrj36 zqxru36);
-        my @bad;
-        for my $nonce (@nonces) {
-            my ($row) = grep { row_text($_) =~ /\Q$nonce\E/ } @$rows;
-            push @bad, $nonce if $row && row_leading($row) != 2;
+        is(scalar(@{ $rows || [] }), 2, 'AC31: exactly 2 rows -- the blueprint line and the ONE judge line; coordinator/worker/admiral render NOTHING');
+        like(row_text($rows->[-1]), qr/zqxrj36/, 'AC31: the single surviving row (beyond the blueprint line) is the live judge\'s line');
+        my $joined = join("\n", map { row_text($_) } @$rows);
+        for my $nonce (qw(zqxrc36 zqxrw36 zqxru36)) {
+            unlike($joined, qr/\Q$nonce\E/, "AC31: the non-judge run_agents entry ($nonce) is rendered NOWHERE");
         }
-        is(scalar(@bad), 0, 'AC31 (t/187 AC36 re-asserted): every run_agents row renders at indent 2') or diag(' bad: ' . join(',', @bad));
     }
     my $marker = Theme::glyph('status.judge');
     $marker = '' unless defined $marker;
   SKIP: {
-        skip('no marker', 1) unless length($marker) && ref($rows) eq 'ARRAY';
-        my ($judge_row) = grep { row_text($_) =~ /zqxrj36/ } @$rows;
-        like($judge_row->[1]{text}, qr/^\Q$marker\E/, 'AC31 (t/187 AC36 re-asserted): the judge run_agents row label begins with the judge marker') if $judge_row;
+        skip('no marker', 1) unless length($marker) && ref($rows) eq 'ARRAY' && @$rows >= 2;
+        my ($judge_span) = grep { ref($_) eq 'HASH' && defined($_->{text}) && $_->{text} eq $marker } @{ $rows->[-1] };
+        ok(defined($judge_span), 'AC31: the judge line\'s dot is the judge marker (status.judge)');
     }
 }
 
@@ -1599,20 +1657,28 @@ SKIP: {
         ok(scalar(@running) >= 1, 'AC36 precondition: at least one synth_runs element has state=>running');
       SKIP: {
             skip('no running element', 3) unless @running;
+            # Widened 19 -> 23 / 8 -> 10 by package 01-run-blocks (spec
+            # S2.1/S2.6, C5 write-set amendment): scripts/tui-preview.pl's
+            # synth_runs/_synth_packages now emit paused_window, relaunch_at,
+            # relaunch_local, next_package (run) and step_word, waits_on
+            # (package) -- set equality against RunState's own closed key
+            # set, mechanically widened in lockstep (same rationale as
+            # runstate-package-facts.t's identically-named comment).
             my @RUN_KEYS = qw(blueprint runs_dir state orchestrator_pid orchestrator_alive
                 orchestrator_started_at paused_manual paused_reason packages_total packages_done
                 current_package running_coordinators escalations_waiting inbox_waiting
                 triage_waiting packages run_agents
-                thread thread_events);   # package 13 added the 18th/19th keys to RunState's struct
+                thread thread_events
+                paused_window relaunch_at relaunch_local next_package);
             my $r = $running[0];
-            is_deeply([ sort keys %$r ], [ sort @RUN_KEYS ], 'AC36: a running synth_runs element has EXACTLY the 19 run-level keys RunState emits (set equality)');
+            is_deeply([ sort keys %$r ], [ sort @RUN_KEYS ], 'AC36: a running synth_runs element has EXACTLY the 23 run-level keys RunState emits (set equality)');
             my $pkgs = $r->{packages};
             ok(ref($pkgs) eq 'ARRAY' && @$pkgs, 'AC36 precondition: the running element carries a non-empty packages array');
           SKIP: {
                 skip('no packages', 1) unless ref($pkgs) eq 'ARRAY' && @$pkgs;
-                my @PKG_KEYS = qw(name status attempt attempt_cap step steps_pending next_action agents);
+                my @PKG_KEYS = qw(name status attempt attempt_cap step steps_pending next_action agents step_word waits_on);
                 my @bad = grep { !(ref($_) eq 'HASH' && "@{[sort keys %$_]}" eq "@{[sort @PKG_KEYS]}") } @$pkgs;
-                is(scalar(@bad), 0, 'AC36: every packages element has exactly the 8 package keys');
+                is(scalar(@bad), 0, 'AC36: every packages element has exactly the 10 package keys');
             }
             my @agents;
             push @agents, @{ $_->{agents} } for grep { ref($_->{agents}) eq 'ARRAY' } @$pkgs;
@@ -1684,11 +1750,27 @@ SKIP: {
   SKIP: {
         skip('no such fixture found', 1) unless defined($found_agent);
         my ($dump) = call_main1('render_plain', $found_state, 60, 200, 0, $found_phase);
-        like($dump // '', qr/bp-resolve-judge/, "AC38 (phase=$found_phase): the resolve-judge row is present in the 200x60 dump");
+        # RETARGETED (01-run-blocks, spec S2.3.6, ruling J): the judge
+        # segment's label is no longer the raw worker_type -- it is
+        # "<kind> judge" with a leading bp- and a trailing -judge stripped
+        # ("bp-resolve-judge" -> "resolve judge"). The judge dot
+        # (status.judge, via _judge_marker) is what marks the package line
+        # as stuck-under-a-judge, not the literal worker_type string.
+        like($dump // '', qr/resolve judge/, "AC38 (phase=$found_phase): the resolve-judge segment ('resolve judge', bp-/-judge stripped) is present in the 200x60 dump");
     }
 }
 
 # --- AC39 --------------------------------------------------------------
+# RETARGETED (01-run-blocks): the candidate pool is now restricted to
+# PACKAGE-sourced worker agents only, excluding run_agents entirely -- spec
+# S2.3.7/ruling J says a non-judge run_agents entry (which a worker always
+# is) renders NO line at all, regardless of liveness or budget, so a
+# worker found only in run_agents could never appear in any dump and would
+# make this AC fail for a reason the spec itself predicts, not a missing
+# behaviour. The owning package's status is also required to be outside
+# {blocked, parked}: a BLOCKED/PARKED package's detail never lists agents
+# (spec S2.3.6 BLOCKED detail), so an over-budget worker on such a package
+# would likewise never appear even once the renderer is fully implemented.
 SKIP: {
     skip('preview did not load', 3) unless $PREVIEW_LOADED;
     my ($found_state, $found_agent, $found_phase);
@@ -1696,28 +1778,32 @@ SKIP: {
         my ($state) = call_main1('synth_state', $phase);
         next unless ref($state) eq 'HASH' && ref($state->{runs}) eq 'ARRAY';
         for my $r (@{ $state->{runs} }) {
-            next unless ref($r) eq 'HASH';
-            my @pool;
-            push @pool, @{ $r->{run_agents} } if ref($r->{run_agents}) eq 'ARRAY';
-            push @pool, map { ref($_) eq 'HASH' && ref($_->{agents}) eq 'ARRAY' ? @{ $_->{agents} } : () } @{ $r->{packages} || [] };
-            for my $a (@pool) {
-                next unless ref($a) eq 'HASH' && defined($a->{role}) && $a->{role} eq 'worker';
-                next unless defined($a->{started_at}) && defined($a->{budget_seconds});
-                next unless ($state->{now} // 0) - $a->{started_at} > $a->{budget_seconds};
-                my ($live) = call1('_agent_live', $a, $state->{now});
-                next unless $live;
-                $found_state = $state; $found_agent = $a; $found_phase = $phase;
-                last;
+            next unless ref($r) eq 'HASH' && ref($r->{packages}) eq 'ARRAY';
+            for my $p (@{ $r->{packages} }) {
+                next unless ref($p) eq 'HASH' && defined($p->{status}) && $p->{status} !~ /^(?:blocked|parked)\z/;
+                next unless ref($p->{agents}) eq 'ARRAY';
+                for my $a (@{ $p->{agents} }) {
+                    next unless ref($a) eq 'HASH' && defined($a->{role}) && $a->{role} eq 'worker';
+                    next unless defined($a->{started_at}) && defined($a->{budget_seconds});
+                    next unless ($state->{now} // 0) - $a->{started_at} > $a->{budget_seconds};
+                    my ($live) = call1('_agent_live', $a, $state->{now});
+                    next unless $live;
+                    $found_state = $state; $found_agent = $a; $found_phase = $phase;
+                    last;
+                }
+                last if $found_agent;
             }
             last if $found_agent;
         }
         last if $found_agent;
     }
-    ok(defined($found_agent), 'AC39: some phase yields a live worker with (now - started_at) > budget_seconds (over-budget)');
+    ok(defined($found_agent), 'AC39: some phase yields a live worker (on a non-blocked/parked package) with (now - started_at) > budget_seconds (over-budget)');
   SKIP: {
         skip('no such fixture found', 1) unless defined($found_agent);
         my ($dump) = call_main1('render_plain', $found_state, 60, 200, 0, $found_phase);
-        like($dump // '', qr/\Q$found_agent->{worker_type}\E/, "AC39 (phase=$found_phase): the over-budget worker's worker_type appears in the 200x60 dump");
+        (my $expect_label = $found_agent->{worker_type} // '') =~ s/^bp-//;
+        like($dump // '', qr/\Q$expect_label\E/, "AC39 (phase=$found_phase): the over-budget worker's label (bp- stripped, spec S2.3.6) appears in the 200x60 dump")
+            if length($expect_label);
     }
 }
 
@@ -1955,14 +2041,21 @@ SKIP: {
 # collapses (a notice row is present), per S4's own fixture-discipline
 # rule ("a collapse AC whose precondition fails fails, it does not skip
 # silently"):
-#   - 200x60 phase 9: HAS a side column; this is the exact geometry that
-#     exposed MEDIUM-1 (report said "hidden 5", the frame's own notice
-#     said "+6").
+#   - 200x60 phase 44: HAS a side column; this is a geometry/phase pair
+#     that genuinely produces a "+N rows hidden (short panel)" notice
+#     under package 01-run-blocks's far more compact per-package block
+#     rendering (1-4 package lines per run instead of one row per agent,
+#     S2.3.6) -- phase 9, pinned for the OLD per-agent tree, no longer
+#     collapses at this geometry at all (measured: hidden=0, re-verified
+#     below as a hard precondition rather than assumed). Re-selected by
+#     scanning phases for one whose report and rendered notice both show
+#     a non-zero hidden count (S4's "measured, not modeled" discipline),
+#     landing on 44 (hidden 7) as the first that also HAS a side column.
 #   - 120x35 phase 5: no side column, the narrow case, same phase family
 #     as the original geometry but at a height that genuinely produces a
 #     Blueprints body instead of none at all.
 for my $case (
-    { geom => '200x60', phase => 9, label => 'wide, side column' },
+    { geom => '200x60', phase => 44, label => 'wide, side column' },
     { geom => '120x35', phase => 5, label => 'narrow, no side column' },
 ) {
     my ($out, $rc);
@@ -2057,16 +2150,22 @@ for my $case (
         ok(defined($idx), 'package-13/B16: a plan entry mentions the thread name zqx13-thrln') or diag(' plan: ' . join(' | ', map { row_text($_->{spans}) } @$plan));
       SKIP: {
             skip('thread entry not found', 3) unless defined $idx;
-            is($entry->{kind}, 'partial', 'package-13/B16: the thread-line entry reuses kind "partial" (no eleventh kind invented)');
-            is($entry->{pri}, 2, 'package-13/B16: the thread-line entry has pri 2 (S2.3 placement)');
-            ok(defined($entry->{parent}) && $entry->{parent} < $idx, 'package-13/B16: the thread-line entry has a defined parent index strictly before itself (the run row)');
+            # Retargeted (spec S2.2.1/S2.3.4/S2.5, ruling A): package
+            # 13-dashboard-threads's own `_thread_line` is one of the subs
+            # ruling A removes; 01-run-blocks's `_run_block` renders a
+            # thread (or no-thread) driver line as its OWN `driver` kind
+            # (not a reused 'partial'), still pri 2, per S2.5's table.
+            is($entry->{kind}, 'driver', 'package-13/B16: the thread-line entry is kind "driver" (S2.5\'s own kind for a thread or no-thread driver line, not a reused "partial")');
+            is($entry->{pri}, 2, 'package-13/B16: the thread-line entry has pri 2 (S2.5 placement)');
+            ok(defined($entry->{parent}) && $entry->{parent} < $idx, 'package-13/B16: the thread-line entry has a defined parent index strictly before itself (the blueprint row)');
         }
 
-        # AC2's closed 10-word kind vocabulary (already including 'partial')
-        # keeps holding with a thread line in the plan.
-        my %KIND = map { $_ => 1 } qw(run partial cur overflow orchestrator package coordinator worker judge other);
+        # AC2's closed kind vocabulary is now S2.5's six (blueprint/
+        # overflow/driver/package/judge/next), and still holds with a
+        # thread (driver) line in the plan.
+        my %KIND = map { $_ => 1 } qw(blueprint overflow driver package judge next);
         my @bad_kind = grep { !(ref($plan->[$_]) eq 'HASH' && defined($plan->[$_]{kind}) && $KIND{$plan->[$_]{kind}}) } (0 .. $#$plan);
-        is(scalar(@bad_kind), 0, 'package-13/B16 (AC2): every plan entry kind is still one of the ten listed, with a thread line present')
+        is(scalar(@bad_kind), 0, 'package-13/B16 (AC2): every plan entry kind is still one of S2.5\'s six, with a thread line present')
             or diag(' bad idx: ' . join(',', @bad_kind));
     }
 
@@ -2074,7 +2173,7 @@ for my $case (
     # thread, and a budget that still has room for the run row and the
     # thread line (but not everything), the thread line must survive.
     my $s40 = base_state(runs => [ tree_run_40pkg(thread => $thread, blueprint => 'zqx13-runbp') ]);
-    my ($width) = call1('_blueprints_table_width', 120);
+    my ($width) = call1('_blueprints_body_width', 120);
     my ($plan40, $eplan40) = call1('_blueprints_row_plan', $s40, 120);
     ok(!$eplan40, 'package-13/B16 (40pkg): _blueprints_row_plan does not die') or diag(" error: $eplan40");
   SKIP: {

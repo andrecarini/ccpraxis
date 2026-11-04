@@ -390,7 +390,6 @@ my $LIVE_DIR  = make_bp($LIVE_ROOT, 'coord-bp',
         [ q{open '-|'},           qr/open\s*\(?\s*[^,]*,\s*['"]-\|['"]/ ],
         [ 'glob',                 qr/\bglob\b/ ],
         [ 'time(',                qr/\btime\s*\(/ ],
-        [ 'localtime',            qr/\blocaltime\b/ ],
         [ 'gmtime',               qr/\bgmtime\b/ ],
         [ 'print',                qr/\bprint\b/ ],
         [ 'warn',                 qr/\bwarn\b/ ],
@@ -400,6 +399,25 @@ my $LIVE_DIR  = make_bp($LIVE_ROOT, 'coord-bp',
         my ($label, $qr) = @$f;
         my $desc = "AC-21: RunState.pm source (comments stripped) contains no $label";
         $have ? unlike($src, $qr, $desc) : fail("$desc [RunState.pm not on disk]");
+    }
+
+    # CHANGED by package 01-run-blocks (spec S2.1.6/S5.2, ruling C3):
+    # localtime is narrowed, not forbidden -- exactly one call, inside
+    # _local_parts, converting an on-disk relaunch_at epoch.
+    {
+        my $desc_count = 'AC-21: RunState.pm source (comments stripped) contains exactly one localtime call';
+        my $count = () = ($src =~ /\blocaltime\b/g);
+        $have ? is($count, 1, $desc_count) : fail("$desc_count [RunState.pm not on disk]");
+
+        my $desc_shape = 'AC-21: the one localtime call has the form localtime($var)';
+        $have ? like($src, qr/\blocaltime\(\s*\$\w+\s*\)/, $desc_shape) : fail("$desc_shape [RunState.pm not on disk]");
+
+        my $desc_loc = 'AC-21: the localtime call lies between sub _local_parts and the next sub';
+        my $ok_loc = 0;
+        if ($have && $src =~ /\bsub\s+_local_parts\b(.*?)(?:\nsub\s|\z)/s) {
+            $ok_loc = ($1 =~ /\blocaltime\b/) ? 1 : 0;
+        }
+        $have ? ok($ok_loc, $desc_loc) : fail("$desc_loc [RunState.pm not on disk]");
     }
 }
 
@@ -623,13 +641,20 @@ my $LIVE_DIR  = make_bp($LIVE_ROOT, 'coord-bp',
     # 0; the live builder lays the same facts out differently, and an oracle
     # that pins WHERE a fact sits breaks on every reflow while an oracle that
     # pins WHAT it says does not.
+    #
+    # RE-RETARGETED by package 01-run-blocks (spec S5.1 table): the table
+    # (_one_run_summary_cells) is gone (ruling A). The same property --
+    # unrecognised state rendered verbatim and muted -- now lives on the
+    # STATE span of the blueprint line, lines[0], of _run_block.
     for my $state (qw(stale solo)) {
-        my $cells = eval { tui::DashboardScreen::_one_run_summary_cells(
-            mk_summary(blueprint => 'b', state => $state), 80) };
-        ok(!$@, "AC-22: the live run-summary renderer does not die rendering state=>'$state'")
+        my $block = eval { tui::DashboardScreen::_run_block(
+            mk_summary(blueprint => 'b', state => $state), 1_800_000_000, undef) };
+        ok(!$@, "AC-22: the live run-block renderer does not die rendering state=>'$state'")
             or diag("  \$\@ = $@");
-        my @spans = map { @$_ } grep { ref($_) eq 'ARRAY' } @{ $cells || [] };
-        my ($state_span) = grep { ref($_) eq 'HASH' && defined($_->{text}) && $_->{text} eq $state } @spans;
+        my $spans = (ref($block) eq 'HASH' && ref($block->{lines}) eq 'ARRAY' && ref($block->{lines}[0]) eq 'HASH')
+            ? $block->{lines}[0]{spans} : undef;
+        my ($state_span) = grep { ref($_) eq 'HASH' && defined($_->{text}) && $_->{text} eq $state }
+            (ref($spans) eq 'ARRAY' ? @$spans : ());
         ok($state_span, "AC-22: state=>'$state' -- a span carries the state VERBATIM (no renderer change needed)");
         is(ref($state_span) eq 'HASH' ? $state_span->{role} : undef, 'text.muted',
             "AC-22: state=>'$state' -- that span is muted (the unknown-state fallback)");

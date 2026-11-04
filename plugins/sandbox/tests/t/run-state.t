@@ -340,11 +340,16 @@ sub field       { my ($h, $k) = @_; return is_hashref($h) ? $h->{$k} : $FAILED; 
 # up to $RunState::MAX_THREAD_EVENTS newest thread-log entries, identical
 # across every summary from one summarize() call) are ALWAYS present, same
 # closed-set discipline as every earlier widening.
+# Widened 19 -> 23 by package 01-run-blocks (spec S2.1): paused_window,
+# relaunch_at, relaunch_local and next_package are ALWAYS present (closed
+# key set discipline, same as every earlier widening), undef when their
+# source is absent.
 my @SUMMARY_KEYS = qw(
     blueprint runs_dir state orchestrator_pid orchestrator_alive orchestrator_started_at
     paused_manual paused_reason packages_total packages_done current_package
     running_coordinators escalations_waiting inbox_waiting triage_waiting packages
     run_agents thread thread_events
+    paused_window relaunch_at relaunch_local next_package
 );
 
 # EVENT_KEYS -- the 11 always-present keys of one %event element inside
@@ -356,7 +361,7 @@ my @EVENT_KEYS = qw(thread id at epoch event actor session task from to reason);
 sub assert_summary_shape {
     my ($s, $label) = @_;
     ok(is_hashref($s), "$label: summary is a hashref") or return;
-    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS ], "$label: exactly the 19 S2.1+AT-8+package-13 keys, no more, no fewer");
+    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS ], "$label: exactly the 23 S2.1+AT-8+package-13+package-01-run-blocks keys, no more, no fewer");
     ok(defined($s->{blueprint}) && !ref($s->{blueprint}) && length($s->{blueprint}), "$label: blueprint is a non-empty Str");
     ok(defined($s->{runs_dir})  && !ref($s->{runs_dir})  && length($s->{runs_dir}),  "$label: runs_dir is a non-empty Str");
     # Widened by blueprint unified-tui-design-system package
@@ -435,6 +440,24 @@ sub assert_summary_shape {
             is_deeply([ sort keys %$e ], [ sort @EVENT_KEYS ], "$label: thread_events[$i] has exactly the 11 S2.2 event keys");
         }
     }
+
+    # package 01-run-blocks (spec S2.1): paused_window, relaunch_at,
+    # relaunch_local, next_package.
+    ok(!defined($s->{paused_window}) || (!ref($s->{paused_window}) && $s->{paused_window} =~ /\A[a-z0-9_]{1,32}\z/),
+        "$label: paused_window is undef or a bare [a-z0-9_]{1,32} token");
+    ok(!defined($s->{relaunch_at}) || ($s->{relaunch_at} =~ /^\d+$/ && $s->{relaunch_at} > 0),
+        "$label: relaunch_at is undef or a positive Int epoch");
+    ok(!defined($s->{relaunch_local}) || is_hashref($s->{relaunch_local}),
+        "$label: relaunch_local is undef or a HASH");
+    if (is_hashref($s->{relaunch_local})) {
+        is_deeply([ sort keys %{ $s->{relaunch_local} } ], [ sort qw(wday hhmm day mon) ],
+            "$label: relaunch_local has exactly wday/hhmm/day/mon");
+    }
+    # relaunch_local is undef iff relaunch_at is undef (AC25).
+    is(defined($s->{relaunch_at}) ? 1 : 0, defined($s->{relaunch_local}) ? 1 : 0,
+        "$label: relaunch_local definedness tracks relaunch_at definedness");
+    ok(!defined($s->{next_package}) || (!ref($s->{next_package}) && length($s->{next_package})),
+        "$label: next_package is undef or a non-empty Str");
 }
 
 # ===========================================================================
@@ -489,13 +512,34 @@ BAIL_OUT("tui::DashboardScreen.pm did not load ($@) -- LABEL_GUTTER() is this fi
         [ 'warn',      qr/\bwarn\b/ ],
         [ 'die',       qr/\bdie\b/ ],
         [ 'time(',     qr/\btime\s*\(/ ],
-        [ 'localtime', qr/\blocaltime\b/ ],
         [ 'gmtime',    qr/\bgmtime\b/ ],
     );
     for my $q (@quiet) {
         my ($label, $qr) = @$q;
         my $desc = "S2.0: RunState.pm source (comments stripped) contains no $label";
         $have ? unlike($src, $qr, $desc) : fail("$desc [RunState.pm not on disk]");
+    }
+
+    # CHANGED by package 01-run-blocks (spec S2.1.6/S5.2, ruling C3): the old
+    # blanket "no localtime anywhere" scan is narrowed. RunState now converts
+    # an on-disk relaunch_at epoch to local parts in exactly one helper,
+    # _local_parts -- a timezone conversion of a value already read from
+    # disk, not a clock read (no time(), no argument-less localtime()). The
+    # narrowed scan still forbids localtime ANYWHERE ELSE in the module.
+    {
+        my $desc_count = 'S2.1.6: RunState.pm source (comments stripped) contains exactly one localtime call';
+        my $count = () = ($src =~ /\blocaltime\b/g);
+        $have ? is($count, 1, $desc_count) : fail("$desc_count [RunState.pm not on disk]");
+
+        my $desc_shape = 'S2.1.6: the one localtime call has the form localtime($var)';
+        $have ? like($src, qr/\blocaltime\(\s*\$\w+\s*\)/, $desc_shape) : fail("$desc_shape [RunState.pm not on disk]");
+
+        my $desc_loc = 'S2.1.6: the localtime call lies between sub _local_parts and the next sub';
+        my $ok_loc = 0;
+        if ($have && $src =~ /\bsub\s+_local_parts\b(.*?)(?:\nsub\s|\z)/s) {
+            $ok_loc = ($1 =~ /\blocaltime\b/) ? 1 : 0;
+        }
+        $have ? ok($ok_loc, $desc_loc) : fail("$desc_loc [RunState.pm not on disk]");
     }
 
     # --- S2.0: nothing exported. -------------------------------------------
@@ -828,7 +872,7 @@ sub can_detect_symlink {
     is(field($s, 'state'), 'parked', "AC12 (B15): authored parked beats a live orchestrator marker");
     SKIP: {
         skip 'summarize_dir did not return a hashref', 1 unless is_hashref($s);
-        is_deeply([sort keys %$s], [sort @SUMMARY_KEYS], 'AC12 (B15): the key set is still the closed set (19, package 13 widening)');
+        is_deeply([sort keys %$s], [sort @SUMMARY_KEYS], 'AC12 (B15): the key set is still the closed set (23, package 01-run-blocks widening)');
     }
 
     my $root2 = tempdir(CLEANUP => 1);
@@ -1413,6 +1457,107 @@ my %BASE_STATE = (
     is(field($s, 'thread'), undef, 'B6/AC1: no almanac/thread/ dir anywhere -> summary.thread is undef');
     is_deeply(field($s, 'thread_events'), [], 'B6/AC1: ... -> summary.thread_events is [] (ARRAY, never undef)');
     assert_summary_shape($s, 'package-13 no-thread fixture');
+}
+
+# ===========================================================================
+# 15. package 01-run-blocks, step-7 fix-batch oracle strengthening
+#     (reports/01-run-blocks/redteam-step6.md MAJOR-1/MINOR-1; triage item
+#     3 of the ledger's step-6 attempt log): _last_pause_window's tail scan
+#     and its cross-check against .paused.
+# ===========================================================================
+
+# AC24 (step-7 strengthening): MAJOR-1 -- the orchestrator keeps appending
+# busy_lease_tick/usage_poll records to orchestrator.log for the WHOLE
+# duration of a pause (bp-orchestrator.pl:4700-4745); only the pause record
+# itself is written once. A tail read bounded at $MAX_ORCH_LOG_TAIL_BYTES
+# (64 KiB) therefore pushes the pause record out of the window after a long
+# enough pause, and paused_window silently degrades from 'seven_day' to
+# undef ("weekly limit" -> "usage limit") -- exactly the scenario Decision
+# 10's target block exists to show. Minimal fix (redteam's own proposal): a
+# backward chunked scan past 64 KiB, cheaply prefiltered, under a larger
+# byte cap.
+{
+    my $root = tempdir(CLEANUP => 1);
+    make_blueprint($root, 'long-pause', registry => registry_json(p1 => 'running'),
+        paused => '{"reason":"usage","relaunch_at":1762193100,"resets_at":1762192500,"created_at":1762000000}');
+    my $dir = "$root/long-pause";
+    my @log_lines = ('{"ts":1,"type":"pause","reason":"usage","window":"seven_day","resets_at":2,"relaunch_at":1762193100,"util":0}');
+    # ~352,000 bytes of busy_lease_tick noise AFTER the pause record -- well
+    # past the 64 KiB tail cap, matching the redteam's measured real-log
+    # figure (423 KB accumulated during one real weekly pause).
+    push @log_lines, '{"ts":3,"type":"busy_lease_tick","util":0}' for (1 .. 8000);
+    write_file("$dir/runs/orchestrator.log", join("\n", @log_lines) . "\n");
+
+    my $s = RS('summarize_dir', $dir);
+    ok(is_hashref($s), 'AC24 (long pause, >64KB tail) precondition: summarize_dir returns a hashref') or diag(" got: " . (defined($s) ? $s : 'undef'));
+    is(field($s, 'paused_window'), 'seven_day',
+        'AC24 (long pause, >64KB tail, MAJOR-1): paused_window is still the pause record\'s window even though >64 KiB of later log records sit between it and EOF');
+}
+
+# AC24 (step-7 strengthening): MINOR-1 -- a pause written WITHOUT a matching
+# orchestrator.log pause record (e.g. drive-solo's bp-drive-next.pl, which
+# writes .paused directly with no log append) must not silently inherit an
+# OLDER, unrelated pause record's window just because it is the nearest one
+# to EOF. The log record carries its own relaunch_at; the fix accepts the
+# window only when that value agrees with .paused's relaunch_at (or the
+# record is at/after .paused's created_at) -- otherwise the window is
+# undef, and the panel falls back to the generic "usage limit" rather than
+# asserting a weekly/5-hour window that was never decided for THIS pause.
+{
+    my $root = tempdir(CLEANUP => 1);
+    make_blueprint($root, 'mismatched-pause', registry => registry_json(p1 => 'running'),
+        paused => '{"reason":"usage","relaunch_at":1762500000,"resets_at":1762499000,"created_at":1762400000}');
+    my $dir = "$root/mismatched-pause";
+    # The log's only pause record is from an EARLIER pause cycle: a
+    # different relaunch_at/resets_at, and a ts well before .paused's
+    # created_at.
+    write_file("$dir/runs/orchestrator.log",
+        '{"ts":1,"type":"pause","reason":"usage","window":"five_hour","resets_at":1,"relaunch_at":1,"util":0}' . "\n");
+
+    my $s = RS('summarize_dir', $dir);
+    ok(is_hashref($s), 'AC24 (mismatched pause record) precondition: summarize_dir returns a hashref') or diag(" got: " . (defined($s) ? $s : 'undef'));
+    is(field($s, 'paused_window'), undef,
+        'AC24 (mismatched pause record, MINOR-1): paused_window is undef, NOT the stale "five_hour" of an older pause record whose relaunch_at disagrees with the CURRENT .paused');
+
+    # Non-vacuity / contrast: the SAME log record, when its relaunch_at DOES
+    # agree with .paused, is accepted.
+    my $root2 = tempdir(CLEANUP => 1);
+    make_blueprint($root2, 'matched-pause', registry => registry_json(p1 => 'running'),
+        paused => '{"reason":"usage","relaunch_at":1,"resets_at":1,"created_at":1}');
+    my $dir2 = "$root2/matched-pause";
+    write_file("$dir2/runs/orchestrator.log",
+        '{"ts":1,"type":"pause","reason":"usage","window":"five_hour","resets_at":1,"relaunch_at":1,"util":0}' . "\n");
+    my $s2 = RS('summarize_dir', $dir2);
+    is(field($s2, 'paused_window'), 'five_hour',
+        'AC24 (matched pause record) non-vacuity: the SAME log record is accepted when its relaunch_at agrees with .paused -- proving the rejection above is the mismatch, not the mechanism');
+}
+
+# AC26 (step-7 strengthening): redteam MINOR-2 -- next_package must resolve
+# short-id dependency PREFIXES the same way the orchestrator's own
+# resolve_dep_token/deps_met do (bp-orchestrator.pl:1507-1559): exact match,
+# then case-insensitive, then a UNIQUE "<tok>-" prefix match against the
+# table's own pkg ids. An exact-key-only reader (today's _next_package)
+# treats a short-id dep as unmet forever, so a package the orchestrator
+# would actually start next is skipped in favour of a later one.
+{
+    my $root = tempdir(CLEANUP => 1);
+    my $dir = make_blueprint($root, 'short-id-deps', registry => registry_json(),
+        packages => {
+            '01-a' => ledger_with_status('done'),
+            '02-b' => ledger_with_status('pending'),
+            '03-c' => ledger_with_status('pending'),
+        });
+    write_file("$dir/blueprint.md", join("\n",
+        '| pkg | deliverable | depends_on | model |',
+        '|-----|-------------|------------|-------|',
+        "| 01-a | x | \xE2\x80\x94 | sonnet |",
+        '| 02-b | y | 01 | sonnet |',        # short-id prefix dep on 01-a
+        '| 03-c | z | 01-a | sonnet |',      # exact dep, later in doc order
+        ''));
+    my $s = RS('summarize_dir', $dir);
+    ok(is_hashref($s), 'AC26 (short-id dep prefix) precondition: summarize_dir returns a hashref') or diag(" got: " . (defined($s) ? $s : 'undef'));
+    is(field($s, 'next_package'), '02-b',
+        'AC26 (short-id dep prefix, MINOR-2): next_package is 02-b -- its dep token "01" resolves as a unique short-id PREFIX of "01-a" (done), exactly as the orchestrator\'s own resolve_dep_token/deps_met would; an exact-match-only reader would skip it and wrongly report 03-c');
 }
 
 done_testing();

@@ -895,12 +895,23 @@ sub _ac11_expect {
         owner   => { kind => 'session', id => 'zqx15-sess', alive => undef, activity_at => 1_700_000_000, armed => 0 },
     };
     my $now = 1_700_000_100;
-    my ($line_spans, $line_err) = (eval { tui::DashboardScreen::_thread_line({ thread => $thread }, $now) }, $@);
-    ok(!$line_err, 'package-13/B15 precondition: tui::DashboardScreen::_thread_line does not die') or diag(" error: $line_err");
-    ok(ref($line_spans) eq 'ARRAY' && @$line_spans, 'package-13/B15 precondition: _thread_line returns a non-empty spans row');
+    # RETARGETED by package 01-run-blocks (spec S5.1 table): _thread_line is
+    # removed (ruling A). The same precondition -- a real, non-degenerate
+    # driver line to word-survival-test under wrapping -- is now the
+    # `driver`-kind line of _run_block($summary, $now, undef).
+    my $summary_13 = { blueprint => 'zqx15-tooling-fixes', state => 'running',
+        packages_done => 4, packages_total => 9, running_coordinators => 0,
+        escalations_waiting => 0, thread => $thread };
+    my $block = eval { tui::DashboardScreen::_run_block($summary_13, $now, undef) };
+    my $line_err = $@;
+    ok(!$line_err, 'package-13/B15 precondition: tui::DashboardScreen::_run_block does not die') or diag(" error: $line_err");
+    my ($driver_line) = (ref($block) eq 'HASH' && ref($block->{lines}) eq 'ARRAY')
+        ? (grep { ref($_) eq 'HASH' && ($_->{kind} // '') eq 'driver' } @{ $block->{lines} }) : ();
+    my $line_spans = (ref($driver_line) eq 'HASH') ? $driver_line->{spans} : undef;
+    ok(ref($line_spans) eq 'ARRAY' && @$line_spans, 'package-13/B15 precondition: _run_block returns a non-empty driver-line spans row');
 
   SKIP: {
-        skip('_thread_line not available', 1) unless ref($line_spans) eq 'ARRAY' && @$line_spans;
+        skip('_run_block driver line not available', 1) unless ref($line_spans) eq 'ARRAY' && @$line_spans;
         my $line_text = Dashboard::spans_text($line_spans);
         my @words = grep { length } split /\s+/, $line_text;
         ok(scalar(@words) > 3, 'package-13/B15 precondition: the thread line has more than 3 words (a real fixture, not a degenerate one)');

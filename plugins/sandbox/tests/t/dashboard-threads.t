@@ -333,21 +333,42 @@ SKIP: {
     my $th = field($s, 'thread');
     skip('no thread hash from AC1', 1) unless is_hashref($th);
 
-    my $FULL  = Theme::glyph('gauge.full');
-    my $EMPTY = Theme::glyph('gauge.empty');
+    # Spec S2.3 (Meter): a thread bar B(d,t) uses thread.full/thread.empty,
+    # NOT the blueprint-progress meter's gauge.full/gauge.empty (Theme.pm:
+    # distinct glyphs, U+25B0/U+25B1 vs U+2501/U+2500). Ruling F pins this
+    # bar to the session-owned thread line.
+    my $FULL  = Theme::glyph('thread.full');
+    my $EMPTY = Theme::glyph('thread.empty');
     ok(defined($FULL) && defined($EMPTY) && length($FULL) && length($EMPTY),
-        'AC6/B2 precondition: Theme declares gauge.full/gauge.empty glyphs');
+        'AC6/B2 precondition: Theme declares thread.full/thread.empty glyphs');
   SKIP: {
-        skip('no gauge glyphs', 2) unless defined($FULL) && defined($EMPTY) && length($FULL) && length($EMPTY);
-        my $line = eval { tui::DashboardScreen::_thread_line({ thread => $th }, 1_700_000_100) };
-        my $err  = $@;
-        ok(!$err, 'AC6/B2: _thread_line does not die') or diag(" error: $err");
+        skip('no thread bar glyphs', 2) unless defined($FULL) && defined($EMPTY) && length($FULL) && length($EMPTY);
+        # RETARGETED by package 01-run-blocks (spec S5.1 table): _thread_line
+        # is removed (ruling A). The same exact-text pin now targets the
+        # `driver`-kind line of _run_block (spec S2.3.4): a session-owned
+        # thread (not a mirror) renders its own 15-cell thread.full/
+        # thread.empty bar, "done/total", then "session " + status.ok (live).
+        # Ruling H: the thread's own `doing`/`next` labels are no longer
+        # rendered at all -- the old golden text's "doing ... +1  next ..."
+        # tail is GONE, not retargeted.
+        my $block = eval { tui::DashboardScreen::_run_block({ thread => $th }, 1_700_000_100, undef) };
+        my $err   = $@;
+        ok(!$err, 'AC6/B2: _run_block does not die') or diag(" error: $err");
       SKIP: {
-            skip('_thread_line died', 1) unless !$err;
-            my $text = Dashboard::spans_text($line);
-            my $expected = "  thread drive-tooling " . ($FULL x 4) . ($EMPTY x 5)
-                . " 4/9  doing tooling-fixes/12 scout +1  next tooling-fixes/13 scout  session live";
-            is($text, $expected, 'AC6/B2: _thread_line spans_text matches exactly');
+            skip('_run_block died', 1) unless !$err;
+            my ($driver_line) = (ref($block) eq 'HASH' && ref($block->{lines}) eq 'ARRAY')
+                ? (grep { ref($_) eq 'HASH' && ($_->{kind} // '') eq 'driver' } @{ $block->{lines} }) : ();
+            ok(ref($driver_line) eq 'HASH', 'AC6/B2 precondition: _run_block emits a driver line') or skip('no driver line', 1);
+            my $text = Dashboard::spans_text($driver_line->{spans});
+            my $THREADS = Theme::glyph('icon.threads') // '';
+            my $OK      = Theme::glyph('status.ok') // '';
+            # W = max(dw('?') [no blueprint name given], dw('drive-tooling')) = 13.
+            my $W = tui::Layout::display_width('drive-tooling');
+            my $name_padded = 'drive-tooling' . (' ' x ($W + 2 - length('drive-tooling')));
+            # B(4,9): f = ceil(4*15/9) = 7 (capped at 14; d<t so never 15).
+            my $bar = ($FULL x 7) . ($EMPTY x 8);
+            my $expected = '  ' . $THREADS . ' ' . $name_padded . $bar . '  4/9' . '   ' . 'session ' . $OK;
+            is($text, $expected, 'AC6/B2: the driver line spans_text matches exactly');
         }
     }
 }
@@ -434,16 +455,25 @@ SKIP: {
             skip('DashboardScreen/Theme not loaded', 3) unless $DS_OK && $THEME_OK;
             my ($word) = eval { tui::DashboardScreen::thread_owner_status($th, 1_700_000_000) };
             is($word, 'unowned', 'AC5/B4: thread_owner_status is unowned (state handed-off beats owner.kind)');
-            my $line = eval { tui::DashboardScreen::_thread_line({ thread => $th }, 1_700_000_000) };
-            my $err  = $@;
-            ok(!$err, 'AC6/B4: _thread_line does not die') or diag(" error: $err");
+            # RETARGETED by package 01-run-blocks (spec S5.1 table): same
+            # swap as AC6/B2 above. The driver line now ends "handed off " +
+            # status.warn, then THREAD_STATE (thread.doing is empty here) =
+            # thread.blocked + " blocked <title> waiting on <id>". The old
+            # "next Announce it" assertion is REMOVED: ruling E says the
+            # thread's own `next` is never rendered.
+            my $block = eval { tui::DashboardScreen::_run_block({ thread => $th }, 1_700_000_000, undef) };
+            my $err   = $@;
+            ok(!$err, 'AC6/B4: _run_block does not die') or diag(" error: $err");
           SKIP: {
-                skip('_thread_line died', 1) unless !$err;
-                my $text = Dashboard::spans_text($line);
+                skip('_run_block died', 1) unless !$err;
+                my ($driver_line) = (ref($block) eq 'HASH' && ref($block->{lines}) eq 'ARRAY')
+                    ? (grep { ref($_) eq 'HASH' && ($_->{kind} // '') eq 'driver' } @{ $block->{lines} }) : ();
+                ok(ref($driver_line) eq 'HASH', 'AC6/B4 precondition: _run_block emits a driver line') or skip('no driver line', 4);
+                my $text = Dashboard::spans_text($driver_line->{spans});
                 like($text, qr/blocked Publish the package waiting on 20261002-120000-abcd/,
                     'AC6/B4: the blocked form has no colon and carries "waiting on <id>"');
-                like($text, qr/next Announce it/, 'AC6/B4: the next form is present');
-                like($text, qr/handed off\z/, 'AC6/B4: the line ends "handed off"');
+                unlike($text, qr/next Announce it/, 'AC6/B4: the thread\'s own "next" is NOT rendered (ruling E)');
+                like($text, qr/handed off /, 'AC6/B4: the line carries "handed off "');
                 unlike($text, qr/:/, 'AC6/B4: the rendered line contains no colon at all');
             }
         }

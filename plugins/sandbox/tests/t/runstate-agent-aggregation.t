@@ -429,7 +429,15 @@ my @SUMMARY_KEYS_17 = (@SUMMARY_KEYS_16, 'run_agents');
 # runstate-package-facts.t.
 my @SUMMARY_KEYS_19 = (@SUMMARY_KEYS_17, 'thread', 'thread_events');
 
+# Widened 19 -> 23 / 8 -> 10 by package 01-run-blocks (spec S2.1):
+# paused_window, relaunch_at, relaunch_local, next_package (run level) and
+# step_word, waits_on (package level). Same mechanical-widening rationale
+# as the 17->19 comment above -- this file's own ACs are unrelated to
+# package 01-run-blocks.
+my @SUMMARY_KEYS_23 = (@SUMMARY_KEYS_19, 'paused_window', 'relaunch_at', 'relaunch_local', 'next_package');
+
 my @PKG_KEYS_8 = qw(agents attempt attempt_cap name next_action status step steps_pending);
+my @PKG_KEYS_10 = (@PKG_KEYS_8, 'step_word', 'waits_on');
 
 my @AGENT_KEYS = qw(budget_seconds id role stale_after_seconds started_at worker_type);
 my @FORBIDDEN_AGENT_KEYS = qw(
@@ -440,15 +448,15 @@ my @FORBIDDEN_AGENT_KEYS = qw(
 sub assert_17_keys {
     my ($s, $label) = @_;
     ok(is_hashref($s), "$label: summary is a hashref") or return;
-    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS_19 ],
-        "$label: AC1 [AT-8 amended, 16->17; package-13 widened 17->19] -- exactly the 19 run-level keys, incl. run_agents/thread/thread_events");
+    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS_23 ],
+        "$label: AC1 [AT-8 amended, 16->17; package-13 widened 17->19; package-01-run-blocks widened 19->23] -- exactly the 23 run-level keys, incl. run_agents/thread/thread_events/paused_window/relaunch_at/relaunch_local/next_package");
     ok(is_arrayref($s->{run_agents}), "$label: AT-8 -- run_agents is an ARRAY ref, never undef");
 }
 
 sub assert_pkg8_shape {
     my ($e, $label) = @_;
     ok(is_hashref($e), "$label: package entry is a hashref") or return;
-    is_deeply([ sort keys %$e ], [ sort @PKG_KEYS_8 ], "$label: AC2 -- exactly the 8 S2.2 keys");
+    is_deeply([ sort keys %$e ], [ sort @PKG_KEYS_10 ], "$label: AC2 -- exactly the 10 S2.2+package-01-run-blocks keys");
     ok(is_arrayref($e->{agents}), "$label: AC3 -- agents is an ARRAY ref, never undef");
 }
 
@@ -515,7 +523,6 @@ use_ok('RunState');
 
     my @forbidden = (
         [ 'time(',                qr/\btime\s*\(/ ],
-        [ 'localtime',            qr/\blocaltime\b/ ],
         [ 'gmtime',                qr/\bgmtime\b/ ],
         [ 'kill',                   qr/\bkill\b/ ],
         [ 'a backtick character',   qr/`/ ],
@@ -538,6 +545,25 @@ use_ok('RunState');
         my $qr = qr/\b(?:require|use)\b[^\n;]*\Q$needle\E/;
         $have ? unlike($src, $qr, $desc) : fail("$desc [RunState.pm not on disk]");
     }
+
+    # CHANGED by package 01-run-blocks (spec S2.1.6/S5.2, ruling C3):
+    # localtime is narrowed, not forbidden -- exactly one call, inside
+    # _local_parts, converting an on-disk epoch.
+    {
+        my $desc_count = 'AC42: RunState.pm source (comments stripped) contains exactly one localtime call';
+        my $count = () = ($src =~ /\blocaltime\b/g);
+        $have ? is($count, 1, $desc_count) : fail("$desc_count [RunState.pm not on disk]");
+
+        my $desc_shape = 'AC42: the one localtime call has the form localtime($var)';
+        $have ? like($src, qr/\blocaltime\(\s*\$\w+\s*\)/, $desc_shape) : fail("$desc_shape [RunState.pm not on disk]");
+
+        my $desc_loc = 'AC42: the localtime call lies between sub _local_parts and the next sub';
+        my $ok_loc = 0;
+        if ($have && $src =~ /\bsub\s+_local_parts\b(.*?)(?:\nsub\s|\z)/s) {
+            $ok_loc = ($1 =~ /\blocaltime\b/) ? 1 : 0;
+        }
+        $have ? ok($ok_loc, $desc_loc) : fail("$desc_loc [RunState.pm not on disk]");
+    }
 }
 
 # --- AC43: t/run-state.t green, and its own @SUMMARY_KEYS still holds --
@@ -557,7 +583,11 @@ use_ok('RunState');
         # @SUMMARY_KEYS gained `thread` and `thread_events` (spec S2.2), another
         # driver-authorised widening of the exact same literal this assertion reads --
         # same precedent as the 16->17 edit just above, now superseded in turn.
-        is(scalar(@names), 19, 'AC43: t/45 @SUMMARY_KEYS holds all 19 names (AT-8 + package-13 widenings)');
+        # Widened 19 -> 23 by package 01-run-blocks (spec S2.1): t/45's own
+        # @SUMMARY_KEYS gained paused_window/relaunch_at/relaunch_local/
+        # next_package, another driver-authorised widening of the exact
+        # same literal this assertion reads.
+        is(scalar(@names), 23, 'AC43: t/45 @SUMMARY_KEYS holds all 23 names (AT-8 + package-13 + package-01-run-blocks widenings)');
         ok(!(grep { $_ eq 'agents' } @names), q{AC43: t/45 @SUMMARY_KEYS contains no 'agents'});
     }
     else {

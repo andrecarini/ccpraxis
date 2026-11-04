@@ -1040,108 +1040,64 @@ sub _nonneg_int {
     return (defined($v) && !ref($v) && $v =~ /^\d+$/) ? ($v + 0) : 0;
 }
 
-# _one_run_summary_cells($s) -> \@cells, one per TABLE COLUMN, in column order.
+# package 01-run-blocks (specs/01-run-blocks-spec.md S2.3, ruling I): the
+# 15-cell ceil meter shared by the blueprint-progress meter M(d,t) and the
+# thread bar B(d,t) -- same math, different glyph pair.
 #
-# t04-blueprints-table. This used to be _one_run_summary_spans and returned one
-# flat, concatenated span list per run -- variable-width fields glued together
-# with two-space separators, so the state of run 2 sat under the middle of run
-# 1's name and nothing below the first field lined up with anything. The
-# operator's words: "hard to see with things randomly aligned."
-#
-# The change is that a row now describes its CELLS and lets tui::Frame::table
-# decide the widths, because only the table can see the other rows. A per-row
-# renderer structurally cannot align anything.
-#
-# The colon after the blueprint name is gone with the concatenation (Decision 2).
-# In a table the column IS the separator; a colon would be decoration.
-sub _one_run_summary_cells {
-    my ($s) = @_;
-    $s = {} unless ref($s) eq 'HASH';
-
-    my $bp = (defined($s->{blueprint}) && !ref($s->{blueprint}) && length($s->{blueprint})) ? $s->{blueprint} : '?';
-    my $state = (defined($s->{state}) && !ref($s->{state}) && length($s->{state})) ? $s->{state} : '?';
-    my $done  = _nonneg_int($s->{packages_done});
-    my $total = _nonneg_int($s->{packages_total});
-    my $coord = _nonneg_int($s->{running_coordinators});
-    # ONLY WHAT NEEDS THE OPERATOR (operator, 2026-08-28: "panel should only
-    # show what actually needs me").
-    #
-    # escalations_waiting is the TOTAL, and it counts two different things: the
-    # escalations a human must answer, and the ones an automated resolver is
-    # expected to triage. Showing the total meant the panel raised its hand for
-    # work nobody needed to look at -- and the resolver's queue moving on its
-    # own made the number tick down for no reason the operator could see.
-    #
-    # inbox_waiting is that split's human half. FALLING BACK to the total
-    # when the split is absent is deliberate and matches launcher.pl's own
-    # _count_needs_you: a summary written by an older RunState has no split, and
-    # erring toward "the operator owns it" is the safe direction -- silently
-    # reporting zero would hide real work.
-    my $waiting = defined($s->{inbox_waiting})
-                ? _nonneg_int($s->{inbox_waiting})
-                : _nonneg_int($s->{escalations_waiting});
-
-    # triage_waiting is the automated-resolver half of the same split
-    # (RunState.pm:724). It rides in the SAME cell as the waiting count --
-    # not a new column -- so the two figures sit adjacent and are visible
-    # together; see spec S2.2.1 for why a sixth column/new line were both
-    # rejected. Its own word ("triage") and its own role (text.muted) keep
-    # it distinguishable from inbox_waiting's "N waiting" span.
-    my $triage = _nonneg_int($s->{triage_waiting});
-
-    my @waiting_cell = ( {
-        text => ($waiting > 0 ? sprintf('%d waiting', $waiting) : ''),
-        role => ($state eq 'paused' ? 'state.crit' : 'state.warn'),
-    } );
-    if ($triage > 0) {
-        my $lead = ($waiting > 0) ? ', ' : '';
-        push @waiting_cell, { text => $lead . sprintf('%d triage', $triage), role => 'text.muted' };
+# _meter_spans($d, $t, $full_name, $empty_name) -> \@spans. f=0 if d==0 or
+# t==0; f=15 if d>=t>0; else ceil(d*15/t) capped at 14. Full fill first
+# (role accent), then empty track (role text.faint); a zero-length part is
+# omitted entirely rather than emitted as a 0-repeat (empty) span.
+sub _meter_spans {
+    my ($d, $t, $full_name, $empty_name) = @_;
+    $d = _nonneg_int($d);
+    $t = _nonneg_int($t);
+    my $f;
+    if ($d == 0 || $t == 0) { $f = 0; }
+    elsif ($d >= $t)        { $f = 15; }
+    else {
+        $f = int(($d * 15 + $t - 1) / $t);
+        $f = 14 if $f > 14;
     }
-
-    return [
-        [ { text => $bp,    role => 'accent' } ],
-        [ { text => $state, role => (_run_state_role_map()->{$state} // 'text.muted') } ],
-        [ { text => sprintf('%d/%d pkg', $done, $total), role => 'text.primary' } ],
-        [ { text => ($coord > 0 ? sprintf('%d coord', $coord) : ''), role => 'accent' } ],
-        \@waiting_cell,
-    ];
+    my $full  = Theme::glyph($full_name);  $full  = '' unless defined $full;
+    my $empty = Theme::glyph($empty_name); $empty = '' unless defined $empty;
+    my @spans;
+    push @spans, { text => ($full  x $f),        role => 'accent' }     if $f > 0;
+    push @spans, { text => ($empty x (15 - $f)), role => 'text.faint' } if (15 - $f) > 0;
+    return \@spans;
 }
 
-# _current_package_line($s) -> a spans row, or undef.
-#
-# THE CURRENT PACKAGE IS DELIBERATELY NOT A TABLE COLUMN, and the reason is a
-# rule this project already paid for. Package d02 of the predecessor initiative
-# closed bug report 20260814-093052-312a with a standing requirement, asserted
-# by plugins/sandbox/tests/t/wrap-on-overflow.t AC1: an overflowing row must
-# WRAP, and no word may be silently dropped. A table column that is given up
-# when the panel is narrow drops content -- which is exactly what that rule
-# forbids, and the first draft of this package did it. t/75 caught it.
-#
-# It is also bad table design independently. Every other field here is a short,
-# bounded token (a state word, two counters); a package identifier is
-# unbounded free text, and it is the single field most responsible for the
-# "randomly aligned" appearance the operator reported. Measured: at a typical
-# 48-column band, name + state + count + gaps already spend 45, so a `cur`
-# column would have been dropped on nearly every real screen -- present in the
-# design and absent from the display.
-#
-# As its own indented line it goes through _render_panel's ordinary wrap, so it
-# wraps like any other row and stays fully readable at any width.
-sub _current_package_line {
-    my ($s) = @_;
-    return undef unless ref($s) eq 'HASH';
-    my $cp = $s->{current_package};
-    return undef unless defined $cp && !ref($cp) && length $cp;
-    return [ { text => '  cur ' . substr($cp, 0, 200), role => 'text.primary' } ];
+# _worker_label($a) -> Str. worker_type with a leading 'bp-' stripped, bounded
+# 64; 'worker' when worker_type is absent/hostile (spec S2.3.6).
+sub _worker_label {
+    my ($a) = @_;
+    my $wt = (ref($a) eq 'HASH') ? _bound_display($a->{worker_type}, 64) : undef;
+    return 'worker' unless defined $wt;
+    $wt =~ s/\Abp-//;
+    return length($wt) ? $wt : 'worker';
 }
+
+# _judge_label($a) -> Str. "<kind> judge" where kind = worker_type minus a
+# leading 'bp-' and a trailing '-judge'; 'judge' alone when that leaves
+# nothing or worker_type is absent/hostile (spec S2.3.6/2.3.7).
+sub _judge_label {
+    my ($a) = @_;
+    my $wt = (ref($a) eq 'HASH') ? _bound_display($a->{worker_type}, 64) : undef;
+    return 'judge' unless defined $wt;
+    $wt =~ s/\Abp-//;
+    $wt =~ s/-judge\z//;
+    return length($wt) ? "$wt judge" : 'judge';
+}
+
 
 # ===========================================================================
 # package 13-dashboard-threads (specs/13-dashboard-threads-spec.md S2.3): the
-# thread line beneath a blueprint's table row, and the pure owner-liveness
-# verdict it renders. RunState reports only evidence (activity_at, armed,
-# orchestrator alive/0/undef); the live/dead/unowned/unknown JUDGEMENT is
-# made HERE, at draw time, from a caller-supplied $now -- RunState's own
-# purity contract forbids it from reading a clock itself.
+# driver line of a blueprint's _run_block (ruling A replaced the old table +
+# sub-lines with one aligned block per blueprint), and the pure owner-
+# liveness verdict it renders. RunState reports only evidence (activity_at,
+# armed, orchestrator alive/0/undef); the live/dead/unowned/unknown
+# JUDGEMENT is made HERE, at draw time, from a caller-supplied $now --
+# RunState's own purity contract forbids it from reading a clock itself.
 # ===========================================================================
 
 # thread_owner_status(\%thread, $now) -> 'live'|'dead'|'unowned'|'unknown'.
@@ -1195,136 +1151,87 @@ sub _label_spans {
     return [ { text => $title, role => $role } ];
 }
 
-# _thread_line($s, $now) -> \@spans | undef (private surface, called fully
-# qualified by the test oracle). undef when $s->{thread} is not a HASH. Spec
-# S2.3's row, in order; no rendered colon anywhere (no-rendered-colons.t), and
-# nothing elided -- the row is meant to WRAP through the panel's ordinary
-# word wrap rather than being truncated.
-sub _thread_line {
-    my ($s, $now) = @_;
-    return undef unless ref($s) eq 'HASH';
-    my $th = $s->{thread};
-    return undef unless ref($th) eq 'HASH';
-
-    my @spans;
-    push @spans, { text => '  thread ', role => 'text.muted' };
-    my $name = _bound_display($th->{name}, 200);
-    push @spans, { text => $name, role => 'accent' } if defined($name) && length($name);
-
-    my $total = (defined($th->{total}) && !ref($th->{total}) && $th->{total} =~ /\A\d+\z/) ? $th->{total} + 0 : 0;
-    my $done  = (defined($th->{done})  && !ref($th->{done})  && $th->{done}  =~ /\A\d+\z/) ? $th->{done}  + 0 : 0;
-    my $w = ($total < 10) ? $total : 10;
-    if ($w > 0) {
-        my $f = int($done * $w / $total);
-        $f = $w if $f > $w;
-        my $full  = Theme::glyph('gauge.full');
-        my $empty = Theme::glyph('gauge.empty');
-        $full  = '' unless defined $full;
-        $empty = '' unless defined $empty;
-        push @spans, { text => ' ', role => 'text.muted' };
-        push @spans, { text => ($full  x $f),        role => 'accent' }     if $f > 0;
-        push @spans, { text => ($empty x ($w - $f)), role => 'text.faint' } if ($w - $f) > 0;
+# package 01-run-blocks (spec S2.3.4): _driver_spans builds DRIVER -- the
+# liveness/ownership word+dot that follows a thread line's bar/name, shared
+# with the same table thread_owner_status already drives. The leading status
+# dot is always its OWN bare span (never glued to the following text) so a
+# caller can find it by exact text match (dashboard-blueprints-blocks.t
+# AC5/AC6 grep for G('status.crit')/G('status.warn')/G('status.idle')
+# verbatim) -- Decision 3's "one space after a glyph" lives on the FOLLOWING
+# span instead (or, here, on the PRECEDING word's own trailing space).
+sub _driver_spans {
+    my ($th, $s, $now) = @_;
+    my $owner = (ref($th->{owner}) eq 'HASH') ? $th->{owner} : {};
+    my $kind_text = (defined($owner->{kind}) && !ref($owner->{kind}) && length($owner->{kind})) ? $owner->{kind} : 'none';
+    my $status = thread_owner_status($th, $now);
+    my @out;
+    if ($status eq 'live') {
+        push @out, { text => "$kind_text ", role => 'text.muted' };
+        my $g = Theme::glyph('status.ok'); $g = '' unless defined $g;
+        push @out, { text => $g, role => 'state.ok' };
+        if (defined($owner->{kind}) && $owner->{kind} eq 'orchestrator' && _epoch($now) && _epoch($s->{orchestrator_started_at})) {
+            # Uptime uses the RAW difference, never the display-clamped
+            # _elapsed: a future orchestrator_started_at is a data error, not
+            # ordinary clock skew, and omits the token entirely rather than
+            # showing a disguised "<1m" (blueprints-panel-tree.t AC16).
+            my $el = _block_elapsed($now - $s->{orchestrator_started_at});
+            push @out, { text => ' ' . $el, role => 'text.muted' } if defined $el;
+        }
     }
-    push @spans, { text => " $done/$total", role => 'text.primary' };
+    elsif ($status eq 'dead') {
+        push @out, { text => "$kind_text ", role => 'text.muted' };
+        my $g = Theme::glyph('status.crit'); $g = '' unless defined $g;
+        push @out, { text => $g, role => 'state.crit' };
+    }
+    elsif ($status eq 'unknown') {
+        push @out, { text => "$kind_text ", role => 'text.muted' };
+        my $g = Theme::glyph('status.idle'); $g = '' unless defined $g;
+        push @out, { text => $g, role => 'text.muted' };
+    }
+    elsif ($status eq 'unowned' && defined($th->{state}) && !ref($th->{state}) && $th->{state} eq 'handed-off') {
+        push @out, { text => 'handed off ', role => 'text.muted' };
+        my $g = Theme::glyph('status.warn'); $g = '' unless defined $g;
+        push @out, { text => $g, role => 'state.warn' };
+    }
+    else {
+        push @out, { text => 'unowned ', role => 'text.muted' };
+        my $g = Theme::glyph('status.idle'); $g = '' unless defined $g;
+        push @out, { text => $g, role => 'text.muted' };
+    }
+    return \@out;
+}
 
-    my $doing   = (ref($th->{doing}) eq 'ARRAY') ? $th->{doing} : [];
+# _thread_state_spans($th) -> \@spans (spec S2.3.4 THREAD_STATE; caller gates
+# on `doing` being empty).
+sub _thread_state_spans {
+    my ($th) = @_;
     my $current = (ref($th->{current}) eq 'HASH') ? $th->{current} : undef;
-    if (@$doing) {
-        push @spans, { text => '  doing ', role => 'text.muted' };
-        push @spans, @{ _label_spans($doing->[0], 'text.primary') };
-        my $k = scalar(@$doing) - 1;
-        push @spans, { text => " +$k", role => 'text.muted' } if $k > 0;
-    }
-    elsif (defined($current) && defined($current->{class}) && $current->{class} eq 'blocked') {
-        push @spans, { text => '  blocked ', role => 'state.warn' };
-        push @spans, @{ _label_spans($current, 'text.primary') };
+    if (defined($current) && defined($current->{class}) && $current->{class} eq 'blocked') {
+        my $g = Theme::glyph('thread.blocked'); $g = '' unless defined $g;
+        my @out = ( { text => $g . ' blocked ', role => 'state.warn' } );
+        push @out, @{ _label_spans($current, 'text.primary') };
         if ((!defined($current->{kind}) || $current->{kind} eq 'text')
             && defined($current->{waits_on}) && length($current->{waits_on})) {
             my $wo = _bound_display($current->{waits_on}, 200);
-            push @spans, { text => ' waiting on ' . (defined($wo) ? $wo : ''), role => 'text.muted' };
+            push @out, { text => ' waiting on ' . (defined($wo) ? $wo : ''), role => 'text.muted' };
         }
+        return \@out;
     }
-    else {
-        push @spans, { text => '  idle', role => 'text.muted' };
-    }
-
-    my $next = (ref($th->{next}) eq 'HASH') ? $th->{next} : undef;
-    if (defined $next) {
-        push @spans, { text => '  next ', role => 'text.muted' };
-        push @spans, @{ _label_spans($next, 'text.muted') };
-    }
-
-    my $owner = (ref($th->{owner}) eq 'HASH') ? $th->{owner} : {};
-    my $kind_text = (defined($owner->{kind}) && length($owner->{kind})) ? $owner->{kind} : 'none';
-    my $status = thread_owner_status($th, $now);
-    if ($status eq 'live') {
-        push @spans, { text => "  $kind_text ", role => 'text.muted' };
-        push @spans, { text => 'live', role => 'state.ok' };
-    }
-    elsif ($status eq 'dead') {
-        push @spans, { text => "  $kind_text ", role => 'text.muted' };
-        push @spans, { text => 'dead', role => 'state.crit' };
-    }
-    elsif ($status eq 'unknown') {
-        push @spans, { text => "  $kind_text ", role => 'text.muted' };
-        push @spans, { text => 'unknown', role => 'text.muted' };
-    }
-    elsif (defined($th->{state}) && $th->{state} eq 'handed-off') {
-        push @spans, { text => '  handed off', role => 'state.warn' };
-    }
-    else {
-        push @spans, { text => '  unowned', role => 'text.muted' };
-    }
-
-    return \@spans;
-}
-
-# _paused_reason_line($s) -> a spans row, or undef.
-#
-# Same shape as _current_package_line above: an optional standalone line
-# beneath a run's table row, not a table column. Gated on state=>'paused' IN
-# ADDITION TO paused_reason being present -- paused_reason is carried forward
-# from the .paused marker file and this sub has no way to prove it was
-# cleared the instant a run resumed, so the row's own state cell (already
-# trusted as authoritative) is what gates rendering. See spec S2.1.1.
-#
-# Deliberately does NOT sanitize/truncate-for-control-chars/re-encode: that is
-# the render pipeline's job, done exactly once, downstream (Frame::wrap_line
-# -> spanify -> safe). See spec S2.1.2.
-sub _paused_reason_line {
-    my ($s) = @_;
-    return undef unless ref($s) eq 'HASH';
-    return undef unless defined($s->{state}) && $s->{state} eq 'paused';
-    my $reason = $s->{paused_reason};
-    return undef unless defined $reason && !ref($reason) && length $reason;
-    return [ { text => '  paused ' . substr($reason, 0, 200), role => 'state.warn' } ];
-}
-
-# The table's shape, declared once beside the cells it describes.
-#
-# `drop` is the order columns are given up when the panel is too narrow --
-# HIGHEST FIRST -- and only two columns carry one:
-#   coordinator count (2) goes first: an operational detail, not a status;
-#   waiting count (1) next, because it is the only field that says a human is
-#     BLOCKING the run.
-# Name, state and package count have no `drop` entry and are never dropped:
-# without them the row identifies nothing, and there would be no table left.
-sub _BLUEPRINT_TABLE_OPTS {
-    return {
-        gap   => 2,
-        align => [ 'left', 'left', 'right', 'right', 'right' ],
-        min   => [ 8,      4,      5,       3,       3       ],
-        drop  => [ undef,  undef,  undef,   2,       1       ],
-    };
+    my $g = Theme::glyph('thread.idle'); $g = '' unless defined $g;
+    return [ { text => $g . ' idle', role => 'text.muted' } ];
 }
 
 # ===========================================================================
-# The blueprints tree (package 06-blueprints-panel-tree). Renders per-run
-# agent detail (orchestrator liveness, in-flight packages, their
-# coordinator/worker/judge agents, and blueprint-scoped run_agents) BENEATH a
-# run's table row and its existing optional lines, gated on state=>'running'
-# (spec S2.8, Decision 5). Pure and total, same house rule as the rest of
-# this file: every "now"-like value is an ARGUMENT ($now), never read here.
+# package 06-blueprints-panel-tree's original home, now ruling A's one
+# aligned block per blueprint (_run_block): per-run agent detail
+# (orchestrator/driver liveness, in-flight packages, their coordinator/
+# worker/judge agents, and blueprint-scoped run_agents). _multiline_blocks
+# (below) decides whether a block needs row-budget treatment at all -- per
+# spec S2.2.1 that is ANY block whose _run_block(...) draws 2+ lines,
+# whatever the run's state (fix-batch item 2: the old state=>'running' gate
+# silently clipped paused/stale/idle blocks with no hidden-rows notice).
+# Pure and total, same house rule as the rest of this file: every "now"-like
+# value is an ARGUMENT ($now), never read here.
 #
 # _tree_now($state) is the one seam that reads the caller's optional
 # $state->{now} (spec S1.4) -- it does not call a clock itself, it only
@@ -1361,87 +1268,79 @@ sub _elapsed {
     return $d < 0 ? 0 : $d;
 }
 
-# _indent($level) -> two spaces per level. The row's own leading whitespace
-# span (spec S2.4) -- never baked into a label span, so Frame::wrap_line's
-# leading-indent recovery still sees it after a row wraps.
-sub _indent {
-    my ($level) = @_;
-    $level = 0 unless defined($level) && !ref($level) && $level =~ /\A\d+\z/;
-    return ' ' x (2 * $level);
+# _wrap_block_row($spans, $width, $hang) -> \@rows (spec S2.2.1). Pre-wraps
+# one block row (an arrayref of spans, as _run_block returns) to $width
+# display columns, continuing at $hang columns -- the block's own detail
+# column, so a wrapped line continues exactly under the rest of its own
+# column (spec S2.4). Replaces _wrap_tree_row/_wrap_tree_rows (ruling A):
+# same mechanics, with the hang now supplied per block instead of one fixed
+# constant for the whole panel.
+#
+# $width undef/non-positive -> the row unchanged, wrapped in an arrayref (no
+# cols known). A row that already fits is returned COMPLETELY UNTOUCHED --
+# not routed through wrap_capped at all, so a direct oracle call that passes
+# a real $width purely for alignment, not wrapping, gets its row back byte-
+# identical, with no trailing padding.
+sub _wrap_block_row {
+    my ($spans, $width, $hang) = @_;
+    return [ $spans ] unless ref($spans) eq 'ARRAY';
+    return [ $spans ] unless defined($width) && !ref($width) && $width =~ /\A\d+\z/ && $width > 0;
+    return [ $spans ] if tui::Frame::spans_width($spans) <= $width;
+    my $h = (defined($hang) && !ref($hang) && $hang =~ /\A\d+\z/) ? $hang : 2;
+    my $cells = tui::Frame::wrap_capped($spans, 'text.muted', $width, $h, undef);
+    return [ $spans ] unless ref($cells) eq 'ARRAY' && @$cells;
+    my @rows = map { (ref($_) eq 'HASH' && ref($_->{spans}) eq 'ARRAY') ? $_->{spans} : $spans } @$cells;
+    @rows = map { _unstrand_sep_dot($_, $width) } @rows;
+    return \@rows;
 }
 
-# TREE_WRAP_CONTINUATION_INDENT -- fix-batch (H1, red-team): tui::Screen's
-# own continuation indent (WRAP_CONTINUATION_INDENT, tui/Screen.pm) is fixed
-# at 2 -- exactly this tree's own level step -- so a wrapped row's
-# continuation lands exactly on the NEXT level's own indent (own_indent + 2
-# == child_indent), a hierarchy inversion: a continuation of a package row
-# reads as its own coordinator, a continuation of a coordinator reads as its
-# own worker. tui::Screen DOES let a panel override the continuation indent
-# via `wrap_indent`, but AT THE TIME THIS WAS WRITTEN only on its
-# character-break wrap path; the word-wrap path this panel actually uses
-# hardcoded tui::Screen's constant and ignored the override. Both
-# tui/Screen.pm and tui/Frame.pm were outside that package's write set, so
-# the plumbing gap could not be closed there (verified: switching the whole
-# Blueprints panel to the char-break path instead was tried and reverted --
-# it breaks t/182 AC14's "every word survives a wrap" guarantee, because
-# character breaking is not word-safe for the "cur"/"paused" free-text
-# lines that share this panel).
-#
-# So tree rows are pre-wrapped HERE, before tui::Screen ever sees them (see
-# _wrap_tree_row/_wrap_tree_rows below), with THIS smaller continuation
-# indent: own indent + 1 (3, 5, 7 for levels 1-3) never collides with a real
-# level's own indent (2, 4, 6). A row that already fits the panel's content
-# width hits tui::Frame::wrap_line's own unmodified fast path -- byte-
-# identical passthrough -- so a row that never wraps is unaffected.
-#
-# THAT PLUMBING GAP IS NOW CLOSED. tui::Screen's word-wrap path honours
-# `wrap_indent` too (needed by the approval screen's label/value rows, whose
-# values wrapped back to column 2 from a gutter at 16). So this panel COULD
-# now declare wrap_indent instead of pre-wrapping its own rows. It is left
-# as-is deliberately: the pre-wrap is correct, tested, and per-ROW, while
-# wrap_indent is per-PANEL and this panel mixes tree rows with free-text
-# "cur"/"paused" lines that want the ordinary indent. Adopting it would be a
-# behaviour change across t/182 and t/187, which is its own piece of work and
-# not a side effect of closing the gap.
-use constant TREE_WRAP_CONTINUATION_INDENT => 1;
+# _unstrand_sep_dot(\@row_spans, $width) -> \@row_spans (fix-batch item 6,
+# reviewer MINOR-3). tui::Frame::wrap_line treats every lone ASCII space as
+# an ordinary break point, and the one-character sep.dot separator is
+# always flanked by single spaces (so the pinned, unwrapped rendering stays
+# byte-exact -- see _package_active_line) -- which means it is, by that
+# library's own documented rules, a valid one-character WORD that can
+# legally be the last thing that fits on a wrapped row, stranding it with
+# its label pushed to the next row. Fixed here, after wrap, rather than by
+# changing the glyph's spacing (which would break byte-exact pinned
+# fixtures that need exactly one space on each side when a row does NOT
+# wrap): drop the dangling dot and the one space before it, repadding the
+# row to the same width. The separator is decorative punctuation, not a
+# tracked word, so dropping the lone orphaned instance (rather than
+# relocating it, which risks overflowing the next row and needing a THIRD
+# wrap pass) is the conservative choice.
+sub _unstrand_sep_dot {
+    my ($spans, $width) = @_;
+    return $spans unless ref($spans) eq 'ARRAY' && @$spans;
+    my $dot = Theme::glyph('sep.dot');
+    return $spans unless defined($dot) && !ref($dot) && length($dot);
 
-# _wrap_tree_row($row, $width) -> \@rows. Pre-wraps one tree row (an
-# arrayref of spans, as every tree row builder below returns) to $width
-# display columns using TREE_WRAP_CONTINUATION_INDENT rather than
-# tui::Screen's own (colliding) continuation indent. Returns the row
-# UNCHANGED, wrapped in an arrayref, for anything that is not a plain
-# arrayref of spans (defensive; every real caller passes one).
-sub _wrap_tree_row {
-    my ($row, $width) = @_;
-    return [ $row ] unless ref($row) eq 'ARRAY';
-    # A row that already fits is returned COMPLETELY UNTOUCHED -- not even
-    # routed through wrap_capped -- because wrap_capped's make_cell always
-    # RIGHT-PADS to exactly $width, and this sub's callers include direct,
-    # non-composed-frame oracle calls (AC1/AC47) that pass a real $width
-    # (120) purely for the TABLE's own column layout and expect the tree's
-    # logical rows back byte-identical, with no trailing padding. Only an
-    # actually-overflowing row needs wrap_capped at all.
-    return [ $row ] if tui::Frame::spans_width($row) <= $width;
-    my $cells = tui::Frame::wrap_capped(
-        $row, 'text.muted', $width, TREE_WRAP_CONTINUATION_INDENT(), undef);
-    return [ $row ] unless ref($cells) eq 'ARRAY' && @$cells;
-    return [ map { (ref($_) eq 'HASH' && ref($_->{spans}) eq 'ARRAY') ? $_->{spans} : $row } @$cells ];
-}
+    my $text = tui::Frame::spans_text($spans);
+    (my $trimmed = $text) =~ s/ +\z//;
+    return $spans unless length($trimmed) >= length($dot) && substr($trimmed, -length($dot)) eq $dot;
 
-# _wrap_tree_rows(\@rows, $width) -> \@rows. Applies _wrap_tree_row across a
-# whole tree, in order. $width absent/malformed means "no cols known" (every
-# direct-call/unit-test site that calls _tree_lines with two arguments) --
-# returns $rows completely UNCHANGED, so every pre-wrap logical-row
-# assertion (B1/AC1/AC12/AC36/AC43 and friends) keeps seeing exactly
-# today's un-wrapped rows.
-sub _wrap_tree_rows {
-    my ($rows, $width) = @_;
-    return $rows unless ref($rows) eq 'ARRAY';
-    return $rows
-        unless defined($width) && !ref($width) && $width =~ /\A\d+\z/ && $width > 0;
-    my @out;
-    push @out, @{ _wrap_tree_row($_, $width) } for @$rows;
-    return \@out;
+    my $before_dot = substr($trimmed, 0, length($trimmed) - length($dot));
+    (my $new_trimmed = $before_dot) =~ s/ \z//;
+    my $keep_bytes = length($new_trimmed);
+
+    my @kept;
+    my $seen = 0;
+    for my $sp (@$spans) {
+        last if $seen >= $keep_bytes;
+        my $t = (ref($sp) eq 'HASH' && defined($sp->{text})) ? $sp->{text} : '';
+        next unless length($t);
+        if ($seen + length($t) <= $keep_bytes) {
+            push @kept, { %$sp, text => $t };
+            $seen += length($t);
+        }
+        else {
+            push @kept, { %$sp, text => substr($t, 0, $keep_bytes - $seen) };
+            $seen = $keep_bytes;
+        }
+    }
+
+    my $w = (defined($width) && !ref($width) && $width =~ /\A\d+\z/) ? $width : tui::Frame::spans_width($spans);
+    return tui::Frame::fit_spans(\@kept, $w, 'text.muted');
 }
 
 # _bound_display($v, $max) -> Str | undef. Bounds byte length only (no
@@ -1466,8 +1365,9 @@ sub _bound_display {
 # REJECTED interpretation -- the accepted one (AT ruling (a)) is the bare
 # glyph, per spec S3.1's own B1 golden table and the oracle's AC1/AC12/AC36/
 # AC43, which all glue the glyph directly onto the label with no separator
-# of its own ($JUDGE_MARKER . 'bp-resolve-judge'). _agent_row's judge branch
-# below concatenates _judge_marker() . $label with no separator either, so a
+# of its own ($JUDGE_MARKER . 'bp-resolve-judge'). _run_block's judge line
+# (S2.3.7, glyph_bare => 1) and _package_active_line's own judge branch both
+# concatenate _judge_marker() . $label with no separator either, so a
 # trailing-space marker would double the gap. Do not "fix" this back to
 # match spec S2.5's pseudocode -- that would silently reintroduce the space
 # and break five golden strings.
@@ -1516,199 +1416,375 @@ sub _agent_live {
     return ($d <= $s) ? 1 : 0;
 }
 
-# _agent_row($a, $level, $now) -> \@spans | undef. Renders ONE agent element
-# at the given tree level; does not itself apply the staleness filter (the
-# caller passes only agents _agent_live already accepted) -- undef here means
-# "not a renderable element" (a hostile/non-hash input), not "stale".
-#
-# Role vocabulary is CLOSED to three words (Decision 6): coordinator, worker,
-# judge. Anything else -- undef, '', an unrecognised string, a ref -- renders
-# as the unattributed '?'/worker_type row rather than inventing a fourth word
-# or silently dropping a live agent.
-sub _agent_row {
-    my ($a, $level, $now) = @_;
-    return undef unless ref($a) eq 'HASH';
-
-    my $role = (defined($a->{role}) && !ref($a->{role})) ? $a->{role} : undef;
-    $role = undef unless defined($role) && ($role eq 'coordinator' || $role eq 'worker' || $role eq 'judge');
-    my $wt = _bound_display($a->{worker_type}, 64);
-
-    my ($label, $role_span);
-    if (!defined $role) {
-        $label     = defined($wt) ? $wt : '?';
-        $role_span = 'text.muted';
-    }
-    elsif ($role eq 'coordinator') {
-        # R3 (package-scoped, level 2): never shows worker_type -- there is
-        # one coordinator per package, so a type discriminator adds nothing.
-        # R7 (run-scoped, level 1): no such uniqueness guarantee, so it
-        # identifies itself the same way a worker row does (t/187 AC36) -- but
-        # M2 (package 07 red-team): a bare worker_type in accent at indent 2 is
-        # byte-for-byte the shape of a package row, so the run-scoped label
-        # carries its own word first ("coordinator  <worker_type>"), two spaces
-        # matching every other separator in a tree row. The judge nonce still
-        # appears (spec S2.9): AC36's (c) only checks the nonce is present.
-        $label     = ($level == 2) ? 'coordinator' : (defined($wt) ? 'coordinator  ' . $wt : 'coordinator');
-        $role_span = 'accent';
-    }
-    elsif ($role eq 'worker') {
-        $label     = defined($wt) ? $wt : 'worker';
-        $role_span = 'text.primary';
-    }
-    else {    # judge
-        $label     = _judge_marker() . (defined($wt) ? $wt : 'judge');
-        $role_span = 'state.warn';
-    }
-
-    my @spans = ( { text => _indent($level), role => 'text.muted' },
-                  { text => $label,          role => $role_span } );
-    my $e = _elapsed($now, $a->{started_at});
-    push @spans, { text => '  ' . fmt_duration($e), role => 'text.muted' } if defined $e;
-    return \@spans;
+# package 01-run-blocks (specs/01-run-blocks-spec.md S2.3.6, ruling K/C6):
+# _block_elapsed is the block renderer's own duration format -- distinct
+# from fmt_duration (which day-rolls past 24h): "under a minute" -> '<1m',
+# under an hour -> 'Nm', else 'NhMMm' with NO day rollover (C6 amends ruling
+# J, which did not address sub-minute). undef for anything that is not a
+# non-negative-looking number.
+sub _block_elapsed {
+    my ($s) = @_;
+    return undef unless defined($s) && !ref($s) && $s =~ /^-?\d+(?:\.\d+)?$/;
+    return undef if $s < 0;
+    $s = int($s);
+    return '<1m' if $s < 60;
+    return int($s / 60) . 'm' if $s < 3600;
+    return sprintf('%dh%02dm', int($s / 3600), int(($s % 3600) / 60));
 }
 
-# _orchestrator_line($s, $now) -> \@spans | undef. R1 (spec S2.6): emitted
-# exactly once, first, whenever a run draws a tree at all. CF1 lives in the
-# duration gate below -- a duration is shown ONLY when liveness is 'alive',
-# never merely because a start time happens to be present (an 'unknown'
-# orchestrator commonly HAS one; showing its age would read as a forever-
-# growing uptime for a pid nobody could actually probe).
-sub _orchestrator_line {
+# _pause_words($s) -> Str (spec S2.3.2, ruling B). Never dies, never undef.
+sub _pause_words {
+    my ($s) = @_;
+    return 'paused' unless ref($s) eq 'HASH';
+    my $reason = $s->{paused_reason};
+    return 'paused' unless defined($reason) && !ref($reason) && length($reason);
+    if ($reason eq 'usage') {
+        my $window = $s->{paused_window};
+        return '5-hour limit' if defined($window) && !ref($window) && $window eq 'five_hour';
+        return 'weekly limit' if defined($window) && !ref($window) && $window eq 'seven_day';
+        return 'usage limit';
+    }
+    return 'usage unknown' if $reason eq 'telemetry';
+    my $bounded = _bound_display($reason, 200);
+    return defined($bounded) ? $bounded : 'paused';
+}
+
+# _resume_words($s, $now) -> Str (spec S2.3.3, ruling C). '' (no "until"
+# part), 'resuming', or 'until ...'. Never dies.
+sub _resume_words {
     my ($s, $now) = @_;
-    return undef unless ref($s) eq 'HASH';
-
-    my $av = $s->{orchestrator_alive};
-    my ($liveness, $role);
-    if (defined($av) && !ref($av) && $av) {
-        $liveness = 'alive';
-        $role     = 'state.ok';
+    return '' unless ref($s) eq 'HASH';
+    my $at = $s->{relaunch_at};
+    return '' unless defined($at) && !ref($at) && $at =~ /\A\d{1,12}\z/ && $at > 0;
+    $at += 0;
+    my $now_ok = _epoch($now);
+    return 'resuming' if $now_ok && $at <= $now;
+    my $L = $s->{relaunch_local};
+    return ''
+        unless ref($L) eq 'HASH' && defined($L->{wday}) && defined($L->{hhmm})
+            && defined($L->{day}) && defined($L->{mon});
+    if ($now_ok) {
+        my $diff = $at - $now;
+        return "until $L->{hhmm}"            if $diff < 86400;
+        return "until $L->{wday} $L->{hhmm}" if $diff < 604800;
+        return "until $L->{day} $L->{mon}";
     }
-    elsif (defined($av) && !ref($av) && !$av) {
-        $liveness = 'dead';
-        $role     = 'state.crit';
-    }
-    else {
-        $liveness = 'unknown';
-        $role     = 'text.muted';
-    }
-
-    my @spans = ( { text => _indent(1),           role => 'text.muted' },
-                  { text => 'orchestrator',        role => 'accent' },
-                  { text => '  ' . $liveness,      role => $role } );
-    if ($liveness eq 'alive') {
-        my $e = _elapsed($now, $s->{orchestrator_started_at});
-        push @spans, { text => '  ' . fmt_duration($e), role => 'text.muted' } if defined $e;
-    }
-    return \@spans;
+    return "until $L->{wday} $L->{hhmm}";
 }
 
-# _pkg_in_flight($p, $now) -> 1 | 0 (spec S2.7). A package's OWN status is
-# not the sole gate: a coordinator's ledger write can lag a genuinely live
-# agent, and hiding that agent because the status field has not caught up
-# would be exactly the kind of lie this initiative exists to remove.
-sub _pkg_in_flight {
-    my ($p, $now) = @_;
-    return 0 unless ref($p) eq 'HASH';
-    return 0 unless defined(_bound_display($p->{name}, 200));
-    return 1 if defined($p->{status}) && !ref($p->{status}) && $p->{status} eq 'running';
-    return 1 if ref($p->{agents}) eq 'ARRAY' && grep { _agent_live($_, $now) } @{ $p->{agents} };
-    return 0;
-}
-
-# _package_tree_lines($p, $now) -> \@rows. R2-R6 (spec S2.6): the package
-# row itself, then its live agents grouped coordinator, worker, judge,
-# unattributed -- in that order, each group preserving its own `agents`
-# array order. [] when the package is not in-flight or malformed.
-sub _package_tree_lines {
-    my ($p, $now) = @_;
-    return [] unless ref($p) eq 'HASH';
-    my $name = _bound_display($p->{name}, 200);
-    return [] unless defined $name;
-    return [] unless _pkg_in_flight($p, $now);
-
-    my @spans = ( { text => _indent(1), role => 'text.muted' },
-                  { text => $name,      role => 'accent' } );
-
-    my ($att, $cap) = ($p->{attempt}, $p->{attempt_cap});
-    if (defined($att) && !ref($att) && $att =~ /\A\d{1,10}\z/
-        && defined($cap) && !ref($cap) && $cap =~ /\A\d{1,10}\z/) {
-        push @spans, { text => "  attempt $att/$cap",
-                       role => ($att >= $cap ? 'state.warn' : 'text.primary') };
-    }
-    my $step = _bound_display($p->{step}, 32);
-    push @spans, { text => "  step $step", role => 'text.muted' } if defined $step;
-
-    my @rows = ( \@spans );
-
+# _package_active_line($p, $name, $now) -> \%line (spec S2.3.6 ACTIVE). Dot
+# precedence (ruling K, already narrowed to non-BLOCKED by the caller): a
+# live judge agent -> the judge marker; the package's last attempt -> warn;
+# else ok.
+sub _package_active_line {
+    my ($p, $name, $now) = @_;
     my @agents = (ref($p->{agents}) eq 'ARRAY') ? @{ $p->{agents} } : ();
     my @live   = grep { _agent_live($_, $now) } @agents;
     my $rolewd = sub {
         my ($a) = @_;
-        my $r = $a->{role};
+        my $r = (ref($a) eq 'HASH') ? $a->{role} : undef;
         return (defined($r) && !ref($r)) ? $r : '';
     };
-    my @coordinators = grep { $rolewd->($_) eq 'coordinator' } @live;
-    my @workers      = grep { $rolewd->($_) eq 'worker' } @live;
-    my @judges       = grep { $rolewd->($_) eq 'judge' } @live;
-    my @others       = grep {
-        my $r = $rolewd->($_);
-        $r ne 'coordinator' && $r ne 'worker' && $r ne 'judge';
-    } @live;
+    my @live_workers = grep { $rolewd->($_) eq 'worker' } @live;
+    my @live_judges  = grep { $rolewd->($_) eq 'judge' } @live;
 
-    if (@coordinators) {
-        for my $c (@coordinators) {
-            my $row = _agent_row($c, 2, $now);
-            push @rows, $row if $row;
+    my ($att, $cap) = ($p->{attempt}, $p->{attempt_cap});
+    my $att_n = (defined($att) && !ref($att) && $att =~ /\A\d{1,10}\z/) ? $att + 0 : undef;
+    my $cap_n = (defined($cap) && !ref($cap) && $cap =~ /\A\d{1,10}\z/) ? $cap + 0 : undef;
+    my $last_attempt = (defined($cap_n) && $cap_n >= 1 && defined($att_n) && $att_n >= $cap_n) ? 1 : 0;
+
+    my ($gname, $grole);
+    if (@live_judges)      { ($gname, $grole) = ('__judge__', 'state.warn'); }
+    elsif ($last_attempt)  { ($gname, $grole) = ('status.warn', 'state.warn'); }
+    else                   { ($gname, $grole) = ('status.ok', 'state.ok'); }
+
+    my @detail;
+    my $step = _bound_display($p->{step_word}, 32);
+    $step = _bound_display($p->{status}, 32) unless defined $step;
+    $step = 'running' unless defined $step;
+    push @detail, { text => $step, role => 'text.primary' };
+
+    if (defined($att_n) && $att_n >= 2 && defined($cap_n)) {
+        push @detail, { text => " $att_n/$cap_n", role => ($att_n >= $cap_n ? 'state.warn' : 'text.primary') };
+    }
+
+    for my $w (@live_workers) {
+        # Kept as TWO spans (separator, then label) -- blueprints-panel-
+        # tree.t AC42 locates the worker label by its OWN span starting with
+        # the label's first byte, so merging the separator into the label's
+        # span would hide it from that lookup. The dangling-lone-dot risk
+        # (fix-batch item 6, reviewer MINOR-3) is fixed downstream instead,
+        # in _wrap_block_row's _unstrand_sep_dot post-pass, which repairs any
+        # wrapped row (whatever its span layout) rather than trying to make
+        # the separator un-isolatable by construction.
+        push @detail, { text => ' ' . (Theme::glyph('sep.dot') // '') . ' ', role => 'text.muted' };
+        push @detail, { text => _worker_label($w), role => 'text.primary' };
+        # Agent elapsed uses the CLAMPED (_elapsed) value, never the raw
+        # difference -- an agent record dated moments in the future is
+        # ordinary clock skew (blueprints-panel-tree.t AC27) and renders
+        # '<1m', unlike an orchestrator uptime's raw-diff omission rule.
+        my $e = _elapsed($now, $w->{started_at});
+        push @detail, { text => ' ' . _block_elapsed($e), role => 'text.muted' } if defined $e;
+    }
+    for my $j (@live_judges) {
+        push @detail, { text => ' ' . (Theme::glyph('sep.dot') // '') . ' ', role => 'text.muted' };
+        push @detail, { text => _judge_label($j), role => 'text.primary' };
+        my $e = _elapsed($now, $j->{started_at});
+        push @detail, { text => ' ' . _block_elapsed($e), role => 'text.muted' } if defined $e;
+    }
+
+    return { kind => 'package', is_sub => 1, glyph_name => $gname, glyph_role => $grole,
+             name => $name, name_role => 'accent', detail => \@detail };
+}
+
+# _package_lines($s, $now) -> \@lines (spec S2.3.6). One entry per rendered
+# package (ACTIVE or BLOCKED), in `packages[]` order; the legacy
+# `current_package`-only fallback when `packages` is not an ARRAY.
+sub _package_lines {
+    my ($s, $now) = @_;
+    my @out;
+    if (ref($s->{packages}) eq 'ARRAY') {
+        for my $p (@{ $s->{packages} }) {
+            next unless ref($p) eq 'HASH';
+            my $name = _bound_display($p->{name}, 200);
+            next unless defined $name;
+            my $status = (defined($p->{status}) && !ref($p->{status})) ? $p->{status} : '';
+            my $has_live = (ref($p->{agents}) eq 'ARRAY') ? (grep { _agent_live($_, $now) } @{ $p->{agents} }) : 0;
+            if ($status eq 'blocked' || $status eq 'parked') {
+                my @detail = ( { text => $status, role => 'state.warn' } );
+                my $wo_raw = $p->{waits_on};
+                if (defined($wo_raw) && !ref($wo_raw) && length($wo_raw)) {
+                    my $wo = _bound_display($wo_raw, 200);
+                    push @detail, { text => ' waiting on ' . (defined($wo) ? $wo : ''), role => 'text.muted' };
+                }
+                push @out, { kind => 'package', is_sub => 1, glyph_name => 'thread.blocked', glyph_role => 'state.warn',
+                              name => $name, name_role => 'accent', detail => \@detail };
+            }
+            elsif ($status eq 'running' || $status eq 'converging' || $status eq 'reviewing' || $has_live) {
+                push @out, _package_active_line($p, $name, $now);
+            }
         }
     }
-    elsif (defined($p->{status}) && !ref($p->{status}) && $p->{status} eq 'running') {
-        # Decision 10/D7: a package can own no worker (pipeline step 5) and
-        # would otherwise be indistinguishable from a dead package.
-        push @rows, [ { text => _indent(2), role => 'text.muted' },
-                      { text => 'coordinator', role => 'accent' } ];
+    elsif (defined($s->{current_package}) && !ref($s->{current_package}) && length($s->{current_package})) {
+        my $name = _bound_display($s->{current_package}, 200);
+        if (defined $name) {
+            push @out, { kind => 'package', is_sub => 1, glyph_name => 'status.ok', glyph_role => 'state.ok',
+                          name => $name, name_role => 'accent', detail => [ { text => 'running', role => 'text.primary' } ] };
+        }
     }
-    for my $w (@workers) { my $row = _agent_row($w, 3, $now); push @rows, $row if $row; }
-    for my $j (@judges)  { my $row = _agent_row($j, 2, $now); push @rows, $row if $row; }
-    for my $o (@others)  { my $row = _agent_row($o, 3, $now); push @rows, $row if $row; }
-
-    return \@rows;
+    return \@out;
 }
 
-# _tree_lines($s, $now) -> \@rows. The gate (spec S2.8, Decision 5): a tree
-# renders only for a run whose state is 'running' AND whose `packages` is
-# genuinely an arrayref -- the second clause is a capability gate that keeps
-# every pre-04 / hand-built summary byte-identical to today (AC8/AC9).
-sub _tree_lines {
+# _run_block($s, $now, $width) -> { w, hang, lines } (specs/01-run-blocks-
+# spec.md S2.2.1/S2.3). Replaces the table + _paused_reason_line +
+# _thread_line + _current_package_line + the agent tree (ruling A) with one
+# aligned block per blueprint. Never dies; a non-HASH $s degrades to an
+# empty block.
+sub _run_block {
     my ($s, $now, $width) = @_;
-    return [] unless ref($s) eq 'HASH';
-    return [] unless defined($s->{state}) && !ref($s->{state}) && $s->{state} eq 'running';
-    return [] unless ref($s->{packages}) eq 'ARRAY';
+    return { w => 0, hang => 2, lines => [] } unless ref($s) eq 'HASH';
 
-    my @rows;
-    my $orch = _orchestrator_line($s, $now);
-    push @rows, $orch if $orch;
+    my @pending;   # { kind, is_sub, glyph_name, glyph_role, name, name_role, detail }
 
-    for my $p (@{ $s->{packages} }) {
-        push @rows, @{ _package_tree_lines($p, $now) };
+    # ---- blueprint line (S2.3.1, always present) ----
+    {
+        my $bp = _bound_display($s->{blueprint}, 200);
+        $bp = '?' unless defined $bp;
+        my $done  = _nonneg_int($s->{packages_done});
+        my $total = _nonneg_int($s->{packages_total});
+
+        my @detail;
+        push @detail, @{ _meter_spans($done, $total, 'gauge.full', 'gauge.empty') };
+        push @detail, { text => '  ' . "$done/$total", role => 'text.primary' };
+
+        my $state = (defined($s->{state}) && !ref($s->{state}) && length($s->{state})) ? $s->{state} : '?';
+        push @detail, { text => '   ', role => 'text.muted' };
+        if ($state eq 'paused') {
+            # Decision 11 C4 (binding amendment): the pause slot uses
+            # thread.idle, NEVER title.paused -- same rendered bytes (both
+            # U+23F8 pad 1), but title.* glyphs are reserved for the window
+            # title (Theme.pm's own rule) and this is a body row.
+            my $g = Theme::glyph('thread.idle'); $g = '' unless defined $g;
+            my $pw = _pause_words($s);
+            my $rw = _resume_words($s, $now);
+            my $txt = $g . ' ' . $pw;
+            $txt .= ' ' . $rw if length($rw);
+            # Glyph, pad and words in ONE span (fix-batch item 1, reviewer
+            # BLOCKER-1): tui::Frame::wrap_line drops a lone space at a span
+            # edge, which used to strip the pad the moment this line wrapped.
+            push @detail, { text => $txt, role => 'state.warn' };
+        }
+        else {
+            push @detail, { text => $state, role => (_run_state_role_map()->{$state} // 'text.muted') };
+        }
+
+        my $n = defined($s->{inbox_waiting}) ? _nonneg_int($s->{inbox_waiting}) : _nonneg_int($s->{escalations_waiting});
+        if ($n > 0) {
+            my $g = Theme::glyph('icon.decisions'); $g = '' unless defined $g;
+            push @detail, { text => '   ', role => 'text.muted' };
+            push @detail, { text => $g . ' ' . $n, role => ($state eq 'paused' ? 'state.crit' : 'state.warn') };
+        }
+        my $triage = _nonneg_int($s->{triage_waiting});
+        if ($triage > 0) {
+            push @detail, { text => '   ', role => 'text.muted' };
+            push @detail, { text => "$triage triage", role => 'text.muted' };
+        }
+
+        push @pending, { kind => 'blueprint', is_sub => 0, glyph_name => 'icon.blueprints', glyph_role => 'accent',
+                          name => $bp, name_role => 'accent', detail => \@detail };
     }
 
-    # R7: run_agents is a flat list, rendered after every package block, at
-    # level 1, with no grouping and no reordering (spec S2.6).
+    # ---- driver line: thread (S2.3.4), or no-thread (S2.3.5) ----
+    my $th = $s->{thread};
+    if (ref($th) eq 'HASH') {
+        my @detail;
+        my $total = _nonneg_int($th->{total});
+        my $done  = _nonneg_int($th->{done});
+        my $owner = (ref($th->{owner}) eq 'HASH') ? $th->{owner} : {};
+        my $kind  = (defined($owner->{kind}) && !ref($owner->{kind})) ? $owner->{kind} : 'none';
+        if ($kind ne 'orchestrator' && $total > 0) {
+            push @detail, @{ _meter_spans($done, $total, 'thread.full', 'thread.empty') };
+            push @detail, { text => '  ' . "$done/$total", role => 'text.primary' };
+            push @detail, { text => '   ', role => 'text.muted' };
+        }
+        push @detail, @{ _driver_spans($th, $s, $now) };
+        my $coord = _nonneg_int($s->{running_coordinators});
+        if ($coord > 0) {
+            push @detail, { text => '   ', role => 'text.muted' };
+            push @detail, { text => "$coord coord", role => 'accent' };
+        }
+        my $doing = (ref($th->{doing}) eq 'ARRAY') ? $th->{doing} : [];
+        if (!@$doing) {
+            push @detail, { text => '   ', role => 'text.muted' };
+            push @detail, @{ _thread_state_spans($th) };
+        }
+        my $name = _bound_display($th->{name}, 200);
+        $name = '' unless defined $name;
+        push @pending, { kind => 'driver', is_sub => 1, glyph_name => 'icon.threads', glyph_role => 'accent',
+                          name => $name, name_role => 'accent', detail => \@detail };
+    }
+    elsif (defined($s->{orchestrator_pid}) && !ref($s->{orchestrator_pid})) {
+        my $alive = $s->{orchestrator_alive};
+        my ($gname, $grole);
+        if    (defined($alive) && !ref($alive) && "$alive" eq '1') { ($gname, $grole) = ('status.ok',   'state.ok'); }
+        elsif (defined($alive) && !ref($alive) && "$alive" eq '0') { ($gname, $grole) = ('status.crit', 'state.crit'); }
+        else                                                       { ($gname, $grole) = ('status.idle', 'text.muted'); }
+
+        my @parts;
+        if (defined($alive) && !ref($alive) && "$alive" eq '1'
+            && _epoch($now) && _epoch($s->{orchestrator_started_at})) {
+            # Same RAW-difference rule as _driver_spans above (AC16).
+            my $el = _block_elapsed($now - $s->{orchestrator_started_at});
+            push @parts, { text => $el, role => 'text.muted' } if defined $el;
+        }
+        my $coord = _nonneg_int($s->{running_coordinators});
+        push @parts, { text => "$coord coord", role => 'accent' } if $coord > 0;
+
+        my @detail;
+        my $first = 1;
+        for my $p (@parts) {
+            my $t = $p->{text};
+            $t = '   ' . $t unless $first;
+            push @detail, { text => $t, role => $p->{role} };
+            $first = 0;
+        }
+        # glyph_bare: the leading dot IS the liveness verdict itself here
+        # (unlike every other kind's leading icon, which is a fixed symbol),
+        # and blueprints-panel-tree.t AC5/AC16 grep for it as an EXACT bare
+        # span (G('status.crit') etc. with no trailing space) -- so this
+        # kind keeps the glyph bare and carries the one Decision-3 separator
+        # space as the NAME span's own leading character instead.
+        push @pending, { kind => 'driver', is_sub => 1, glyph_name => $gname, glyph_role => $grole,
+                          glyph_bare => 1,
+                          name => 'orchestrator', name_role => 'text.primary', detail => \@detail };
+    }
+
+    # ---- package lines (S2.3.6) ----
+    push @pending, @{ _package_lines($s, $now) };
+
+    # ---- blueprint-wide judge lines (S2.3.7) ----
     my @run_agents = (ref($s->{run_agents}) eq 'ARRAY') ? @{ $s->{run_agents} } : ();
     for my $a (@run_agents) {
+        next unless ref($a) eq 'HASH';
+        next unless defined($a->{role}) && !ref($a->{role}) && $a->{role} eq 'judge';
         next unless _agent_live($a, $now);
-        my $row = _agent_row($a, 1, $now);
-        push @rows, $row if $row;
+        my $label = _judge_label($a);
+        my @detail = ( { text => 'whole blueprint', role => 'text.muted' } );
+        my $e = _elapsed($now, $a->{started_at});
+        push @detail, { text => ' ' . _block_elapsed($e), role => 'text.muted' } if defined $e;
+        # glyph_bare: row-budget-and-preview.t AC31 greps this line's dot
+        # for an EXACT bare match on the judge marker.
+        push @pending, { kind => 'judge', is_sub => 1, glyph_name => '__judge__', glyph_role => 'state.warn',
+                          glyph_bare => 1,
+                          name => $label, name_role => 'text.primary', detail => \@detail };
     }
 
-    # H1 fix-batch: pre-wrap now, with a continuation indent that cannot be
-    # mistaken for a real level (see TREE_WRAP_CONTINUATION_INDENT above).
-    # $width absent (every direct call in the oracle) -> unchanged, exactly
-    # today's un-wrapped rows.
-    return _wrap_tree_rows(\@rows, $width);
+    # ---- next line (S2.3.8) ----
+    my $next_pkg = $s->{next_package};
+    if (defined($next_pkg) && !ref($next_pkg) && length($next_pkg)) {
+        my $already = grep { $_->{kind} eq 'package' && $_->{name} eq $next_pkg } @pending;
+        unless ($already) {
+            push @pending, { kind => 'next', is_sub => 1, glyph_name => 'arrow.right', glyph_role => 'text.muted',
+                              name => $next_pkg, name_role => 'accent', detail => [ { text => 'next', role => 'text.muted' } ] };
+        }
+    }
+
+    # ---- W, aligned/compact mode, and final span assembly ----
+    my $w = 0;
+    for my $ln (@pending) {
+        my $dw = tui::Layout::display_width($ln->{name});
+        $w = $dw if defined($dw) && $dw > $w;
+    }
+
+    my $threshold = ($w + 26 > 2 * $w + 9) ? $w + 26 : 2 * $w + 9;
+    my $aligned = (!defined($width))
+        || (!ref($width) && $width =~ /\A\d+\z/ && $width >= $threshold);
+    my $hang = $aligned ? $w + 4 : 2;
+
+    my @lines;
+    for my $ln (@pending) {
+        my @spans;
+        push @spans, { text => '  ', role => 'text.muted' } if $ln->{is_sub};
+        my $g = ($ln->{glyph_name} eq '__judge__') ? _judge_marker() : (Theme::glyph($ln->{glyph_name}) // '');
+
+        # Every OTHER kind bakes the one Decision-3 separator space into the
+        # glyph span itself (glyph_span = G(name).' ') and the name span is
+        # the bare name (+ trailing pad only) -- this is what lets a caller
+        # locate the name span by its own leading byte (blueprints-panel-
+        # tree.t AC42: a bounded 300-byte name's span must start with the
+        # name's own first byte, not a space). glyph_bare (the no-thread
+        # driver line only) keeps the glyph bare instead, for an unrelated
+        # reason: AC5/AC16 grep for an EXACT bare match on that glyph.
+        my $glyph_text = $ln->{glyph_bare} ? $g : "$g ";
+        push @spans, { text => $glyph_text, role => $ln->{glyph_role} };
+
+        my $name_text = $ln->{glyph_bare} ? ' ' . $ln->{name} : $ln->{name};
+        if (@{ $ln->{detail} }) {
+            if ($aligned) {
+                # Same pad count either way: the one Decision-3 separator
+                # space is already in the name span's own leading byte
+                # (glyph_bare) or in the glyph span (otherwise) -- the
+                # padding below only ever covers the TRAILING gap up to
+                # column W+2, which does not move with that choice.
+                my $pad = ($w + 2) - tui::Layout::display_width($ln->{name});
+                $name_text .= (' ' x $pad) if $pad > 0;
+            }
+            else {
+                $name_text .= '  ';
+            }
+        }
+        push @spans, { text => $name_text, role => $ln->{name_role} };
+        push @spans, @{ $ln->{detail} };
+        push @lines, { kind => $ln->{kind}, spans => \@spans };
+    }
+
+    return { w => $w, hang => $hang, lines => \@lines };
 }
 
-# _run_summary_lines(\@runs, $max_rows) -- one row per blueprint.
+# _run_summary_lines(\@runs, $max_rows) -- one pre-wrapped BLOCK per
+# blueprint (ruling A: the blueprint line, driver line, package/judge/next
+# lines _run_block assembles), not one row -- a block can and routinely
+# does span several physical rows.
 #
 # $max_rows used to be the literal 3, unconditionally, with no relationship to
 # the space available. The operator's dashboard had twelve blueprints, three
@@ -1729,37 +1805,15 @@ sub _run_summary_lines {
         unless defined($max_rows) && !ref($max_rows) && $max_rows =~ /\A\d+\z/ && $max_rows >= 1;
     my $shown = (@summaries < $max_rows) ? scalar(@summaries) : $max_rows;
 
-    # THE WHOLE TABLE IS BUILT AT ONCE, which is the point: column widths come
-    # from every row that will be shown, so a reader can scan down a column.
-    # The "+N more" footer is deliberately NOT a table row -- it belongs to no
-    # column and would otherwise widen the first one for everybody.
-    my $opts = { %{ _BLUEPRINT_TABLE_OPTS() } };
-    $opts->{width} = $width if defined $width && !ref($width) && $width =~ /^\d+$/;
-    my $rows = tui::Frame::table(
-        [ map { _one_run_summary_cells($summaries[$_]) } 0 .. $shown - 1 ], $opts);
-
-    # Interleave each run's optional sub-lines directly beneath its own row, so
-    # the association is positional and needs no repeated label.
-    #
-    # ORDER IS DELIBERATE (spec S2.3): the paused reason comes BEFORE the
-    # current-package line. A parked run's reason is why the operator is being
-    # asked to look at all, so it must not be pushed below a package name that is
-    # merely incidental to it. Both lines are optional and independent -- either,
-    # neither, or both may render, and when neither does the run's output is
-    # byte-identical to what it was before this package existed (t/182 AC9/AC10
-    # pin exactly that).
+    # ruling A: the table + optional sub-lines + agent tree are gone, replaced
+    # by one aligned block per blueprint (_run_block), each line pre-wrapped
+    # at its own hang.
     my @out;
     for my $i (0 .. $shown - 1) {
-        push @out, $rows->[$i] if defined $rows->[$i];
-        my $reason = _paused_reason_line($summaries[$i]);
-        push @out, $reason if $reason;
-        # package 13-dashboard-threads (spec S2.3 Placement): the thread line
-        # comes after the paused-reason line and before `cur`.
-        my $thread_line = _thread_line($summaries[$i], $now);
-        push @out, $thread_line if $thread_line;
-        my $cur = _current_package_line($summaries[$i]);
-        push @out, $cur if $cur;
-        push @out, @{ _tree_lines($summaries[$i], $now, $width) };
+        my $block = _run_block($summaries[$i], $now, $width);
+        for my $line (@{ $block->{lines} || [] }) {
+            push @out, @{ _wrap_block_row($line->{spans}, $width, $block->{hang}) };
+        }
     }
     if (@summaries > $max_rows) {
         my $extra = @summaries - $max_rows;
@@ -1890,41 +1944,18 @@ sub _run_body {
 # empty/absent/non-array $state->{runs} renders one honest no-data line
 # rather than an empty panel.
 # ===========================================================================
-# _blueprints_table_width($cols) -> the display columns a Blueprints row may
-# actually use, or undef when $cols says nothing useful.
-#
-# THE TABLE HAS TO SIZE ITSELF TO THE BAND IT WILL LAND IN, not to the terminal.
-# panels() is handed the FULL terminal width, but this panel is then placed into
-# one band of a multi-column layout and, since t03, into the main region left of
-# the activity column. Sizing to $cols would build a table two or three times
-# wider than the space it gets, and _render_panel's wrap would then break the
-# rows -- destroying exactly the alignment this package exists to create.
-#
-# So: subtract the side column, ask tui::Layout for the bands at that width,
-# and take the NARROWEST. Deliberately the narrowest rather than the band this
-# panel happens to occupy today: the placement depends on how many panels are
-# present and on their min_cols, and a table that silently over-runs when a
-# panel is added elsewhere would be a bug nobody connects to this code. The
-# cost of being conservative is that the table is sometimes narrower than it
-# could be; the cost of being wrong is a broken layout.
-sub _blueprints_table_width {
+# _blueprints_body_width($cols) -> the display columns the Blueprints panel
+# body may actually use, or undef when $cols says nothing useful (spec
+# S2.2.1). Replaces _blueprints_table_width everywhere: Blueprints has been a
+# full_width panel alone in its band since 2026-08-27, is the last panel of
+# that band (so no separator column) and BODY_INDENT is 0, so
+# `$cols - side_column_width($cols)` IS the panel's real content width --
+# no banded-layout probe needed any more.
+sub _blueprints_body_width {
     my ($cols) = @_;
-    return undef if !defined $cols || ref($cols) || $cols !~ /^\d+$/ || $cols < 1;
-    my $main = $cols - tui::Screen::side_column_width($cols);
-    my $bands = tui::Layout::columns($main);
-    return undef if ref($bands) ne 'ARRAY' || !@$bands;
-    my $narrow;
-    for my $b (@$bands) {
-        next unless ref($b) eq 'HASH' && defined $b->{w};
-        $narrow = $b->{w} if !defined $narrow || $b->{w} < $narrow;
-    }
-    return undef if !defined $narrow;
-    # _render_panel bakes a two-column body indent into every row before
-    # wrapping, and adds WRAP_CONTINUATION_INDENT on top for any row that does
-    # wrap. Give the table the room that is actually left after the indent, so
-    # a table that reports as fitting genuinely does.
-    my $avail = $narrow - 2;
-    return $avail > 0 ? $avail : undef;
+    return undef unless defined($cols) && !ref($cols) && $cols =~ /\A\d+\z/ && $cols >= 1;
+    my $w = $cols - tui::Screen::side_column_width($cols);
+    return ($w > 0) ? $w : undef;
 }
 
 # _blueprints_body_today($state, $cols) -> \@lines. The pipeline as it existed
@@ -1935,7 +1966,7 @@ sub _blueprints_body_today {
     my ($state, $cols) = @_;
     $state = {} unless ref($state) eq 'HASH';
     my $lines = _run_summary_lines($state->{runs}, $state->{blueprint_rows_max},
-                                   _blueprints_table_width($cols), _tree_now($state));
+                                   _blueprints_body_width($cols), _tree_now($state));
     return $lines if @$lines;
     # NO 'blueprints' LABEL (operator request, 2026-08-25: "that's unnecessary
     # repeating"). The panel is titled Blueprints and this is its only row, so
@@ -1946,30 +1977,39 @@ sub _blueprints_body_today {
 }
 
 # ===========================================================================
-# Row budget and priority (package 07-row-budget-and-preview). The tree
-# package 06 shipped is unbounded, and tui::Screen::_render_panel clips it
-# SILENTLY past the panel's height (Screen.pm:279/341, outside this write
-# set). This section adds a MEASURED capacity (never a predicted one -- see
-# _blueprints_capacity below and ruling AT-14), a documented priority order
-# (S2.4) that decides which rows survive, and a collapse notice that says so.
+# Row budget and priority (package 07-row-budget-and-preview, motivating
+# history: package 06's original tree was unbounded). _run_block's blocks
+# (ruling A) are equally unbounded on their own, and tui::Screen::_render_panel
+# clips overflow SILENTLY past the panel's height (Screen.pm:279/341, outside
+# this write set). This section adds a MEASURED capacity (never a predicted
+# one -- see _blueprints_capacity below and ruling AT-14), a documented
+# priority order (S2.4) that decides which rows survive, and a collapse
+# notice that says so.
 # ===========================================================================
 
 # BLUEPRINTS_PROBE_MARK -- the sentinel text a probe-mode _blueprints_body
 # emits, ASCII-only (tui-ascii-only), unrelated to any real render output.
 use constant BLUEPRINTS_PROBE_MARK => '~bpcap~';
 
-# _tree_present($state) -> 1 | 0. 1 iff some element of $state->{runs} is a
-# HASH with state eq 'running' AND (packages is an ARRAY or run_agents is an
-# ARRAY) -- the same capability gate _tree_lines already applies, generalised
-# across every run rather than one. Total.
-sub _tree_present {
+# _multiline_blocks($state) -> 0 | 1 (spec S2.2.1). Replaces _tree_present
+# (ruling A, same name-change the spec table lists for compose/
+# _blueprints_capacity/_blueprints_body). S2.2.1 has NO state condition: ANY
+# run whose _run_block(...) actually emits 2+ lines makes this 1, whatever
+# its state (paused/stale/idle/queued included) -- the capacity probe and
+# the "+N row(s) hidden (short panel)" notice must cover a paused fleet just
+# as much as a running one (fix-batch item 2, reviewer BLOCKER-2 / redteam
+# MAJOR-2). The oracle (row-budget-and-preview.t AC20) was strengthened at
+# step 7 to match this reading; the old state-eq-running gate silently
+# clipped paused/stale/idle blocks with no hidden-rows notice.
+sub _multiline_blocks {
     my ($state) = @_;
     return 0 unless ref($state) eq 'HASH';
     return 0 unless ref($state->{runs}) eq 'ARRAY';
+    my $now = _tree_now($state);
     for my $r (@{ $state->{runs} }) {
         next unless ref($r) eq 'HASH';
-        next unless defined($r->{state}) && !ref($r->{state}) && $r->{state} eq 'running';
-        return 1 if ref($r->{packages}) eq 'ARRAY' || ref($r->{run_agents}) eq 'ARRAY';
+        my $block = _run_block($r, $now, undef);
+        return 1 if ref($block) eq 'HASH' && ref($block->{lines}) eq 'ARRAY' && @{ $block->{lines} } >= 2;
     }
     return 0;
 }
@@ -1986,7 +2026,7 @@ sub _blueprints_capacity {
     return undef unless ref($state) eq 'HASH';
     return undef unless defined($rows) && !ref($rows) && $rows =~ /\A\d+\z/ && $rows >= 1;
     return undef unless defined($cols) && !ref($cols) && $cols =~ /\A\d+\z/ && $cols >= 1;
-    return undef unless _tree_present($state);
+    return undef unless _multiline_blocks($state);
 
     my $probe_state = { %$state, blueprints_probe => $rows };
     my $scr = screen($probe_state, $cols);
@@ -2027,69 +2067,30 @@ sub _blueprints_capacity {
 }
 
 # _row_cost($row, $width) -> Int >= 1. How many PHYSICAL rows one logical row
-# will occupy, using the same pre-wrap helper the tree already uses (a tree
-# row that has already been through _wrap_tree_row at this $width therefore
-# fits, and costs exactly 1). $width absent/malformed means "cannot measure a
-# wrap" -- costs 1, never dies.
+# will occupy, re-pointed at _wrap_block_row (ruling A). Every caller hands
+# this a row _push_plan_row already pre-wrapped at this same $width, so it
+# always fits already and the hang argument (fixed at 2) never actually
+# matters -- this sub exists to COUNT physical rows, not to re-decide where
+# they break. $width absent/malformed means "cannot measure a wrap" -- costs
+# 1, never dies.
 sub _row_cost {
     my ($row, $width) = @_;
     return 1 unless defined($width) && !ref($width) && $width =~ /\A\d+\z/ && $width > 0;
-    my $physical = _wrap_tree_row($row, $width);
+    my $physical = _wrap_block_row($row, $width, 2);
     return 1 unless ref($physical) eq 'ARRAY';
     my $n = scalar(@$physical);
     return $n >= 1 ? $n : 1;
 }
 
-# _pkg_stuck($p, $now) -> 1 | 0 (spec S2.4). Total: 0 for a non-HASH, missing
-# keys, refs, or hostile values.
-sub _pkg_stuck {
-    my ($p, $now) = @_;
-    return 0 unless ref($p) eq 'HASH';
-
-    if (ref($p->{agents}) eq 'ARRAY') {
-        for my $a (@{ $p->{agents} }) {
-            next unless ref($a) eq 'HASH';
-            next unless defined($a->{role}) && !ref($a->{role}) && $a->{role} eq 'judge';
-            return 1 if _agent_live($a, $now);
-        }
-    }
-
-    my ($att, $cap) = ($p->{attempt}, $p->{attempt_cap});
-    if (defined($att) && !ref($att) && $att =~ /\A\d{1,10}\z/
-        && defined($cap) && !ref($cap) && $cap =~ /\A\d{1,10}\z/
-        && $cap > 0 && $att >= $cap) {
-        return 1;
-    }
-
-    if (defined($p->{status}) && !ref($p->{status})
-        && ($p->{status} eq 'blocked' || $p->{status} eq 'parked')) {
-        return 1;
-    }
-
-    return 0;
-}
-
-# _agent_kind($a) -> one of coordinator|worker|judge|other. Same closed
-# vocabulary _agent_row already enforces (Decision 6): anything else is
-# 'other', matching this file's own @others grouping -- no new role word.
-sub _agent_kind {
-    my ($a) = @_;
-    my $r = (ref($a) eq 'HASH' && defined($a->{role}) && !ref($a->{role})) ? $a->{role} : '';
-    return 'coordinator' if $r eq 'coordinator';
-    return 'worker'      if $r eq 'worker';
-    return 'judge'       if $r eq 'judge';
-    return 'other';
-}
-
-# _push_plan_row(\@entries, $spans, $pri, $kind, $parent, $width) -> Int |
-# undef. Pre-wraps $spans exactly as _tree_lines/_wrap_tree_rows already do
-# (one physical row per element of _wrap_tree_row's result), pushing one plan
-# entry per physical row, all sharing $pri/$kind/$parent. Returns the index of
-# the FIRST physical entry pushed (the anchor a child row's `parent` points
-# at), or undef if nothing was pushed.
+# _push_plan_row(\@entries, $spans, $pri, $kind, $parent, $width, $hang) ->
+# Int | undef. Pre-wraps $spans via _wrap_block_row (ruling A's replacement
+# for the deleted _tree_lines/_wrap_tree_rows), pushing one plan entry per
+# physical row, all sharing $pri/$kind/$parent. Returns the index of the
+# FIRST physical entry pushed (the anchor a child row's `parent` points at),
+# or undef if nothing was pushed.
 sub _push_plan_row {
-    my ($entries, $spans, $pri, $kind, $parent, $width) = @_;
-    my $physical = _wrap_tree_row($spans, $width);
+    my ($entries, $spans, $pri, $kind, $parent, $width, $hang) = @_;
+    my $physical = _wrap_block_row($spans, $width, $hang);
     $physical = [ $spans ] unless ref($physical) eq 'ARRAY' && @$physical;
     my $anchor;
     my @cont_idx;
@@ -2147,129 +2148,18 @@ sub _atomic_group {
     return @g;
 }
 
-# _package_plan_rows(\@entries, $p, $now, $run_i, $width). Mirrors
-# _package_tree_lines row-for-row (same gate, same group order: coordinators,
-# workers, judges, others), annotating each with S2.4's priority. Pushes
-# DIRECTLY onto the caller's shared \@entries (never a local array of its
-# own) -- a local array whose own anchors get spliced into a larger one after
-# the fact is exactly how a package's coordinator/worker rows end up pointing
-# at the WRONG (pre-splice, locally-numbered) parent index; this file has
-# already paid for that bug once, during this same package's own build.
-sub _package_plan_rows {
-    my ($entries, $p, $now, $run_i, $width) = @_;
-    return unless ref($p) eq 'HASH';
-    my $name = _bound_display($p->{name}, 200);
-    return unless defined $name;
-    return unless _pkg_in_flight($p, $now);
-
-    my @spans = ( { text => _indent(1), role => 'text.muted' },
-                  { text => $name,      role => 'accent' } );
-    my ($att, $cap) = ($p->{attempt}, $p->{attempt_cap});
-    if (defined($att) && !ref($att) && $att =~ /\A\d{1,10}\z/
-        && defined($cap) && !ref($cap) && $cap =~ /\A\d{1,10}\z/) {
-        push @spans, { text => "  attempt $att/$cap",
-                       role => ($att >= $cap ? 'state.warn' : 'text.primary') };
-    }
-    my $step = _bound_display($p->{step}, 32);
-    push @spans, { text => "  step $step", role => 'text.muted' } if defined $step;
-
-    my $pkg_pri = _pkg_stuck($p, $now) ? 4 : 5;
-    my $pkg_i = _push_plan_row($entries, \@spans, $pkg_pri, 'package', $run_i, $width);
-
-    my @agents = (ref($p->{agents}) eq 'ARRAY') ? @{ $p->{agents} } : ();
-    my @live   = grep { _agent_live($_, $now) } @agents;
-    my $rolewd = sub {
-        my ($a) = @_;
-        my $r = $a->{role};
-        return (defined($r) && !ref($r)) ? $r : '';
-    };
-    my @coordinators = grep { $rolewd->($_) eq 'coordinator' } @live;
-    my @workers      = grep { $rolewd->($_) eq 'worker' } @live;
-    my @judges       = grep { $rolewd->($_) eq 'judge' } @live;
-    my @others       = grep {
-        my $r = $rolewd->($_);
-        $r ne 'coordinator' && $r ne 'worker' && $r ne 'judge';
-    } @live;
-
-    my $coord_i;
-    if (@coordinators) {
-        for my $c (@coordinators) {
-            my $row = _agent_row($c, 2, $now);
-            next unless $row;
-            my $i = _push_plan_row($entries, $row, 6, 'coordinator', $pkg_i, $width);
-            $coord_i = $i unless defined $coord_i;
-        }
-    }
-    elsif (defined($p->{status}) && !ref($p->{status}) && $p->{status} eq 'running') {
-        my $row = [ { text => _indent(2), role => 'text.muted' },
-                    { text => 'coordinator', role => 'accent' } ];
-        $coord_i = _push_plan_row($entries, $row, 6, 'coordinator', $pkg_i, $width);
-    }
-    for my $w (@workers) {
-        my $row = _agent_row($w, 3, $now);
-        next unless $row;
-        _push_plan_row($entries, $row, 7, 'worker', (defined($coord_i) ? $coord_i : $pkg_i), $width);
-    }
-    for my $j (@judges) {
-        my $row = _agent_row($j, 2, $now);
-        next unless $row;
-        _push_plan_row($entries, $row, 3, 'judge', $pkg_i, $width);
-    }
-    for my $o (@others) {
-        my $row = _agent_row($o, 3, $now);
-        next unless $row;
-        _push_plan_row($entries, $row, 7, 'other', $pkg_i, $width);
-    }
-    return;
-}
-
-# _tree_plan_rows(\@entries, $s, $now, $width, $run_i). Mirrors _tree_lines
-# row-for-row: the same gate (state=>running AND packages is an ARRAY), the
-# same order (orchestrator, then every package block, then run_agents flat at
-# level 1, unreordered). Pushes directly onto the caller's shared \@entries,
-# for the same reason _package_plan_rows does.
-sub _tree_plan_rows {
-    my ($entries, $s, $now, $width, $run_i) = @_;
-    return unless ref($s) eq 'HASH';
-    return unless defined($s->{state}) && !ref($s->{state}) && $s->{state} eq 'running';
-    return unless ref($s->{packages}) eq 'ARRAY';
-
-    my $orch = _orchestrator_line($s, $now);
-    if ($orch) {
-        my $av = $s->{orchestrator_alive};
-        my $alive = (defined($av) && !ref($av) && $av) ? 1 : 0;
-        _push_plan_row($entries, $orch, ($alive ? 8 : 3), 'orchestrator', $run_i, $width);
-    }
-
-    for my $p (@{ $s->{packages} }) {
-        _package_plan_rows($entries, $p, $now, $run_i, $width);
-    }
-
-    my @run_agents = (ref($s->{run_agents}) eq 'ARRAY') ? @{ $s->{run_agents} } : ();
-    for my $a (@run_agents) {
-        next unless _agent_live($a, $now);
-        my $row = _agent_row($a, 1, $now);
-        next unless $row;
-        my $kind = _agent_kind($a);
-        my $pri  = ($kind eq 'judge') ? 3 : ($kind eq 'coordinator' ? 6 : 7);
-        _push_plan_row($entries, $row, $pri, $kind, $run_i, $width);
-    }
-
-    return;
-}
-
-# _blueprints_row_plan($state, $cols) -> \@entries (spec S2.2). The whole
-# panel body as an ordered plan, one entry per (physical, after pre-wrap) row.
-# Mirrors _run_summary_lines exactly -- same table build, same interleave
-# order (table row, paused reason, cur line, tree lines), same overflow
-# footer -- so that with no budget in play, [ map {spans} @plan ] is
-# is_deeply-equal to _blueprints_body's own output (S2.2's own invariant).
+# _blueprints_row_plan($state, $cols) -> \@entries (spec S2.2.1/S2.5). The
+# whole panel body as an ordered plan, one entry per (physical, after
+# pre-wrap) row -- mirrors _run_summary_lines exactly (same blocks, same
+# per-line wrap at the block's own hang), so that with no budget in play,
+# [ map {spans} @plan ] is is_deeply-equal to _blueprints_body's own output.
+# Priority per S2.5's table: blueprint 1, driver 2, package 3, judge 4, next 5.
 sub _blueprints_row_plan {
     my ($state, $cols) = @_;
     my @entries;
     return \@entries unless ref($state) eq 'HASH';
     my $now   = _tree_now($state);
-    my $width = _blueprints_table_width($cols);
+    my $width = _blueprints_body_width($cols);
     return \@entries unless ref($state->{runs}) eq 'ARRAY';
     my @summaries = grep { ref($_) eq 'HASH' } @{ $state->{runs} };
     return \@entries unless @summaries;
@@ -2279,27 +2169,17 @@ sub _blueprints_row_plan {
         unless defined($max_rows) && !ref($max_rows) && $max_rows =~ /\A\d+\z/ && $max_rows >= 1;
     my $shown = (@summaries < $max_rows) ? scalar(@summaries) : $max_rows;
 
-    my $opts = { %{ _BLUEPRINT_TABLE_OPTS() } };
-    $opts->{width} = $width if defined $width && !ref($width) && $width =~ /^\d+$/;
-    my $rows = tui::Frame::table(
-        [ map { _one_run_summary_cells($summaries[$_]) } 0 .. $shown - 1 ], $opts);
+    my %kind_pri = ( blueprint => 1, driver => 2, package => 3, judge => 4, next => 5 );
 
     for my $i (0 .. $shown - 1) {
-        my $run_i;
-        if (defined $rows->[$i]) {
-            push @entries, { spans => $rows->[$i], pri => 1, kind => 'run', parent => undef };
-            $run_i = $#entries;
+        my $block = _run_block($summaries[$i], $now, $width);
+        my $bp_anchor;
+        for my $line (@{ $block->{lines} || [] }) {
+            my $pri = $kind_pri{ $line->{kind} // '' } // 9;
+            my $parent = ($line->{kind} eq 'blueprint') ? undef : $bp_anchor;
+            my $idx = _push_plan_row(\@entries, $line->{spans}, $pri, $line->{kind}, $parent, $width, $block->{hang});
+            $bp_anchor = $idx if $line->{kind} eq 'blueprint';
         }
-        my $reason = _paused_reason_line($summaries[$i]);
-        push @entries, { spans => $reason, pri => 2, kind => 'partial', parent => $run_i } if $reason;
-        # package 13-dashboard-threads (spec S2.3 Placement): reuses the
-        # `partial` kind rather than inventing an eleventh one; not pre-wrapped,
-        # mirroring the `cur` line, so AC1's plan/body equivalence holds.
-        my $thread_line = _thread_line($summaries[$i], $now);
-        push @entries, { spans => $thread_line, pri => 2, kind => 'partial', parent => $run_i } if $thread_line;
-        my $cur = _current_package_line($summaries[$i]);
-        push @entries, { spans => $cur, pri => 5, kind => 'cur', parent => $run_i } if $cur;
-        _tree_plan_rows(\@entries, $summaries[$i], $now, $width, $run_i);
     }
     if (@summaries > $max_rows) {
         my $extra = @summaries - $max_rows;
@@ -2357,65 +2237,27 @@ sub _select_rows {
 
     my %kept;
     my $spent = 0;
-    # PRIORITY TIERS in ascending order (pri 1 first); WITHIN a tier, by
-    # ascending closure cost -- cheapest first. Cheapest-first within a tier
-    # is what lets a row whose ancestor is already kept (a run-scoped judge,
-    # whose parent is the run row admitted at pri 1) win a slot ahead of
-    # same-priority siblings that would each drag in their OWN not-yet-kept
-    # parent (a package-scoped judge, cost 2, vs the run-scoped one's cost
-    # 1) -- this is M4 (spec Behavior 6/AC27): the blueprint-scoped
-    # conformance judge must survive whenever there is room for {run row +
-    # judge row}, even competing against forty same-priority package judges
-    # that sit earlier in document order.
+    # package 01-run-blocks (spec S2.5): the M4 cheapest-first ordering is
+    # REMOVED -- its subject (package judges competing with a run judge) no
+    # longer exists under the block grammar. Within a tier, candidates are
+    # taken in plain document (index) order.
     #
-    # CORRECTED (fix-batch, redteam HIGH-2): this used to compute each
-    # candidate's closure/cost ONCE per tier, against the kept-set as of the
-    # tier's start, on the claimed invariant that "every parent ... sits in
-    # a strictly earlier (numerically lower) tier than its children". THAT
-    # CLAIM WAS FALSE -- a `judge` entry is pri 3, but its parent (the
-    # package row) is pri 4/5, a LATER tier; an alive orchestrator is pri 8,
-    # a coordinator pri 6, both later than a judge's pri 3. So when two
-    # judges shared an unkept package-row parent, the SECOND judge's frozen
-    # cost still charged for that parent even after the first judge's
-    # admission had already paid for it -- a spurious rejection that also
-    # inverted priority order (a healthy pri-7 worker admitted while a live
-    # pri-3 judge was dropped) and systematically under-filled the budget
-    # (wasted slack nothing later could claim, with the hidden count
-    # inflated to match).
-    #
-    # The tier-start closure below is now used ONLY to produce a cheapest-
-    # first admission ORDER for the tier; the closure/cost that actually
-    # gates admission is recomputed against the LIVE %kept at the moment
-    # each candidate is considered (S2.5's own pseudocode), so an ancestor
-    # another same-tier sibling just admitted is never double-charged.
-    # Document index remains the tie-break when costs are equal, so the
-    # ordering is still a refinement of "index asc", never a departure from
-    # it when there is nothing to break a cost tie with.
+    # Tier 3 (packages) is a PREFIX: the first tier-3 candidate whose closure
+    # does not fit ENDS the tier entirely -- no later package line, in any
+    # block, is admitted. Every other tier keeps the old skip-and-continue
+    # behaviour (a candidate that does not fit is passed over, and a LATER,
+    # cheaper one in the same tier may still be admitted).
     for my $pri (sort { $a <=> $b } keys %tier) {
-        my %closure;
-        for my $i (@{ $tier{$pri} }) {
-            # _atomic_group($i) folds $i's own continuations (fix-batch
-            # MEDIUM-4) into its own need; an ancestor pulled in below gets
-            # the SAME treatment, so admitting a multi-line ancestor row
-            # (e.g. a wrapped package row) as someone else's dependency
-            # never leaves that ancestor's own continuation orphaned.
-            my @need = _atomic_group($entries, $i);
-            my $p = _valid_parent($entries, $i);
-            while (defined($p) && !$kept{$p}) {
-                push @need, _atomic_group($entries, $p);
-                $p = _valid_parent($entries, $p);
-            }
-            my $cost = 0;
-            $cost += _row_cost($entries->[$_]{spans}, $width) for @need;
-            $closure{$i} = { cost => $cost };
-        }
-        my @order = sort {
-            $closure{$a}{cost} <=> $closure{$b}{cost} || $a <=> $b
-        } @{ $tier{$pri} };
+        my @order = sort { $a <=> $b } @{ $tier{$pri} };
 
         for my $i (@order) {
             next if $kept{$i};
-            # Recomputed against the LIVE %kept -- see the comment above.
+            # Closure/cost recomputed against the LIVE %kept at the moment
+            # each candidate is considered (S2.5's own pseudocode), so an
+            # ancestor another same-tier sibling just admitted is never
+            # double-charged. _atomic_group folds $i's own continuations
+            # (fix-batch MEDIUM-4) into its own need; an ancestor pulled in
+            # below gets the same treatment.
             my @need = _atomic_group($entries, $i);
             my $p = _valid_parent($entries, $i);
             while (defined($p) && !$kept{$p}) {
@@ -2424,7 +2266,10 @@ sub _select_rows {
             }
             my $cost = 0;
             $cost += _row_cost($entries->[$_]{spans}, $width) for @need;
-            next if $spent + $cost > $budget;
+            if ($spent + $cost > $budget) {
+                last if $pri == 3;   # tier 3 (packages): a PREFIX, stop entirely
+                next;                 # every other tier: skip and continue
+            }
             $kept{$_} = 1 for @need;
             $spent += $cost;
         }
@@ -2433,14 +2278,14 @@ sub _select_rows {
 }
 
 # _collapse_notice($hidden) -> \@spans (spec S2.6). One span, indent 0, so it
-# can never be read as a tree row at any level.
+# can never be read as a block sub-line at any level.
 sub _collapse_notice {
     my ($hidden) = @_;
-    # A leading EMPTY-TEXT span (indent 0), matching every tree row's own
-    # leading-indent-as-its-own-span convention (_indent($level)) -- so
-    # row_leading (the same "first span is pure whitespace" probe AC30 uses
-    # against a real indent-2 row) sees this row's indent as exactly 0,
-    # rather than -1 for "no separate indent span at all".
+    # A leading EMPTY-TEXT span (indent 0), matching every block sub-line's
+    # own leading-indent-as-its-own-span convention -- so row_leading (the
+    # same "first span is pure whitespace" probe AC30 uses against a real
+    # indent-2 row) sees this row's indent as exactly 0, rather than -1 for
+    # "no separate indent span at all".
     return [ { text => '', role => 'text.muted' },
              { text => '+' . count_of($hidden, 'row') . ' hidden (short panel)',
                role => 'text.muted' } ];
@@ -2461,12 +2306,20 @@ sub _blueprints_body {
     my $cap = $state->{blueprint_body_rows};
     my $has_cap = defined($cap) && !ref($cap) && $cap =~ /\A\d+\z/ && $cap >= 1;
     return _blueprints_body_today($state, $cols) unless $has_cap;
-    return _blueprints_body_today($state, $cols) unless _tree_present($state);
-
+    # _multiline_blocks is NOT used as a gate here (unlike _blueprints_capacity
+    # and compose below): it keeps _tree_present's OLD capability-gate
+    # semantics (state eq 'running' AND packages-or-run_agents an ARRAY,
+    # content not inspected -- row-budget-and-preview.t AC20), which a block
+    # can now exceed its cap WITHOUT satisfying (any state can render a
+    # multi-line block -- a paused run with packages and a judge, dashboard-
+    # blueprints-blocks.t AC20). The plan-build below is cheap enough to run
+    # unconditionally; the `$total <= $cap` check two lines down is what
+    # actually supplies the "nothing to collapse" shortcut, correctly, for
+    # every state.
     my $plan = _blueprints_row_plan($state, $cols);
     return _blueprints_body_today($state, $cols) unless ref($plan) eq 'ARRAY' && @$plan;
 
-    my $width = _blueprints_table_width($cols);
+    my $width = _blueprints_body_width($cols);
     my $total = 0;
     $total += _row_cost($_->{spans}, $width) for @$plan;
     return _blueprints_body_today($state, $cols) if $total <= $cap;
@@ -3532,9 +3385,9 @@ sub compose {
     # distinct from blueprint_rows_max above, which caps RUNS, never rows
     # (t/79 Behavior13/15 pin that meaning; it is not reopened here). A
     # caller-supplied blueprint_body_rows wins, exactly as blueprint_rows_max
-    # does. No probe is composed when _tree_present is false -- that is the
-    # common case (no running run with a tree) and it must cost nothing.
-    if (ref($state) eq 'HASH' && !defined($state->{blueprint_body_rows}) && _tree_present($state)) {
+    # does. No probe is composed when _multiline_blocks is false -- that is
+    # the common case (no running run with a tree) and it must cost nothing.
+    if (ref($state) eq 'HASH' && !defined($state->{blueprint_body_rows}) && _multiline_blocks($state)) {
         my $cap = _blueprints_capacity($state, $rows, $cols);
         $state = { %$state, blueprint_body_rows => $cap } if defined $cap;
     }

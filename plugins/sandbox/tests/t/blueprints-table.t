@@ -191,51 +191,46 @@ sub panel_rows {
     return $p ? $p->{lines} : [];
 }
 
+# RETIRED/REPLACED by package 01-run-blocks (spec S5.1 table): the table
+# (tui::Frame::table over blueprint rows) is gone -- Decision 1 replaces it
+# with the per-run block, whose own column alignment is tested in
+# dashboard-blueprints-blocks.t AC16. What remains true of the PANEL at
+# every width is weaker and stays here: every blueprint line leads with the
+# blueprint glyph, and nothing exceeds the terminal width.
+my $ICON_BP = Theme::glyph('icon.blueprints') // '';
 for my $cols (60, 80, 100, 130, 150, 200) {
     my $lines = panel_rows($cols);
-    my @table = grep { text_of($_) !~ /^\s*cur / && text_of($_) =~ /pkg/ } @$lines;
+    my @bp_lines = grep { length($ICON_BP) && index(text_of($_), $ICON_BP) == 0 } @$lines;
 
-    cmp_ok(scalar(@table), '>=', 3, "AC5: cols=$cols -- all three runs render as table rows");
+    cmp_ok(scalar(@bp_lines), '>=', 3, "AC5 (retargeted): cols=$cols -- all three runs render a blueprint-line leading with the blueprint glyph");
 
-    my %w; $w{ width_of($_) } = 1 for @table;
-    is(scalar(keys %w), 1, "AC5: cols=$cols -- every blueprint row is the same width");
-
-    my %at;
-    $at{ index(text_of($_), 'pkg') } = 1 for @table;
-    is(scalar(keys %at), 1,
-        "AC5: cols=$cols -- the package-count column ends at a common offset in every row, which is the operator's actual ask");
-
-    # AC6 -- the table sizes to the BAND, not the terminal. A table wider than
-    # the band it lands in would be wrapped by _render_panel, destroying the
-    # alignment this package exists to create.
-    my @over = grep { width_of($_) > $cols } @table;
-    is(scalar(@over), 0, "AC6: cols=$cols -- no row exceeds even the full terminal width");
+    my @over = grep { width_of($_) > $cols } @$lines;
+    is(scalar(@over), 0, "AC6 (retargeted): cols=$cols -- no panel row exceeds the terminal width");
 }
 
-# AC7 -- the current package is NOT a table column, and this is the assertion
-# that encodes why. Package d02 of the predecessor initiative closed bug report
-# 20260814-093052-312a with a standing rule -- an overflowing row must WRAP and
-# no word may be silently dropped -- and a droppable column violates it. The
-# first draft of this package made `cur` a column; t/wrap-on-overflow.t AC1
-# caught it, at cols=30, where the column was dropped and the package name
-# vanished entirely.
+# AC7 -- RETARGETED by package 01-run-blocks: the current package is now a
+# package LINE built via the `current_package` fallback (spec S2.3.6, kept
+# explicitly so this fixture -- which has no `packages` array -- still
+# renders one ACTIVE line per run that has a current package, with detail
+# "running"), not a `cur` table column.
 for my $cols (60, 100, 150) {
     my $lines = panel_rows($cols);
     my $joined = join("\n", map { text_of($_) } @$lines);
     like($joined, qr/d05-almanac-frontmatter-injection/,
         "AC7: cols=$cols -- the current package survives at every width, because it is its own wrappable line rather than a droppable column");
-    my @curs = grep { text_of($_) =~ /^\s*cur / } @$lines;
-    is(scalar(@curs), 2,
-        "AC7: cols=$cols -- exactly one such line per run that HAS a current package, and none for the run that does not");
+    my @active = grep { text_of($_) =~ /\brunning\b/ && text_of($_) =~ /(?:d05-almanac-frontmatter-injection|t04-blueprints-table)/ } @$lines;
+    is(scalar(@active), 2,
+        "AC7: cols=$cols -- exactly one such ACTIVE (current_package fallback) line per run that HAS a current package, and none for the run that does not");
 }
 
-# AC8 -- no colon in a blueprint table row (Decision 2). The old shape wrote
-# "$bp : " between the name and the state; in a table the column IS the
-# separator, so the colon was decoration.
+# AC8 -- no colon in a blueprint line (Decision 2). The old shape wrote
+# "$bp : " between the name and the state; the block has no such separator
+# either. RETARGETED from the now-gone "pkg" table-row selector to the
+# blueprint-glyph selector (AC5/AC6 above).
 for my $cols (60, 100, 150) {
-    my @table = grep { text_of($_) =~ /pkg/ } @{ panel_rows($cols) };
-    my $with = grep { text_of($_) =~ /:/ } @table;
-    is($with, 0, "AC8 (Decision 2): cols=$cols -- no colon in any blueprint table row");
+    my @bp_lines = grep { length($ICON_BP) && index(text_of($_), $ICON_BP) == 0 } @{ panel_rows($cols) };
+    my $with = grep { text_of($_) =~ /:/ } @bp_lines;
+    is($with, 0, "AC8 (Decision 2): cols=$cols -- no colon in any blueprint line");
 }
 
 # AC9 -- the empty case still says something rather than rendering nothing.
