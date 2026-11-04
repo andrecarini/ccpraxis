@@ -156,9 +156,20 @@ sub _snapshot_real_state {
             # watching it failed every standalone run made while a sandbox was
             # open (2026-11-02). No test writes there; it is the machine's.
             next if -d $full && $entry eq 'sandbox-holds' && $d =~ m{/continuity\z};
+            # continuity/host-ac/ is the live refresher's battery state machine
+            # (wake-and-pause-consolidation 09): it is rewritten every tick
+            # while anything holds the machine awake. Machine-owned, like
+            # sandbox-holds; no test may write there.
+            next if -d $full && $entry eq 'host-ac' && $d =~ m{/continuity\z};
             if (-d $full) { push @stack, $full; next }
             my @st = stat $full;
             (my $rel = $full) =~ s{\\}{/}g;
+            # continuity/awake-sources/ entries are refreshed and pruned by
+            # every live producer (launchers, drive-solo, the fleet) on their
+            # own cadence, so only a NEW entry is evidence of a test leak --
+            # which is exactly how the 08 subprocess leak was caught. Record
+            # presence only; the END check ignores their removal.
+            if ($d =~ m{/continuity/awake-sources\z}) { $seen{$rel} = 'present'; next }
             $seen{$rel} = ($st[9] // 0) . ':' . ($st[7] // 0);
         }
         closedir $dh;
@@ -184,6 +195,7 @@ END {
         push @diffs, "changed: $k" if !defined($b) || $b ne $a;
     }
     for my $k (@before_keys) {
+        next if $k =~ m{/continuity/awake-sources/[^/]+\z};   # live producers prune these
         push @diffs, "removed: $k" unless exists $after->{$k};
     }
     if (@diffs) {
