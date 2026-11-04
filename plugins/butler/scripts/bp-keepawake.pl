@@ -319,6 +319,88 @@ sub ps_available {
     return $_PS_AVAILABLE = 0;
 }
 
+# pin_ps_analysis_cache() -> the path now in $ENV{PSModuleAnalysisCachePath},
+# or undef when nothing needed pinning. Call it in the process that is about
+# to exec powershell.exe (a forked child, ideally), before the exec. It
+# mutates %ENV on purpose: the value it sets is an absolute, harmless cache
+# location, so anything else spawned later from the same env inherits a
+# correct value too.
+#
+# THE STRAY THIS PREVENTS. Windows PowerShell 5.1 writes its module-analysis
+# cache to $env:PSModuleAnalysisCachePath, or, when that is unset, to
+# [Environment]::GetFolderPath('LocalApplicationData') +
+# '\Microsoft\Windows\PowerShell\ModuleAnalysisCache'. That known folder is
+# expanded from %USERPROFILE%, NOT read from %LOCALAPPDATA%, and GetFolderPath
+# returns "" when the folder does not exist. So a powershell.exe started with
+# USERPROFILE pointing at a throwaway home that has no AppData\Local (every
+# test harness that isolates HOME/USERPROFILE does exactly this) resolves the
+# cache to the RELATIVE path Microsoft\Windows\PowerShell\ModuleAnalysisCache
+# and writes it into its own cwd -- the repo root, for a test run as
+# `perl plugins/.../x.t`. The write happens on a timer about ten seconds after
+# the first module analysis, so only a powershell that lives that long leaves
+# the stray: the long-lived keep-awake.ps1 helper spawn() starts is the one
+# that did (todo 20261104-035939-482d0000). Measured 2026-11-04: a
+# powershell.exe with USERPROFILE=<empty temp home>, an autoloading cmdlet and
+# an 11s sleep writes <cwd>/Microsoft/Windows/PowerShell/ModuleAnalysisCache
+# (7s does not); the same process with this pin writes nothing to its cwd.
+#
+# The real profile's default location is left alone: the pin only applies
+# when the variable is unset/empty and $USERPROFILE/AppData/Local is not a
+# directory (exactly when PowerShell's own fallback is the broken one), or
+# when the variable holds a RELATIVE path (which PowerShell would also
+# resolve against cwd). An already-absolute value is kept; a POSIX-absolute
+# one (/tmp/..., /c/...) is rewritten to its drive-letter form so it stays
+# correct even where MSYS2's environment conversion is switched off.
+#
+# The pinned location is one shared directory under the first usable,
+# absolute, existing temp directory: TEMP, TMP, LOCALAPPDATA\Temp,
+# SYSTEMROOT\Temp, then File::Spec->tmpdir() (translated from its MSYS
+# form). A drive-letter candidate is used AS GIVEN, never through abs_path:
+# this host's TEMP is the 8.3 form (C:\Users\ANDR~1\...), pure ASCII, and
+# resolving it would only reintroduce the non-ASCII long name for no gain.
+# Nothing usable -> undef and the variable is left alone: a path relative to
+# cwd is the one thing this must never produce.
+sub pin_ps_analysis_cache {
+    return undef unless $^O =~ /^(MSWin32|msys|cygwin)$/;
+    my $abs_win = qr{\A(?:[A-Za-z]:[\\/]|[\\/]{2})};
+    my $cur = $ENV{PSModuleAnalysisCachePath};
+    if (defined $cur && length $cur) {
+        return undef if $cur =~ $abs_win;
+        if ($cur =~ m{\A/}) {
+            my $w = _winify_translate($cur);
+            if (defined $w && $w =~ $abs_win) {
+                $ENV{PSModuleAnalysisCachePath} = $w;
+                return $w;
+            }
+        }
+        # relative (or an untranslatable POSIX path): fall through and pin
+    } else {
+        my $up = $ENV{USERPROFILE};
+        return undef if defined $up && $up =~ m{\A(?:[A-Za-z]:[\\/]|/)} && -d "$up/AppData/Local";
+    }
+    require File::Spec;
+    my @cands = ($ENV{TEMP}, $ENV{TMP},
+                 (defined $ENV{LOCALAPPDATA} && length $ENV{LOCALAPPDATA} ? "$ENV{LOCALAPPDATA}/Temp" : ()),
+                 (defined $ENV{SYSTEMROOT}   && length $ENV{SYSTEMROOT}   ? "$ENV{SYSTEMROOT}/Temp"   : ()),
+                 File::Spec->tmpdir());
+    require File::Path;
+    for my $cand (@cands) {
+        next unless defined $cand && length $cand;
+        (my $base = $cand) =~ s{\\}{/}g;
+        $base =~ s{/+\z}{};
+        my $win = $base =~ $abs_win     ? $base
+                : $base =~ m{\A/}       ? _winify_translate($base)
+                :                         undef;   # relative: never
+        next unless defined $win && $win =~ $abs_win && -d $base;
+        my $dir = "$base/ccpraxis-ps-analysis-cache";
+        eval { File::Path::make_path($dir) };
+        next unless -d $dir;
+        $ENV{PSModuleAnalysisCachePath} = "$win/ccpraxis-ps-analysis-cache/ModuleAnalysisCache";
+        return $ENV{PSModuleAnalysisCachePath};
+    }
+    return undef;
+}
+
 # spawn($pid_file, \%owner?, \%opts?) -> pid | undef. DIES if the helper is
 # missing or fork fails. %owner keys: owner_winpid, owner_desc -- see
 # owner_desc_clean and winpid_of. Never pass $$, getppid() or a fork return
@@ -398,6 +480,10 @@ sub spawn {
         }
         my $clean_desc = owner_desc_clean($owner->{owner_desc});
         push @extra, '-OwnerDesc', $clean_desc if defined $clean_desc;
+        # This helper is the long-lived powershell whose module-analysis
+        # cache landed in the caller's cwd under a throwaway USERPROFILE
+        # (see pin_ps_analysis_cache).
+        eval { pin_ps_analysis_cache() };
         exec('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
              '-WindowStyle', 'Hidden', '-File', winify($ps1),
              '-PidFile', winify_out($pid_f),
@@ -612,7 +698,15 @@ sub _production_cmdline_of {
     # 'not-ours' for paths under this account. Measured directly, not guessed.
     my $out = do {
         local $ENV{MSYS2_ARG_CONV_EXCL} = '*';
-        `powershell.exe -NoProfile -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; (Get-CimInstance Win32_Process -Filter 'ProcessId=$winpid').CommandLine" 2>&1`;
+        # Pinned for this one child only: this runs in the CALLER's process
+        # (no fork), so the pin is undone on the way out rather than left
+        # behind in a library caller's %ENV.
+        my $had_ps = exists $ENV{PSModuleAnalysisCachePath};
+        my $old_ps = $ENV{PSModuleAnalysisCachePath};
+        eval { pin_ps_analysis_cache() };
+        my $o = `powershell.exe -NoProfile -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; (Get-CimInstance Win32_Process -Filter 'ProcessId=$winpid').CommandLine" 2>&1`;
+        if ($had_ps) { $ENV{PSModuleAnalysisCachePath} = $old_ps } else { delete $ENV{PSModuleAnalysisCachePath} }
+        $o;
     };
     return undef unless defined $out;
     $out =~ s/^\s+//; $out =~ s/\s+$//;

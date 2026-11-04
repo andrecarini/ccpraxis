@@ -357,6 +357,55 @@ sub _install_sweep_cleanup_handlers {
     $SIG{TERM} = $handler;
 }
 
+# _pin_host_ps_analysis_cache() -> $path | undef -- todo
+# 20261104-035939-482d0000. run_one() already pins PSModuleAnalysisCachePath
+# inside each per-file sandbox (5ac5912), but that pin lives in run_one's
+# `local %ENV` only: the sweep process itself, and anything it spawns outside
+# run_one (the audit's own probes, the container lane's host-side commands),
+# still ran with the ambient value. Unset there plus a USERPROFILE without
+# AppData\Local -- an agent or test harness that sandboxes HOME and then
+# starts a sweep -- and a powershell that lives ~10 s writes
+# Microsoft/Windows/PowerShell/ModuleAnalysisCache RELATIVE to its cwd, the
+# repo root. So the sweep owner pins it here to a per-sweep directory,
+# absolute and in drive-letter form (correct whether or not MSYS2 converts
+# the environment), removed by the END block below. Windows only; an
+# already-absolute ambient value is respected, not replaced.
+my $PS_ANALYSIS_CACHE_DIR;
+sub _pin_host_ps_analysis_cache {
+    return undef unless $^O =~ /^(MSWin32|msys|cygwin)$/;
+    my $abs_win = qr{\A(?:[A-Za-z]:[\\/]|[\\/]{2})};
+    my $cur = $ENV{PSModuleAnalysisCachePath};
+    return $cur if defined $cur && $cur =~ $abs_win;
+    my $base = $REAL_WINDOWS_TMP // _short_tmp_base();
+    return undef unless defined $base;
+    my $dir = eval { File::Temp::tempdir('ccpraxis-psmac-XXXXXX', DIR => $base, CLEANUP => 0) };
+    return undef unless defined $dir && -d $dir;
+    $PS_ANALYSIS_CACHE_DIR = $dir;
+    _register_sandbox_dir($dir);   # so an INT/TERM removes it too
+    (my $win = $dir) =~ s{\\}{/}g;
+    if ($win =~ m{\A/}) {
+        if    ($win =~ s{\A/([a-zA-Z])/}{\u$1:/}) { }
+        elsif (defined &Cygwin::posix_to_win_path) {
+            my $w = Cygwin::posix_to_win_path($win, 1);
+            $win = defined $w ? $w : '';
+            $win =~ s{\\}{/}g;
+        }
+    }
+    # Never a path PowerShell would resolve against cwd: leave the variable
+    # alone instead (the per-file sandbox pin still applies).
+    return undef unless $win =~ $abs_win;
+    $ENV{PSModuleAnalysisCachePath} = "$win/ModuleAnalysisCache";
+    return $ENV{PSModuleAnalysisCachePath};
+}
+END {
+    # Only the sweep owner removes it: forked workers run this same END block
+    # on their own exit while siblings may still be using the directory.
+    if (defined $PS_ANALYSIS_CACHE_DIR && defined $SWEEP_OWNER_PID && $$ == $SWEEP_OWNER_PID) {
+        local ($?, $@, $!);
+        eval { _force_remove_tree($PS_ANALYSIS_CACHE_DIR) };
+    }
+}
+
 # _short_tmp_base() -> $dir | undef -- on this project's actual host (a
 # cygwin/msys-flavored Git-for-Windows perl), "/tmp" is a real, writable
 # mount aliasing the same physical directory $ENV{TEMP} names, but through a
@@ -1603,6 +1652,12 @@ sub run_sweep {
     # to clean up but before any worker is forked (a forked worker inherits
     # these same %SIG entries but is guarded off by $SWEEP_OWNER_PID).
     _install_sweep_cleanup_handlers();
+
+    # The sweep process itself (and every child it starts OUTSIDE run_one's
+    # per-file sandbox) gets an absolute module-analysis cache too -- see
+    # _pin_host_ps_analysis_cache. After the handlers above, so the owner pid
+    # its END-block cleanup is guarded by is already recorded.
+    _pin_host_ps_analysis_cache();
 
     # Pre-sweep audit snapshot (package 21-test-sandbox). Taken here, before
     # any test file runs, so a file that appears afterward is genuinely new

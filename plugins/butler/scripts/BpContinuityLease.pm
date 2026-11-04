@@ -1170,6 +1170,10 @@ sub _run_detached {
     if ($pid == 0) {
         open(STDIN,  '<', '/dev/null');
         open(STDERR, '>', '/dev/null');   # never NUL -- a hook's stderr must stay clean
+        # The transient powershell, and the refresher daemon it starts (which
+        # inherits this env and later spawns the keep-awake helper), must
+        # never resolve PowerShell's module-analysis cache relative to cwd.
+        eval { BpKeepAwake::pin_ps_analysis_cache() };
         exec(@$argv) or POSIX::_exit(127);
     }
     local $/;

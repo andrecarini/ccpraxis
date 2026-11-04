@@ -291,6 +291,9 @@ sub run_bounded {
         open(STDIN,  '<', '/dev/null');
         open(STDOUT, '>', $out_path);
         open(STDERR, '>', '/dev/null');
+        # Most argv run here are powershell probes: never let one resolve its
+        # module-analysis cache relative to cwd (a no-op for anything else).
+        eval { BpKeepAwake::pin_ps_analysis_cache() };
         { local $ENV{MSYS2_ARG_CONV_EXCL} = '*'; exec(@$argv) or POSIX::_exit(127); }
         POSIX::_exit(127);
     }
