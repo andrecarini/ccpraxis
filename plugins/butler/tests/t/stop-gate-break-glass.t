@@ -271,7 +271,9 @@ sub write_glass {
     spew_append($w->{tp}, shell_call(0, 'PowerShell'));
     my $r2 = stop($w);
     my $t2 = token_of($r2);
-    like($r2->{err}, qr/Last resort: create this file with the Write tool/,
+    # Wording since 2026-11-05 (tooling-defect framing; pinned in full by
+    # stop-gate-defect-wording.t).
+    like($r2->{err}, qr/Break-glass is the exit for that: create this file with the Write tool/,
         'HINT: after a failed shell call, the refusal offers the break-glass file');
     my $want = BpHook::StopGate::_display_path("$w->{data}/butler-break-glass/$w->{sid}.json");
     like($r2->{err}, qr/\Q$want\E/, 'HINT: it names the project data-dir path');

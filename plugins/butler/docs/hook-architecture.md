@@ -914,7 +914,8 @@ One tab-separated line per event, appended with `O_APPEND` by `butler-continuity
 ```
 
 Fields: ISO-8601 UTC time, session id, actor (`agent`, `operator`, `coordinator`, `gate` or `gc`), verb
-(`off`, `emergency-stop`, `break-glass-off`, `refusal-cap`, `gc` or `fork-ok`), project root, and
+(`off`, `emergency-stop`, `break-glass-off`, `refusal-cap`, `holder-starting`, `holder-reaped`, `gc` or
+`fork-ok`), project root, and
 reason. A judged off logs `<reason>; goal: <goal>; justification: <text>; verdict:
 disarm-judge/<otp>.verdict.json`, each part cut to 70 characters; an emergency stop logs `<reason>; bug
 report: <id>`, or `bug report: FAILED (<error>)`. For `off` and `emergency-stop` the project root is
@@ -1007,7 +1008,9 @@ if bg valid                              -> clear streak, file a bug report, dis
 touch armed/<sid>                        ; activity for the wake-lock lease
 clear_running_snapshot(sid)              ; G7b: the snapshot describes only the latest Stop
 holder_live(sid, p)                      -> clear streak, allow
-streak = bump_streak(sid, p)             ; G9b: >= REFUSAL_CAP -> clear, log, allow
+starting_holder(p)                     -> clear streak, log holder-starting, allow  (G8b)
+holder_reaped(sid, p)                   -> clear streak, mark the reap seen, log holder-reaped, allow; continuity stays ON  (G8c)
+streak = bump_streak(sid, p)             ; G9b: >= REFUSAL_CAP and the last shell call failed -> clear, log, allow
 t = mint_stop_token(sid)                 ; undef -> allow, one hook-errors.log line
 work = running_work(sid, p)              ; G11
 if work: set_running_snapshot(sid, work) ; deny(running text with t)
@@ -1052,26 +1055,60 @@ itself is broken:
   break glass exists for when the tooling is broken (judged-continuity-disarm Decision 26). A file
   whose action is the removed silence is refused with a pointer to filing the question instead.
 
-The idle refusal offers the file only once the shell has visibly failed: a shell call errored since
+A valid file is honoured on any stop, whatever the streak (operator ruling 2026-11-05: break-glass is
+always allowed). What follows governs only when the refusal ADVERTISES it. It is the exit for a
+tooling defect that blocks a legitimate stop: a broken shell, a disarm command (off-confirm,
+emergency-stop) refused by the harness or a permission check, a gate that cannot see what happened.
+It is not another way to stop finished work (that is off, then off-confirm), and not a way past a
+disarm judge that refused; its bug report is the record of the defect (bugs 20261105-212229-7709,
+20261105-212239-5c1d). The idle refusal offers the file only once the shell has visibly failed: a shell call errored since
 the previous refusal, or this is at least the `$BREAK_GLASS_HINT_AT` (2) refusal in a row with
 nothing succeeding. A healthy session never sees it, so it cannot become the habitual way out.
-The idle text is 6 lines without them, 11 with them, and 12 when a refused file is named;
+The idle text is 6 lines without them, 11 or 12 with them (the cap line is conditional), and 13 when a
+refused file is named;
 stop-gate.sh's budget below stays 13 rather than Decision 8's 8 (it was set when the idle text had 7
 lines).
 The running-work refusal never offers it: while work runs the way out is a hold (Decision 128), and
 a session that cannot hold still reaches the cap. The lines appended to the idle text are:
 
 ```
-No shell command can run? Last resort: create this file with the Write tool:
+Tooling defect blocking a legitimate stop? Break-glass is the exit for that: create this file with the Write tool:
   <path>
-  containing {"token":"<token>","action":"off","reason":"<what is done>"}
-  (only when all work is done: it turns continuity off and files a bug report).
-After 5 refusals in a row with no tool call succeeding, the gate lets the stop through by itself.
+  containing {"token":"<token>","action":"off","reason":"<the defect, and what is done>"}
+  For a defect such as a broken shell, or off-confirm (or emergency-stop) refused by the harness or a permission check.
+  Not for finished work (use off, then off-confirm), nor a way past a disarm judge that refused. It turns continuity off and files a bug report on the defect.
+After 5 refusals in a row with no tool call succeeding, and the last shell call failed, the gate lets the stop through by itself.
 ```
 
 The last line appears only when the cap can fire, that is when the newest shell result failed.
 
-Oracle: `plugins/butler/tests/t/stop-gate-break-glass.t`.
+Oracles: `plugins/butler/tests/t/stop-gate-break-glass.t`, `plugins/butler/tests/t/stop-gate-defect-wording.t`.
+
+The settings payload pre-approves the file for the Write tool with
+`Edit(//**/.ccpraxis-local-data/butler-break-glass/*.json)` (a `Write(path)` rule never matches; see
+https://code.claude.com/docs/en/permissions.md), and the writes guard exempts exactly
+`<data>/butler-break-glass/<session_id>.json` for the driver and every subagent
+(`plugins/butler/tests/t/break-glass-write-guards.t`). The state-dir fallback sits under `~/.claude`, a
+protected path, which Claude Code routes to the classifier even when an allow rule matches.
+
+### Reaped holder (G8c)
+
+Bug `20261105-143727-3d66`: Claude Code's low-memory reaper killed an armed session's background
+butler-hold and the wait it held, and told the agent not to start them again on its own. With every
+remaining step waiting on the operator, the session could neither hold nor honestly disarm, and the gate
+refused it dozens of times. Now, when the session's most recent holder, or a task it held, was reaped, the
+gate lets the stop through with continuity LEFT ON and logs `holder-reaped` to `reasons.log` and
+`hook-errors.log`. The session idles and resumes when woken.
+
+The signal is the harness's task-notification record (`<status>killed</status>` and "stopped because
+the system is running low on memory"), read from the last 2 MiB of the transcript. butler-hold cannot
+record this itself: on Windows the harness ends the process tree without a catchable signal, and a TERM,
+where one arrives, reads the same as a TaskStop. A reap counts only when the reaped task is the latest
+butler-hold launch, an id on that launch's command line, or the holder record's `self_task`/`items` with
+the reap no earlier than its `started_at`; when no butler-hold was launched after it; and when it lies past
+the transcript offset of both the last refusal (`stop-refusals/<sid>`) and the last reap acted on
+(`stop-reaped/<sid>`, written on each such allow and removed by `gc_sessions`). One reap lets one stop
+through. Oracle: `plugins/butler/tests/t/stop-gate-reaped-holder.t`.
 
 ## Operator off versus agent off
 

@@ -159,6 +159,28 @@ sub run {
         return 0;
     }
 
+    # G8c: a REAPED holder lets the stop through with continuity LEFT ON (bug
+    # 20261105-143727-3d66). Claude Code's low-memory reaper kills idle
+    # background shells and tells the agent not to start them again on its
+    # own. A session whose holder (or the task it held) was reaped can then
+    # neither hold nor, with its work waiting on the operator, honestly
+    # disarm, and was refused dozens of times in a row. The reaper's
+    # task-notification in the transcript is the signal; see _holder_reaped
+    # for why it, and not a record butler-hold writes, and what counts. One
+    # reap lets one stop through: the session idles, and the next wake (the
+    # operator, a finished task) starts from the ordinary gate again.
+    my $reap = eval { _holder_reaped($sid, $p) };
+    if (ref $reap eq 'HASH') {
+        eval { _clear_streak($sid) };
+        eval { _mark_reap_seen($sid, $p->{transcript_path}, $reap->{size}, $reap->{task}) };
+        my $why = "holder reaped (low memory): task $reap->{task} was killed by Claude Code's low-memory reaper; "
+                . "continuity left on, the session idles until woken";
+        eval { BpHook::log_reason($sid, 'gate', 'holder-reaped', $why, $p->{cwd}) };
+        warn "stop-gate: holder-reaped: task $reap->{task} killed by the low-memory reaper; "
+           . "letting the stop through with continuity on (session $sid)\n";
+        return 0;
+    }
+
     # G9b: THE REFUSAL CAP (bug 20261021-202419-bf19). Every escape above is a
     # shell command; a session whose shell is broken (a PreToolUse hook that
     # errors on every call, say) cannot run any of them, and was refused more
@@ -180,7 +202,8 @@ sub run {
         ? (eval { _last_shell_failed($p->{transcript_path}) } || 0) : 0;
     if ($streak >= $REFUSAL_CAP && $cap_armed) {
         eval { _clear_streak($sid) };
-        my $why = "refusal cap: $streak consecutive refusals with no tool call succeeding in between";
+        my $why = "refusal cap: $streak consecutive refusals with no tool call succeeding in between, "
+                . "and the last shell call failed";
         eval { BpHook::log_reason($sid, 'gate', 'refusal-cap', $why, $p->{cwd}) };
         warn "stop-gate: $why; letting the stop through (session $sid)\n";
         return 0;
@@ -194,22 +217,38 @@ sub run {
         return 0;
     }
 
-    # The break-glass lines are offered only once the shell paths have visibly
-    # failed: a shell tool call errored since the last refusal, or this is not
-    # the first refusal in a row with nothing succeeding. A healthy session
-    # never sees them, so they cannot become the habitual way out.
+    # The break-glass lines are ADVERTISED only once the shell paths have
+    # visibly failed: a shell tool call errored since the last refusal, or this
+    # is not the first refusal in a row with nothing succeeding. A healthy
+    # session never sees them, so they cannot become the habitual way out.
+    # This gates the advert only: a valid file is honoured at G6b on any stop
+    # (operator ruling 2026-11-05, "break-glass should be always allowed").
+    #
+    # Wording (operator ruling 2026-11-05, bugs 20261105-212229-7709 and
+    # -212239-5c1d): break-glass is the exit for a TOOLING DEFECT that blocks a
+    # legitimate stop. The old "No shell command can run?" framing was read as
+    # forbidding it to a session whose shell worked but whose off-confirm the
+    # harness refused, and dozens of refusals followed. It is not another way
+    # to stop finished work, and not a way past a judge that ruled against
+    # stopping; its bug report is the record of the defect.
     my @glass;
     if ($shell_failed || $streak >= $BREAK_GLASS_HINT_AT || defined $bg_why) {
         my ($path) = _break_glass_paths($sid, $p);
         push @glass, "The break-glass file was not used: $bg_why" if defined $bg_why;
         if (defined $path) {
             push @glass,
-                "No shell command can run? Last resort: create this file with the Write tool:",
+                "Tooling defect blocking a legitimate stop? Break-glass is the exit for that: create this file with the Write tool:",
                 "  " . _display_path($path),
-                "  containing {\"token\":\"$t\",\"action\":\"off\",\"reason\":\"<what is done>\"}",
-                "  (only when all work is done: it turns continuity off and files a bug report).";
+                "  containing {\"token\":\"$t\",\"action\":\"off\",\"reason\":\"<the defect, and what is done>\"}",
+                "  For a defect such as a broken shell, or off-confirm (or emergency-stop) refused by the harness or a permission check.",
+                "  Not for finished work (use off, then off-confirm), nor a way past a disarm judge that refused. "
+                    . "It turns continuity off and files a bug report on the defect.";
+            # The cap needs BOTH conditions (G9b): the streak, and the newest
+            # shell result being a failure. The line says so, and is shown
+            # only when the second already holds, i.e. when it can fire.
             push @glass,
-                "After $REFUSAL_CAP refusals in a row with no tool call succeeding, the gate lets the stop through by itself."
+                "After $REFUSAL_CAP refusals in a row with no tool call succeeding, and the last shell call failed, "
+                    . "the gate lets the stop through by itself."
                 if $cap_armed;
         }
     }
@@ -842,6 +881,188 @@ sub _last_shell_failed {
     }
     close $fh;
     return $last ? 1 : 0;
+}
+
+# ---------------------------------------------------------------------------
+# REAPED HOLDER (G8c, bug 20261105-143727-3d66).
+#
+# The signal is the harness's own task-notification, a `user` record whose
+# content is
+#   <task-notification><task-id>ID</task-id>...<status>killed</status>
+#   <summary>... was stopped because the system is running low on memory</summary>
+# (session 3f77dfd2, 2026-11-05, both for the held wait and for butler-hold).
+# Not a record butler-hold writes about its own end, because butler-hold
+# cannot tell this kill from any other: on Windows the harness ends the
+# process tree without a signal it could catch, and where a TERM does arrive
+# it reads the same as a TaskStop. Only the harness knows the reason, and the
+# transcript is where it says so.
+#
+# What counts, all of it:
+#   - status killed AND the low-memory phrase (a TaskStop kill is not a reap);
+#   - a plain notification record, never text quoted inside a tool result;
+#   - the reaped task is the session's most recent butler-hold launch, a word
+#     of that launch's command (the ids it held), or the holder record's own
+#     self_task/items with the reap no earlier than the record's started_at;
+#   - no butler-hold was launched after the reap (that holder supersedes it);
+#   - the reap sits at or past the transcript offset of the last refusal and
+#     of the last reap the gate already acted on, so one reap is acted on once.
+# Reads the last $REAP_SCAN_BYTES of the transcript; never spawns.
+# ---------------------------------------------------------------------------
+our $REAP_SCAN_BYTES = 2 * 1024 * 1024;
+my $REAP_ID_RE = qr/\A[A-Za-z0-9_-]{1,64}\z/;
+
+sub _reap_seen_path {
+    my ($sid) = @_;
+    my $root = BpHook::state_dir();
+    return undef unless defined $root;
+    return "$root/stop-reaped/$sid";
+}
+
+sub _mark_reap_seen {
+    my ($sid, $tp, $size, $task) = @_;
+    my $path = _reap_seen_path($sid);
+    return unless defined $path;
+    (my $dir = $path) =~ s{/[^/]*$}{};
+    unless (-d $dir) { eval { require File::Path; File::Path::make_path($dir) } }
+    if (open(my $fh, '>:raw', "$path.tmp.$$")) {
+        print {$fh} JSON::PP->new->utf8->canonical->encode(
+            { offset => $size, transcript => $tp, task => $task }) . "\n";
+        close $fh;
+        rename("$path.tmp.$$", $path) or unlink "$path.tmp.$$";
+    }
+    return;
+}
+
+# _reap_epoch('2026-11-05T14:35:28.073Z') -> epoch seconds, or undef.
+sub _reap_epoch {
+    my ($s) = @_;
+    return undef unless defined $s && !ref $s
+        && $s =~ /\A(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?Z\z/;
+    require Time::Local;
+    return eval { Time::Local::timegm($6, $5, $4, $3, $2 - 1, $1) };
+}
+
+# _holder_reaped($sid, $p) -> { task, size } | undef.
+sub _holder_reaped {
+    my ($sid, $p) = @_;
+    my $tp = $p->{transcript_path};
+    return undef unless defined $tp && !ref $tp && length $tp;
+    my $tpb = $tp;
+    utf8::encode($tpb) if utf8::is_utf8($tpb);
+    return undef unless -f $tpb;
+    my $size = -s $tpb;
+    return undef unless $size;
+
+    # The floor: nothing at or before the last refusal, or the last reap
+    # already acted on, counts. An offset measured in another transcript, or
+    # past this one's end, is ignored, as _bump_streak ignores it.
+    my $floor = 0;
+    for my $path (_streak_path($sid), _reap_seen_path($sid)) {
+        next unless defined $path && -f $path;
+        my $rec = _read_json_file($path);
+        next unless ref $rec eq 'HASH' && defined $rec->{offset} && !ref $rec->{offset}
+            && $rec->{offset} =~ /\A\d+\z/ && $rec->{offset} <= $size;
+        next if defined $rec->{transcript} && $rec->{transcript} ne $tp;
+        $floor = $rec->{offset} if $rec->{offset} > $floor;
+    }
+
+    my $start = $size > $REAP_SCAN_BYTES ? $size - $REAP_SCAN_BYTES : 0;
+    open(my $fh, '<:raw', $tpb) or return undef;
+    seek($fh, $start, 0);
+    <$fh> if $start;    # drop the partial first line
+
+    my (%hold_use, @launches, @reaps);
+    while (1) {
+        my $off  = tell($fh);
+        my $line = <$fh>;
+        last unless defined $line;
+        if (index($line, '<task-notification>') >= 0 && index($line, 'low on memory') >= 0) {
+            my $rec = eval { JSON::PP->new->utf8->decode($line) };
+            next unless ref $rec eq 'HASH' && defined $rec->{type} && !ref $rec->{type} && $rec->{type} eq 'user'
+                && ref $rec->{message} eq 'HASH';
+            my $c = $rec->{message}{content};
+            my $text = (defined $c && !ref $c) ? $c
+                : ref $c eq 'ARRAY'
+                    ? join("\n", map { (ref $_ eq 'HASH' && defined $_->{type} && !ref $_->{type} && $_->{type} eq 'text'
+                                         && defined $_->{text} && !ref $_->{text}) ? $_->{text} : () } @$c)
+                    : '';
+            next unless $text =~ /\A\s*<task-notification>/;
+            while ($text =~ m{<task-notification>(.*?)</task-notification>}sg) {
+                my $b = $1;
+                my ($id) = $b =~ m{<task-id>([^<]*)</task-id>};
+                my ($st) = $b =~ m{<status>([^<]*)</status>};
+                next unless defined $id && $id =~ $REAP_ID_RE && defined $st && $st eq 'killed';
+                next unless $b =~ /running low on memory/;
+                push @reaps, { task => $id, off => $off, at => _reap_epoch($rec->{timestamp}) };
+            }
+            next;
+        }
+        next unless $line =~ /"tool_(?:use|result)"/;
+        next unless $line =~ /butler-hold|backgroundTaskId|background with ID/;
+        my $rec = eval { JSON::PP->new->utf8->decode($line) };
+        next unless ref $rec eq 'HASH' && ref $rec->{message} eq 'HASH';
+        my $content = $rec->{message}{content};
+        next unless ref $content eq 'ARRAY';
+        for my $c (@$content) {
+            next unless ref $c eq 'HASH' && defined $c->{type} && !ref $c->{type};
+            if ($c->{type} eq 'tool_use') {
+                next unless defined $c->{id} && !ref $c->{id} && defined $c->{name} && !ref $c->{name}
+                    && $c->{name} eq 'Bash';
+                my $in = $c->{input};
+                next unless ref $in eq 'HASH' && $in->{run_in_background}
+                    && defined $in->{command} && !ref $in->{command};
+                my $argv = eval { BpHook::sole_invocation($in->{command}, 'butler-hold') };
+                $hold_use{ $c->{id} } = [ grep { defined } @$argv ] if ref $argv eq 'ARRAY';
+            }
+            elsif ($c->{type} eq 'tool_result') {
+                next unless defined $c->{tool_use_id} && !ref $c->{tool_use_id} && $hold_use{ $c->{tool_use_id} };
+                my $task;
+                my $tur = $rec->{toolUseResult};
+                if (ref $tur eq 'HASH' && defined $tur->{backgroundTaskId} && !ref $tur->{backgroundTaskId}) {
+                    $task = $tur->{backgroundTaskId};
+                }
+                else {
+                    my $text = ref $c->{content} eq 'ARRAY'
+                        ? join("\n", map { (ref $_ eq 'HASH' && defined $_->{text} && !ref $_->{text}) ? $_->{text} : () } @{ $c->{content} })
+                        : ((defined $c->{content} && !ref $c->{content}) ? $c->{content} : '');
+                    ($task) = $text =~ /background with ID: ([A-Za-z0-9_-]+)/;
+                }
+                next unless defined $task && $task =~ $REAP_ID_RE;
+                push @launches, { task => $task, off => $off, words => { map { $_ => 1 } @{ $hold_use{ $c->{tool_use_id} } } } };
+            }
+        }
+    }
+    close $fh;
+    return undef unless @reaps;
+
+    my $h = BpHook::holder($sid);
+    my %rec_ids;
+    my $rec_started;
+    if (ref $h eq 'HASH') {
+        $rec_ids{ $h->{self_task} } = 1 if defined $h->{self_task} && !ref $h->{self_task};
+        if (ref $h->{items} eq 'ARRAY') {
+            $rec_ids{$_} = 1 for grep { defined && !ref } @{ $h->{items} };
+        }
+        $rec_started = $h->{started_at}
+            if defined $h->{started_at} && !ref $h->{started_at} && $h->{started_at} =~ /\A\d+\z/;
+    }
+    my $last_launch = @launches ? $launches[-1] : undef;
+
+    for my $r (reverse @reaps) {    # newest first
+        last if $r->{off} < $floor;
+        # A holder started after this reap supersedes it, and every older one.
+        last if defined $last_launch && $last_launch->{off} > $r->{off};
+        my $t = $r->{task};
+        my $ok = 0;
+        if (defined $last_launch && ($last_launch->{task} eq $t || $last_launch->{words}{$t})) {
+            $ok = 1;
+        }
+        elsif ($rec_ids{$t} && defined $rec_started && defined $r->{at} && $r->{at} >= $rec_started) {
+            $ok = 1;
+        }
+        return { task => $t, size => $size } if $ok;
+    }
+    return undef;
 }
 
 # _scan_tool_results($transcript, $offset) -> ($any_ok, $shell_failed) over

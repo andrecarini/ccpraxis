@@ -239,6 +239,30 @@ sub _ciswriter   { return BpHook::Guards::Common::is_writer(@_) }
 # starts with canon($dir) . '/'. $dir need not be pre-canon'd. Decision 69
 # A2: folds ASCII case when _is_ci() is true.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# _own_break_glass($p, $abs_c, $R) -- true iff $abs_c is exactly
+# <data>/butler-break-glass/<this payload's session_id>.json, the file the
+# Stop gate's idle refusal asks the agent to create with the Write tool
+# (BpHook::StopGate::_break_glass_paths). Operator ruling 2026-11-05:
+# break-glass is the exit for a tooling defect and is always honoured, so no
+# butler write guard may refuse it, for the driver or for any subagent,
+# whatever packages are in flight. Exactly one file per session, never the
+# directory, another session's file, or anything beside it. Writing it does
+# nothing by itself: the gate acts on it only when it carries the current
+# stop token, and then disarms and files a bug report. No data dir (the
+# coordinator shape) -> false: a coordinator's Stop never reads the file.
+# ---------------------------------------------------------------------------
+sub _own_break_glass {
+    my ($p, $abs_c, $R) = @_;
+    return 0 unless defined $abs_c && ref $R eq 'HASH' && defined $R->{data} && length $R->{data};
+    my $sid = eval { BpHook::session_id($p) };
+    return 0 unless defined $sid && $sid =~ /\A[A-Za-z0-9_-]{1,128}\z/;
+    my $want = _ccanon(_cresolvepath("$R->{data}/butler-break-glass/$sid.json", undef));
+    return 0 unless defined $want && length $want;
+    return (_foldc($abs_c) eq _foldc($want)) ? 1 : 0 if _is_ci();
+    return ($abs_c eq $want) ? 1 : 0;
+}
+
 sub _in {
     my ($abs_c, $dir) = @_;
     return 0 unless defined $abs_c && defined $dir && length $dir;
@@ -1094,6 +1118,7 @@ sub may_write {
 
     return { allow => 1 } if _own_scratchpad($p, $ABS_c, $R);
     return { allow => 1 } if _is_temp($ABS_c, $R->{root}, $R->{data});
+    return { allow => 1 } if _own_break_glass($p, $ABS_c, $R);
 
     my $in_deny = 0;
     for my $d (@{ $R->{deny_dirs} || [] }) {

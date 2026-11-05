@@ -864,6 +864,7 @@ sub gc_sessions {
         # only ever cleared by that session's own later Stop, so a session
         # that ends mid-streak would otherwise leave them forever.
         unlink("$root/stop-refusals/$sid");
+        unlink("$root/stop-reaped/$sid");    # G8c's last-acted-on reap offset
         unlink("$root/break-glass/$sid.json");
         revoke_stop_token($sid);
         revoke_disarm_otp($sid);
