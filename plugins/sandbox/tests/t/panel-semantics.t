@@ -460,7 +460,7 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
     my @run_cases = (
         # [ busy_age, stay_awake, needs_you, busy_text, busy_role, keep_text, keep_role, needs_text, needs_role ]
         [undef, 0, 0, 'none (no active run)', 'muted',
-            'released (PC may sleep)', 'muted', 'none', 'muted'],
+            'released', 'muted', 'none', 'muted'],
         [30, 1, 2, 'active (' . Dashboard::fmt_age(30) . ' ago)', 'good',
             # NOT "(PC stays awake)". That was an OUTCOME the row cannot know,
             # and it was false: measured 2026-09-18, this host slept 9h58m in one
@@ -468,9 +468,11 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
             # refreshing. Under Modern Standby ES_SYSTEM_REQUIRED is a request
             # against the idle timer, not a decision. What is asserted is
             # knowable here; what the machine then does is not.
-            'holding (wake-lock asserted)', 'good', '2 escalations waiting', 'warn'],
+            # 2026-11-05: and since package 08 not even the assertion is the
+            # launcher's -- it publishes a REQUEST the host refresher acts on.
+            'requested', 'good', '2 escalations waiting', 'warn'],
         [9999, 0, 0, 'idle (' . Dashboard::fmt_age(9999) . ' ago)', 'warn',
-            'released (PC may sleep)', 'muted', 'none', 'muted'],
+            'released', 'muted', 'none', 'muted'],
     );
     for my $c (@run_cases) {
         my ($busy_age, $stay_awake, $needs_you, $bt, $br, $kt, $kr, $nt, $nr) = @$c;

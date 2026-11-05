@@ -278,7 +278,12 @@ my @SUMMARY_KEYS = qw(
     run_agents thread thread_events
     paused_window relaunch_at relaunch_local next_package
 );
-my @PKG_KEYS = qw(name status attempt attempt_cap step steps_pending next_action agents step_word waits_on);
+# Widened 10 -> 12 (operator request 2026-11-04, Blueprints panel activity
+# rows): coordinator_alive / coordinator_started_at carry the registry pid
+# verdict and launched_at so a package row is green only when something runs
+# and can show its coordinator's uptime.
+my @PKG_KEYS = qw(name status attempt attempt_cap step steps_pending next_action agents step_word waits_on
+                  coordinator_alive coordinator_started_at);
 
 sub assert_summary_keys {
     my ($s, $label) = @_;
@@ -289,7 +294,7 @@ sub assert_summary_keys {
 sub assert_pkg_shape {
     my ($e, $label) = @_;
     ok(is_hashref($e), "$label: package entry is a hashref") or return;
-    is_deeply([ sort keys %$e ], [ sort @PKG_KEYS ], "$label: AC28 -- exactly the 10 S2.2+package-01-run-blocks keys (package 05 adds 'agents'; package 01-run-blocks adds step_word/waits_on)");
+    is_deeply([ sort keys %$e ], [ sort @PKG_KEYS ], "$label: AC28 -- exactly the 12 package keys (package 05 adds 'agents'; package 01-run-blocks adds step_word/waits_on; the 2026-11-04 panel change adds coordinator_alive/coordinator_started_at)");
 }
 
 sub assert_new_key_types {

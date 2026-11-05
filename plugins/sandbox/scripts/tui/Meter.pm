@@ -286,10 +286,15 @@ sub numbers_used_free_total {
 #
 # The padding stays attached to its figure so the columns still line up: the
 # figure span is the full BYTES_COL_WIDTH field, not the trimmed number.
+# $compact true -> the one-letter words u/f/t ("6.6 GB u | 3.9 GB f | 10.4 GB
+# t"), the form a narrow Resources panel falls back to (operator, 2026-11-05).
+# The quantities keep their BYTES_COL_WIDTH columns either way, so rows in one
+# form still line up with each other.
 sub numbers_used_free_total_spans {
-    my ($used, $free, $total) = @_;
+    my ($used, $free, $total, $compact) = @_;
     my @spans;
-    my @parts = ([ $used, 'used' ], [ $free, 'free' ], [ $total, 'total' ]);
+    my @parts = $compact ? ([ $used, 'u' ], [ $free, 'f' ], [ $total, 't' ])
+                         : ([ $used, 'used' ], [ $free, 'free' ], [ $total, 'total' ]);
     for my $i (0 .. $#parts) {
         my ($v, $word) = @{ $parts[$i] };
         push @spans, { text => ' | ', role => 'rule' } if $i;

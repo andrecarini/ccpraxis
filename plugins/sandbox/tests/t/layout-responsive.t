@@ -677,10 +677,15 @@ sub _ac11_expect {
 {
     my $floor24 = 3;
     my %exited24 = (%st, status => 'exited');
-    is(Dashboard::activity_capacity(\%st, 24, 80), $floor24,
-        "AC-11 saturation: 24x80 (stacked) -- capacity == the hand-derived flex floor ($floor24)");
-    is(Dashboard::activity_capacity(\%exited24, 24, 80), $floor24,
-        "AC-11 saturation: 24x80 with a status alert -- capacity is STILL $floor24 (the floor absorbs the alert row; no differential at this row count)");
+    # RE-POINTED 2026-11-05: 24x80 IS NO LONGER SATURATED either. The Claude
+    # Code panel puts two label/value pairs on a row now (operator), one row
+    # shorter, and that row goes to Activity -- so capacity sits ABOVE the
+    # floor. What still holds, and is what this block exists for: never below
+    # the floor, and an alert costs nothing.
+    cmp_ok(Dashboard::activity_capacity(\%st, 24, 80), '>=', $floor24,
+        "AC-11: 24x80 (stacked) -- capacity never drops below the hand-derived flex floor ($floor24)");
+    is(Dashboard::activity_capacity(\%exited24, 24, 80), Dashboard::activity_capacity(\%st, 24, 80),
+        "AC-11: 24x80 with a status alert -- capacity is UNCHANGED (an alert is an overlay and consumes no layout row)");
     cmp_ok(Dashboard::activity_capacity(\%st, 24, 120), '>=', $floor24,
         "AC-11: 24x120 -- capacity never drops below the flex floor ($floor24); pairing at this width frees a band, so it legitimately exceeds it");
     is(Dashboard::activity_capacity(\%exited24, 24, 120), Dashboard::activity_capacity(\%st, 24, 120),
@@ -906,9 +911,12 @@ sub _ac11_expect {
     my $line_err = $@;
     ok(!$line_err, 'package-13/B15 precondition: tui::DashboardScreen::_run_block does not die') or diag(" error: $line_err");
     my ($driver_line) = (ref($block) eq 'HASH' && ref($block->{lines}) eq 'ARRAY')
-        ? (grep { ref($_) eq 'HASH' && ($_->{kind} // '') eq 'driver' } @{ $block->{lines} }) : ();
+        ? (grep { ref($_) eq 'HASH' && ($_->{kind} // '') eq 'blueprint' } @{ $block->{lines} }) : ();
+    # RETARGETED AGAIN (operator, 2026-11-05): there is no driver row; the
+    # driver sits on the blueprint line, so that line is the one whose words
+    # must survive wrapping.
     my $line_spans = (ref($driver_line) eq 'HASH') ? $driver_line->{spans} : undef;
-    ok(ref($line_spans) eq 'ARRAY' && @$line_spans, 'package-13/B15 precondition: _run_block returns a non-empty driver-line spans row');
+    ok(ref($line_spans) eq 'ARRAY' && @$line_spans, 'package-13/B15 precondition: _run_block returns a non-empty blueprint-line (driver-carrying) spans row');
 
   SKIP: {
         skip('_run_block driver line not available', 1) unless ref($line_spans) eq 'ARRAY' && @$line_spans;

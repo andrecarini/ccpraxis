@@ -62,6 +62,16 @@
 #       line when present, which every threaded fixture in
 #       dashboard-blueprints-blocks.t (F1, F3, F5b, F6, F6b) already pins.
 #
+# SUPERSEDED IN PART BY OPERATOR DECISION (2026-11-05, the Blueprints panel
+# rework -- see .ccpraxis-local-data/mockups/panel-work-report.md): there is
+# no driver row (the driver is on the blueprint line), and a package row no
+# longer lists its agents by label -- its live workers feed the step-time
+# column (oldest live worker), its live coordinator the total column, its
+# live judge the dot. So the staleness-filter ACs (AC22-AC27) now observe the
+# filter through _package_live_agents and the step-time column instead of a
+# rendered worker label, and the label-only ACs (AC5 order, AC33 judge label,
+# AC41/AC42 worker label) are retargeted to what a package row still shows.
+#
 # Do NOT weaken an assertion here to make a future implementation's life
 # easier.
 use strict;
@@ -403,8 +413,12 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
     ok(!$@, 'AC18: _run_summary_lines does not die') or diag("  \$\@ = $@");
   SKIP: {
         skip('no rows', 1) unless ref($rows) eq 'ARRAY' && @$rows >= 2;
-        is(row_text($rows->[1]), S(2) . G('status.ok') . ' 04-agent-records' . S(2) . 'implementation 2/5',
-            'AC18: the package line carries step_word and " N/M" (attempt 2 >= 2)');
+        # CHANGED 2026-11-05 (operator): the dot leads the row and is the
+        # muted idle one, because nothing live backs this package (no agents,
+        # no coordinator verdict); the name is cut to 16 columns; the attempt
+        # is labelled "attempt N/M" so it cannot be read as step progress.
+        is(row_text($rows->[1]), S(2) . G('status.idle') . ' 04-agent-records' . S(3) . 'implementation' . S(3) . 'attempt 2/5',
+            'AC18: the package line carries step_word and "attempt N/M" (attempt 2 >= 2)');
     }
 }
 
@@ -428,13 +442,13 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
             skip('no rows', 1) unless ref($rows) eq 'ARRAY' && @$rows >= 2;
             my $text = row_text($rows->[1]);
             if ($present) {
-                like($text, qr/\bscout \Q$att\E\/\Q$cap\E\b/, "AC20 (attempt=$alab/$cap): the N/M clause is present and correct");
+                like($text, qr/\bscout   attempt \Q$att\E\/\Q$cap\E\z/, "AC20 (attempt=$alab/$cap): the N/M clause is present and correct");
             } else {
                 unlike($text, qr{\d+/\d+}, "AC20 (attempt=$alab/$clab): no N/M clause present");
             }
           SKIP: {
                 skip('no N/M expected', 1) unless $present;
-                my ($nm_span) = grep { ref($_) eq 'HASH' && defined($_->{text}) && $_->{text} =~ m{^ \Q$att\E/\Q$cap\E\z} } @{ $rows->[1] };
+                my ($nm_span) = grep { ref($_) eq 'HASH' && defined($_->{text}) && $_->{text} =~ m{^\Q$att\E/\Q$cap\E\z} } @{ $rows->[1] };
                 is($nm_span ? $nm_span->{role} : undef, $role, "AC20 (attempt=$alab/$cap): N/M span role is $role")
                     if $nm_span;
             }
@@ -478,12 +492,22 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
     my $s = { blueprint => 'bp22', state => 'running', packages => [$pkg], run_agents => [] };
     my $rows = eval { tui::DashboardScreen::_run_summary_lines([$s], undef, undef, $NOW) };
     ok(!$@, 'AC22: does not die') or diag("  \$\@ = $@");
+    my @live = tui::DashboardScreen::_package_live_agents($pkg, $NOW);
+    is_deeply([ map { $_->{id} } @live ], [ 'w1', 'w2' ],
+        'AC22: the live set is w1 (7199s) and w2 (exactly 7200s, the boundary itself) -- w3 (7201s) is out');
   SKIP: {
-        skip('no rows', 3) unless ref($rows) eq 'ARRAY' && @$rows >= 2;
-        my $joined = join("\n", map { row_text($_) } @$rows);
-        like($joined, qr/nonce-ac22-w1/, 'AC22: w1 (7199s, within boundary) IS rendered');
-        like($joined, qr/nonce-ac22-w2/, 'AC22: w2 (exactly 7200s, boundary itself) IS rendered');
-        unlike($joined, qr/\Q$nonce3\E/, 'AC22: w3 (7201s, one second past) is rendered NOWHERE in the output');
+        skip('no rows', 2) unless ref($rows) eq 'ARRAY' && @$rows >= 2;
+        my $t = row_text($rows->[1]);
+        like($t, qr/\s2h\z/, 'AC22: the step time is the oldest LIVE worker\'s (w2, 7200s -> 2h)');
+        is(substr($t, 2, length(G('status.ok'))), G('status.ok'), 'AC22: the live workers make the dot green');
+    }
+    my $only_stale = { name => 'pkg-ac22s', status => 'running', agents => [ $pkg->{agents}[2] ] };
+    my $rows_s = eval { tui::DashboardScreen::_run_summary_lines([ { blueprint => 'bp22s', state => 'running',
+        packages => [$only_stale], run_agents => [] } ], undef, undef, $NOW) };
+  SKIP: {
+        skip('no rows', 1) unless ref($rows_s) eq 'ARRAY' && @$rows_s >= 2;
+        is(row_text($rows_s->[1]), S(2) . G('status.idle') . ' pkg-ac22s' . S(3) . 'running',
+            'AC22: a package whose only worker is one second stale shows no step time and an idle dot');
     }
 }
 {
@@ -503,9 +527,9 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
         ok(!$@, "AC23 (stale_after_seconds=$label): does not die") or diag("  \$\@ = $@");
       SKIP: {
             skip('no rows', 2) unless ref($rows) eq 'ARRAY' && @$rows >= 2;
-            my $joined = join("\n", map { row_text($_) } @$rows);
-            unlike($joined, qr/zqxbad23/, "AC23 (stale_after_seconds=$label): the malformed agent is not rendered");
-            like($joined, qr/zqxlive23/, "AC23 (stale_after_seconds=$label): its live sibling IS still rendered");
+            my @live = tui::DashboardScreen::_package_live_agents($pkg, $NOW);
+            is_deeply([ map { $_->{id} } @live ], [ 'y' ], "AC23 (stale_after_seconds=$label): the malformed agent is not live, its sibling is");
+            like(row_text($rows->[1]), qr/\s1m\z/, "AC23 (stale_after_seconds=$label): the step time is the live sibling's (100s -> 1m)");
         }
     }
 }
@@ -524,9 +548,9 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
         ok(!$@, "AC24 (started_at=$label): does not die") or diag("  \$\@ = $@");
       SKIP: {
             skip('no rows', 2) unless ref($rows) eq 'ARRAY' && @$rows >= 2;
-            my $joined = join("\n", map { row_text($_) } @$rows);
-            like($joined, qr/zqxlive24/, "AC24 (started_at=$label) precondition: the live sibling IS rendered");
-            unlike($joined, qr/zqxbad24/, "AC24 (started_at=$label): the malformed agent is not rendered");
+            like(row_text($rows->[1]), qr/\s1m\z/, "AC24 (started_at=$label) precondition: the live sibling's step time is rendered");
+            my @live = tui::DashboardScreen::_package_live_agents($pkg, $NOW);
+            is_deeply([ map { $_->{id} } @live ], [ 'y' ], "AC24 (started_at=$label): the malformed agent is not live");
         }
     }
 }
@@ -553,7 +577,8 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
     ok(!$@, 'AC26 (status=running): does not die') or diag("  \$\@ = $@");
   SKIP: {
         skip('wrong row count', 1) unless ref($rows_run) eq 'ARRAY' && @$rows_run == 2;
-        unlike(row_text($rows_run->[1]), qr/zqxac26/, 'AC26 (status=running): the stale agent does not appear even though the package line still renders (status-driven ACTIVE line)');
+        is(row_text($rows_run->[1]), S(2) . G('status.idle') . ' pkg-ac26' . S(3) . 'running',
+            'AC26 (status=running): the stale agent gives no time and no green dot, though the package line still renders (status-driven ACTIVE line)');
     }
 }
 {
@@ -565,9 +590,9 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
     ok(!$@, 'AC27: does not die') or diag("  \$\@ = $@");
   SKIP: {
         skip('no rows', 2) unless ref($rows) eq 'ARRAY' && @$rows >= 2;
-        my $joined = join("\n", map { row_text($_) } @$rows);
-        like($joined, qr/zqxfuture27/, 'AC27: a 600s-ahead record (ordinary clock skew) IS still rendered -- not treated as stale');
-        like($joined, qr/<1m/, "AC27: its elapsed token is exactly '<1m' (clamped, never negative)");
+        my $t = row_text($rows->[1]);
+        is(substr($t, 2, length(G('status.ok'))), G('status.ok'), 'AC27: a 600s-ahead record (ordinary clock skew) still counts as live -- not treated as stale');
+        like($t, qr/\s<1m\z/, "AC27: its elapsed token is exactly '<1m' (clamped, never negative)");
     }
 }
 
@@ -586,19 +611,12 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
   SKIP: {
         skip('no rows', 1) unless ref($rows) eq 'ARRAY' && @$rows >= 2;
         my $text = row_text($rows->[1]);
-        my $pw1 = index($text, 'zqxw5a');
-        my $pw2 = index($text, 'zqxw5b');
-        # Spec S2.3.6: judge label = worker_type minus a leading 'bp-' AND a
-        # trailing '-judge' (space-joined with 'judge'), so 'bp-zqxj5-judge'
-        # renders as 'zqxj5 judge', not the raw substring 'zqxj5-judge'.
-        my $pj  = index($text, 'zqxj5 judge');
-        ok($pw1 >= 0 && $pw2 >= 0 && $pj >= 0, 'AC5 precondition: both workers and the judge segment all appear');
-      SKIP: {
-            skip('a segment is missing', 2) unless $pw1 >= 0 && $pw2 >= 0 && $pj >= 0;
-            cmp_ok($pw1, '<', $pw2, 'AC5: worker1 precedes worker2 (original agents() relative order preserved within the worker group)');
-            cmp_ok($pw2, '<', $pj, 'AC5: both workers precede the judge segment (workers, then judges)');
-        }
-        unlike($text, qr/\bcoordinator\b/, 'AC5/scope: the coordinator agent contributes no segment at all (collapses into the dot+step only)');
+        # Operator layout (2026-11-05): the judge is the dot, the coordinator
+        # the total (1m), the workers the step time (1m); no agent label.
+        is($text, S(2) . G('status.judge') . ' pkg-ac5 1m   running   1m',
+            'AC5: judge -> dot, coordinator -> total, workers -> step time, and no agent is named');
+        unlike($text, qr/zqx|\bcoordinator\b/, 'AC5/scope: no agent label or role word appears on the package row');
+        is(scalar(@$rows), 2, 'AC5/scope: the agents add no rows of their own');
     }
 }
 
@@ -611,8 +629,8 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
     ok(!$@, 'AC37: does not die') or diag("  \$\@ = $@");
   SKIP: {
         skip('no rows', 1) unless ref($rows) eq 'ARRAY' && @$rows >= 2;
-        is(row_text($rows->[1]), S(2) . G('status.ok') . ' pkg-ac37' . S(2) . 'scout',
-            'AC37: a package with only a coordinator renders step_word alone -- the coordinator is never shown (Scope)');
+        is(row_text($rows->[1]), S(2) . G('status.ok') . ' pkg-ac37 31m   scout',
+            'AC37: a coordinator-only package shows the coordinator\'s run time as its total and no step time -- the coordinator is never named');
     }
 }
 
@@ -669,8 +687,9 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
                   running_coordinators => 0, packages => [], run_agents => [] };
         my ($lines, $err) = block_lines($s, $NOW, undef);
         ok(!$err, "AC12-17 driver ($label): _run_block does not die") or diag("  error: $err");
-        my $driver = line_by_kind($lines, 'driver');
-        ok(defined($driver), "AC12-17 driver ($label) precondition: a driver line is present");
+        # The driver is on the blueprint line now (operator, 2026-11-05).
+        my $driver = line_by_kind($lines, 'blueprint');
+        ok(defined($driver), "AC12-17 driver ($label) precondition: the blueprint line carrying the driver is present");
       SKIP: {
             skip('no driver line', 2) unless defined $driver;
             my ($glyph_span) = grep { ref($_) eq 'HASH' && defined($_->{text}) && $_->{text} eq G($glyph_name) } @{ $driver->{spans} };
@@ -688,11 +707,11 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
                   running_coordinators => 0, packages => [], run_agents => [] };
         my ($lines, $err) = block_lines($s, $NOW, undef);
         ok(!$err, 'AC16: _run_block does not die') or diag("  error: $err");
-        my $driver = line_by_kind($lines, 'driver');
-        ok(defined($driver), 'AC16 precondition: a driver line is present');
+        my $driver = line_by_kind($lines, 'blueprint');
+        ok(defined($driver), 'AC16 precondition: the blueprint line is present');
       SKIP: {
             skip('no driver line', 1) unless defined $driver;
-            is(spans_text($driver), S(2) . G('status.ok') . ' orchestrator',
+            like(spans_text($driver), qr/\Q${\ G('status.ok') } orchestrator\E\z/,
                 'AC16: a future orchestrator_started_at renders no uptime token at all (never "<1m", never negative)');
         }
     }
@@ -705,10 +724,10 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
                   running_coordinators => 0, packages => [], run_agents => [] };
         my ($lines, $err) = block_lines($s, $NOW, undef);
         ok(!$err, 'AC14: _run_block does not die') or diag("  error: $err");
-        my $driver = line_by_kind($lines, 'driver');
+        my $driver = line_by_kind($lines, 'blueprint');
       SKIP: {
             skip('no driver line', 1) unless defined $driver;
-            is(spans_text($driver), S(2) . G('status.idle') . ' orchestrator',
+            like(spans_text($driver), qr/\Q${\ G('status.idle') } orchestrator   running\E\z/,
                 'AC14: a 30-day-old marker for an unknown (not literally alive) orchestrator renders NO duration');
         }
     }
@@ -787,10 +806,10 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
               orchestrator_started_at => $NOW - 60, running_coordinators => 0, packages => [], run_agents => [] };
     my $rows = eval { tui::DashboardScreen::_run_summary_lines([$s], undef, undef, $NOW) };
     ok(!$@, 'B4: _run_summary_lines does not die for an orchestrator-only, package-less run') or diag("  \$\@ = $@");
-    is(scalar(@{ $rows || [] }), 2, 'B4: exactly two rows -- the blueprint line and the driver line, nothing else');
+    is(scalar(@{ $rows || [] }), 1, 'B4: exactly one row -- the blueprint line, which carries the driver');
   SKIP: {
-        skip('wrong row count', 1) unless ref($rows) eq 'ARRAY' && @$rows == 2;
-        like(row_text($rows->[1]), qr/\borchestrator\b/, 'B4: the second row is the driver line');
+        skip('wrong row count', 1) unless ref($rows) eq 'ARRAY' && @$rows == 1;
+        like(row_text($rows->[0]), qr/\borchestrator 1m\z/, 'B4: the blueprint line ends in the driver and its uptime (60s -> 1m)');
     }
 }
 
@@ -814,7 +833,9 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
     ok(!@warns, 'AC33: _run_summary_lines does not warn with the marker unavailable') or diag(' warned: ' . join('; ', @warns));
   SKIP: {
         skip('no rows', 1) unless ref($rows) eq 'ARRAY' && @$rows >= 2;
-        like(row_text($rows->[1]), qr/zqxjudge33/, 'AC33: the package line still renders the judge label with no marker prefix');
+        # No judge label is drawn on a package row any more; with the marker
+        # unavailable the dot slot is simply empty and the row still renders.
+        like(row_text($rows->[1]), qr/\Apkg-ac33|\A\s+pkg-ac33/, 'AC33: the package line still renders, its empty marker leaving only blanks before the name');
     }
 }
 
@@ -885,7 +906,8 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
   SKIP: {
         skip('no rows', 2) unless ref($rows) eq 'ARRAY' && @$rows >= 2;
         like(row_text($rows->[1]), qr/\Q$name\E/, 'AC41: the package name round-trips byte-identically');
-        like(row_text($rows->[1]), qr/impl\xC3\xA9menter/, 'AC41: the worker_type (bp- stripped) round-trips byte-identically');
+        # The worker is no longer named; it still counts (dot and step time).
+        like(row_text($rows->[1]), qr/\s1m\z/, 'AC41: the non-ASCII-typed worker still feeds the step time');
     }
 }
 
@@ -912,6 +934,7 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
             # pad before checking it.
             (my $name_only = $name_span->{text}) =~ s/ +\z//;
             cmp_ok(length($name_only), '<=', 200, 'AC42 (package name): the bounded package name (pad stripped) is at most 200 bytes');
+            is($name_only, ('a' x 15) . G('ellipsis'), 'AC42 (package name): the drawn name is cut to 16 columns, ending in the theme ellipsis');
             my $ok_utf8 = eval { Encode::decode('UTF-8', $name_span->{text}, Encode::FB_CROAK()); 1 };
             ok($ok_utf8, 'AC42 (package name): the rendered package name decodes cleanly as UTF-8') or diag(" decode error: $@");
         }
@@ -929,14 +952,12 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
         my $text = row_text($rows2->[1]);
         like($text, qr/^(?:(?!zqx).)*\Q$pkg2->{name}\E/, 'AC42 (worker_type) precondition: the package row is present')
             if length($text);
-        my ($label_span) = grep { ref($_) eq 'HASH' && defined($_->{text}) && index($_->{text}, 'c') == 0 } @{ $rows2->[1] };
-        ok(defined($label_span), 'AC42 (worker_type) precondition: the worker label span is located');
-      SKIP: {
-            skip('span not found', 2) unless defined $label_span;
-            cmp_ok(length($label_span->{text}), '<=', 64, 'AC42 (worker_type): rendered worker label is at most 64 bytes');
-            my $ok_utf8 = eval { Encode::decode('UTF-8', $label_span->{text}, Encode::FB_CROAK()); 1 };
-            ok($ok_utf8, 'AC42 (worker_type): the rendered worker label decodes cleanly as UTF-8') or diag(" decode error: $@");
-        }
+        # Worker labels are no longer drawn on a package row, so the bound
+        # is moot there; what remains true is that the oversized worker_type
+        # never reaches the row at all.
+        unlike($text, qr/ccc/, 'AC42 (worker_type): the oversized worker_type never reaches the package row');
+        my $ok_utf8 = eval { Encode::decode('UTF-8', $text, Encode::FB_CROAK()); 1 };
+        ok($ok_utf8, 'AC42 (worker_type): the package row decodes cleanly as UTF-8') or diag(" decode error: $@");
     }
 }
 
@@ -1013,10 +1034,10 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
     my $rows = eval { tui::DashboardScreen::_run_summary_lines([$s], undef, undef) };
     ok(!$@, 'AC47: _run_summary_lines(three args, no now) does not die') or diag("  \$\@ = $@");
   SKIP: {
-        skip('no rows', 3) unless ref($rows) eq 'ARRAY' && @$rows >= 3;
-        unlike(row_text($rows->[1]), qr/\d+h\d{2}m|\b\d+m\b|<1m/, 'AC47: without now, the driver line has no uptime token');
-        unlike(row_text($rows->[2]), qr/implementer/, 'AC47: without now, the package line has no agent segment at all (no agent can be judged live)');
-        like(row_text($rows->[2]), qr/implementation 2\/5/, 'AC47: without now, the package line STILL carries its step_word and N/M (those do not need a clock)');
+        skip('no rows', 3) unless ref($rows) eq 'ARRAY' && @$rows == 2;
+        like(row_text($rows->[0]), qr/\Q${\ G('status.ok') } orchestrator\E\z/, 'AC47: without now, the driver on the blueprint line has no uptime token');
+        unlike(row_text($rows->[1]), qr/\d+[mhd]\b|<1m/, 'AC47: without now, the package line has no time at all (no agent can be judged live)');
+        like(row_text($rows->[1]), qr/implementation   attempt 2\/5\z/, 'AC47: without now, the package line STILL carries its step_word and attempt (those do not need a clock)');
     }
 
     # Resume words: with no $now, rule 5 ("now undefined") always wins over
@@ -1049,7 +1070,7 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
   SKIP: {
         skip('no panel', 1) unless $bpp_with;
         my $joined = join("\n", @{ panel_line_texts($bpp_with) });
-        like($joined, qr/test-writer/, 'AC48: with now => $NOW in $state, panels() Blueprints panel contains the live worker segment');
+        like($joined, qr/tests\s+12m/, 'AC48: with now => $NOW in $state, panels() Blueprints panel shows the live worker\'s step time');
     }
 
     my $state_without = base_state(runs => [$run]);
@@ -1059,8 +1080,8 @@ my $SCRIPTS = File::Spec->rel2abs("$Bin/../../scripts");
   SKIP: {
         skip('no panel', 1) unless $bpp_without;
         my $joined = join("\n", @{ panel_line_texts($bpp_without) });
-        unlike($joined, qr/test-writer/,
-            'AC48: without now in $state, panels() Blueprints panel does NOT contain the worker segment -- pins $state->{now} as the wired path');
+        unlike($joined, qr/12m/,
+            'AC48: without now in $state, panels() Blueprints panel shows NO step time -- pins $state->{now} as the wired path');
     }
 }
 

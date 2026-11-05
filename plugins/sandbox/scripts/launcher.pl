@@ -6788,6 +6788,12 @@ sub enter_dashboard {
                 # failure is being held through, which is the case worth
                 # rendering honestly.
                 keepawake_held  => ($KEEPAWAKE && $KEEPAWAKE->running) ? 1 : 0,
+                # Since package 08 the holder's handle is the published
+                # registry source: defined only when the sandbox-<container>
+                # entry was really written. `running` alone flips to 1 even
+                # when the write failed (KeepAwake::sync), so the Run panel
+                # needs this to tell "requested" from "not published".
+                keepawake_published => ($KEEPAWAKE && $KEEPAWAKE->running && defined $KEEPAWAKE->handle) ? 1 : 0,
                 needs_you        => $cached_needs_you,
                 triage_queued    => $cached_triage_queued,
                 backpack         => $cached_backpack,

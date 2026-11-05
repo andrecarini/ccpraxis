@@ -44,6 +44,9 @@
 # anything that looks wrong and press [c] -- the phase is deterministic, so
 # `--dump WxH --phase N` reproduces exactly what was on screen, and
 # `--dump WxH --phase N --report` prints the same capture.
+# `--scenario operator` swaps the synthetic runs for a fixed paused fleet plus a
+# running one, the shape the Blueprints panel is judged against (see
+# synth_operator_runs).
 use strict;
 use warnings;
 use FindBin qw($Bin);
@@ -71,6 +74,10 @@ use constant SYNTH_NOW => 1_767_225_600;
 # producing a warning while its period is active, so "dismissed" has to be
 # remembered by the loop or the popup would return on the next frame.
 my %DISMISSED;
+
+# --scenario NAME. '' is the phase-driven sweep; 'operator' swaps the runs for
+# synth_operator_runs()'s fixed pair (see there). Read by synth_state.
+our $SCENARIO = '';
 
 # ---------------------------------------------------------------------------
 # Synthetic state.
@@ -272,6 +279,12 @@ sub _synth_packages {
             agents        => _synth_pkg_agents($i, $phase, $j, $stuck),
             step_word     => $STEP_WORDS[ ($i + $phase + $j) % scalar(@STEP_WORDS) ],
             waits_on      => $blocked ? '20261002-120000-abcd' : undef,
+            # RunState's per-package coordinator facts (registry pid liveness and
+            # launched_at). Only the stuck package claims a live coordinator, so
+            # every other row's indicator has to earn its colour from a live
+            # dispatch-log agent -- the case the operator saw go wrong.
+            coordinator_alive      => $stuck ? 1 : undef,
+            coordinator_started_at => $stuck ? SYNTH_NOW() - 4_000 : undef,
         };
     }
     return \@packages;
@@ -429,6 +442,94 @@ sub synth_runs {
     return \@out;
 }
 
+# synth_operator_runs() -> \@runs. `--scenario operator`: a FIXED pair of runs
+# shaped like the operator's own panel of 2026-11-04, so a Blueprints-panel
+# change can be judged against the case that prompted it rather than against
+# whatever the phase sweep happens to produce:
+#
+#   1. a fleet PAUSED on the 5-hour limit, orchestrator up 30h14m, four
+#      packages still `running` in the ledgers, every coordinator gone (three
+#      checked dead, one unknown -- which is what RunState's "1 coord" counts),
+#      and no live dispatch-log agent anywhere. Nothing here is running, so
+#      nothing may render as running.
+#   2. a RUNNING fleet with real activity: a live coordinator per package (with
+#      its registry launched_at), live workers, a package on its last attempt,
+#      a second attempt, a blocked package, and a blueprint-wide judge.
+#   3. a drive-solo run: a session-owned thread, no registry pids, liveness
+#      from the dispatch log alone (one package live, one not).
+#
+# Same rules as synth_runs: SYNTH_NOW only, no clock, no rand.
+sub synth_operator_runs {
+    my $now = SYNTH_NOW();
+    my $ag = sub {
+        my ($id, $role, $wt, $age) = @_;
+        return { id => $id, role => $role, worker_type => $wt, started_at => $now - $age,
+                 budget_seconds => 1800, stale_after_seconds => 7200 };
+    };
+    my $pkg = sub {
+        my (%o) = @_;
+        return { name => $o{name}, status => $o{status} // 'running', attempt => $o{attempt} // 1,
+                 attempt_cap => 5, step => undef, steps_pending => undef, next_action => undef,
+                 agents => $o{agents} // [], step_word => $o{step_word}, waits_on => $o{waits_on},
+                 coordinator_alive => $o{alive}, coordinator_started_at => $o{started} };
+    };
+    my $thread = sub {
+        my ($bp) = @_;
+        return { name => "fleet-$bp", state => 'live', done => 0, total => 0,
+                 doing => [ { class => 'doing', kind => 'link', blueprint => $bp, number => '03', step => 'implementation' } ],
+                 current => undef, next => undef,
+                 owner => { kind => 'orchestrator', id => $bp, alive => 1, activity_at => undef, armed => 1 } };
+    };
+    my %common = (paused_manual => 0, escalations_waiting => 0, triage_waiting => 0,
+                  thread_events => [], current_package => undef);
+    return [
+        { %common, blueprint => 'acxpraxis-step-2', runs_dir => '/tmp/ccpraxis-preview-runs/acxpraxis-step-2',
+          state => 'paused', orchestrator_pid => 4101, orchestrator_alive => 1,
+          orchestrator_started_at => $now - (30 * 3600 + 14 * 60),
+          paused_reason => 'usage', paused_window => 'five_hour', relaunch_at => $now + 3 * 3600 + 49 * 60,
+          relaunch_local => { wday => 'Thu', hhmm => '21:49', day => '01', mon => 'Jan' },
+          packages_total => 15, packages_done => 9, running_coordinators => 1, inbox_waiting => 0,
+          packages => [
+              $pkg->(name => '03-make-and-hooks',         step_word => 'implementation', attempt => 2, alive => 0),
+              $pkg->(name => '05-checks-erlang',          step_word => 'tests',          alive => 0),
+              $pkg->(name => '07-release-notes',          step_word => 'review',         alive => undef),
+              $pkg->(name => '10-model-journal-recovery', step_word => 'implementation', attempt => 5, alive => 0),
+          ],
+          run_agents => [], thread => $thread->('acxpraxis-step-2'), next_package => '11-docs-sweep' },
+        { %common, blueprint => 'fleet-observability', runs_dir => '/tmp/ccpraxis-preview-runs/fleet-observability',
+          state => 'running', orchestrator_pid => 4202, orchestrator_alive => 1,
+          orchestrator_started_at => $now - (3 * 3600 + 12 * 60),
+          paused_reason => undef, paused_window => undef, relaunch_at => undef, relaunch_local => undef,
+          packages_total => 9, packages_done => 3, running_coordinators => 3, inbox_waiting => 1,
+          packages => [
+              $pkg->(name => '04-usage-ledger', step_word => 'tests', alive => 1, started => $now - 5_000,
+                     agents => [ $ag->('w1', 'worker', 'bp-test-writer', 720) ]),
+              $pkg->(name => '06-sampler-rework-with-a-much-longer-package-name', step_word => 'implementation',
+                     attempt => 5, alive => 1, started => $now - 2_700,
+                     agents => [ $ag->('w2', 'worker', 'bp-implementer', 2_460),
+                                 $ag->('j2', 'judge', 'bp-resolve-judge', 300) ]),
+              $pkg->(name => '08-dash', step_word => 'review', attempt => 2, alive => 1, started => $now - 45,
+                     agents => [ $ag->('w3', 'worker', 'bp-reviewer', 30) ]),
+              $pkg->(name => 'z01-follow-up', status => 'blocked', waits_on => '04-usage-ledger'),
+          ],
+          run_agents => [ $ag->('cj', 'judge', 'bp-conformance-judge', 240) ],
+          thread => $thread->('fleet-observability'), next_package => '09-docs' },
+        { %common, blueprint => 'tui-operator-feedback', runs_dir => '/tmp/ccpraxis-preview-runs/tui-operator-feedback',
+          state => 'running', orchestrator_pid => undef, orchestrator_alive => undef, orchestrator_started_at => undef,
+          paused_reason => undef, paused_window => undef, relaunch_at => undef, relaunch_local => undef,
+          packages_total => 6, packages_done => 2, running_coordinators => 0, inbox_waiting => 0,
+          packages => [
+              $pkg->(name => '03-pipeline-strip', step_word => 'spec',
+                     agents => [ $ag->('c4', 'coordinator', 'coordinator', 5_400), $ag->('w4', 'worker', 'bp-architect', 400) ]),
+              $pkg->(name => '04-legend', step_word => 'scout', agents => []),
+          ],
+          run_agents => [],
+          thread => { name => 'drive-tui', state => 'live', done => 2, total => 6, doing => [], current => undef, next => undef,
+                      owner => { kind => 'session', id => 's1', alive => undef, activity_at => $now - 120, armed => 1 } },
+          next_package => undef },
+    ];
+}
+
 # EVERY STATUS THE STATUS BLOCK CAN SHOW, in one cycle-able list.
 #
 # Operator, 2026-08-28: a key to cycle between these on the preview. Driving
@@ -510,7 +611,7 @@ sub synth_state {
         # own cadence), so they are separate here.
         title_spinner_idx => $phase % Theme::SPINNER_FRAMES(),
         resources        => synth_resources($phase),
-        runs             => synth_runs($n_runs, $phase),
+        runs             => ($SCENARIO eq 'operator') ? synth_operator_runs() : synth_runs($n_runs, $phase),
         thread_events    => synth_thread_events($phase),
         backpack         => { items => ($phase % 8), pending => ($phase % 5) },
         oauth_remaining  => 7 * 3600 + 21 * 60 - ($phase * 60),
@@ -812,6 +913,13 @@ END { restore() }
 # one-off render) without launching the interactive loop.
 main() unless caller;
 
+sub usage {
+    return join '',
+        "usage: perl scripts/tui-preview.pl          interactive; needs a terminal\n",
+        "       perl scripts/tui-preview.pl --dump WxH[,WxH...] [--phase N] [--runs N] [--status N]\n",
+        "                                   [--scenario operator] [--report]\n";
+}
+
 sub main {
     my $report_mode = 0;
 
@@ -829,6 +937,9 @@ sub main {
         elsif ($a eq '--runs')    { $dump_runs  = int(shift(@argv) // 0) }
         elsif ($a eq '--report')  { $report_mode = 1 }
         elsif ($a eq '--status')  { $dump_status = int(shift(@argv) // 0) }
+        elsif ($a eq '--scenario') { $SCENARIO = shift(@argv) // '' }
+        elsif ($a eq '--help' || $a eq '-h') { print usage(); return }
+        else { print STDERR "tui-preview: unknown argument '$a'\n", usage(); exit 2 }
     }
     if (@dump) {
         for my $g (@dump) {
@@ -842,6 +953,16 @@ sub main {
                                : render_plain($st, $r, $c, 0, $dump_phase);
         }
         return;
+    }
+
+    # THE INTERACTIVE LOOP NEEDS A TERMINAL, and without one it does not fail:
+    # it waits forever for a key nobody can press. An agent once ran
+    # `tui-preview.pl --help` -- which fell through to here, because unknown
+    # arguments were ignored -- and sat wedged for hours. So unknown arguments
+    # are now refused, and so is the loop itself without a terminal.
+    unless (-t STDIN && -t STDOUT) {
+        print STDERR "tui-preview: the interactive preview needs a terminal; use --dump WxH [--phase N]\n";
+        exit 2;
     }
 
     my ($cols, $rows) = term_size();

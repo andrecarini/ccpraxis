@@ -101,22 +101,24 @@ like($active, qr/busy-lease.*active/i, 'A5: a fresh lease still renders as activ
 # a held-through probe failure the intended value and the actual one diverge,
 # and that is precisely when the row is worth reading.
 # ===========================================================================
-like($unreadable, qr/keep-awake.*holding/i,
-     'B1: the lock held through an unreadable probe is reported as holding');
-unlike($unreadable, qr/keep-awake.*released \(PC may sleep\)/i,
+# 2026-11-05: since package 08 the launcher holds no lock -- it publishes a
+# request the host refresher acts on -- so the row says "requested".
+like($unreadable, qr/keep-awake.*requested/i,
+     'B1: the request kept through an unreadable probe is reported as requested');
+unlike($unreadable, qr/keep-awake\s+released/i,
      'B2: ... and not as released, which is what the operator was shown');
-like($unreadable, qr/keep-awake.*unreadable probe/i,
-     'B3: ... and says WHY it is holding, so a warm laptop is explicable');
+like($unreadable, qr/keep-awake.*probe unreadable/i,
+     'B3: ... and says WHY it is kept, so a warm laptop is explicable');
 
 my $released = plain(render(busy_age => undef, stay_awake => 0,
                             lease_probe => { state => 'lease-absent' }, keepawake_held => 0));
-like($released, qr/keep-awake.*released \(PC may sleep\)/i,
+like($released, qr/keep-awake\s+released/i,
      'B4: a genuinely released lock still says so -- counter-fixture for B2');
 
 # A gather that predates this change passes neither new key. The row must still
 # render off stay_awake rather than going blank or dying.
 my $legacy = plain(render(busy_age => 90, stay_awake => 1));
-like($legacy, qr/keep-awake.*holding/i,
+like($legacy, qr/keep-awake.*requested/i,
      'B5: a state carrying neither new key falls back to stay_awake, unchanged');
 
 # ===========================================================================

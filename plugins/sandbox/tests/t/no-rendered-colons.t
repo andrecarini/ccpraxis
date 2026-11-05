@@ -163,7 +163,7 @@ my %STATES = (
     for my $cols (120) {
         my $f = Dashboard::compose_frame($STATES{'threaded'}, 24, $cols);
         my $joined = join("\n", map { plain($_->{text}) } @$f);
-        like($joined, qr/nocolon-thread/, "package-13/AC12 non-vacuity: the thread line renders at cols=$cols");
+        like($joined, qr/bp-threaded\s.*\bsession\b/, "package-13/AC12 non-vacuity: the thread's driver renders on its blueprint line at cols=$cols (the thread row itself is gone, operator 2026-11-05)");
     }
 
     # 24x80 is a KNOWN, PRE-EXISTING panel-capacity limit of tui::Screen/
@@ -182,7 +182,7 @@ my %STATES = (
         local $TODO = 'pre-existing 24x80 Blueprints panel-capacity limit (reviewer-1.md item 3), not package 13';
         my $f80 = Dashboard::compose_frame($STATES{'threaded'}, 24, 80);
         my $joined80 = join("\n", map { plain($_->{text}) } @$f80);
-        like($joined80, qr/nocolon-thread/, 'package-13/AC12 non-vacuity: the thread line renders at cols=80 (known-limitation TODO)');
+        like($joined80, qr/bp-threaded\s.*\bsession\b/, 'package-13/AC12 non-vacuity: the driver of the thread renders on its blueprint line at cols=80 (known-limitation TODO)');
     }
 }
 

@@ -910,10 +910,18 @@ if ($THEME_OK) {
         # by relaxing the anchors to allow "anything after".
         my $has_bg = (ref($rec->{bg}) eq 'ARRAY') ? 1 : 0;
 
+        # AN ITALIC ROLE EMITS ONE TRAILING SGR 3 AT EVERY RUNG (text.waiting,
+        # operator 2026-11-05: "muted italic"). Italic is a shape, not a
+        # colour, so unlike attr it is not confined to the 'none' rung. Same
+        # treatment as the bg half: the shapes are extended by exactly that
+        # suffix for a role that declares it, and stay anchored for every other.
+        my $it = $rec->{italic} ? "\e[3m" : '';
+        my $it_re = $rec->{italic} ? qr/\e\[3m/ : qr//;
+
         my $tc = Theme::sgr($role, 'truecolor');
         my $tc_re = $has_bg
-            ? qr/\A\e\[38;2;\d{1,3};\d{1,3};\d{1,3}m\e\[48;2;\d{1,3};\d{1,3};\d{1,3}m\z/
-            : qr/\A\e\[38;2;\d{1,3};\d{1,3};\d{1,3}m\z/;
+            ? qr/\A\e\[38;2;\d{1,3};\d{1,3};\d{1,3}m\e\[48;2;\d{1,3};\d{1,3};\d{1,3}m$it_re\z/
+            : qr/\A\e\[38;2;\d{1,3};\d{1,3};\d{1,3}m$it_re\z/;
         if (like($tc, $tc_re, "sgr('$role','truecolor') matches the truecolor SGR shape (B-B3, AC-3)")) {
             my ($r, $g, $b) = $tc =~ /\A\e\[38;2;(\d{1,3});(\d{1,3});(\d{1,3})m/;
             is_deeply([$r, $g, $b], $rec->{rgb}, "sgr('$role','truecolor') numbers equal the role's rgb (B-B3, AC-3)");
@@ -925,8 +933,8 @@ if ($THEME_OK) {
         }
 
         my $x256 = Theme::sgr($role, '256');
-        my $x_re = $has_bg ? qr/\A\e\[38;5;\d{1,3}m\e\[48;5;\d{1,3}m\z/
-                           : qr/\A\e\[38;5;\d{1,3}m\z/;
+        my $x_re = $has_bg ? qr/\A\e\[38;5;\d{1,3}m\e\[48;5;\d{1,3}m$it_re\z/
+                           : qr/\A\e\[38;5;\d{1,3}m$it_re\z/;
         if (like($x256, $x_re, "sgr('$role','256') matches the 256-colour SGR shape (B-B4, AC-13)")) {
             my ($n) = $x256 =~ /\A\e\[38;5;(\d{1,3})m/;
             is($n, $rec->{x256}, "sgr('$role','256') number equals the role's x256 (B-B4, AC-13)");
@@ -942,9 +950,11 @@ if ($THEME_OK) {
         # nobody sees.
         my $none = Theme::sgr($role, 'none');
         my $expected_none = $has_bg ? "\e[7m"
-                          : ($rec->{attr} eq '' ? '' : "\e[$rec->{attr}m");
+                          : ($rec->{attr} eq '' ? '' : "\e[$rec->{attr}m") . $it;
         is($none, $expected_none, "sgr('$role','none') matches the attr-only expectation (B-B5, AC-13)");
-        like($none, qr/\A(?:\e\[(?:1|2|7)m)?\z/, "sgr('$role','none') carries no colour parameter of any kind (B-B5, AC-13)");
+        like($none, qr/\A(?:\e\[(?:1|2|7)m)?$it_re\z/, "sgr('$role','none') carries no colour parameter of any kind (B-B5, AC-13)");
+        ok(!$rec->{italic} || ($tc =~ /\e\[3m\z/ && $x256 =~ /\e\[3m\z/ && $none =~ /\e\[3m\z/),
+            "sgr('$role'): a role declaring italic ends in SGR 3 at every rung, and only such a role does");
     }
 }
 

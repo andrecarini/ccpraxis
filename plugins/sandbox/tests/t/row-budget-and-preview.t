@@ -505,11 +505,14 @@ for my $f (@AC1_FIXTURES) {
         # zqx3-judgeA (a PACKAGE-level judge) is a text segment inside
         # pkg-ac3-stuckjudge's own `package` row, not a separate row -- so
         # it shares that row's pri/kind, found via the package's own name.
+        # Package names are drawn at most 16 columns wide since 2026-11-05
+        # (operator), cut with the theme ellipsis -- so each package is found
+        # by its first 15 characters, which stay unique here.
         my %expect = (
-            'pkg-ac3-stuckjudge'    => [3, 'package'],
-            'pkg-ac3-stuckattempt'  => [3, 'package'],
-            'pkg-ac3-healthypkg'    => [3, 'package'],
-            'pkg-ac3-zeroagents'    => [3, 'package'],
+            'pkg-ac3-stuckju'       => [3, 'package'],
+            'pkg-ac3-stuckat'       => [3, 'package'],
+            'pkg-ac3-healthy'       => [3, 'package'],
+            'pkg-ac3-zeroage'       => [3, 'package'],
             'zqx3-runjudge'         => [4, 'judge'],
         );
         my %found_idx;
@@ -523,12 +526,14 @@ for my $f (@AC1_FIXTURES) {
                 is($e->{kind}, $expect{$nonce}[1], "AC3: '$nonce' row has kind '$expect{$nonce}[1]'");
             }
         }
-        # zqx3-judgeA's own row is the SAME row as pkg-ac3-stuckjudge's --
-        # a package-level judge never gets a row of its own.
+        # A package-level judge never gets a row of its own: since
+        # 2026-11-05 it is not even named -- it is the judge marker that
+        # leads its package's one row.
         my ($judgeA_idx) = find_entry($plan, 'zqx3-judgeA');
-        ok(defined($judgeA_idx) && defined($found_idx{'pkg-ac3-stuckjudge'})
-                && $judgeA_idx == $found_idx{'pkg-ac3-stuckjudge'},
-            'AC3: a package-level judge (zqx3-judgeA) collapses into its own package\'s single row, not a row of its own');
+        my $jm = Theme::glyph('status.judge') // '';
+        ok(!defined($judgeA_idx) && defined($found_idx{'pkg-ac3-stuckju'})
+                && index(row_text($plan->[ $found_idx{'pkg-ac3-stuckju'} ]{spans}), "  $jm") == 0,
+            'AC3: a package-level judge (zqx3-judgeA) has no row and no label of its own -- it is the marker on its package\'s single row');
         # zqx3-runworker (a non-judge run_agents entry) renders no row at
         # all (spec S2.3.7: "Non-judge run_agents are not rendered").
         my ($runworker_idx) = find_entry($plan, 'zqx3-runworker');
@@ -537,13 +542,16 @@ for my $f (@AC1_FIXTURES) {
         # per-run nonce on the no-thread driver line itself). All three runs
         # keep `orchestrator_pid`'s tree_run() default (4242), so all three
         # (runA alive, runB not-alive, runC paused+not-alive) render one.
-        my @drv = grep { ref($_) eq 'HASH' && $_->{kind} eq 'driver' && row_text($_->{spans}) =~ /\borchestrator\b/ } @$plan;
-        is(scalar(@drv), 3, 'AC3 precondition: exactly three driver rows (one per run)');
+        # CHANGED 2026-11-05 (operator): there is no driver row; the driver
+        # sits on each run's blueprint line, so it carries that line's pri 1.
+        my @drv = grep { ref($_) eq 'HASH' && $_->{kind} eq 'blueprint' && row_text($_->{spans}) =~ /\borchestrator\b/ } @$plan;
+        is(scalar(@drv), 3, 'AC3 precondition: exactly three blueprint rows carry a driver (one per run)');
       SKIP: {
             skip('wrong driver row count', 1) unless @drv == 3;
-            my @bad_drv_pri = grep { $_->{pri} != 2 } @drv;
-            is(scalar(@bad_drv_pri), 0, 'AC3: every driver row (alive or not) carries pri 2, per S2.5\'s table');
+            my @bad_drv_pri = grep { $_->{pri} != 1 } @drv;
+            is(scalar(@bad_drv_pri), 0, 'AC3: every driver (alive or not) rides a pri-1 blueprint row');
         }
+        ok(!(grep { ref($_) eq 'HASH' && $_->{kind} eq 'driver' } @$plan), 'AC3: no plan row is of kind driver any more');
         # The pause reason is on run C's OWN blueprint-kind row now (ruling
         # B/G), not a separate 'partial'-kind row -- 'partial' is no longer
         # a member of the kind vocabulary at all.
@@ -677,24 +685,24 @@ for my $f (@AC1_FIXTURES) {
     my ($width) = call1('_blueprints_body_width', 120);
   SKIP: {
         skip('no plan', 4) unless ref($plan) eq 'ARRAY' && @$plan;
-        my ($kept3, $e3) = call1('_select_rows', $plan, 3, $width);
-        ok(!$e3, 'AC8: _select_rows does not die at budget=3') or diag(" error: $e3");
+        # CHANGED 2026-11-05: the driver rides the blueprint row, so the
+        # budget that fits "blueprint + exactly one package" is 2, not 3.
+        my ($kept3, $e3) = call1('_select_rows', $plan, 2, $width);
+        ok(!$e3, 'AC8: _select_rows does not die at budget=2') or diag(" error: $e3");
       SKIP: {
             skip('no kept3', 3) unless ref($kept3) eq 'ARRAY';
             my %kset = map { $_ => 1 } @$kept3;
             my ($bp_i)       = grep { ref($plan->[$_]) eq 'HASH' && $plan->[$_]{kind} eq 'blueprint' } (0 .. $#$plan);
-            my ($drv_i)      = grep { ref($plan->[$_]) eq 'HASH' && $plan->[$_]{kind} eq 'driver' } (0 .. $#$plan);
             my ($stuckrow_i) = find_entry($plan, 'pkg-ac89-stuck');
             my ($healthyrow_i) = find_entry($plan, 'pkg-ac89-healthy');
-            ok(defined($bp_i) && defined($drv_i) && defined($stuckrow_i) && defined($healthyrow_i),
-                'AC8 precondition: blueprint/driver/stuck-package/healthy-package row indices all resolved');
+            ok(defined($bp_i) && defined($stuckrow_i) && defined($healthyrow_i),
+                'AC8 precondition: blueprint/stuck-package/healthy-package row indices all resolved');
           SKIP: {
-                skip('indices unresolved', 5) unless defined($bp_i) && defined($drv_i) && defined($stuckrow_i) && defined($healthyrow_i);
-                is(scalar(@$kept3), 3, 'AC8 precondition: budget=3 on this fixture admits exactly 3 rows');
-                ok($kset{$bp_i},  'AC8: the blueprint row survives at budget=3');
-                ok($kset{$drv_i}, 'AC8: the driver row survives at budget=3');
-                ok($kset{$stuckrow_i}, 'AC8: the first (stuck) package\'s whole row survives at budget=3, judge/worker segments included atomically');
-                ok(!$kset{$healthyrow_i}, 'AC8: the SECOND package\'s row does not survive at budget=3 (tier-3 prefix rule, document order)');
+                skip('indices unresolved', 4) unless defined($bp_i) && defined($stuckrow_i) && defined($healthyrow_i);
+                is(scalar(@$kept3), 2, 'AC8 precondition: budget=2 on this fixture admits exactly 2 rows');
+                ok($kset{$bp_i},  'AC8: the blueprint row (carrying the driver) survives at budget=2');
+                ok($kset{$stuckrow_i}, 'AC8: the first (stuck) package\'s whole row survives at budget=2, its judge/worker evidence included atomically');
+                ok(!$kset{$healthyrow_i}, 'AC8: the SECOND package\'s row does not survive at budget=2 (tier-3 prefix rule, document order)');
             }
         }
     }
@@ -735,11 +743,15 @@ for my $f (@AC1_FIXTURES) {
               SKIP: {
                     skip('no kept', 2) unless ref($kept) eq 'ARRAY';
                     my %kset = map { $_ => 1 } @$kept;
-                    my ($drv_i) = grep { ref($plan->[$_]) eq 'HASH' && $plan->[$_]{kind} eq 'driver' } (0 .. $#$plan);
-                    my ($worker_i) = find_entry($plan, 'zqx9-worker');
-                    ok(defined($drv_i) && defined($worker_i), "AC9 ($label) precondition: driver and worker rows resolved");
+                    # CHANGED 2026-11-05: the driver rides the blueprint row
+                    # (pri 1), and the worker is no longer named -- the
+                    # package row is found by the package's own name.
+                    my ($drv_i) = grep { ref($plan->[$_]) eq 'HASH' && $plan->[$_]{kind} eq 'blueprint'
+                                         && row_text($plan->[$_]{spans}) =~ /\borchestrator\b/ } (0 .. $#$plan);
+                    my ($worker_i) = find_entry($plan, 'pkg-ac9');
+                    ok(defined($drv_i) && defined($worker_i), "AC9 ($label) precondition: driver-carrying blueprint row and package row resolved");
                     ok($kset{$drv_i} && !$kset{$worker_i},
-                        "AC9 ($label): the driver row (pri 2) survives at budget=total-1 regardless of liveness, while the package row (pri 3) is dropped instead");
+                        "AC9 ($label): the driver (on the pri-1 blueprint row) survives at budget=total-1 regardless of liveness, while the package row (pri 3) is dropped instead");
                 }
             }
         }
@@ -768,8 +780,14 @@ for my $f (@AC1_FIXTURES) {
     # packages wraps into exactly a head + ONE continuation physical row
     # (fewer columns wraps into head + TWO continuations instead, which
     # would not exercise this AC's two-physical-rows shape).
+    # Retargeted again 2026-11-05 (operator: package names are cut to 16
+    # columns): an ACTIVE package row is now short and never wraps at 64, so
+    # the fixture that wraps is a BLOCKED package whose "waiting on" aside
+    # runs past the width. Same shape under test: one logical package row,
+    # two physical rows.
     my @pkgs = map {
-        { name => "zqxm4-$_-dispatch-log-write-path-and-hardening", status => 'running',
+        { name => "zqxm4-$_-dispatch-log-write-path-and-hardening", status => 'blocked',
+          waits_on => "escalation-$_-waiting-on-the-operator-answer-xyz",
           attempt => 2, attempt_cap => 5, step_word => 'implementation', agents => [] }
     } (1 .. 7);
     my $run = tree_run(blueprint => 'zqxm4-run', packages => \@pkgs);
@@ -785,7 +803,7 @@ for my $f (@AC1_FIXTURES) {
         # i.e. a DIFFERENT physical row).
         my (@heads, @conts);
         for my $n (1 .. 7) {
-            my $nonce = "zqxm4-$n-dispatch";
+            my $nonce = "zqxm4-$n-dispat";   # the name's first 15 characters
             my ($head_i) = grep { row_text($plan->[$_]{spans}) =~ /\Q$nonce\E/ } (0 .. $#$plan);
             push @heads, $head_i;
             my ($cont_i) = grep {
@@ -800,12 +818,14 @@ for my $f (@AC1_FIXTURES) {
       SKIP: {
             skip('indices unresolved', 3)
                 unless (grep { defined } @heads) == 7 && (grep { defined } @conts) == 7;
-            # Budget: blueprint(1) + driver(1) + 4 whole packages (1 head +
-            # 1 continuation each = 2) + one bare extra unit -- enough to
-            # admit package 5's head on its own (cost 1) if heads and
-            # continuations were still independently costed, but not
-            # enough to also admit its continuation.
-            my $budget = 1 + 1 + (4 * 2) + 1;
+            # Budget: the blueprint line (its measured physical rows; the
+            # driver rides it) + 4 whole packages (1 head + 1 continuation
+            # each = 2) + one bare extra unit -- enough to admit package 5's
+            # head on its own (cost 1) if heads and continuations were still
+            # independently costed, but not enough to also admit its
+            # continuation.
+            my $bp_rows = grep { ref($_) eq 'HASH' && $_->{kind} eq 'blueprint' } @$plan;
+            my $budget = $bp_rows + (4 * 2) + 1;
             my ($kept, $err) = call1('_select_rows', $plan, $budget, $width);
             ok(!$err, 'MEDIUM-4: _select_rows does not die at the mid-tier budget') or diag(" error: $err");
           SKIP: {
@@ -1138,14 +1158,19 @@ for my $f (@AC1_FIXTURES) {
     # 'failed'/'idle' with packages, and 'neither key') are exactly the old
     # `state eq 'running'` gate's blind spot: they were pinned at 0 under the
     # OLD _tree_present semantics, which the fix replaces.
+    # CHANGED 2026-11-05 (operator): the driver no longer has a row of its
+    # own -- it rides the blueprint line -- so a block with a driver and no
+    # rendering package is ONE line now (the first three cases), and the
+    # "no state condition" property is carried by fixtures with a package
+    # that renders (status running) in every state instead.
     my @cases = (
-        [ 'running, packages=>[]',           { runs=>[ tree_run(state=>'running', packages=>[], run_agents=>undef) ] }, 1 ],
-        [ 'running, run_agents=>[]',         { runs=>[ tree_run(state=>'running', packages=>undef, run_agents=>[]) ] }, 1 ],
-        [ 'running, neither key',            { runs=>[ $neither_run ] }, 1 ],
-        [ 'queued with packages',            { runs=>[ tree_run(state=>'queued', packages=>[{name=>'x'}]) ] }, 1 ],
-        [ 'done with packages',              { runs=>[ tree_run(state=>'done', packages=>[{name=>'x'}]) ] }, 1 ],
-        [ 'failed with packages',            { runs=>[ tree_run(state=>'failed', packages=>[{name=>'x'}]) ] }, 1 ],
-        [ 'idle with packages',              { runs=>[ tree_run(state=>'idle', packages=>[{name=>'x'}]) ] }, 1 ],
+        [ 'running, packages=>[]',           { runs=>[ tree_run(state=>'running', packages=>[], run_agents=>undef) ] }, 0 ],
+        [ 'running, run_agents=>[]',         { runs=>[ tree_run(state=>'running', packages=>undef, run_agents=>[]) ] }, 0 ],
+        [ 'running, neither key',            { runs=>[ $neither_run ] }, 0 ],
+        [ 'queued with packages',            { runs=>[ tree_run(state=>'queued', packages=>[{name=>'x', status=>'running'}]) ] }, 1 ],
+        [ 'done with packages',              { runs=>[ tree_run(state=>'done', packages=>[{name=>'x', status=>'running'}]) ] }, 1 ],
+        [ 'failed with packages',            { runs=>[ tree_run(state=>'failed', packages=>[{name=>'x', status=>'running'}]) ] }, 1 ],
+        [ 'idle with packages',              { runs=>[ tree_run(state=>'idle', packages=>[{name=>'x', status=>'running'}]) ] }, 1 ],
         [ 'runs absent',                     {}, 0 ],
         [ "runs='x'",                        { runs=>'x' }, 0 ],
         [ 'runs=[]',                         { runs=>[] }, 0 ],
@@ -1155,7 +1180,7 @@ for my $f (@AC1_FIXTURES) {
         my ($label, $s, $expect) = @$c;
         my ($res, $err) = call1('_multiline_blocks', $s);
         ok(!$err, "AC20 ($label): _multiline_blocks does not die") or diag(" error: $err");
-        is($res, $expect, "AC20 ($label): _multiline_blocks returns $expect (S2.2.1: 2+ lines, no state condition)");
+        is($res, $expect, "AC20 ($label): _multiline_blocks returns $expect (S2.2.1: 2+ lines, no state condition; the driver adds no line)");
     }
 
     # A block whose run has NO driver (orchestrator_pid genuinely ABSENT, no
@@ -1416,39 +1441,43 @@ for my $f (@AC1_FIXTURES) {
     # (large) are MEASURED below, not hand-predicted, to be the points
     # where this 4-content-row fixture's capacity is first non-zero-but-
     # insufficient and first sufficient for everything.
+    # CHANGED 2026-11-05 (operator): agents are no longer named on a
+    # package row and the driver rides the blueprint line, so this
+    # fixture is THREE body rows (blueprint+driver, two packages) and the
+    # two packages are observed by name. rows=18 (capacity 2: the blueprint
+    # line and the notice) and rows=24 (capacity 8) are MEASURED below (the Claude Code panel is one row shorter since its pairs, 2026-11-05).
     my %cap_at;
-    for my $rows (20, 24) {
+    for my $rows (18, 24) {
         my ($cap) = call1('_blueprints_capacity', $s0, $rows, 120);
         $cap_at{$rows} = $cap;
     }
-    ok((defined($cap_at{20}) && defined($cap_at{24}) && $cap_at{20} > 0 && $cap_at{20} < $cap_at{24}),
-        'AC26 precondition: measured capacity is > 0 at rows=20 and strictly larger at rows=24')
-        or diag(' cap20=' . ($cap_at{20}//'undef') . ' cap24=' . ($cap_at{24}//'undef'));
+    ok((defined($cap_at{18}) && defined($cap_at{24}) && $cap_at{18} > 0 && $cap_at{18} < 3 && $cap_at{24} >= 3),
+        'AC26 precondition: measured capacity is > 0 but below the 3 body rows at rows=18, and covers them at rows=24')
+        or diag(' cap18=' . ($cap_at{18}//'undef') . ' cap24=' . ($cap_at{24}//'undef'));
     my $plan = ( call1('_blueprints_row_plan', $s0, 120) )[0];
   SKIP: {
         skip('no plan', 1) unless ref($plan) eq 'ARRAY';
         my $joined = join("\n", map { row_text($_->{spans}) } @$plan);
-        # S2.3.6: a judge label strips a leading 'bp-' AND a trailing
-        # '-judge' ('bp-resolve-judge' -> 'resolve judge'); a worker label
-        # strips only the leading 'bp-' ('bp-implementer' -> 'implementer').
-        ok(($joined =~ /resolve judge/ && $joined =~ /\bimplementer\b/),
-            'AC26 precondition: both agents\' rendered labels are present in the uncollapsed body');
+        my $jm = Theme::glyph('status.judge') // '';
+        ok(($joined =~ /\Q$jm\E pkg-ac26-stuck/ && $joined =~ /pkg-ac26-healthy/),
+            'AC26 precondition: both packages are present in the uncollapsed body, the stuck one under its judge marker');
+        unlike($joined, qr/resolve judge|\bimplementer\b/, 'AC26: no agent is named on a package row');
     }
   SKIP: {
-        skip('capacities not increasing', 2)
-            unless (defined($cap_at{20}) && defined($cap_at{24}) && $cap_at{20} > 0 && $cap_at{20} < $cap_at{24});
-        my $frame_small = Dashboard::compose_frame($s0, 20, 120);
+        skip('capacities not as measured', 2)
+            unless (defined($cap_at{18}) && defined($cap_at{24}) && $cap_at{18} > 0 && $cap_at{18} < 3 && $cap_at{24} >= 3);
+        my $frame_small = Dashboard::compose_frame($s0, 18, 120);
         my $ft_small = frame_text($frame_small);
-        unlike($ft_small, qr/resolve judge/, 'AC26: at the smaller height, the stuck package\'s judge segment is NOT present (package content is atomic, no special-case judge survival)');
-        unlike($ft_small, qr/\bimplementer\b/, 'AC26: at the smaller height, the healthy package\'s worker segment is NOT present either');
-        like($ft_small, qr/\borchestrator\b/, 'AC26: at the smaller height, the orchestrator/driver row IS present (pri 2, strictly before package pri 3)');
+        unlike($ft_small, qr/pkg-ac26-stuck/, 'AC26: at the smaller height, the stuck package\'s row is NOT present (package content is atomic, no special-case judge survival)');
+        unlike($ft_small, qr/pkg-ac26-healthy/, 'AC26: at the smaller height, the healthy package\'s row is NOT present either');
+        like($ft_small, qr/\borchestrator\b/, 'AC26: at the smaller height, the driver IS present (on the pri-1 blueprint row, strictly before package pri 3)');
         like($ft_small, qr/hidden/, 'AC26: at the smaller height, a hidden-rows notice appears (package content did not fit)');
 
         my $frame_large = Dashboard::compose_frame($s0, 24, 120);
         my $ft_large = frame_text($frame_large);
-        like($ft_large, qr/resolve judge/, 'AC26: at the larger height, the resolve-judge segment is present');
-        like($ft_large, qr/\bimplementer\b/, 'AC26: at the larger height, the implementer segment is present');
-        like($ft_large, qr/\borchestrator\b/, 'AC26: at the larger height, the orchestrator row is present');
+        like($ft_large, qr/pkg-ac26-stuck/, 'AC26: at the larger height, the stuck package is present');
+        like($ft_large, qr/pkg-ac26-healthy/, 'AC26: at the larger height, the healthy package is present');
+        like($ft_large, qr/\borchestrator\b/, 'AC26: at the larger height, the driver is present');
     }
 }
 
@@ -1676,9 +1705,12 @@ SKIP: {
             ok(ref($pkgs) eq 'ARRAY' && @$pkgs, 'AC36 precondition: the running element carries a non-empty packages array');
           SKIP: {
                 skip('no packages', 1) unless ref($pkgs) eq 'ARRAY' && @$pkgs;
-                my @PKG_KEYS = qw(name status attempt attempt_cap step steps_pending next_action agents step_word waits_on);
+                # +2 (2026-11-05): RunState's per-package coordinator facts,
+                # which the Blueprints panel's truthful dot and total read.
+                my @PKG_KEYS = qw(name status attempt attempt_cap step steps_pending next_action agents step_word waits_on
+                                  coordinator_alive coordinator_started_at);
                 my @bad = grep { !(ref($_) eq 'HASH' && "@{[sort keys %$_]}" eq "@{[sort @PKG_KEYS]}") } @$pkgs;
-                is(scalar(@bad), 0, 'AC36: every packages element has exactly the 10 package keys');
+                is(scalar(@bad), 0, 'AC36: every packages element has exactly the 12 package keys');
             }
             my @agents;
             push @agents, @{ $_->{agents} } for grep { ref($_->{agents}) eq 'ARRAY' } @$pkgs;
@@ -1722,7 +1754,7 @@ SKIP: {
 # --- AC38 --------------------------------------------------------------
 SKIP: {
     skip('preview did not load', 3) unless $PREVIEW_LOADED;
-    my ($found_state, $found_agent, $found_phase);
+    my ($found_state, $found_agent, $found_phase, $found_pkg);
     for my $phase (0 .. 40) {
         my ($state) = call_main1('synth_state', $phase);
         next unless ref($state) eq 'HASH' && ref($state->{runs}) eq 'ARRAY';
@@ -1737,7 +1769,7 @@ SKIP: {
                              && defined($a->{worker_type}) && $a->{worker_type} eq 'bp-resolve-judge';
                     my ($live) = call1('_agent_live', $a, $state->{now});
                     next unless $live;
-                    $found_state = $state; $found_agent = $a; $found_phase = $phase;
+                    $found_state = $state; $found_agent = $a; $found_phase = $phase; $found_pkg = $p;
                     last;
                 }
                 last if $found_agent;
@@ -1756,7 +1788,11 @@ SKIP: {
         # ("bp-resolve-judge" -> "resolve judge"). The judge dot
         # (status.judge, via _judge_marker) is what marks the package line
         # as stuck-under-a-judge, not the literal worker_type string.
-        like($dump // '', qr/resolve judge/, "AC38 (phase=$found_phase): the resolve-judge segment ('resolve judge', bp-/-judge stripped) is present in the 200x60 dump");
+        # RETARGETED AGAIN (2026-11-05, operator): a package row names no
+        # agent; a live judge is the marker that LEADS its package's row.
+        my $jm = Theme::glyph('status.judge') // '';
+        my $nm = substr($found_pkg->{name}, 0, 15);
+        like($dump // '', qr/\Q$jm\E +\Q$nm\E/, "AC38 (phase=$found_phase): the stuck package's row is led by the judge marker in the 200x60 dump");
     }
 }
 
@@ -1773,7 +1809,7 @@ SKIP: {
 # would likewise never appear even once the renderer is fully implemented.
 SKIP: {
     skip('preview did not load', 3) unless $PREVIEW_LOADED;
-    my ($found_state, $found_agent, $found_phase);
+    my ($found_state, $found_agent, $found_phase, $found_pkg);
     for my $phase (0 .. 40) {
         my ($state) = call_main1('synth_state', $phase);
         next unless ref($state) eq 'HASH' && ref($state->{runs}) eq 'ARRAY';
@@ -1781,6 +1817,7 @@ SKIP: {
             next unless ref($r) eq 'HASH' && ref($r->{packages}) eq 'ARRAY';
             for my $p (@{ $r->{packages} }) {
                 next unless ref($p) eq 'HASH' && defined($p->{status}) && $p->{status} !~ /^(?:blocked|parked)\z/;
+                $found_pkg = $p;
                 next unless ref($p->{agents}) eq 'ARRAY';
                 for my $a (@{ $p->{agents} }) {
                     next unless ref($a) eq 'HASH' && defined($a->{role}) && $a->{role} eq 'worker';
@@ -1801,9 +1838,12 @@ SKIP: {
   SKIP: {
         skip('no such fixture found', 1) unless defined($found_agent);
         my ($dump) = call_main1('render_plain', $found_state, 60, 200, 0, $found_phase);
-        (my $expect_label = $found_agent->{worker_type} // '') =~ s/^bp-//;
-        like($dump // '', qr/\Q$expect_label\E/, "AC39 (phase=$found_phase): the over-budget worker's label (bp- stripped, spec S2.3.6) appears in the 200x60 dump")
-            if length($expect_label);
+        # RETARGETED AGAIN (2026-11-05, operator): workers are not named on a
+        # package row; an over-budget live worker still counts -- its
+        # package's row carries a step time.
+        my $nm = substr($found_pkg->{name}, 0, 15);
+        my ($row) = grep { index($_, $nm) >= 0 } split /\n/, ($dump // '');
+        like($row // '', qr/\s(?:<1m|\d+[mhd])(?:\s|\z)/, "AC39 (phase=$found_phase): the package of the over-budget live worker shows a step time in the 200x60 dump");
     }
 }
 
@@ -2054,9 +2094,14 @@ SKIP: {
 #   - 120x35 phase 5: no side column, the narrow case, same phase family
 #     as the original geometry but at a height that genuinely produces a
 #     Blueprints body instead of none at all.
+# RE-SELECTED 2026-11-05 (operator layout: no driver rows, no per-agent
+# detail, so every block is shorter): scanned phases 0..60 at 200x60 and
+# none collapses any more; 200x40 phase 11 (hidden 3) is the first wide
+# geometry/phase pair with a side column that does, and 120x35 phase 7
+# (hidden 5) the first narrow one.
 for my $case (
-    { geom => '200x60', phase => 44, label => 'wide, side column' },
-    { geom => '120x35', phase => 5, label => 'narrow, no side column' },
+    { geom => q(200x40), phase => 11, label => q(wide, side column) },
+    { geom => '120x35', phase => 7, label => 'narrow, no side column' },
 ) {
     my ($out, $rc);
     {
@@ -2144,28 +2189,26 @@ for my $case (
             fail('package-13/B16 (AC1): plan spans equal body, with a thread line present');
         }
 
-        # The thread line itself: find the plan entry whose text names the
-        # thread (its name and 'doing'/'next' wording are distinctive nonces).
+        # RETARGETED AGAIN (2026-11-05, operator): the thread row is gone.
+        # The thread's name is not drawn; its owner -- the driver -- rides
+        # the blueprint line, which is pri 1 and has no parent.
         my ($idx, $entry) = find_entry($plan, 'zqx13-thrln');
-        ok(defined($idx), 'package-13/B16: a plan entry mentions the thread name zqx13-thrln') or diag(' plan: ' . join(' | ', map { row_text($_->{spans}) } @$plan));
+        ok(!defined($idx), 'package-13/B16: no plan entry draws the thread name any more');
+        my ($bidx, $bentry) = find_entry($plan, 'zqx13-runbp');
+        ok(defined($bidx), 'package-13/B16: the blueprint row is present');
       SKIP: {
-            skip('thread entry not found', 3) unless defined $idx;
-            # Retargeted (spec S2.2.1/S2.3.4/S2.5, ruling A): package
-            # 13-dashboard-threads's own `_thread_line` is one of the subs
-            # ruling A removes; 01-run-blocks's `_run_block` renders a
-            # thread (or no-thread) driver line as its OWN `driver` kind
-            # (not a reused 'partial'), still pri 2, per S2.5's table.
-            is($entry->{kind}, 'driver', 'package-13/B16: the thread-line entry is kind "driver" (S2.5\'s own kind for a thread or no-thread driver line, not a reused "partial")');
-            is($entry->{pri}, 2, 'package-13/B16: the thread-line entry has pri 2 (S2.5 placement)');
-            ok(defined($entry->{parent}) && $entry->{parent} < $idx, 'package-13/B16: the thread-line entry has a defined parent index strictly before itself (the blueprint row)');
+            skip('blueprint entry not found', 3) unless defined $bidx;
+            is($bentry->{kind}, 'blueprint', 'package-13/B16: the driver-carrying entry is the blueprint row');
+            is($bentry->{pri}, 1, 'package-13/B16: it has pri 1');
+            like(row_text($bentry->{spans}), qr/\bsession\b/, 'package-13/B16: it carries the thread owner (session) as its driver');
         }
 
         # AC2's closed kind vocabulary is now S2.5's six (blueprint/
         # overflow/driver/package/judge/next), and still holds with a
         # thread (driver) line in the plan.
-        my %KIND = map { $_ => 1 } qw(blueprint overflow driver package judge next);
+        my %KIND = map { $_ => 1 } qw(blueprint overflow package judge next);
         my @bad_kind = grep { !(ref($plan->[$_]) eq 'HASH' && defined($plan->[$_]{kind}) && $KIND{$plan->[$_]{kind}}) } (0 .. $#$plan);
-        is(scalar(@bad_kind), 0, 'package-13/B16 (AC2): every plan entry kind is still one of S2.5\'s six, with a thread line present')
+        is(scalar(@bad_kind), 0, 'package-13/B16 (AC2): every plan entry kind is one of blueprint/overflow/package/judge/next, with a thread attached')
             or diag(' bad idx: ' . join(',', @bad_kind));
     }
 
@@ -2179,8 +2222,8 @@ for my $case (
   SKIP: {
         skip('no plan40', 2) unless ref($plan40) eq 'ARRAY' && @$plan40;
         my ($run_idx) = find_entry($plan40, 'zqx13-runbp');
-        my ($thread_idx) = find_entry($plan40, 'zqx13-thrln');
-        ok(defined($run_idx) && defined($thread_idx), 'package-13/B16 (40pkg): both the run row and the thread line are present in the uncollapsed plan');
+        my $thread_idx = $run_idx;   # the driver rides the run's own blueprint row now
+        ok(defined($run_idx), 'package-13/B16 (40pkg): the run row (carrying the driver) is present in the uncollapsed plan');
       SKIP: {
             skip('rows not found', 1) unless defined($run_idx) && defined($thread_idx);
             # A budget costed as exactly the run row + the thread line (plus
@@ -2209,7 +2252,7 @@ for my $case (
             my ($body40, $err40) = call1('_blueprints_body', $s40, 120);
             ok(!$err40, 'package-13/B16 (40pkg): _blueprints_body does not die with a pri<=2-plus-notice budget') or diag(" error: $err40");
             my $body_text = join("\n", map { row_text($_) } @{ $body40 || [] });
-            like($body_text, qr/zqx13-thrln/, 'package-13/B16 (40pkg): the thread line survives a budget sized to cover its own run row + itself + the reserved collapse notice');
+            like($body_text, qr/zqx13-runbp\s.*\bsession\b/, 'package-13/B16 (40pkg): the driver survives (on its run row) a budget sized to cover that row + the reserved collapse notice');
         }
     }
 }

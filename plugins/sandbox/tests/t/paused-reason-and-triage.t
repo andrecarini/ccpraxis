@@ -151,7 +151,7 @@ sub frame_text { my ($f) = @_; return join("\n", map { plain($_) } @$f) }
   SKIP: {
         skip('_run_summary_lines did not return rows', 2) unless ref($rows) eq 'ARRAY';
         my ($row_idx)    = grep { ref($rows->[$_]) eq 'ARRAY' && tui::Frame::spans_text($rows->[$_]) =~ /bp-ac1\b/ } 0 .. $#$rows;
-        my ($cur_idx)    = grep { ref($rows->[$_]) eq 'ARRAY' && tui::Frame::spans_text($rows->[$_]) =~ /ac1-current-pkg-marker/ } 0 .. $#$rows;
+        my ($cur_idx)    = grep { ref($rows->[$_]) eq 'ARRAY' && tui::Frame::spans_text($rows->[$_]) =~ /ac1-current-pkg/ } 0 .. $#$rows;   # cut to 16 columns (2026-11-05)
         ok(defined($row_idx) && defined($cur_idx) && $cur_idx > $row_idx,
             'AC1: the current-package line appears strictly AFTER the blueprint line (same row carries the pause words, so "after the reason" is automatic)');
     }
@@ -360,20 +360,23 @@ my $DECISIONS = Theme::glyph('icon.decisions') // '';
         return ($GAUGE_FULL x $f) . ($GAUGE_EMPTY x (15 - $f));
     };
 
+    # Operator layout (2026-11-05): the meter sits three columns after the
+    # blueprint name, whatever the block's other names.
     # Fixture A: one line (blueprint only -- no packages/thread/driver).
-    # W = dw('bp-golden-a') = 12.
-    my $GOLDEN_TEXT_A = $ICON_BP . ' bp-golden-a' . (' ' x 2) . $meter->(2, 5) . '  2/5' . '   ' . 'running'
+    my $GOLDEN_TEXT_A = $ICON_BP . ' bp-golden-a' . (' ' x 3) . $meter->(2, 5) . '  2/5' . '   ' . 'running'
         . '   ' . $DECISIONS . ' 3';
 
     # Fixture B: one line. paused_reason absent -> PAUSE_WORDS 'paused'.
-    my $GOLDEN_TEXT_B = $ICON_BP . ' bp-golden-b' . (' ' x 2) . $meter->(1, 4) . '  1/4' . '   '
+    my $GOLDEN_TEXT_B = $ICON_BP . ' bp-golden-b' . (' ' x 3) . $meter->(1, 4) . '  1/4' . '   '
         . $IDLE_GLYPH . ' paused' . '   ' . $DECISIONS . ' 2';
 
-    # Fixture C: two lines. W = max(dw('bp-golden-c')=11, dw('golden-current-pkg')=18) = 18.
-    # inbox_waiting=>0 (defined, n=0) gates WAIT off entirely.
-    # Blueprint line pad = (W+2) - dw('bp-golden-c') = 20 - 11 = 9 spaces.
-    my $GOLDEN_TEXT_C_L1 = $ICON_BP . ' bp-golden-c' . (' ' x 9) . $meter->(3, 6) . '  3/6' . '   ' . 'running';
-    my $GOLDEN_TEXT_C_L2 = '  ' . $OK_GLYPH . ' golden-current-pkg' . (' ' x 2) . 'running';
+    # Fixture C: two lines. inbox_waiting=>0 (defined, n=0) gates WAIT off.
+    my $GOLDEN_TEXT_C_L1 = $ICON_BP . ' bp-golden-c' . (' ' x 3) . $meter->(3, 6) . '  3/6' . '   ' . 'running';
+    # 2026-11-05 (operator): the dot leads the package row; this legacy
+    # current_package-only shape carries no liveness evidence, so it is the
+    # muted idle dot, never green; the 18-column name is cut to 16.
+    my $GOLDEN_TEXT_C_L2 = '  ' . (Theme::glyph('status.idle') // '') . ' golden-current-' . (Theme::glyph('ellipsis') // '')
+        . (' ' x 3) . 'running';
 
     my ($rows_a, $err_a) = (eval { tui::DashboardScreen::_run_summary_lines([$A], undef, undef, undef) }, $@);
     ok(!$err_a, 'AC9: fixture A -- _run_summary_lines does not die') or diag("  \$\@ = $err_a");

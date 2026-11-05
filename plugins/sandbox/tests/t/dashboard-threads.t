@@ -356,19 +356,22 @@ SKIP: {
         ok(!$err, 'AC6/B2: _run_block does not die') or diag(" error: $err");
       SKIP: {
             skip('_run_block died', 1) unless !$err;
-            my ($driver_line) = (ref($block) eq 'HASH' && ref($block->{lines}) eq 'ARRAY')
-                ? (grep { ref($_) eq 'HASH' && ($_->{kind} // '') eq 'driver' } @{ $block->{lines} }) : ();
-            ok(ref($driver_line) eq 'HASH', 'AC6/B2 precondition: _run_block emits a driver line') or skip('no driver line', 1);
-            my $text = Dashboard::spans_text($driver_line->{spans});
-            my $THREADS = Theme::glyph('icon.threads') // '';
-            my $OK      = Theme::glyph('status.ok') // '';
-            # W = max(dw('?') [no blueprint name given], dw('drive-tooling')) = 13.
-            my $W = tui::Layout::display_width('drive-tooling');
-            my $name_padded = 'drive-tooling' . (' ' x ($W + 2 - length('drive-tooling')));
-            # B(4,9): f = ceil(4*15/9) = 7 (capped at 14; d<t so never 15).
-            my $bar = ($FULL x 7) . ($EMPTY x 8);
-            my $expected = '  ' . $THREADS . ' ' . $name_padded . $bar . '  4/9' . '   ' . 'session ' . $OK;
-            is($text, $expected, 'AC6/B2: the driver line spans_text matches exactly');
+            # RETARGETED AGAIN (operator, 2026-11-05): the thread row is gone.
+            # The driver -- the session owner's liveness dot and word -- sits
+            # on the blueprint line after the meter, and the thread's own bar
+            # is not drawn anywhere any more.
+            my ($bp_line) = (ref($block) eq 'HASH' && ref($block->{lines}) eq 'ARRAY')
+                ? (grep { ref($_) eq 'HASH' && ($_->{kind} // '') eq 'blueprint' } @{ $block->{lines} }) : ();
+            ok(ref($bp_line) eq 'HASH', 'AC6/B2 precondition: _run_block emits a blueprint line') or skip('no blueprint line', 1);
+            my $text = Dashboard::spans_text($bp_line->{spans});
+            my $OK = Theme::glyph('status.ok') // '';
+            my $EMPTY_G = Theme::glyph('gauge.empty') // '';
+            # No blueprint name, no counts, no state: '?', an empty meter, '?'.
+            my $expected = (Theme::glyph('icon.blueprints') // '') . ' ?' . '   ' . ($EMPTY_G x 15) . '  0/0'
+                . '   ' . $OK . ' session' . '   ?';
+            is($text, $expected, 'AC6/B2: the blueprint line carries the session driver, exactly');
+            unlike($text, qr/\Q$FULL\E|\Q$EMPTY\E/, 'AC6/B2: the thread\'s own bar is not drawn');
+            ok(!(grep { ref($_) eq 'HASH' && ($_->{kind} // '') eq 'driver' } @{ $block->{lines} }), 'AC6/B2: there is no driver row');
         }
     }
 }
@@ -466,14 +469,18 @@ SKIP: {
             ok(!$err, 'AC6/B4: _run_block does not die') or diag(" error: $err");
           SKIP: {
                 skip('_run_block died', 1) unless !$err;
+                # RETARGETED AGAIN (operator, 2026-11-05): the driver is on the
+                # blueprint line, and the thread's blocked task went with the
+                # thread row -- it is no longer drawn.
                 my ($driver_line) = (ref($block) eq 'HASH' && ref($block->{lines}) eq 'ARRAY')
-                    ? (grep { ref($_) eq 'HASH' && ($_->{kind} // '') eq 'driver' } @{ $block->{lines} }) : ();
-                ok(ref($driver_line) eq 'HASH', 'AC6/B4 precondition: _run_block emits a driver line') or skip('no driver line', 4);
+                    ? (grep { ref($_) eq 'HASH' && ($_->{kind} // '') eq 'blueprint' } @{ $block->{lines} }) : ();
+                ok(ref($driver_line) eq 'HASH', 'AC6/B4 precondition: _run_block emits a blueprint line') or skip('no driver line', 4);
                 my $text = Dashboard::spans_text($driver_line->{spans});
-                like($text, qr/blocked Publish the package waiting on 20261002-120000-abcd/,
-                    'AC6/B4: the blocked form has no colon and carries "waiting on <id>"');
+                unlike($text, qr/Publish the package/,
+                    'AC6/B4: the thread\'s blocked task is not drawn (the thread row is gone)');
                 unlike($text, qr/next Announce it/, 'AC6/B4: the thread\'s own "next" is NOT rendered (ruling E)');
-                like($text, qr/handed off /, 'AC6/B4: the line carries "handed off "');
+                my $WARN = Theme::glyph(q(status.warn)); $WARN = q() unless defined $WARN;
+                ok(index($text, $WARN . q( handed off)) >= 0, q(AC6/B4: the line carries the warn dot and "handed off"));
                 unlike($text, qr/:/, 'AC6/B4: the rendered line contains no colon at all');
             }
         }

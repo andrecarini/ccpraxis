@@ -906,8 +906,11 @@ ok(!Theme->can('display_width'),
         # than merely declared -- is unchanged, and these still fail if either
         # row stops being emitted. Anchored to the start of a line so a stray
         # "access" inside some other row's prose cannot satisfy them.
-        like($joined, qr/^\s*access\s+\S/m, "AC-E5: the 'access' row is rendered even though its value is an absent token (ALWAYS_SHOWN honoured, not just declared)");
-        like($joined, qr/^\s*refresh\s+\S/m, "AC-E5: the 'refresh' row is rendered even though its value is an absent token");
+        # 2026-11-05 (operator): access and refresh are the RIGHT-hand pairs of
+        # the Claude Code panel's two rows when the pairs fit, so each is
+        # anchored either at a line start or after a three-space pair gap.
+        like($joined, qr/(?:^|\S {3,})access {3,}\S/m, "AC-E5: the 'access' row is rendered even though its value is an absent token (ALWAYS_SHOWN honoured, not just declared)");
+        like($joined, qr/(?:^|\S {3,})refresh {3,}\S/m, "AC-E5: the 'refresh' row is rendered even though its value is an absent token");
     }
 }
 {

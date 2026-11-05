@@ -83,9 +83,25 @@ sub cc_texts {
     my $p = panel_by_title(tui::DashboardScreen::panels($state, $cols // 120), $TITLE);
     return $p ? panel_line_texts($p) : undef;
 }
+# facts($texts) -> the label/value FACTS of the panel's lines. Since 2026-11-05
+# (operator) the panel puts two pairs on a row when they fit -- "account" beside
+# "access", "usage" beside "refresh" -- so a physical line may carry two facts.
+# A right-hand pair starts after a run of at least three spaces with its own
+# label (access or refresh); each fact is returned starting at its label, so
+# every label-anchored check below reads a pair row exactly as it read a
+# single-fact row.
+sub facts {
+    my ($texts) = @_;
+    my @out;
+    for my $t (@{ $texts || [] }) {
+        if ($t =~ /\A(.*?\S) {3,}((?:access|refresh) {3,}\S.*)\z/) { push @out, $1, $2; }
+        else { push @out, $t; }
+    }
+    return \@out;
+}
 sub row_for {
     my ($texts, $label) = @_;
-    my ($r) = grep { /^\s*\Q$label\E\s+\S/ } @{ $texts || [] };
+    my ($r) = grep { /^\s*\Q$label\E\s+\S/ } @{ facts($texts) };
     return $r;
 }
 
@@ -163,8 +179,12 @@ my $NO_OPENCODE_RE = qr/OpenCode|\bGo\b|\bZen\b/;
                 "AC2: cols=$cols -- no OpenCode / Go / Zen text anywhere in the panel");
             is(scalar(grep { /^\s/ } @$texts), 0,
                 "AC2: cols=$cols -- no body row is indented (no nesting under a heading)");
-            like($texts->[0], qr/^access\s+\S/,
-                "AC2: cols=$cols -- the body leads with the access fact, not a heading or summary");
+            # 2026-11-05: with the pairs the first row leads with account
+            # (access beside it); a panel too narrow for the pairs keeps the
+            # old four rows, led by access. Either way, a fact -- never a
+            # heading or summary.
+            like($texts->[0], qr/^(?:account\s+\S.*\s{3}access|access)\s+\S/,
+                "AC2: cols=$cols -- the body leads with a fact (account|access pair, or access), not a heading or summary");
         }
     }
     # Non-vacuity: the OpenCode/Go/Zen detector sees each of the old row shapes.
@@ -236,9 +256,16 @@ my $NO_OPENCODE_RE = qr/OpenCode|\bGo\b|\bZen\b/;
             'AC3: the account row renders subscription_type / rate_limit_tier when both are present');
     }
 
+    # CHANGED 2026-11-05: in the paired layout the account pair holds the
+    # left of the first row, so with no account facts it says "unknown"
+    # rather than leaving a bare label; it still fabricates no plan. In the
+    # narrow fallback (four rows) there is still no account row at all.
     my $texts_noacct = cc_texts(base_state(tokens => { %TOKENS_NO_ACCOUNT })) || [];
-    ok(!defined row_for($texts_noacct, 'account'),
-        'AC3: with neither subscription_type nor rate_limit_tier, NO account row renders (no blank row, no fabricated plan)');
+    like(row_for($texts_noacct, 'account') // '', qr/\Aaccount\s+unknown\z/,
+        'AC3: with neither subscription_type nor rate_limit_tier, the account pair says "unknown" (no blank pair, no fabricated plan)');
+    my $texts_noacct_narrow = cc_texts(base_state(tokens => { %TOKENS_NO_ACCOUNT }), 40) || [];
+    ok(!defined row_for($texts_noacct_narrow, 'account'),
+        'AC3: in the narrow four-row form, with no account facts NO account row renders');
     my $refresh_absent = row_for(cc_texts(base_state(tokens => { %TOKENS_EXPIRED_45S, refresh_present => 0 })) || [], 'refresh');
     like($refresh_absent // '', qr/absent/, 'AC3/Behavior6: with no refresh token, the refresh row says absent');
 }
@@ -317,8 +344,10 @@ my $NO_OPENCODE_RE = qr/OpenCode|\bGo\b|\bZen\b/;
     like($usage // '', qr/7d 9%/,  'LEGACY: the claude seven_day figure (9%) renders in the usage row');
     is(scalar(grep { $_ =~ $NO_OPENCODE_RE } @$texts), 0,
         'LEGACY: nothing about OpenCode / Go / Zen renders from a snapshot that still carries go/zen rows');
-    is(scalar(@$texts), 4,
-        'LEGACY: the panel is exactly access, refresh, account, usage -- the go/zen rows added no row');
+    is(scalar(@$texts), 2,
+        'LEGACY: the panel is exactly two pair rows (2026-11-05) -- the go/zen rows added no row');
+    is_deeply([ map { /^(\S+)/ ? $1 : '' } @{ facts($texts) } ], [ qw(account access usage refresh) ],
+        'LEGACY: ... carrying exactly account|access and usage|refresh');
 
     my $t = frame_text(Dashboard::compose_frame(base_state(spend => $spend), 30, 140));
     unlike($t, $NO_OPENCODE_RE, 'LEGACY: no OpenCode / Go / Zen text anywhere in the composed frame');
@@ -350,8 +379,8 @@ my $NO_OPENCODE_RE = qr/OpenCode|\bGo\b|\bZen\b/;
         is(scalar(grep { /$footnote_re/ } @$texts), 0,
             'Behavior8/D6: a spend sampler with nothing to report renders NO footnote -- the usage row already says "not collected yet"');
     }
-    is(scalar(@{ $texts || [] }), 4,
-        'Behavior8/D6: the neutral case adds no row (access, refresh, account, usage -- no blank footnote row)');
+    is(scalar(@{ $texts || [] }), 2,
+        'Behavior8/D6: the neutral case adds no row (account|access, usage|refresh -- no blank footnote row)');
 
     for my $case (
         ['FAILED',  { status => 'failed' },             qr/FAILED - spend sampler/],

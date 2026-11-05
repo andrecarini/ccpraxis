@@ -670,11 +670,15 @@ SKIP: {
     # -- DashboardScreen::compose --------------------------------------
     SKIP: {
         skip 'tui::DashboardScreen did not load', 4 if !$DS_OK;
+        # The marker rides in the BLUEPRINT name, not the package name: since
+        # 2026-11-05 (operator) a package name is drawn at most 16 columns
+        # wide and cut with an ellipsis by design, so it can no longer carry
+        # an overflowing row. The blueprint name is never cut; its line wraps.
         my $state = {
             project_name => 'p', container => 'c', status => 'running',
-            runs => [ { blueprint => 'bp', state => 'running',
+            runs => [ { blueprint => $marker_text, state => 'running',
                         packages_done => 1, packages_total => 3,
-                        current_package => $marker_text } ],
+                        current_package => 'pkg' } ],
         };
         my $f = tui::DashboardScreen::compose($state, $rows, $cols);
         _assert_surface_wraps('DashboardScreen', $f, \@marker_words, $marker_text, $cols);

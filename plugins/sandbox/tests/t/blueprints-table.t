@@ -216,9 +216,16 @@ for my $cols (60, 80, 100, 130, 150, 200) {
 for my $cols (60, 100, 150) {
     my $lines = panel_rows($cols);
     my $joined = join("\n", map { text_of($_) } @$lines);
-    like($joined, qr/d05-almanac-frontmatter-injection/,
-        "AC7: cols=$cols -- the current package survives at every width, because it is its own wrappable line rather than a droppable column");
-    my @active = grep { text_of($_) =~ /\brunning\b/ && text_of($_) =~ /(?:d05-almanac-frontmatter-injection|t04-blueprints-table)/ } @$lines;
+    # 2026-11-05 (operator): a package name is drawn at most 16 columns wide,
+    # cut with the theme's ellipsis, at EVERY width -- so the package line
+    # carries the name's first 15 characters and the ellipsis, never a
+    # silently wrong name. It still survives at every width.
+    my $ELL = quotemeta(Theme::glyph('ellipsis') // '.');
+    my $d05 = qr/d05-almanac-fro$ELL/;
+    my $t04 = qr/t04-blueprints-$ELL/;
+    like($joined, $d05,
+        "AC7: cols=$cols -- the current package survives at every width, because it is its own line rather than a droppable column (its name cut to 16 columns)");
+    my @active = grep { text_of($_) =~ /\brunning\b/ && text_of($_) =~ /(?:$d05|$t04)/ } @$lines;
     is(scalar(@active), 2,
         "AC7: cols=$cols -- exactly one such ACTIVE (current_package fallback) line per run that HAS a current package, and none for the run that does not");
 }

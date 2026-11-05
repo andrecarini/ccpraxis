@@ -437,7 +437,9 @@ my @SUMMARY_KEYS_19 = (@SUMMARY_KEYS_17, 'thread', 'thread_events');
 my @SUMMARY_KEYS_23 = (@SUMMARY_KEYS_19, 'paused_window', 'relaunch_at', 'relaunch_local', 'next_package');
 
 my @PKG_KEYS_8 = qw(agents attempt attempt_cap name next_action status step steps_pending);
-my @PKG_KEYS_10 = (@PKG_KEYS_8, 'step_word', 'waits_on');
+# Widened 10 -> 12 by the 2026-11-04 Blueprints panel change (operator
+# request): coordinator_alive / coordinator_started_at, see RunState.
+my @PKG_KEYS_10 = (@PKG_KEYS_8, 'step_word', 'waits_on', 'coordinator_alive', 'coordinator_started_at');
 
 my @AGENT_KEYS = qw(budget_seconds id role stale_after_seconds started_at worker_type);
 my @FORBIDDEN_AGENT_KEYS = qw(
@@ -456,7 +458,7 @@ sub assert_17_keys {
 sub assert_pkg8_shape {
     my ($e, $label) = @_;
     ok(is_hashref($e), "$label: package entry is a hashref") or return;
-    is_deeply([ sort keys %$e ], [ sort @PKG_KEYS_10 ], "$label: AC2 -- exactly the 10 S2.2+package-01-run-blocks keys");
+    is_deeply([ sort keys %$e ], [ sort @PKG_KEYS_10 ], "$label: AC2 -- exactly the 12 package keys (10 + coordinator_alive/coordinator_started_at)");
     ok(is_arrayref($e->{agents}), "$label: AC3 -- agents is an ARRAY ref, never undef");
 }
 

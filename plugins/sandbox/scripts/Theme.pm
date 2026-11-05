@@ -364,6 +364,53 @@ sub _roles_data {
             class   => 'body',
             meaning => 'The one identifying/focused element: project, selection.',
         },
+        # THE PACKAGE NAME ROLES (operator, 2026-11-04/05: the blueprint name
+        # and the package names "are all the same blue", so a block read as
+        # one smear). The blueprint name keeps 'accent'. A package name is
+        # split: its number prefix (`03`, `z01`) takes 'name.package', the
+        # rest of the name (`-make-and-hooks`) the faded 'name.package.slug',
+        # so the eye finds the number first. ONLY the name strings take these
+        # roles -- the rest of each row keeps its colours.
+        #
+        # name.package sits between accent's blue and state.ok's green without
+        # being either (and well clear of gauge.mid's darker teal): 8.74:1
+        # against #1E1E1E, its 256 rung 14.2 units from the truecolour value.
+        #
+        # name.package.slug is the same hue family greyed and darkened. It is
+        # deliberately TERTIARY, like text.faint, and is held to the 'large'
+        # floor (3:1) rather than 'body': 4.36:1 truecolour, 4.20:1 through
+        # its 256 rung (66, rgb(95,135,135), 16.8 units away). A slug is read
+        # beside its prefix, never alone.
+        #
+        # AT THE 'none' RUNG the prefix is plain and the slug dim, so the
+        # split survives without colour.
+        'name.package' => {
+            rgb     => [86, 204, 214],
+            x256    => 80,
+            attr    => '',
+            class   => 'body',
+            meaning => 'The number prefix of a blueprint package name on the Blueprints panel.',
+        },
+        'name.package.slug' => {
+            rgb     => [88, 138, 150],
+            x256    => 66,
+            attr    => '2',
+            class   => 'large',
+            meaning => 'The rest of a blueprint package name, after its number prefix.',
+        },
+        # text.waiting -- the one ITALIC role. A package that has not started
+        # says why ("waiting on <dep>", "next") where a step time would be, and
+        # must not read as a step (operator, 2026-11-05: "muted italic"). Same
+        # colour and attr as text.muted; the italic is the whole difference,
+        # which is why it is emitted at EVERY capability rung (see sgr()).
+        'text.waiting' => {
+            rgb     => [148, 163, 184],
+            x256    => 248,
+            attr    => '2',
+            italic  => 1,
+            class   => 'body',
+            meaning => 'Why a not-yet-started item is waiting; never a step or a value.',
+        },
         'state.ok' => {
             rgb     => [26, 168, 74],
             x256    => 35,
@@ -416,6 +463,8 @@ sub roles {
         # a describe-the-table function that omitted the reason would leave the
         # oracle unable to tell a role that legitimately paints a background
         # from one that had sprouted a stray escape.
+        # italic likewise: present only on a role that declares it.
+        $copy{$name}{italic} = 1 if $rec->{italic};
         if (ref($rec->{bg}) eq 'ARRAY') {
             $copy{$name}{bg}    = [ @{ $rec->{bg} } ];
             $copy{$name}{bg256} = $rec->{bg256};
@@ -860,23 +909,28 @@ sub sgr {
     #
     # A role without `bg` behaves exactly as before, byte for byte.
     my $bg = $rec->{bg};
+    # ITALIC IS A SHAPE, NOT A COLOUR, so unlike attr (which stands in for
+    # colour only at the 'none' rung) it is emitted at EVERY rung, as a
+    # trailing SGR 3. A role without `italic` is byte-for-byte unchanged.
+    # Every painted span is followed by reset(), which ends the italic too.
+    my $it = $rec->{italic} ? "\e[3m" : '';
     if ($cap eq 'truecolor') {
         my ($r, $g, $b) = @{ $rec->{rgb} };
         my $s = "\e[38;2;$r;$g;${b}m";
         $s .= "\e[48;2;$bg->[0];$bg->[1];$bg->[2]m" if ref($bg) eq 'ARRAY';
-        return $s;
+        return $s . $it;
     }
     if ($cap eq '256') {
         my $s = "\e[38;5;$rec->{x256}m";
         $s .= "\e[48;5;$rec->{bg256}m" if ref($bg) eq 'ARRAY' && defined $rec->{bg256};
-        return $s;
+        return $s . $it;
     }
     # 'none', or any unrecognised capability string -- treated as 'none'.
     # Reverse video is the only way to say "this is a surface, not text" with
     # no colour at all, and an overlay that vanished on a mono terminal would
     # be a warning nobody sees.
     return "\e[7m" if ref($bg) eq 'ARRAY';
-    return $rec->{attr} eq '' ? '' : "\e[$rec->{attr}m";
+    return ($rec->{attr} eq '' ? '' : "\e[$rec->{attr}m") . $it;
 }
 
 # named `reset` deliberately -- shadows the core `reset` builtin inside this

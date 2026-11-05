@@ -753,7 +753,7 @@ my %st = (
     ok($run, 'panels: a Run panel is present');
     my $rtext = join "\n", map { Dashboard::spans_text($_) } @{ $run->{lines} };
     like($rtext, qr/busy-lease.*active/,   'run: fresh lease + stay_awake -> active');
-    like($rtext, qr/keep-awake.*holding/,  'run: stay_awake -> keep-awake holding');
+    like($rtext, qr/keep-awake.*requested/,  'run: stay_awake -> keep-awake requested (since package 08 the launcher publishes a request; it holds no lock)');
     like($rtext, qr/needs you.*2 escalation/,'run: escalations count surfaced');
 }
 {
@@ -858,7 +858,7 @@ my %st = (
     # renders "1 item" rather than "1 item(s)". That the SINGULAR form is what a
     # count of one produces is the assertion worth making here.
     like($joined, qr/\b1 item\b/, 'compose: backpack summary reaches the frame (as a Run-panel row, not a titled panel -- Decision 9)');
-    like($joined, qr/keep-awake.*holding/, 'compose: keep-awake state surfaced in a frame');
+    like($joined, qr/keep-awake.*requested/, q(compose: keep-awake state surfaced in a frame));
 }
 
 # ===========================================================================
@@ -1303,10 +1303,15 @@ is(Dashboard::activity_capacity({ %st, status => 'exited' }, 28, 120),
 {
     my $floor24 = 3;
     my %exited24 = (%st, status => 'exited');
-    is(Dashboard::activity_capacity(\%st, 24, 80), $floor24,
-        "AC-11 saturation: 24x80 (stacked) -- capacity == the hand-derived flex floor ($floor24)");
-    is(Dashboard::activity_capacity(\%exited24, 24, 80), $floor24,
-        "AC-11 saturation: 24x80 with a status alert -- capacity is STILL $floor24 (the floor absorbs the alert row; no differential at this row count)");
+    # RE-POINTED 2026-11-05: 24x80 IS NO LONGER SATURATED either. The Claude
+    # Code panel puts two label/value pairs on a row now (operator), one row
+    # shorter, and that row goes to Activity -- so capacity sits ABOVE the
+    # floor. What still holds, and is what this block exists for: never below
+    # the floor, and an alert costs nothing.
+    cmp_ok(Dashboard::activity_capacity(\%st, 24, 80), '>=', $floor24,
+        "AC-11: 24x80 (stacked) -- capacity never drops below the hand-derived flex floor ($floor24)");
+    is(Dashboard::activity_capacity(\%exited24, 24, 80), Dashboard::activity_capacity(\%st, 24, 80),
+        "AC-11: 24x80 with a status alert -- capacity is UNCHANGED (an alert is an overlay and consumes no layout row)");
     # RE-POINTED 2026-08-28: 24x120 IS NO LONGER SATURATED.
     #
     # At 120 columns the main region is 120, which now clears the ~119 that Run

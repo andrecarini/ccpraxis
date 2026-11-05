@@ -1983,6 +1983,19 @@ sub _utc_epoch {
     return $days * 86400 + $h * 3600 + $mi * 60 + $s;
 }
 
+# _iso_utc_epoch($v) -> Int | undef (private, pure). An epoch for the exact
+# shape bp-lib.sh's iso_now writes (`date -u +%Y-%m-%dT%H:%M:%SZ`), through the
+# same clock-free _utc_epoch arithmetic the thread log uses. Anything else --
+# a ref, a local offset, fractional seconds, an impossible instant -- is undef:
+# a start this module cannot read exactly is not shown at all.
+sub _iso_utc_epoch {
+    my ($v) = @_;
+    return undef unless defined($v) && !ref($v);
+    return undef unless $v =~ /\A(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)Z\z/;
+    my $e = _utc_epoch($1, $2, $3, $4, $5, $6);
+    return (defined($e) && $e > 0) ? $e : undef;
+}
+
 # _thread_events_for(\%kept, $project_root) -> \@events (private). Spec S2.2 step 7:
 # project-level, the newest $MAX_THREAD_EVENTS entries across every kept
 # thread, ascending by (epoch, thread, id).
@@ -2286,6 +2299,7 @@ sub summarize_dir {
         my $status = _effective_status($blueprint_dir, $pkg, $entry, $ledger_mode);
         $status_by_pkg{$pkg} = $status;
         $packages_done++ if $status eq 'done';
+        my ($coordinator_alive, $coordinator_started_at);
         if ($status eq 'running') {
             # MEDIUM-7: a per-package registry-recorded coordinator PID is
             # now liveness-checked too (via the same injected $PID_ALIVE,
@@ -2301,6 +2315,20 @@ sub summarize_dir {
                 ? _pid_state($pkg_pid + 0) : undef;
             my $pkg_checked_dead = (defined($pkg_alive) && !$pkg_alive) ? 1 : 0;
             $running_count++ unless $pkg_checked_dead;
+            # The SAME verdict that just decided the count, handed to the
+            # renderer per package -- so running_coordinators and the
+            # Blueprints panel's package dots are two readings of one probe,
+            # never two probes that can disagree. 1 alive, 0 checked dead,
+            # undef unknown (exactly _pid_state's contract).
+            $coordinator_alive = $pkg_alive;
+            # When this coordinator process started: the registry's
+            # launched_at, which bp-launch.sh writes (UTC, iso_now) only
+            # AFTER the process is up -- a recorded start, never a guess.
+            # Suppressed the moment the pid is checked dead, the same rule
+            # orchestrator_started_at follows, so a finished coordinator can
+            # never grow an uptime.
+            $coordinator_started_at = _iso_utc_epoch($entry->{launched_at})
+                if ref($entry) eq 'HASH' && !$pkg_checked_dead;
             # MAJOR-3: current_package is a display value (s11 renders the
             # same struct); bound its length at the producer so an
             # oversized key can never reach a per-character sanitizer
@@ -2355,6 +2383,10 @@ sub summarize_dir {
             # below, once the chosen thread (if any) is known.
             step_word     => $facts->{step_word},
             waits_on      => undef,
+            # Per-package coordinator facts (see the running branch above):
+            # undef for every package that is not `running`.
+            coordinator_alive      => $coordinator_alive,
+            coordinator_started_at => $coordinator_started_at,
         };
     }
 

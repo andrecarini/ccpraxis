@@ -275,6 +275,7 @@ sub _render_panel {
     );
 
     my $lines = (ref($panel->{lines}) eq 'ARRAY') ? $panel->{lines} : [];
+    $lines = _pick_alternatives($lines, $content_w - BODY_INDENT());
     for my $ln (@$lines) {
         last if @out >= $maxh;
         my $role = (ref($ln) eq 'HASH' && defined $ln->{role}) ? $ln->{role} : 'text.primary';
@@ -352,6 +353,61 @@ sub _render_panel {
     push @out, $edge->(tui::Frame::make_cell('', 'text.primary', $content_w), $sep_glyph, 'rule')
         if @out < $maxh;
     return @out;
+}
+
+# _pick_alternatives(\@lines, $room) -> \@lines. NARROWER FORMS OF A ROW, CHOSEN
+# AT THE WIDTH THE PANEL ACTUALLY GOT (operator, 2026-11-05: "when the full form
+# doesn't fit, use i 11.6 GB  c 3.7 GB ..."). A panel's builder cannot know its
+# width -- Layout::place splits a band only after every panel is built -- so a
+# row that has a shorter form carries it, and the choice is made here.
+#
+# THE SHAPE. A line that is a span ARRAY whose FIRST span carries
+# `alts => [ \@variant1, \@variant2, ... ]` offers the line itself as variant 0
+# and each further variant as a list of ROWS (each a span array, so a variant
+# may be one row, several, or none). Every reader that does not know about
+# alternatives sees an ordinary span array in its full form -- which is why the
+# marker rides on a span rather than turning the line into a hash.
+#
+# ONE CHOICE PER PANEL, NOT PER ROW. The rows that offer alternatives in one
+# panel are columns of one table (the used/free/total figures of the gauge
+# rows), and a table whose rows each picked their own form would not line up.
+# So the panel takes the first variant index at which EVERY such row fits
+# $room (a row with fewer variants uses its last), and the last index when none
+# does -- that one then wraps as any row would. Lines without the marker pass
+# through untouched, so a panel that uses none renders byte for byte as before.
+sub _pick_alternatives {
+    my ($lines, $room) = @_;
+    my $alts_of = sub {
+        my ($ln) = @_;
+        return undef unless ref($ln) eq 'ARRAY' && ref($ln->[0]) eq 'HASH' && ref($ln->[0]{alts}) eq 'ARRAY';
+        my %first = %{ $ln->[0] };
+        delete $first{alts};
+        return [ [ [ \%first, @{$ln}[1 .. $#$ln] ] ],
+                 grep { ref($_) eq 'ARRAY' } @{ $ln->[0]{alts} } ];
+    };
+    my @variants = map { $alts_of->($_) } @$lines;
+    return $lines unless grep { defined } @variants;
+
+    my $n = 0;
+    for my $v (grep { defined } @variants) { $n = @$v if @$v > $n; }
+    my $pick = $n - 1;
+    for my $i (0 .. $n - 1) {
+        my $fits = 1;
+        for my $v (grep { defined } @variants) {
+            my $rows = $v->[ $i < @$v ? $i : $#$v ];
+            for my $r (@$rows) {
+                $fits = 0 if ref($r) ne 'ARRAY' || tui::Frame::spans_width($r) > $room;
+            }
+        }
+        if ($fits) { $pick = $i; last; }
+    }
+    my @out;
+    for my $k (0 .. $#$lines) {
+        my $v = $variants[$k];
+        if (!defined $v) { push @out, $lines->[$k]; next; }
+        push @out, @{ $v->[ $pick < @$v ? $pick : $#$v ] };
+    }
+    return \@out;
 }
 
 # _join_row_cells(@cells) -> \%cell, concatenating text and spans across a
