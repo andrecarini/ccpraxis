@@ -123,10 +123,38 @@ All read fresh from disk, never cached or assumed from a prior turn:
    `relaunch` | `widen-write-set` | `edit-depends-on` | `author-ledger`. **Never `accept` or `drop`,
    under any circumstance, for any category** — those are irreversible-in-spirit calls that stay
    human-only unconditionally, not something a citation can ever qualify you for.
-   `author-ledger` renders the ledger from the blueprint's own `### <package>` section (its `write_set`,
-   `test_paths`, `checks`, `scope`, `done_criteria` bullets) and refuses when that section or its
-   `write_set` is missing; a refusal is handed to the operator as a question, never written as a stub.
-   So choose it only after confirming the section exists with a `write_set`.
+
+   **What each action is for, and nothing else.** Pick the action by what it DOES to disk, never by a
+   word in your own rationale that happens to resemble its name:
+
+   - `relaunch` — restart the package's coordinator with your guidance (`rationale`) attached. The
+     default for anything within the agents' purview that needs no change to scope or ordering.
+   - `widen-write-set` — ADD one path to an EXISTING ledger's `write_set` (`path`, required). This is
+     the action for "the package needs to touch one more file". Add `decision` (below) when the
+     widening should be recorded as a blueprint Decision with its reason — for instance when you are
+     granting something else in the same breath. It does not itself relaunch the package.
+   - `edit-depends-on` — change the package's row in blueprint.md's status table (`deps`).
+   - `author-ledger` — **ONLY for a package that has NO ledger file at all** (`packages/<pkg>.md`
+     absent). It creates the ledger from the blueprint's own `### <package>` section (its `write_set`,
+     `test_paths`, `checks`, `scope`, `done_criteria` bullets) and refuses when that section or its
+     `write_set` is missing; a refusal is handed to the operator as a question, never written as a
+     stub. It never edits, repairs, re-scopes or records a Decision in an existing ledger. The apply
+     step refuses an `author-ledger` verdict for a package whose ledger exists before doing anything
+     (logged as `escalation_resolve_contradiction`, the ledger untouched) and sends the whole record to
+     the operator — so choosing it wrongly does not resolve anything, it costs the operator a question.
+     Choose it only after confirming the ledger file is absent and the section exists with a
+     `write_set`. (Observed 2026-11-04: an escalation asking for one more write_set file plus a lint
+     exemption got `author-ledger`, and an older apply step replaced the package's live ledger with a
+     stub. The right verdict was `widen-write-set` with a `decision`.)
+
+   **A policy or quality-gate exemption** (a lint warning waived, a coverage floor relaxed, a check
+   skipped for a named file) has **no automatic action** — nothing in the vocabulary writes one. When
+   blueprint precedent puts it plainly within the agents' remit (an `agent`-decided Decisions row, or a
+   ruling such as a check's stated scope that already covers the case), it is `relaunch` with the
+   ruling and its citation in `rationale`, so the coordinator records and applies it; if the same
+   escalation also needs a write_set widening, use `widen-write-set` with a `decision` that states
+   both, so the exemption is on record as a Decisions row the coordinator reads. Otherwise it is the
+   operator's: `product` (or `operator-action`) with a `product_question`.
 
 ## Output contract
 
@@ -137,6 +165,7 @@ Write exactly one JSON object to **verdict_path** (and nothing else to it):
   "category": "product | operator-action | conformance | oracle | scoping | implementation",
   "action": "relaunch | widen-write-set | edit-depends-on | author-ledger",
   "path": "<REQUIRED when action is widen-write-set — the exact write_set entry to add, e.g. a directory or file path such as p/blk9/. Never a citation, never a file:line, never anything containing ':'>",
+  "decision": "<OPTIONAL, widen-write-set only — one line recorded as a new blueprint.md Decisions row (decided by agent) before the widening; see below>",
   "confidence": "high | low",
   "evidence": "<citation resolving the SPECIFIC disputed fact — file:line, ledger section, or Decisions row>",
   "rationale": "<one-line: why this classifies where it does>",
@@ -158,6 +187,13 @@ already meets this bar. It is omitted entirely for every other category.
   reads `path` ONLY for `widen-write-set` and refuses the action outright (no partial/fallback
   behavior) if `path` is missing, blank, or contains a `:`. Omit `path` entirely for every other
   action — it is meaningless outside `widen-write-set` and is ignored there.
+- `decision` (optional, `widen-write-set` only) is the ruling the widening rests on, in one line: what
+  is granted and why. When present, the apply step appends it to blueprint.md's Decisions table under
+  the next free number, decided by `agent`, with the escalation id, package and `path` appended so the
+  row names the path; then it widens the ledger through `bp-ledger.pl widen-write-set --decision <n>`,
+  which logs the widening in the ledger's attempt log. It must not contain `|` or the literal token
+  `depends_on`; a blueprint whose Decisions section is not a table cannot take it, and that refusal
+  goes to the operator. Without `decision` the widening is applied as before, with no Decisions row.
 - Omit `action` and `rationale` entirely when `category` is `product` or `operator-action` — a
   product/operator-action verdict must never also carry a mutation; including one there is a contract
   violation the deterministic apply-step refuses outright, not a shortcut that gets acted on anyway.

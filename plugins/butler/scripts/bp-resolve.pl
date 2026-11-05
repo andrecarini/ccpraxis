@@ -398,10 +398,19 @@ sub _dispatch_action {
         # A missing/blank/colon-bearing path is a clean refusal, not a
         # fallback to the wrong field.
         my $path = $verdict->{path};
-        return 1 unless defined $path;
+        return 1 unless defined $path && !ref $path;
         $path =~ s/^\s+|\s+$//g;
         return 1 unless length $path;
         return 1 if $path =~ /:/;   # same guard bp-answer-escalation enforces -- refuse here, don't shell out to fail there
+        # bug 20261105-055544-2c28: a widening the resolver wants RECORDED as a
+        # blueprint Decision (with its reason, e.g. an exemption granted in the
+        # same breath) goes through the Decision-gated typed path instead.
+        if (defined $verdict->{decision}) {
+            my ($ok, $why) = _widen_with_decision($verdict, $rec, $id, $ctx, $path);
+            return 0 if $ok;
+            $ctx->{needs_human} = $why if defined $why;
+            return 1;
+        }
         return _run_quiet($^X, "$SELF_DIR/bp-answer-escalation.pl", $bp,
             '--decision', $id, '--widen-write-set', $path, '--bp-dir', $bpdir);
     }
@@ -432,6 +441,87 @@ sub _dispatch_action {
 sub _iso_now {
     my @t = gmtime(time);
     return sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ', $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
+}
+
+# ---------------------------------------------------------------------------
+# widen-write-set WITH a decision (bug 20261105-055544-2c28).
+#
+# What the resolver wanted in that bug was "record a Decision and widen the
+# write set"; the vocabulary had no such action, so it reached for the wrong
+# one. A widen-write-set verdict may now carry `decision` (one line of text):
+#   1. bp-blueprint.pl add-decision appends it to blueprint.md's Decisions
+#      table under the next free numeric id, decided by `agent`, with the
+#      provenance (escalation id, package, path) appended so the row names the
+#      path verbatim;
+#   2. bp-ledger.pl widen-write-set --decision <id> widens the ledger. That verb
+#      refuses unless the Decision names the path, checks overlap with other
+#      in-flight packages, and writes the widening and its attempt-log line in
+#      one typed splice under the ledger lock.
+# Without `decision` the action is unchanged (bp-answer-escalation's plain
+# --widen-write-set). Everything checkable is checked before step 1, so a
+# refusal there writes nothing; a refusal at step 2 leaves the Decision row
+# and says so. -> (1, undef) | (0, $reason_for_a_human) | (0, undef) for a
+# malformed verdict (left queued, as for a missing `path`).
+# ---------------------------------------------------------------------------
+sub _next_decision_id {
+    my ($txt) = @_;
+    my @lines = split /\n/, ($txt // '');
+    my ($in, $table, $max) = (0, 0, 0);
+    my $fence = 0;
+    for my $l (@lines) {
+        if ($l =~ /^\s*(?:```|~~~)/) { $fence = !$fence; next; }
+        next if $fence;
+        if ($l =~ /^##\s+Decisions\b/) { $in = 1; next; }
+        next unless $in;
+        last if $l =~ /^#{1,2}\s/;
+        next unless $l =~ /^\s*\|/;
+        $table = 1;
+        $max = $1 if $l =~ /^\s*\|\s*([0-9]+)\s*\|/ && $1 > $max;
+    }
+    return $table ? $max + 1 : undef;
+}
+
+sub _widen_with_decision {
+    my ($verdict, $rec, $id, $ctx, $path) = @_;
+    my $bpdir = $ctx->{bpdir};
+    my $pkg   = ref $rec eq 'HASH' ? $rec->{package} : undef;
+    my $dtext = $verdict->{decision};
+    return (0, undef) unless defined $dtext && !ref $dtext && _has_visible_text($dtext);
+    return (0, undef) unless defined $pkg && $pkg =~ /\A[A-Za-z0-9._-]+\z/;
+    $dtext =~ s/\s+/ /g;
+    $dtext =~ s/\A | \z//g;
+    # The checks bp-ledger.pl widen-write-set and bp-blueprint.pl add-decision
+    # would refuse on, made here so a doomed call never leaves a Decision row
+    # behind. A malformed verdict is the resolver's to redo: (0, undef).
+    return (0, undef) if $dtext =~ /\|/ || index($dtext, 'depends_on') >= 0;
+    return (0, undef) if $path =~ m{\A(?:/|[A-Za-z]:(?:[\\/]|\z))}
+                      || $path =~ /[|\r\n]/
+                      || $path =~ m{(?:\A|/)\.\.(?:/|\z)}
+                      || $path =~ m{\A(?:\*+|\*\*/\*|\.|\./)\z};
+    my $ledger = "$bpdir/packages/$pkg.md";
+    return (0, "packages/$pkg.md does not exist, so there is no write_set to widen") unless -f $ledger;
+    my $bpmd = "$bpdir/blueprint.md";
+    my $txt  = BpOrch::_read_file($bpmd);
+    return (0, 'cannot read blueprint.md to record the Decision') unless defined $txt;
+    my $did = _next_decision_id($txt);
+    return (0, "blueprint.md has no Decisions table to record the widening of ${pkg}'s write_set by "
+             . "'$path' in; widen it by hand with bp-ledger.pl widen-write-set once a Decision names it")
+        unless defined $did;
+
+    my $row = "$dtext (bp-escalation-resolver, escalation $id: widens $pkg write_set by `$path`)";
+    my ($rc, $err) = _run_capture($^X, "$SELF_DIR/bp-blueprint.pl", 'add-decision',
+        '--file', $bpmd, '--id', $did, '--text', $row, '--decided', 'agent');
+    return (0, "recording Decision $did in blueprint.md was refused (exit $rc): $err; nothing was changed")
+        if $rc;
+
+    local $ENV{BP_LEDGER_LOCK_TIMEOUT} = $ENV{BP_LEDGER_LOCK_TIMEOUT} // 10;
+    ($rc, $err) = _run_capture($^X, "$SELF_DIR/bp-ledger.pl", 'widen-write-set',
+        '--ledger', $ledger, '--path', $path, '--decision', $did);
+    return (0, "Decision $did was recorded in blueprint.md, but widening ${pkg}'s write_set by '$path' "
+             . "was refused (exit $rc): $err") if $rc;
+    _rlog($ctx->{log}, 'escalation_resolve_widened_with_decision',
+        { decision => $id, package => $pkg, path => $path, blueprint_decision => $did }) if $ctx->{log};
+    return (1, undef);
 }
 
 # ---------------------------------------------------------------------------
@@ -750,8 +840,15 @@ sub _bump_chronic_scoping_counter {
 # inbox bridge files it for a human; nothing is unlinked. Same lock and
 # freshness check as the tag-only branch: a record the operator already
 # disposed of is left alone.
+#
+# \%opt (optional): log_type (the event logged on success; '<log_type>_failed'
+# on failure), question (the product_question to file; defaults to the
+# author-ledger wording), stale_ref (a scalar ref set to 1 when the record had
+# changed or vanished, so the caller can report 'stale' rather than a failure).
 sub _surface_needs_human {
-    my ($qpath, $rec, $verdict, $why, $log, $id) = @_;
+    my ($qpath, $rec, $verdict, $why, $log, $id, $opt) = @_;
+    $opt ||= {};
+    my $log_type = $opt->{log_type} // 'escalation_resolve_needs_human';
     my $stale = 0;
     my ($ok) = _with_qpath_lock($qpath, sub {
         my $fresh = BpOrch::_read_json($qpath);
@@ -763,13 +860,65 @@ sub _surface_needs_human {
         $tagged{confidence}       = $verdict->{confidence};
         $tagged{evidence}         = $verdict->{evidence};
         $tagged{resolution}       = "the resolver chose $verdict->{action}, and it was refused: $why";
-        $tagged{product_question} = "Package $pkg cannot be given a ledger automatically: $why";
+        $tagged{product_question} = $opt->{question}
+            // (($verdict->{action} // '') eq 'author-ledger'
+                ? "Package $pkg cannot be given a ledger automatically: $why"
+                : "Package ${pkg}'s escalation could not be resolved automatically: the resolver chose "
+                  . ($verdict->{action} // '?') . ", and it was refused: $why");
         return _atomic_write_json($qpath, \%tagged);
     });
-    _rlog($log, ($ok ? 'escalation_resolve_needs_human' : 'escalation_resolve_needs_human_failed'),
+    ${ $opt->{stale_ref} } = $stale if ref $opt->{stale_ref} eq 'SCALAR';
+    _rlog($log, ($ok ? $log_type : "${log_type}_failed"),
         { decision => $id, package => (ref $rec eq 'HASH' ? $rec->{package} : undef),
           action => $verdict->{action}, why => $why, ($stale ? (stale => 1) : ()) });
     return $ok ? 1 : 0;
+}
+
+# ---------------------------------------------------------------------------
+# _verdict_contradicts_state(\%verdict, \%rec, \%ctx) -> reason | undef
+# (bug 20261105-055544-2c28). A verdict whose action cannot mean what it says
+# against the package as it stands on disk is not a resolution, however
+# confident it is. Observed: an escalation asking to widen a write_set by one
+# file and to grant a lint exemption got `author-ledger` (rationale: "author a
+# new blueprint.md Decision granting both"), and the pre-923dd82 apply step
+# overwrote the package's live 9.9 KB ledger with a stub.
+#
+# author-ledger is valid ONLY for a package with no ledger file. _author_ledger
+# itself also refuses (and its guarded_write refuses a file that appears under
+# the lock), so this is not the only line of defence -- it is the one that
+# fires BEFORE anything is archived or dispatched, logs the case under its own
+# event (escalation_resolve_contradiction), and files the question with the
+# escalation's own text, so the operator answers what was actually asked rather
+# than "cannot be given a ledger".
+#
+# Deliberately structural only. Matching the rationale/evidence prose for
+# "write set" or "Decision" was considered and rejected: when no ledger exists
+# author-ledger renders from the blueprint's own section whatever the prose
+# says, so a text match would add only false refusals (a correct rationale
+# naturally says "its section declares the write_set") and misses for every
+# rewording. The one thing that makes this action destructive is a file on
+# disk, and that is what is checked.
+# ---------------------------------------------------------------------------
+sub _verdict_contradicts_state {
+    my ($verdict, $rec, $ctx) = @_;
+    my $action = $verdict->{action} // '';
+    return undef unless $action eq 'author-ledger';
+    my $pkg = ref $rec eq 'HASH' ? $rec->{package} : undef;
+    return undef unless defined $pkg && length $pkg && defined $ctx->{bpdir};
+    my $ledger = "$ctx->{bpdir}/packages/" . BpOrch::_safe_path_component($pkg) . '.md';
+    return undef unless -e $ledger;
+    return "the resolver chose author-ledger, which only creates a ledger for a package that has none, "
+         . "but packages/$pkg.md already exists; nothing was changed";
+}
+
+# One line, at most $max bytes, for embedding queued prose in a product_question.
+sub _one_line {
+    my ($s, $max) = @_;
+    return '' unless defined $s && !ref $s;
+    (my $t = $s) =~ s/\s+/ /g;
+    $t =~ s/\A | \z//g;
+    $t = substr($t, 0, $max - 3) . '...' if defined $max && length($t) > $max;
+    return $t;
 }
 
 # ---------------------------------------------------------------------------
@@ -786,7 +935,13 @@ sub _surface_needs_human {
 #                 nothing archived.
 #   'refuse'   -> log only; queue file untouched; no archive (a refusal is
 #                 not itself a decision, §2.6).
-# Returns { outcome, applied, archived, reason }.
+#   'contradiction' -> an 'act' verdict whose action contradicts the package's
+#                 state on disk (_verdict_contradicts_state: author-ledger for a
+#                 package that already has a ledger). Checked BEFORE the archive
+#                 and dispatch: nothing archived, nothing dispatched, the ledger
+#                 untouched; the queued record is re-tagged operator-action with
+#                 a question (log event escalation_resolve_contradiction).
+# Returns { outcome, applied, archived, reason } (+ surfaced when handed to a human).
 # ---------------------------------------------------------------------------
 sub apply_verdict {
     my ($verdict, $rec, $id, $ctx) = @_;
@@ -850,6 +1005,34 @@ sub apply_verdict {
         return { outcome => 'act', applied => 1, archived => 1,
                  reason => 'already applied in a prior run (archive already marked applied=true); '
                          . 'finished the interrupted cleanup without re-dispatching' };
+    }
+
+    # After the crash-window check on purpose: an author-ledger that DID land
+    # in a prior run leaves a ledger behind, and that must finish its cleanup,
+    # not read as a contradiction. Nothing is archived here -- nothing was
+    # decided -- and the queued record is re-tagged in place for a human.
+    if (defined(my $contra = _verdict_contradicts_state($verdict, $rec, $ctx))) {
+        my $pkg = ref $rec eq 'HASH' ? ($rec->{package} // '?') : '?';
+        my $asked = _one_line(ref $rec eq 'HASH' ? $rec->{question} : undef, 600);
+        my $why_r = _one_line($verdict->{rationale}, 300);
+        my $question = "Package ${pkg}'s escalation needs your decision: the resolver proposed author-ledger, "
+                     . "but packages/$pkg.md already exists, so its verdict contradicts the package's state "
+                     . "and was not applied (the ledger is untouched)."
+                     . (length $asked ? " The escalation asked: $asked" : '')
+                     . (length $why_r ? " The resolver's rationale: $why_r" : '')
+                     . ' Answer with the action the package actually needs (for example a write_set '
+                     . 'widening backed by a Decision), or not-mine to send it back to the resolver.';
+        my $stale_c = 0;
+        my $ok = _surface_needs_human($qpath, $rec, $verdict, $contra, $log, $id,
+            { log_type => 'escalation_resolve_contradiction', question => $question, stale_ref => \$stale_c });
+        if ($stale_c) {
+            return { outcome => 'stale', applied => 0, archived => 0,
+                     reason => 'queued record changed or was removed before the verdict could be applied -- '
+                             . 'nothing written' };
+        }
+        return { outcome => 'contradiction', applied => 0, archived => 0,
+                 ($ok ? (surfaced => 'operator-action') : ()),
+                 reason => "author-ledger refused: $contra" };
     }
 
     my $stale = 0;
