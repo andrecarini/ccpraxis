@@ -804,11 +804,23 @@ sub _bump_chronic_scoping_counter {
     eval {
         my $runs = $ctx->{runs};
         my $pkg  = $rec->{package};
+        # Resolving the chronic-scoping escalation itself is not another
+        # scoping resolution of the package. Counting it made the counter feed
+        # itself: each resolution of the "more than 2" escalation bumped the
+        # count and filed the next one (acxpraxis 15-model-check-cost,
+        # 2026-11-05: 25 resolver judges in 2h, every one a moot relaunch).
+        return 1 if ($rec->{kind} // '') eq 'chronic-scoping';
         my $reg  = BpOrch::_read_json("$runs/registry.json");
-        my $before = (ref $reg eq 'HASH' && ref $reg->{packages}{$pkg} eq 'HASH')
-                   ? ($reg->{packages}{$pkg}{chronic_scoping_count} // 0) : 0;
+        my $prec = (ref $reg eq 'HASH' && ref $reg->{packages}{$pkg} eq 'HASH') ? $reg->{packages}{$pkg} : {};
+        my $before = $prec->{chronic_scoping_count} // 0;
         my ($after, $fire) = chronic_scoping_bump($before);
-        BpOrch::update_registry_pkg($runs, $pkg, { chronic_scoping_count => $after });
+        # The pure counter keeps reporting "fires" past the threshold; filing
+        # is once per package. queue_needs_you only dedupes against a record
+        # still QUEUED, so after the first one was resolved and archived every
+        # later bump filed a fresh one.
+        $fire = 0 if $prec->{chronic_scoping_filed};
+        BpOrch::update_registry_pkg($runs, $pkg, { chronic_scoping_count => $after,
+                                                   ($fire ? (chronic_scoping_filed => time) : ()) });
         if ($fire) {
             BpOrch::queue_needs_you($runs, {
                 package    => $pkg,
