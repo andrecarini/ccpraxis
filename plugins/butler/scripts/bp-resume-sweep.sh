@@ -55,9 +55,17 @@ revive() {  # BP_NAME PKG SID PID AGE STATUS
     printf '%-28s %-12s RUNNING (pid %s, ledger age %sm)\n' "$bp/$pkg" "$status" "$pid" "$age"
     return 0
   fi
-  local verdict mode args=() exit_reason bpdir
-  verdict=$(CCPRAXIS_DATA_DIR="$DATA" perl "$SCRIPT_DIR/bp-cache-state.pl" verdict "$bp" "$pkg" 2>/dev/null || echo cold)
+  local verdict mode args=() exit_reason bpdir unmet
   bpdir="$DATA/blueprints/$bp"
+  # The orchestrator's launch gate, applied here too: a coordinator is never
+  # revived while a DAG dependency of its package is not done (the same
+  # deps_met rule, through its --deps-unmet seam). A package the blueprint's
+  # table does not list (exit 2) has no dependencies to wait on.
+  if unmet=$(perl "$SCRIPT_DIR/bp-orchestrator.pl" --deps-unmet "$bpdir" "$pkg" 2>/dev/null) && [ -n "$unmet" ]; then
+    printf '%-28s %-12s DEAD, WAITING on %s (not done) -> not revived\n' "$bp/$pkg" "$status" "$(printf '%s' "$unmet" | tr '\n' ',')"
+    return 0
+  fi
+  verdict=$(CCPRAXIS_DATA_DIR="$DATA" perl "$SCRIPT_DIR/bp-cache-state.pl" verdict "$bp" "$pkg" 2>/dev/null || echo cold)
   exit_reason=$(perl "$SCRIPT_DIR/bp-orchestrator.pl" --exit-reason "$bpdir" "$pkg" 2>/dev/null || echo unknown)
   if [ "$exit_reason" = "max_turns" ]; then
     # b16: turn exhaustion forces cold, always -- regardless of how warm the

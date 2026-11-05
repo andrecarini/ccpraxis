@@ -1555,13 +1555,35 @@ sub normalize_dag {
 # lookup; a dangling or ambiguous token fails closed (never met).
 sub deps_met {
     my ($deps, $status) = @_;
-    return 1 unless ref $deps eq 'ARRAY' && @$deps;
+    return unmet_deps($deps, $status) ? 0 : 1;
+}
+
+# --- the same rule, saying WHICH dependencies hold a package back: the resolved
+# name of each dependency that is not done, or the raw token when it does not
+# resolve. Empty list == deps_met. deps_met is defined through this, so the two
+# can never disagree.
+sub unmet_deps {
+    my ($deps, $status) = @_;
+    return () unless ref $deps eq 'ARRAY' && @$deps;
+    my @unmet;
     for my $d (@$deps) {
         my ($how, $name) = resolve_dep_token($d, $status);
-        return 0 unless $how eq 'exact' || $how eq 'normalized';
-        return 0 unless ($status->{$name} // '') eq 'done';
+        if ($how ne 'exact' && $how ne 'normalized') { push @unmet, $d; next; }
+        push @unmet, $name unless ($status->{$name} // '') eq 'done';
     }
-    return 1;
+    return @unmet;
+}
+
+# --- the status map every dependency check reads: the tick's statuses, with a
+# done package demoted to 'harvesting' in harvest gate mode until its verdict
+# passes (audit mode is an identity). The fresh-launch path has always gated
+# dependents this way; the watchdog and the orphan reconciler now read the same
+# map, so "is this dependency done?" has one answer per tick.
+sub deps_status {
+    my ($mode, $status, $reg, $meta) = @_;
+    my %harvest = map { $_ => ((ref $reg eq 'HASH' && ref $reg->{$_} eq 'HASH') ? $reg->{$_}{harvest} : undef) }
+                  keys %{ $meta || {} };
+    return BpJudge::effective_status($mode, $status, \%harvest);
 }
 
 # --- write-set overlap (conservative; path-prefix aware). Two write-sets are
@@ -2456,13 +2478,33 @@ sub _queue_launch_refused {
 
 # _launch_hold($c) -> undef (may launch) | { reason => ..., ... } (hold it).
 # $c: { runs, bpdir, log, bp, reg (the tick's registry snapshot), pkg, now, t,
-#       site, logged (loop-scope dedupe hash) }. Called at every launch site:
-# the watchdog's dead and wedged branches and the fresh-launch ready set.
+#       site, logged (loop-scope dedupe hash), meta, deps_status }. Called at
+# every launch site: the watchdog's dead and wedged branches and the
+# fresh-launch ready set.
+#
+# DEPENDENCIES FIRST. A package whose DAG dependencies are not all done is held
+# at EVERY site, by the one deps_met rule. ready_packages already applied it to
+# the fresh path, but the watchdog relaunches anything it considers launched
+# (attempt > 0, a recorded pid, or a non-pending status) and never asked. On
+# acxpraxis-step-2 (2026-11-05) that relaunched 15-model-check-cost 21 times in
+# an hour while its dependency 03 was reopened by a failed harvest audit: each
+# fresh coordinator saw 03 unfinished and parked again. Held packages keep their
+# status; whichever site owns them starts them the tick the dependencies land.
 sub _launch_hold {
     my ($c) = @_;
     my ($runs, $bpdir, $log, $pkg, $now) = @{$c}{qw(runs bpdir log pkg now)};
     my $r = $c->{reg}{$pkg} || {};   # read-only lookup: never vivify a registry row
     my $logged = $c->{logged} || {};
+    if (ref $c->{meta} eq 'HASH' && ref $c->{deps_status} eq 'HASH') {
+        my @unmet = unmet_deps(($c->{meta}{$pkg} || {})->{deps}, $c->{deps_status});
+        if (@unmet) {
+            my $key = "$pkg:deps:" . join(',', @unmet);
+            _log($log, 'launch_held', { package => $pkg, reason => 'deps_unmet', site => $c->{site},
+                  unmet => \@unmet, detail => 'a dependency is not done; held until every dependency is done' })
+                unless $logged->{$key}++;
+            return { reason => 'deps_unmet', unmet => \@unmet };
+        }
+    }
     if (defined $r->{launch_refused_digest}) {
         my $id  = $r->{launch_refused_decision};
         my $dir = escalations_dir($runs);
@@ -6003,7 +6045,9 @@ sub run {
             my $lctx = sub {
                 my ($p, $site) = @_;
                 return { runs => $runs, bpdir => $bpdir, log => $log, bp => $bp, reg => $reg, pkg => $p,
-                         now => $now, t => $t, site => $site, logged => \%launch_hold_logged };
+                         now => $now, t => $t, site => $site, logged => \%launch_hold_logged,
+                         # built at call time: an earlier step this tick may have moved a status.
+                         meta => $meta, deps_status => deps_status($mode, $status, $reg, $meta) };
             };
 
             # ---- WATCH + WATCHDOG (assess each non-terminal launched package) ----
@@ -6662,6 +6706,35 @@ sub run {
                     next if defined judge_inflight($runs, 'escalation-resolve', $pkg)
                          || -e "$runs/escalation-resolve/$pkg.decision";
                     my $st = $status->{$pkg} // '';
+                    # A park while a DAG dependency is unfinished is a dependency
+                    # wait, not a question. The coordinator was started too early
+                    # (in acxpraxis-step-2 a failed harvest audit reopened the
+                    # dependency after the dependent had launched), found the work
+                    # it builds on missing, and stopped. Escalating it fed the
+                    # resolver, whose only non-structural answer is `relaunch`,
+                    # which the watchdog acted on at once: a loop of fresh
+                    # coordinators each re-discovering the same wait. Put it back
+                    # to pending instead; the launch gate holds it until every
+                    # dependency is done. Any other reason it parked surfaces again
+                    # once it runs with its dependencies met, and is escalated then.
+                    my @unmet = unmet_deps($meta->{$pkg}{deps}, deps_status($mode, $status, $reg, $meta));
+                    if (@unmet) {
+                        # Still alive: it is finishing its stop. Look again next tick.
+                        next if $pid_alive->($pid->{$pkg});
+                        if (_set_ledger_status($bpdir, $pkg, 'pending', { runs => $runs, log => $log })) {
+                            # The attempt was spent on a launch that should not have
+                            # happened; it must not count toward the give-up cap.
+                            update_registry_pkg($runs, $pkg, { attempt => 0 });
+                            $status->{$pkg} = 'pending'; $att->{$pkg} = 0;
+                            $reg->{$pkg}{attempt} = 0 if ref $reg->{$pkg} eq 'HASH';
+                            _log($log, 'dep_wait_requeued', { package => $pkg, status => $st, unmet => \@unmet,
+                                detail => "parked '$st' while a dependency is not done; back to pending until it is" });
+                            next;
+                        }
+                        # Could not write the ledger: escalate as before rather than go silent.
+                        _log($log, 'ledger_status_lost', { package => $pkg, target => 'pending',
+                              reason => ($BpWrite::LAST_RESULT && $BpWrite::LAST_RESULT->{reason}) || '?' });
+                    }
                     my $next = ledger_next_action($bpdir, $pkg);
                     _log($log, 'orphan_escalation', { package => $pkg, status => $st,
                         detail => 'awaiting-human with no queued decision (coordinator self-park) — escalating' });
@@ -7787,6 +7860,28 @@ unless (caller) {
         }
         my $tv = BpOrch::terminal_verdict(BpOrch::_last_jsonl_obj("$bpdir/runs", $pkg));
         print "$tv->{verdict}\n";
+        exit 0;
+    }
+    # The launch gate's dependency rule for bp-resume-sweep.sh, which revives
+    # dead coordinators outside the orchestrator: prints the package's unfinished
+    # dependencies, one per line (nothing when every one is done), from the same
+    # deps_status/unmet_deps the orchestrator's own launch sites use.
+    if (@ARGV && $ARGV[0] eq '--deps-unmet') {
+        shift @ARGV;
+        my ($bpdir, $pkg) = @ARGV;
+        unless (defined $bpdir && length $bpdir && defined $pkg && length $pkg) {
+            print STDERR "usage: bp-orchestrator.pl --deps-unmet <bp-dir> <pkg>\n";
+            exit 2;
+        }
+        my $runs = "$bpdir/runs";
+        my ($meta, $status) = BpOrch::_load_state($bpdir, $runs);
+        unless (exists $meta->{$pkg}) {
+            print STDERR "bp-orchestrator: no package '$pkg' in $bpdir/blueprint.md\n";
+            exit 2;
+        }
+        my $mode = BpJudge::harvest_mode(BpOrch::_tunables_base()->{harvest});
+        my $ds = BpOrch::deps_status($mode, $status, BpOrch::read_registry($runs), $meta);
+        print "$_\n" for BpOrch::unmet_deps($meta->{$pkg}{deps}, $ds);
         exit 0;
     }
     if (@ARGV && $ARGV[0] eq '--ctx-usage') {
