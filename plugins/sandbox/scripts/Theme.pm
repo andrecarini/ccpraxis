@@ -411,6 +411,33 @@ sub _roles_data {
             class   => 'body',
             meaning => 'Why a not-yet-started item is waiting; never a step or a value.',
         },
+        # THE CURRENT STEP OF A PACKAGE'S PIPELINE STRIP -- the two BOLD roles
+        # (operator, 2026-11-10: "current is bold, in accent if something is
+        # live for the package, or in the paused/idle role otherwise"). The
+        # strip's other cells reuse text.muted (done) and text.faint
+        # (upcoming); a skipped step is blank. Each is the colour of an
+        # existing role -- accent and state.idle -- so its contrast is theirs.
+        #
+        # BOLD IS A WEIGHT, NOT A COLOUR, so like italic it must survive every
+        # rung. At truecolour and 256 sgr() appends a trailing SGR 1; at
+        # 'none' the attr is already '1', which carries it there (and also
+        # keeps the current step apart from the dim done/upcoming cells).
+        'step.current' => {
+            rgb     => [66, 148, 250],
+            x256    => 69,
+            attr    => '1',
+            bold    => 1,
+            class   => 'body',
+            meaning => 'The current step of a package with something live, on the Blueprints pipeline strip.',
+        },
+        'step.current.idle' => {
+            rgb     => [110, 126, 148],
+            x256    => 244,
+            attr    => '1',
+            bold    => 1,
+            class   => 'large',
+            meaning => 'The current step of a package with nothing live (paused or idle), on the pipeline strip.',
+        },
         'state.ok' => {
             rgb     => [26, 168, 74],
             x256    => 35,
@@ -465,6 +492,8 @@ sub roles {
         # from one that had sprouted a stray escape.
         # italic likewise: present only on a role that declares it.
         $copy{$name}{italic} = 1 if $rec->{italic};
+        # bold likewise (the two step.current* roles).
+        $copy{$name}{bold} = 1 if $rec->{bold};
         if (ref($rec->{bg}) eq 'ARRAY') {
             $copy{$name}{bg}    = [ @{ $rec->{bg} } ];
             $copy{$name}{bg256} = $rec->{bg256};
@@ -914,16 +943,20 @@ sub sgr {
     # trailing SGR 3. A role without `italic` is byte-for-byte unchanged.
     # Every painted span is followed by reset(), which ends the italic too.
     my $it = $rec->{italic} ? "\e[3m" : '';
+    # BOLD (the step.current* roles) is a weight, not a colour: a trailing
+    # SGR 1 at the colour rungs. At 'none' the role's attr is '1' already,
+    # so nothing is appended there. A role without `bold` is unchanged.
+    my $bd = $rec->{bold} ? "\e[1m" : '';
     if ($cap eq 'truecolor') {
         my ($r, $g, $b) = @{ $rec->{rgb} };
         my $s = "\e[38;2;$r;$g;${b}m";
         $s .= "\e[48;2;$bg->[0];$bg->[1];$bg->[2]m" if ref($bg) eq 'ARRAY';
-        return $s . $it;
+        return $s . $bd . $it;
     }
     if ($cap eq '256') {
         my $s = "\e[38;5;$rec->{x256}m";
         $s .= "\e[48;5;$rec->{bg256}m" if ref($bg) eq 'ARRAY' && defined $rec->{bg256};
-        return $s . $it;
+        return $s . $bd . $it;
     }
     # 'none', or any unrecognised capability string -- treated as 'none'.
     # Reverse video is the only way to say "this is a surface, not text" with

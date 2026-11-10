@@ -253,6 +253,29 @@ sub _synth_pkg_agents {
     return \@agents;
 }
 
+# _synth_pipeline($current, %o) -> \@items. A package's ledger checklist in
+# RunState's `pipeline` shape (_scan_pipeline: { n, label, word, state }): the
+# template's eight steps, plus a ninth (handoff) with handoff => 1. Every step
+# before $current is done and $current onward todo ($current undef: nothing
+# started). Steps named in skip => [...] are ticked as skipped, and ui is
+# skipped too unless ui => 1 (a package that touches no UI).
+my @SYNTH_STEPS = qw(scout spec tests implementation validation review fix-batch ui);
+sub _synth_pipeline {
+    my ($current, %o) = @_;
+    my @words = (@SYNTH_STEPS, ($o{handoff} ? 'handoff' : ()));
+    my %skip = map { $_ => 1 } @{ $o{skip} || [] };
+    $skip{ui} = 1 unless $o{ui};
+    my $started = defined($current) ? 0 : 1;
+    my @items;
+    for my $i (0 .. $#words) {
+        my $w = $words[$i];
+        $started = 1 if defined($current) && $w eq $current;
+        my $state = $skip{$w} ? 'skipped' : ($started ? 'todo' : 'done');
+        push @items, { n => [ $i + 1 ], label => '' . ($i + 1), word => $w, state => $state };
+    }
+    return \@items;
+}
+
 # _synth_packages($i, $phase) -> \@packages. Package index 0 is always the
 # STUCK one (status running, attempt == attempt_cap -- package 07's AC38
 # precondition); the rest sweep attempt/step/agent-count for visual variety.
@@ -265,6 +288,7 @@ sub _synth_packages {
     my @STEP_WORDS = qw(scout spec tests implementation validation review);
     my @packages;
     for my $j (0 .. $n - 1) {
+        my $word  = $STEP_WORDS[ ($i + $phase + $j) % scalar(@STEP_WORDS) ];
         my $stuck = ($j == 0) ? 1 : 0;
         my $blocked = ($j == 1) ? 1 : 0;
         my ($attempt, $cap) = $stuck ? (3, 3) : (1 + ($j % 2), 5);
@@ -277,7 +301,10 @@ sub _synth_packages {
             steps_pending => [ ($j + 1) .. ($j + 3) ],
             next_action   => undef,
             agents        => _synth_pkg_agents($i, $phase, $j, $stuck),
-            step_word     => $STEP_WORDS[ ($i + $phase + $j) % scalar(@STEP_WORDS) ],
+            step_word     => $word,
+            # The checklist the pipeline strip draws, current at step_word; a
+            # blocked package has not started.
+            pipeline      => _synth_pipeline($blocked ? undef : $word),
             waits_on      => $blocked ? '20261002-120000-abcd' : undef,
             # RunState's per-package coordinator facts (registry pid liveness and
             # launched_at). Only the stuck package claims a live coordinator, so
@@ -471,6 +498,7 @@ sub synth_operator_runs {
         return { name => $o{name}, status => $o{status} // 'running', attempt => $o{attempt} // 1,
                  attempt_cap => 5, step => undef, steps_pending => undef, next_action => undef,
                  agents => $o{agents} // [], step_word => $o{step_word}, waits_on => $o{waits_on},
+                 pipeline => $o{pipeline},
                  coordinator_alive => $o{alive}, coordinator_started_at => $o{started} };
     };
     my $thread = sub {
@@ -490,10 +518,19 @@ sub synth_operator_runs {
           relaunch_local => { wday => 'Thu', hhmm => '21:49', day => '01', mon => 'Jan' },
           packages_total => 15, packages_done => 9, running_coordinators => 1, inbox_waiting => 0,
           packages => [
-              $pkg->(name => '03-make-and-hooks',         step_word => 'implementation', attempt => 2, alive => 0),
-              $pkg->(name => '05-checks-erlang',          step_word => 'tests',          alive => 0),
-              $pkg->(name => '07-release-notes',          step_word => 'review',         alive => undef),
-              $pkg->(name => '10-model-journal-recovery', step_word => 'implementation', attempt => 5, alive => 0),
+              # The pipeline strip's cases: 03 skipped its scout, 07 is a
+              # 9-step ledger at its handoff, and 11 (the next package, a
+              # pending entry the panel shows only as `next`) has not started.
+              $pkg->(name => '03-make-and-hooks',         step_word => 'implementation', attempt => 2, alive => 0,
+                     pipeline => _synth_pipeline('implementation', skip => ['scout'])),
+              $pkg->(name => '05-checks-erlang',          step_word => 'tests',          alive => 0,
+                     pipeline => _synth_pipeline('tests')),
+              $pkg->(name => '07-release-notes',          step_word => 'handoff',        alive => undef,
+                     pipeline => _synth_pipeline('handoff', handoff => 1)),
+              $pkg->(name => '10-model-journal-recovery', step_word => 'implementation', attempt => 5, alive => 0,
+                     pipeline => _synth_pipeline('implementation')),
+              $pkg->(name => '11-docs-sweep', status => 'pending', step_word => 'scout',
+                     pipeline => _synth_pipeline(undef)),
           ],
           run_agents => [], thread => $thread->('acxpraxis-step-2'), next_package => '11-docs-sweep' },
         { %common, blueprint => 'fleet-observability', runs_dir => '/tmp/ccpraxis-preview-runs/fleet-observability',
@@ -503,14 +540,18 @@ sub synth_operator_runs {
           packages_total => 9, packages_done => 3, running_coordinators => 3, inbox_waiting => 1,
           packages => [
               $pkg->(name => '04-usage-ledger', step_word => 'tests', alive => 1, started => $now - 5_000,
+                     pipeline => _synth_pipeline('tests'),
                      agents => [ $ag->('w1', 'worker', 'bp-test-writer', 720) ]),
               $pkg->(name => '06-sampler-rework-with-a-much-longer-package-name', step_word => 'implementation',
                      attempt => 5, alive => 1, started => $now - 2_700,
+                     pipeline => _synth_pipeline('implementation', skip => ['scout']),
                      agents => [ $ag->('w2', 'worker', 'bp-implementer', 2_460),
                                  $ag->('j2', 'judge', 'bp-resolve-judge', 300) ]),
               $pkg->(name => '08-dash', step_word => 'review', attempt => 2, alive => 1, started => $now - 45,
+                     pipeline => _synth_pipeline('review'),
                      agents => [ $ag->('w3', 'worker', 'bp-reviewer', 30) ]),
-              $pkg->(name => 'z01-follow-up', status => 'blocked', waits_on => '04-usage-ledger'),
+              $pkg->(name => 'z01-follow-up', status => 'blocked', waits_on => '04-usage-ledger',
+                     pipeline => _synth_pipeline(undef)),
           ],
           run_agents => [ $ag->('cj', 'judge', 'bp-conformance-judge', 240) ],
           thread => $thread->('fleet-observability'), next_package => '09-docs' },
@@ -519,7 +560,9 @@ sub synth_operator_runs {
           paused_reason => undef, paused_window => undef, relaunch_at => undef, relaunch_local => undef,
           packages_total => 6, packages_done => 2, running_coordinators => 0, inbox_waiting => 0,
           packages => [
-              $pkg->(name => '03-pipeline-strip', step_word => 'spec',
+              # A UI package (its ui step is not skipped), and one whose ledger
+              # has no readable checklist (04-legend: no pipeline).
+              $pkg->(name => '03-pipeline-strip', step_word => 'spec', pipeline => _synth_pipeline('spec', ui => 1),
                      agents => [ $ag->('c4', 'coordinator', 'coordinator', 5_400), $ag->('w4', 'worker', 'bp-architect', 400) ]),
               $pkg->(name => '04-legend', step_word => 'scout', agents => []),
           ],

@@ -282,8 +282,11 @@ my @SUMMARY_KEYS = qw(
 # rows): coordinator_alive / coordinator_started_at carry the registry pid
 # verdict and launched_at so a package row is green only when something runs
 # and can show its coordinator's uptime.
+# Widened 12 -> 13 (operator, 2026-11-10, the Blueprints panel's per-step
+# pipeline strip): `pipeline`, _ledger_facts' per-checkbox list, passed
+# through so the panel can draw every step and not only the current word.
 my @PKG_KEYS = qw(name status attempt attempt_cap step steps_pending next_action agents step_word waits_on
-                  coordinator_alive coordinator_started_at);
+                  coordinator_alive coordinator_started_at pipeline);
 
 sub assert_summary_keys {
     my ($s, $label) = @_;
@@ -294,7 +297,7 @@ sub assert_summary_keys {
 sub assert_pkg_shape {
     my ($e, $label) = @_;
     ok(is_hashref($e), "$label: package entry is a hashref") or return;
-    is_deeply([ sort keys %$e ], [ sort @PKG_KEYS ], "$label: AC28 -- exactly the 12 package keys (package 05 adds 'agents'; package 01-run-blocks adds step_word/waits_on; the 2026-11-04 panel change adds coordinator_alive/coordinator_started_at)");
+    is_deeply([ sort keys %$e ], [ sort @PKG_KEYS ], "$label: AC28 -- exactly the 13 package keys (package 05 adds 'agents'; package 01-run-blocks adds step_word/waits_on; the 2026-11-04 panel change adds coordinator_alive/coordinator_started_at; the 2026-11-10 pipeline strip adds pipeline)");
 }
 
 sub assert_new_key_types {

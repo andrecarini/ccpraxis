@@ -917,11 +917,16 @@ if ($THEME_OK) {
         # suffix for a role that declares it, and stay anchored for every other.
         my $it = $rec->{italic} ? "\e[3m" : '';
         my $it_re = $rec->{italic} ? qr/\e\[3m/ : qr//;
+        # A BOLD ROLE (step.current / step.current.idle, the pipeline strip's
+        # current step, operator 2026-11-10) adds ONE trailing SGR 1 at the
+        # colour rungs, before any italic. At 'none' its attr is '1' already,
+        # so the attr-only expectation below covers it unchanged.
+        my $bd_re = $rec->{bold} ? qr/\e\[1m/ : qr//;
 
         my $tc = Theme::sgr($role, 'truecolor');
         my $tc_re = $has_bg
-            ? qr/\A\e\[38;2;\d{1,3};\d{1,3};\d{1,3}m\e\[48;2;\d{1,3};\d{1,3};\d{1,3}m$it_re\z/
-            : qr/\A\e\[38;2;\d{1,3};\d{1,3};\d{1,3}m$it_re\z/;
+            ? qr/\A\e\[38;2;\d{1,3};\d{1,3};\d{1,3}m\e\[48;2;\d{1,3};\d{1,3};\d{1,3}m$bd_re$it_re\z/
+            : qr/\A\e\[38;2;\d{1,3};\d{1,3};\d{1,3}m$bd_re$it_re\z/;
         if (like($tc, $tc_re, "sgr('$role','truecolor') matches the truecolor SGR shape (B-B3, AC-3)")) {
             my ($r, $g, $b) = $tc =~ /\A\e\[38;2;(\d{1,3});(\d{1,3});(\d{1,3})m/;
             is_deeply([$r, $g, $b], $rec->{rgb}, "sgr('$role','truecolor') numbers equal the role's rgb (B-B3, AC-3)");
@@ -933,8 +938,8 @@ if ($THEME_OK) {
         }
 
         my $x256 = Theme::sgr($role, '256');
-        my $x_re = $has_bg ? qr/\A\e\[38;5;\d{1,3}m\e\[48;5;\d{1,3}m$it_re\z/
-                           : qr/\A\e\[38;5;\d{1,3}m$it_re\z/;
+        my $x_re = $has_bg ? qr/\A\e\[38;5;\d{1,3}m\e\[48;5;\d{1,3}m$bd_re$it_re\z/
+                           : qr/\A\e\[38;5;\d{1,3}m$bd_re$it_re\z/;
         if (like($x256, $x_re, "sgr('$role','256') matches the 256-colour SGR shape (B-B4, AC-13)")) {
             my ($n) = $x256 =~ /\A\e\[38;5;(\d{1,3})m/;
             is($n, $rec->{x256}, "sgr('$role','256') number equals the role's x256 (B-B4, AC-13)");

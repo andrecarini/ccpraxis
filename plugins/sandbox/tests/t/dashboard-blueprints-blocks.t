@@ -648,10 +648,16 @@ my ($F12_A, $F12_B);
         # pause glyph. That glyph carries a one-column pad, so the panel's dot
         # slot is 2 columns plus the separator, and the arrow row is padded
         # to match.
+        #
+        # 02-b's ledger has a checklist, which summarize_dir now passes
+        # through as `pipeline`, so the row draws the pipeline strip
+        # (operator, 2026-11-10) instead of the step word: `sco spe tes`, 11
+        # columns. 04-d's ledger has no checklist, so its `next` row has a
+        # blank strip area of that width before the reason.
         my @lines = (
             G('icon.blueprints') . ' acx-int' . S(3) . M(1, 4) . S(2) . '1/4' . S(3) . G('thread.idle') . ' 7d limit' . SD() . 'until Mon 18:05',
-            S(2) . G('thread.idle') . ' 02-b' . S(3) . 'tests',
-            S(2) . G('arrow.right') . S(2) . '04-d' . S(3) . S(5) . S(3) . 'next',
+            S(2) . G('thread.idle') . ' 02-b' . S(3) . 'sco spe tes',
+            S(2) . G('arrow.right') . S(2) . '04-d' . S(3) . S(11) . S(3) . 'next',
         );
         my $rows = eval { tui::DashboardScreen::_run_summary_lines([$s], undef, undef, $NOW) };
         my $err2 = $@;

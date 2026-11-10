@@ -2441,6 +2441,12 @@ sub summarize_dir {
             # below, once the chosen thread (if any) is known.
             step_word     => $facts->{step_word},
             waits_on      => undef,
+            # The per-item checklist the Blueprints panel's pipeline strip
+            # draws (operator, 2026-11-10): _ledger_facts' `pipeline`, from the
+            # same head read -- an arrayref of fresh { n, label, word, state }
+            # hashes from _scan_pipeline, or undef when the ledger has no
+            # readable checklist (or no ledger at all).
+            pipeline      => $facts->{pipeline},
             # Per-package coordinator facts (see the running branch above):
             # undef for every package that is not `running`.
             coordinator_alive      => $coordinator_alive,

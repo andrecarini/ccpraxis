@@ -1707,10 +1707,12 @@ SKIP: {
                 skip('no packages', 1) unless ref($pkgs) eq 'ARRAY' && @$pkgs;
                 # +2 (2026-11-05): RunState's per-package coordinator facts,
                 # which the Blueprints panel's truthful dot and total read.
+                # +1 (2026-11-10): `pipeline`, the per-step checklist the
+                # Blueprints panel's pipeline strip draws.
                 my @PKG_KEYS = qw(name status attempt attempt_cap step steps_pending next_action agents step_word waits_on
-                                  coordinator_alive coordinator_started_at);
+                                  coordinator_alive coordinator_started_at pipeline);
                 my @bad = grep { !(ref($_) eq 'HASH' && "@{[sort keys %$_]}" eq "@{[sort @PKG_KEYS]}") } @$pkgs;
-                is(scalar(@bad), 0, 'AC36: every packages element has exactly the 12 package keys');
+                is(scalar(@bad), 0, 'AC36: every packages element has exactly the 13 package keys');
             }
             my @agents;
             push @agents, @{ $_->{agents} } for grep { ref($_->{agents}) eq 'ARRAY' } @$pkgs;

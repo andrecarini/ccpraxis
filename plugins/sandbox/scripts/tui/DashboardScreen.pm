@@ -1456,7 +1456,9 @@ sub _resume_words {
 # 2026-11-05). Every rule below is an operator decision:
 #
 #   <icon> <blueprint>   <meter>  d/t   <driver>   [<state>|<pause>]   [<decisions> n]   [n triage]
-#     <dot> <package name> <total>   <step word>   <step time>   [attempt N/M]
+#     <dot> <package name> <total>   <pipeline strip | step word>   <step time>   [attempt N/M]
+#
+# (the pipeline strip, 2026-11-10, is described at THE PIPELINE STRIP below)
 #
 # * No thread/run row. The driver (_driver_spans) sits on the blueprint line;
 #   the coordinator count is gone. Package rows sit one indent (two spaces)
@@ -1466,7 +1468,7 @@ sub _resume_words {
 #   name.package.slug). Only the name strings take these roles. A package
 #   name is cut to PKG_NAME_MAX columns with the theme's ellipsis; the name
 #   column is as wide as the longest (cut) name in the panel.
-# * The columns -- total, step word, step time -- line up across EVERY row of
+# * The columns -- total, strip/step word, step time -- line up across EVERY row of
 #   the panel, not only within one blueprint, so _layout_panel lays all the
 #   shown blocks out together.
 # * The attempt counter counts coordinator launches and appears only from
@@ -1640,10 +1642,147 @@ sub _package_row {
         $total = _oldest_elapsed($now, @live_coords);
     }
 
+    my $strip = _strip_of($p->{pipeline}, (_package_is_live($p, $now) ? 'step.current' : 'step.current.idle'));
     return { kind => 'package', dot => [ $gname, $grole ], name => $name,
              name_spans => _package_name_spans($name),
              total => $total, step => { text => $step, role => 'text.primary' },
+             strip => $strip, no_checklist => ($strip ? 0 : 1),
              time => _oldest_elapsed($now, @live_workers), aside => undef, attempt => $attempt };
+}
+
+# ===========================================================================
+# THE PIPELINE STRIP (operator, 2026-11-10, approved against
+# .ccpraxis-local-data/mockups/pipeline-strip-mock.pl). A package row shows
+# every step of its ledger's checklist, not only the current step's word:
+#
+#     <dot> <name> <total>   sco spe tes imp val rev fix   <step time>   [attempt N/M]
+#
+# * Each step is its three-letter label (_step_abbr): the known words map to
+#   sco spe tes imp val rev fix ui hnd, any other word to its first three
+#   letters, lower-cased.
+# * FIXED COLUMNS. A block's step columns are the union of the step words of
+#   all its package rows, in first-seen order, each in its own CELL_W-wide
+#   column, one space apart. A skipped or n/a step is blank space in its
+#   column, so the columns still line up; a column no row of the block has a
+#   step for that is neither skipped nor n/a is dropped entirely.
+# * The STYLE carries the state, with no glyph between steps: done text.muted,
+#   upcoming text.faint, current bold -- step.current (accent) while something
+#   is live for the package, step.current.idle otherwise. A package that has
+#   not started (blocked, parked, next) has no current step: its strip is
+#   drawn all upcoming (done steps of a parked package stay muted), with its
+#   reason in the time slot as before.
+# * A package with no readable checklist has a blank strip area and
+#   `no checklist` (text.waiting) in the time slot.
+# * WIDTH. When any package row of the panel would not fit the width it got,
+#   the whole panel falls back to the single current-step word (the layout as
+#   it was before the strip), keeping the time and attempt columns. So does a
+#   panel in which no row has a checklist at all -- an all-blank strip area
+#   says nothing, and that panel keeps its step words.
+# ===========================================================================
+
+# STRIP_CELL_W -- the display width of one step column.
+use constant STRIP_CELL_W => 3;
+
+my %STEP_ABBR = (
+    scout => 'sco', spec => 'spe', tests => 'tes', implementation => 'imp',
+    validation => 'val', review => 'rev', 'fix-batch' => 'fix', ui => 'ui',
+    handoff => 'hnd',
+);
+
+# _step_abbr($word) -> Str | undef. A step word's label: the known nine, else
+# the first three characters of the word as RunState reduced it (lower case,
+# [a-z0-9-]). undef for an empty or non-string word.
+sub _step_abbr {
+    my ($word) = @_;
+    return undef unless defined($word) && !ref($word);
+    $word = lc $word;
+    $word =~ s/[^a-z0-9-]//g;
+    return undef unless length $word;
+    return $STEP_ABBR{$word} // substr($word, 0, STRIP_CELL_W());
+}
+
+my %STRIP_STATES = map { $_ => 1 } qw(done todo skipped na);
+
+# _strip_of($pipeline, $cur_role) -> \@cells | undef. One row's strip, as
+# cells in checklist order: { key, abbr, role }, role undef for a blank
+# (skipped/na) cell. $pipeline is RunState's `pipeline` (sorted by step
+# number); anything that is not one of its items is ignored, and undef comes
+# back when nothing usable is left -- the "no checklist" case. The first
+# `todo` item is the current step and takes $cur_role; with $cur_role undef
+# (a package that has not started) every todo item is upcoming. The key is the
+# step word (or `#<label>` for a step with no word), with `#2`, `#3`, ... on a
+# word's later occurrences in the same ledger, so every step keeps a column.
+sub _strip_of {
+    my ($pipeline, $cur_role) = @_;
+    return undef unless ref($pipeline) eq 'ARRAY';
+    my (@cells, %occ);
+    my $cur_seen = 0;
+    for my $it (@$pipeline) {
+        next unless ref($it) eq 'HASH';
+        my $state = $it->{state};
+        next unless defined($state) && !ref($state) && $STRIP_STATES{$state};
+        my $abbr = _step_abbr($it->{word});
+        my $base;
+        if (defined $abbr) {
+            ($base = lc $it->{word}) =~ s/[^a-z0-9-]//g;
+        }
+        else {
+            my $l = $it->{label};
+            $l = (defined($l) && !ref($l) && $l =~ /\A\d{1,2}(?:-\d{1,2})?\z/) ? $l : '?';
+            ($base, $abbr) = ("#$l", substr($l, 0, STRIP_CELL_W()));
+        }
+        my $n = ++$occ{$base};
+        my $role;
+        if    ($state eq 'done') { $role = 'text.muted'; }
+        elsif ($state eq 'todo') {
+            if (defined($cur_role) && !$cur_seen) { $role = $cur_role; $cur_seen = 1; }
+            else                                  { $role = 'text.faint'; }
+        }
+        push @cells, { key => ($n > 1 ? "$base#$n" : $base), abbr => $abbr, role => $role };
+    }
+    return @cells ? \@cells : undef;
+}
+
+# _strip_columns(\@rows) -> \@keys. One block's step columns: the union of
+# its rows' step keys in first-seen order, minus every column in which no
+# row has a drawn (neither skipped nor n/a) step.
+sub _strip_columns {
+    my ($rows) = @_;
+    my (@order, %seen, %drawn);
+    for my $r (@{ $rows || [] }) {
+        next unless ref($r) eq 'HASH' && ref($r->{strip}) eq 'ARRAY';
+        for my $c (@{ $r->{strip} }) {
+            push @order, $c->{key} unless $seen{ $c->{key} }++;
+            $drawn{ $c->{key} } = 1 if defined $c->{role};
+        }
+    }
+    return [ grep { $drawn{$_} } @order ];
+}
+
+# _strip_spans(\@cells, \@cols) -> \@spans | undef. A row's strip laid on its
+# block's columns: CELL_W per column, one space between, a blank column as
+# spaces. Trailing blank columns (and the pad after the last label) are not
+# drawn -- _layout_panel pads only when something follows. undef when the
+# row has no drawn step in any column.
+sub _strip_spans {
+    my ($cells, $cols) = @_;
+    return undef unless ref($cells) eq 'ARRAY' && ref($cols) eq 'ARRAY';
+    my %by = map { $_->{key} => $_ } @$cells;
+    my @row = map { (defined($by{$_}) && defined($by{$_}{role})) ? $by{$_} : undef } @$cols;
+    pop @row while @row && !defined $row[-1];
+    return undef unless @row;
+    my @spans;
+    my $gap = '';
+    for my $i (0 .. $#row) {
+        $gap .= ' ' if $i > 0;
+        my $c = $row[$i];
+        if (!defined $c) { $gap .= ' ' x STRIP_CELL_W(); next; }
+        push @spans, { text => $gap, role => 'text.muted' } if length $gap;
+        push @spans, { text => $c->{abbr}, role => $c->{role} };
+        my $pad = STRIP_CELL_W() - (tui::Layout::display_width($c->{abbr}) // 0);
+        $gap = ($pad > 0) ? ' ' x $pad : '';
+    }
+    return \@spans;
 }
 
 # _package_rows($s, $now) -> \@rows. Package rows (ACTIVE or BLOCKED) in
@@ -1667,8 +1806,10 @@ sub _package_rows {
                     my $wo = _bound_display($wo_raw, 200);
                     $aside = 'waiting on ' . (defined($wo) ? $wo : '');
                 }
+                # Not started: the whole strip, nothing current.
                 push @out, { kind => 'package', dot => [ 'thread.blocked', 'state.warn' ], name => $name,
-                             name_spans => _package_name_spans($name), aside => $aside };
+                             name_spans => _package_name_spans($name), aside => $aside,
+                             strip => _strip_of($p->{pipeline}, undef) };
             }
             elsif ($status eq 'running' || $status eq 'converging' || $status eq 'reviewing'
                    || _package_is_live($p, $now)) {
@@ -1707,8 +1848,14 @@ sub _package_rows {
         my $clipped = _clip_name($next_pkg, PKG_NAME_MAX());
         my $already = grep { $_->{kind} eq 'package' && $_->{name} eq $clipped } @out;
         unless ($already) {
+            # Its checklist, when packages[] carries the package: not started,
+            # so the whole strip with nothing current.
+            my ($entry) = grep { ref($_) eq 'HASH' && defined($_->{name}) && !ref($_->{name})
+                                 && $_->{name} eq $s->{next_package} }
+                          (ref($s->{packages}) eq 'ARRAY' ? @{ $s->{packages} } : ());
             push @out, { kind => 'next', dot => [ 'arrow.right', 'text.muted' ], name => $clipped,
-                         name_spans => _package_name_spans($clipped), aside => 'next' };
+                         name_spans => _package_name_spans($clipped), aside => 'next',
+                         strip => ($entry ? _strip_of($entry->{pipeline}, undef) : undef) };
         }
     }
     return \@out;
@@ -1787,6 +1934,10 @@ sub _run_block_parts {
 #
 #   '  ' <dot, slot D> <name, N> ' ' <total, T right>   <step, S>   <time, U right>   <attempt>
 #
+# where <step> is the pipeline strip or the step word: ONE mode for the whole
+# panel, the strip unless a package row would not fit $width (THE PIPELINE
+# STRIP above).
+#
 # A column nobody in the panel uses takes no space at all. A row pads a column
 # only when something follows it, so no row carries trailing blanks. A row's
 # aside (blocked/next) starts where the step time starts and is not measured
@@ -1803,24 +1954,73 @@ sub _layout_panel {
         return defined($g) ? $g : '';
     };
 
+    # THE STEP CELL, per mode (see THE PIPELINE STRIP above): in 'strip' mode
+    # a row with a checklist draws its strip on its block's columns, a
+    # package row without one draws nothing there and says `no checklist` in
+    # the time slot, and every other row (a blueprint-wide judge, the legacy
+    # current_package row) keeps its step word; in 'word' mode every row
+    # keeps its step word -- the layout as it was before the strip.
+    my @good = grep { ref($_) eq 'HASH' } @$parts;
+    my @cols = map { _strip_columns($_->{rows}) } @good;
+    my $any_strip = grep { @$_ } @cols;
+    my $cell_of = sub {
+        my ($mode, $r, $cols) = @_;
+        my $aside = $r->{aside};
+        return ($r->{step} ? [ $r->{step} ] : undef, $aside) if $mode eq 'word';
+        return (_strip_spans($r->{strip}, $cols), $aside) if ref($r->{strip}) eq 'ARRAY';
+        return (undef, (defined($aside) ? $aside : 'no checklist')) if $r->{no_checklist};
+        return ($r->{step} ? [ $r->{step} ] : undef, $aside);
+    };
+
+    my @out = @{ _layout_rows(\@good, \@cols, ($any_strip ? 'strip' : 'word'), $wnum, $dw, $glyph, $cell_of) };
+    if ($any_strip && defined $wnum) {
+        my $over = 0;
+        for my $blk (@out) {
+            for my $ln (@{ $blk->{lines} }) {
+                next if $ln->{kind} eq 'blueprint';
+                $over = 1 if tui::Frame::spans_width($ln->{spans}) > $wnum;
+            }
+        }
+        @out = @{ _layout_rows(\@good, \@cols, 'word', $wnum, $dw, $glyph, $cell_of) } if $over;
+    }
+    return \@out;
+}
+
+# _layout_rows(\@parts, \@cols, $mode, $width, $dw, $glyph, $cell_of) -> \@blocks.
+# _layout_panel's one pass at one step-cell mode ('strip' or 'word').
+sub _layout_rows {
+    my ($parts, $cols, $mode, $wnum, $dw, $glyph, $cell_of) = @_;
+
+    # Each row's step cell and aside for this mode, computed once.
+    my @cell;
+    for my $bi (0 .. $#$parts) {
+        for my $r (@{ $parts->[$bi]{rows} || [] }) {
+            my ($content, $aside) = $cell_of->($mode, $r, $cols->[$bi]);
+            push @{ $cell[$bi] }, [ $content, $aside ];
+        }
+    }
+
     my ($D, $N, $T, $S, $U) = (1, 0, 0, 0, 0);
-    for my $b (@$parts) {
-        next unless ref($b) eq 'HASH';
-        for my $r (@{ $b->{rows} || [] }) {
+    my $has_aside = 0;
+    for my $bi (0 .. $#$parts) {
+        my $ri = 0;
+        for my $r (@{ $parts->[$bi]{rows} || [] }) {
+            my ($content, $aside) = @{ $cell[$bi][ $ri++ ] };
             my $gw = $dw->($glyph->($r->{dot}[0]));
             $D = $gw if $gw > $D;
             my $nw = $dw->($r->{name});
             $N = $nw if $nw > $N;
             my $tw = $dw->($r->{total}); $T = $tw if $tw > $T;
-            my $sw = $r->{step} ? $dw->($r->{step}{text}) : 0; $S = $sw if $sw > $S;
+            my $sw = $content ? tui::Frame::spans_width($content) : 0; $S = $sw if $sw > $S;
             my $uw = $dw->($r->{time}); $U = $uw if $uw > $U;
+            $has_aside = 1 if defined $aside;
         }
     }
-    my $has_time_col = $U > 0 || grep { ref($_) eq 'HASH' && grep { defined $_->{aside} } @{ $_->{rows} || [] } } @$parts;
+    my $has_time_col = $U > 0 || $has_aside;
 
     my @out;
-    for my $b (@$parts) {
-        next unless ref($b) eq 'HASH';
+    for my $bi (0 .. $#$parts) {
+        my $b = $parts->[$bi];
         my @lines;
         my $head = $b->{head};
         # A wrapped blueprint line continues under its meter -- or at the
@@ -1829,7 +2029,9 @@ sub _layout_panel {
         $head_hang = 2 if defined($wnum) && $head_hang > int($wnum / 2);
         push @lines, _blueprint_line_rows($head->{spans}, $wnum, $head_hang);
 
+        my $ri = 0;
         for my $r (@{ $b->{rows} || [] }) {
+            my ($content, $aside) = @{ $cell[$bi][ $ri++ ] };
             my $g = $glyph->($r->{dot}[0]);
             my @spans = ( { text => '  ', role => 'text.muted' }, { text => $g, role => $r->{dot}[1] },
                           { text => ' ' x ($D - $dw->($g) + 1), role => 'text.muted' } );
@@ -1837,9 +2039,9 @@ sub _layout_panel {
             # The cells after the name, in column order: [width, align, \@spans|undef, sep].
             my @cells;
             push @cells, [ $T, 'r', (defined($r->{total}) ? [ { text => $r->{total}, role => 'text.muted' } ] : undef), ' ' ] if $T;
-            push @cells, [ $S, 'l', ($r->{step} ? [ $r->{step} ] : undef), '   ' ] if $S;
-            if (defined $r->{aside}) {
-                push @cells, [ 0, 'l', [ { text => $r->{aside}, role => 'text.waiting' } ], '   ' ];
+            push @cells, [ $S, 'l', $content, '   ' ] if $S;
+            if (defined $aside) {
+                push @cells, [ 0, 'l', [ { text => $aside, role => 'text.waiting' } ], '   ' ];
             }
             else {
                 push @cells, [ $U, 'r', (defined($r->{time}) ? [ { text => $r->{time}, role => 'text.muted' } ] : undef), '   ' ] if $has_time_col;
