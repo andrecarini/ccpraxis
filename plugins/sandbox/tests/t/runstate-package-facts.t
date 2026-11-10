@@ -673,8 +673,12 @@ use_ok('RunState');
             "---\npackage: x\n---\n# body\n\n## Pipeline\n## Decisions & attempt log\n\nnothing between\n",
         'Pipeline section holds only prose' =>
             "---\npackage: x\n---\n# body\n\n## Pipeline\n\nThis section has no checkbox lines at all, just prose.\n",
-        'Pipeline checkbox numbers all outside 1-8' =>
-            "---\npackage: x\n---\n# body\n\n## Pipeline\n\n- [ ] 0. Zero is not a valid step\n- [ ] 9. Nine is not a valid step\n",
+        # Bug 20261104-201500-ee4b: steps run 1-99, not 1-8 -- a 9-step
+        # ledger is real (host-wake-and-suspend/01), and reading only 1-8 made
+        # it look finished at 8/8. The vector keeps its intent (only numbers
+        # outside the valid range) at the new boundary.
+        'Pipeline checkbox numbers all outside 1-99' =>
+            "---\npackage: x\n---\n# body\n\n## Pipeline\n\n- [ ] 0. Zero is not a valid step\n- [ ] 100. A hundred is not a valid step\n",
     );
     for my $label (sort keys %cases) {
         my $dir = make_blueprint($root, 'ac18-' . ($label =~ s/\W+/_/gr), registry => registry_json(), packages => { p1 => $cases{$label} });

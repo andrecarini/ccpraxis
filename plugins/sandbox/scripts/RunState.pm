@@ -975,14 +975,49 @@ sub _attempt_cap {
     return $n > 0 ? $n : 5;
 }
 
-# _parse_pipeline($blob) -> ($step, $steps_pending) (private)
+# _scan_pipeline($blob) -> \@items | undef (private)
 #
-# 04-runstate-run-and-package-facts (spec S2.5): pure, takes the raw ledger
-# bytes, never touches the filesystem, never dies. Returns (undef, undef)
-# when $blob is undef/empty or when no checkbox line is recognised.
-sub _parse_pipeline {
+# THE one reader of a ledger's "## Pipeline" checklist in this module
+# (bug 20261104-201500-ee4b). _parse_pipeline (step / steps_pending),
+# _pipeline_step_word (step_word, _link_resolve's step) and _ledger_facts'
+# `pipeline` list all derive from this, so the "N/M" fraction and the step
+# word can no longer disagree -- they used to be two scans, one reading steps
+# 1-8 only, so a 9-step ledger with 1-8 ticked read "8/8" (finished) beside a
+# step word naming step 9.
+#
+# Pure, never touches the filesystem, never dies. Operates on raw ledger
+# BYTES (U+2014 is matched as its UTF-8 encoding E2 80 94). Returns undef
+# when $blob is undef/empty, has no "## Pipeline" heading, or no checkbox
+# line is recognised; otherwise an arrayref of items sorted by first step
+# number, each a fresh hash:
+#
+#   { n => [ $num, ... ],   # the step number(s) this one checkbox stands for
+#     label => '9' | '3-5', # display label: one number, or first-last
+#     word => Str|undef,    # first word of the step text, lowercased,
+#                           # reduced to [a-z0-9-]; undef when nothing is left
+#     state => 'done'|'todo'|'skipped'|'na' }
+#
+# Recognised line (column-0-insensitive), inside the section, outside a code
+# fence, at most 1024 bytes:
+#   - [M] N. text      or      - [M] A-B. text   (a range: one item, A..B)
+# N, A, B in 1..99 (leading zeros fold: "01." is step 1); a range needs A < B
+# (A-A is just A; A > B is not a step line). M is ' ' (todo), x/X (done),
+# '-' or U+2014 (na). A ticked line whose text carries tick-step's marker --
+# the FIRST " <U+2014> skipped: " / " <U+2014> n/a: " followed by a non-empty
+# reason, the grammar bp-ledger.pl's parse_pipeline_skip_marker reads -- is
+# skipped / na instead of done. The template's own em-dashes ("-- record the
+# skip)") never match, because the keyword+colon+space must follow the dash
+# directly. An unticked line is todo whatever its prose says: N/A written in
+# the text is not a mark (bp-ledger's satisfaction rule reads that, scoped to
+# conditional steps; this reader reports the box).
+#
+# A step number is claimed by the first line that names it; a later line's
+# already-claimed numbers are dropped, and a line left with none is ignored
+# (the old first-occurrence-wins rule, per number).
+my $PIPE_EMDASH = "\xE2\x80\x94";
+sub _scan_pipeline {
     my ($blob) = @_;
-    return (undef, undef) unless defined $blob && length $blob;
+    return undef unless defined $blob && length $blob;
     my $stripped = $blob;
     $stripped =~ s/\A\xEF\xBB\xBF//;
     my @lines = split /\n/, $stripped, -1;
@@ -992,46 +1027,95 @@ sub _parse_pipeline {
     for my $i (0 .. $#lines) {
         if ($lines[$i] =~ /\A##[ \t]+Pipeline[ \t]*\z/i) { $start = $i; last; }
     }
-    return (undef, undef) unless defined $start;
+    return undef unless defined $start;
 
     # fix-batch MEDIUM-2: the heading stop-test is byte-level and
     # markdown-naive -- a shell comment/log line pasted into the section at
-    # column 0 (e.g. "# perl scripts/run-tests.pl", a plausible thing for a
-    # validation step to carry) looks exactly like the next heading and
-    # truncates the scan early, understating $total and (combined with the
-    # AT-6 max-based denominator) rendering an in-progress package as
-    # COMPLETE. Track a fenced-code-block toggle and suppress the heading
-    # stop-test while inside a fence.
-    my %checked;   # step number (string "1".."8") -> 1|0, first occurrence wins
+    # column 0 (e.g. "# perl scripts/run-tests.pl") looks exactly like the
+    # next heading and would truncate the scan early, understating the total
+    # and rendering an in-progress package as COMPLETE. Track a fenced-code-
+    # block toggle and suppress the heading stop-test while inside a fence.
+    # A checkbox lookalike INSIDE a fence is not a step either: bp-ledger.pl's
+    # tick-step and satisfaction rule both skip fenced lines, so such a line
+    # could never be ticked and would read as pending forever.
+    my (%claimed, @items);
     my $in_fence = 0;
     for (my $i = $start + 1; $i <= $#lines; $i++) {
         my $line = $lines[$i];
         if ($line =~ /\A[ \t]*(?:\x60\x60\x60|~~~)/) { $in_fence = !$in_fence; next; }
-        last if !$in_fence && $line =~ /\A#{1,6}[ \t]/;
+        next if $in_fence;
+        last if $line =~ /\A#{1,6}[ \t]/;
         next if length($line) > 1024;
-        if ($line =~ /\A[ \t]*-[ \t]*\[([ xX])\][ \t]*([1-8])\.[ \t]/) {
-            my ($mark, $num) = ($1, $2);
-            next if exists $checked{$num};
-            $checked{$num} = ($mark eq 'x' || $mark eq 'X') ? 1 : 0;
+        next unless $line =~ /\A[ \t]*-[ \t]*\[( |x|X|-|\Q$PIPE_EMDASH\E)\][ \t]*(\d{1,2})(?:-(\d{1,2}))?\.[ \t](.*)\z/s;
+        my ($mark, $lo, $hi, $text) = ($1, $2 + 0, (defined $3 ? $3 + 0 : undef), $4);
+        next if $lo < 1;
+        $hi = $lo if !defined($hi) || $hi == $lo;
+        next if $hi < $lo;
+        my @n = grep { !$claimed{$_} } ($lo .. $hi);
+        next unless @n;
+        $claimed{$_} = 1 for @n;
+
+        $text =~ s/\A[ \t]+//;
+        my $state;
+        if    ($mark eq ' ')                 { $state = 'todo'; }
+        elsif ($mark eq 'x' || $mark eq 'X') {
+            $state = 'done';
+            if ($text =~ /\A(.*?) \Q$PIPE_EMDASH\E (skipped|n\/a): (.*?\S)\s*\z/s) {
+                $state = $2 eq 'skipped' ? 'skipped' : 'na';
+            }
         }
+        else                                 { $state = 'na'; }
+
+        my $word;
+        if ($text =~ /\A(\S+)/) {
+            $word = lc $1;
+            $word =~ s/[^a-z0-9-]//g;
+            $word = undef unless length $word;
+        }
+        push @items, {
+            n     => [ @n ],
+            label => (@n == 1 ? "$n[0]" : "$n[0]-$n[-1]"),
+            word  => $word,
+            state => $state,
+        };
     }
+    return undef unless @items;
+    @items = sort { $a->{n}[0] <=> $b->{n}[0] } @items;
+    return \@items;
+}
 
-    my @seen_nums = map { $_ + 0 } keys %checked;
-    return (undef, undef) unless @seen_nums;
+# _pipeline_current(\@items) -> \%item | undef (private)
+#
+# The current step: the lowest-numbered item that is neither done, skipped
+# nor na (i.e. state 'todo'). undef when every item is settled.
+sub _pipeline_current {
+    my ($items) = @_;
+    return undef unless ref($items) eq 'ARRAY';
+    for my $it (@$items) { return $it if $it->{state} eq 'todo'; }
+    return undef;
+}
 
-    # fix-batch AT-6 (driver ruling): the denominator is the HIGHEST STEP
-    # NUMBER OBSERVED, not a count of parseable lines. The two diverge the
-    # moment any recognised line is skipped (over-length, a repeated number)
-    # while a HIGHER-numbered step is still present -- previously this mixed
-    # a step NUMBER (numerator) with a LINE COUNT (denominator), e.g. six
-    # steps pending against a denominator of seven in an eight-step pipeline.
-    my $total = $seen_nums[0];
-    for my $n (@seen_nums) { $total = $n if $n > $total; }
-
-    my @pending = sort { $a <=> $b } grep { !$checked{$_} } @seen_nums;
-    my $current = @pending ? $pending[0] : $total;
-    my $step = sprintf('%d/%d', $current, $total);
-    return ($step, \@pending);
+# _parse_pipeline($blob) -> ($step, $steps_pending) (private)
+#
+# 04-runstate-run-and-package-facts (spec S2.5): pure, takes the raw ledger
+# bytes, never touches the filesystem, never dies. Returns (undef, undef)
+# when $blob is undef/empty or when no checkbox line is recognised. Derived
+# from _scan_pipeline: $step is "N/M" where M is the highest step number
+# seen (fix-batch AT-6: the HIGHEST NUMBER, not a count of parsed lines, so
+# a guard-skipped line degrades the checked set rather than the denominator)
+# and N the current item's first number, or M when nothing is current.
+# $steps_pending is every step number covered by a 'todo' item, ascending
+# (a todo range 3-5 contributes 3, 4 and 5); [] when nothing is pending.
+sub _parse_pipeline {
+    my ($blob) = @_;
+    my $items = _scan_pipeline($blob);
+    return (undef, undef) unless $items;
+    my $total = 0;
+    for my $it (@$items) { for my $n (@{ $it->{n} }) { $total = $n if $n > $total; } }
+    my @pending = sort { $a <=> $b } map { @{ $_->{n} } } grep { $_->{state} eq 'todo' } @$items;
+    my $cur = _pipeline_current($items);
+    my $current = $cur ? $cur->{n}[0] : $total;
+    return (sprintf('%d/%d', $current, $total), \@pending);
 }
 
 # _parse_next_action($blob) -> Str|undef (private)
@@ -1105,7 +1189,7 @@ sub _parse_next_action {
 # strict and unchanged.
 sub _ledger_facts {
     my ($blueprint_dir, $pkg) = @_;
-    my %facts = (step => undef, steps_pending => undef, next_action => undef, step_word => undef);
+    my %facts = (step => undef, steps_pending => undef, next_action => undef, step_word => undef, pipeline => undef);
     return \%facts unless _safe_pkg_name($pkg);
     my $blob = _read_head("$blueprint_dir/packages/$pkg.md", $MAX_LEDGER_BYTES);
     return \%facts unless defined $blob && length $blob;
@@ -1116,6 +1200,11 @@ sub _ledger_facts {
     # package 01-run-blocks (spec S2.1): step_word, from the SAME head read --
     # no second file open.
     $facts{step_word}     = _pipeline_step_word($blob);
+    # The per-item checklist (bug 20261104-201500-ee4b), data only, for the
+    # planned per-package pipeline strip: one element per checkbox, ascending,
+    # each { n => [nums], label, word, state => done|todo|skipped|na }; undef
+    # when there is no parseable checklist. Fresh hashes from a fresh scan.
+    $facts{pipeline}      = _scan_pipeline($blob);
     return \%facts;
 }
 
@@ -1577,46 +1666,15 @@ sub _fm_status_from_blob {
 
 # _pipeline_step_word($blob) -> Str | undef (private, pinned name)
 #
-# Restates _parse_pipeline's own "## Pipeline" scan, but returns the WORD of
-# the lowest-numbered unchecked entry rather than an "N/M" fraction -- see
-# spec S2.1 "Pipeline step word". Never reuses _parse_pipeline itself (that
-# sub accepts only steps 1-8; this one accepts 1-99 per the spec's checkbox
-# regex).
+# The WORD of the current pipeline item (spec S2.1 "Pipeline step word"):
+# the lowest-numbered item that is neither done, skipped nor na, per
+# _scan_pipeline -- the same scan _parse_pipeline derives "N/M" from, so the
+# two always name the same step (bug 20261104-201500-ee4b). undef when there
+# is no checklist, nothing is current, or the word reduces to nothing.
 sub _pipeline_step_word {
     my ($blob) = @_;
-    return undef unless defined($blob) && length($blob);
-    my $stripped = $blob;
-    $stripped =~ s/\A\xEF\xBB\xBF//;
-    my @lines = split /\n/, $stripped, -1;
-    for my $l (@lines) { $l =~ s/\r\z//; }
-
-    my $start;
-    for my $i (0 .. $#lines) {
-        if ($lines[$i] =~ /\A##[ \t]+Pipeline[ \t]*\z/i) { $start = $i; last; }
-    }
-    return undef unless defined $start;
-
-    my %entry;   # num -> [checked?, word], first occurrence of each number wins
-    my $in_fence = 0;
-    for (my $i = $start + 1; $i <= $#lines; $i++) {
-        my $line = $lines[$i];
-        if ($line =~ /\A[ \t]*(?:\x60\x60\x60|~~~)/) { $in_fence = !$in_fence; next; }
-        last if !$in_fence && $line =~ /\A#{1,6}[ \t]/;
-        next if length($line) > 1024;
-        if ($line =~ /\A[ \t]*-[ \t]*\[([ xX])\][ \t]*(\d{1,2})\.[ \t]+(\S+)/) {
-            my ($mark, $num, $word) = ($1, $2, $3);
-            $num = 0 + $num;   # reviewer N3: "01." and "1." are one step, as statusline.pl reads it
-            next if exists $entry{$num};
-            $entry{$num} = [ ($mark eq 'x' || $mark eq 'X') ? 1 : 0, $word ];
-        }
-    }
-    my @nums = sort { $a <=> $b } keys %entry;
-    return undef unless @nums;
-    my ($lowest_unchecked) = grep { !$entry{$_}[0] } @nums;
-    return undef unless defined $lowest_unchecked;
-    my $word = lc($entry{$lowest_unchecked}[1]);
-    $word =~ s/[^a-z0-9-]//g;
-    return length($word) ? $word : undef;
+    my $cur = _pipeline_current(_scan_pipeline($blob));
+    return $cur ? $cur->{word} : undef;
 }
 
 # _link_resolve($project_root, $link, \%cache) -> \%r (private, pinned name)
