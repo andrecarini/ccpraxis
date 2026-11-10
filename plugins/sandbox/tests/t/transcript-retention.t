@@ -493,6 +493,18 @@ my $HOST_BASELINE = {
             'Bash(perl ~/.claude/ccpraxis/scripts/*)',
             'Bash(perl ~/.claude/ccpraxis/plugins/steward/scripts/*)',
             'Bash(bash ~/.claude/ccpraxis/plugins/steward/scripts/*)',
+            # DELIBERATE DECLARATION: commit f708b5b, approved by the operator on
+            # 2026-11-05 ("You have my permission, go ahead"). butler-continuity's
+            # own disarm (off, then off-confirm with the judge's OTP) and the
+            # break-glass file, the sanctioned exit for a tooling defect. The
+            # auto-mode classifier refused off-confirm as [Security Weaken] and
+            # trapped an armed session for over an hour. The disarm judge is the
+            # safeguard here. emergency-stop does not match (`X *` needs a word
+            # boundary) and stays classifier-visible. The Edit rule matches only
+            # *.json directly inside a .ccpraxis-local-data/butler-break-glass/ dir.
+            'Bash(butler-continuity off *)',
+            'Bash(butler-continuity off-confirm *)',
+            'Edit(//**/.ccpraxis-local-data/butler-break-glass/*.json)',
             # DELIBERATE DECLARATION: commit 29cd74c, approved by the operator on
             # 2026-09-26 ("sounds good to me, go ahead"). Routine read-only and
             # test commands, allowed outright so they never reach the auto-mode
