@@ -445,7 +445,9 @@ sub extract_sub_body {
     # it. Decide, tear down, then act.
     my $decide_at   = index($body, 'menu_choice');
     my $teardown_at = index($body, '$teardown->()');
-    my $spawn_at    = index($body, 'system(');
+    # The kill is a bounded run since bug 20261110-165535-d71b (no podman call
+    # before the session may hang forever); either spawn form is the marker.
+    my $spawn_at    = ($body =~ /(?:\bsystem|\b_bounded_run)\(/) ? $-[0] : -1;
     ok($decide_at >= 0 && $teardown_at > $decide_at,
        'E5 the teardown runs AFTER the decision (the screen needs the frame up)');
     ok($spawn_at > $teardown_at,

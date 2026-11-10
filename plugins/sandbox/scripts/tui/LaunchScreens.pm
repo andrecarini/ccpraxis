@@ -601,6 +601,26 @@ sub stage_end {
     return 1;
 }
 
+# STAGE_ELAPSED_AFTER -- seconds an ACTIVE stage runs before its row starts
+# showing how long it has been running (bug report 20261110-165535-d71b: a
+# wedged podman left "skills, plugins and MCP" looking exactly like a slow
+# step). Below it every healthy stage finishes before the figure would be
+# read, so the panel stays still; past it the elapsed time is the difference
+# between "slow" and "stuck". The figure is tui::DashboardScreen::fmt_duration's
+# -- the one duration format -- so it reads "<1m", then "1m", "2m" ...
+sub STAGE_ELAPSED_AFTER { return 10 }
+
+# stage_elapsed(\%stage, $now) -> seconds an active stage has run, or undef
+# when it is not active, has no start time, or $now is not a real clock
+# reading (the host's default now seam answers 0).
+sub stage_elapsed {
+    my ($s, $now) = @_;
+    return undef unless ref $s eq 'HASH' && _str($s->{state}) eq 'active';
+    return undef unless _is_num($s->{started}) && _is_num($now) && $now > 0;
+    my $e = $now - $s->{started};
+    return $e < 0 ? undef : $e;
+}
+
 # _output_min_cols($cols) -- the output panel's layout demand.
 #
 # The intent is fixed: the output tail always owns a FULL-WIDTH band row, at
@@ -698,6 +718,7 @@ sub progress_screen {
         $label_w = $w if $w > $label_w;
     }
 
+    my ($now) = _try(_seam($host, 'now', undef));
     my @stage_rows;
     for my $s (@stages) {
         next unless ref $s eq 'HASH';
@@ -708,10 +729,13 @@ sub progress_screen {
         my $label = _str($s->{label});
         my $pad   = $label_w - tui::Layout::display_width($label);
         $pad = 0 if $pad < 0;
+        my $el = stage_elapsed($s, $now);
+        my $suffix = (defined $el && $el >= STAGE_ELAPSED_AFTER())
+            ? '  ' . tui::DashboardScreen::fmt_duration($el) : '';
         push @stage_rows, [
             { text => $glyph . ' ',              role => $role },
             { text => $label . (' ' x $pad),     role => 'text.primary' },
-            { text => '  ' . $state,             role => $role },
+            { text => '  ' . $state . $suffix,   role => $role },
         ];
     }
 

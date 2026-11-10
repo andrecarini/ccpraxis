@@ -164,6 +164,7 @@ use PluginSync ();  # Fix 2: copy-model plugin-store reconcile (copy/prune/recon
 use PortAlloc ();         # fix-multiple-running-sandboxes: per-container port-block allocation
 use SandboxLock ();       # 04-build-race-lock: generalised mkdir lock + global build-race guard
 use ProjectSandbox ();    # claude-sandbox.json: a project's image layer + allowlisted run settings
+use BoundedRun ();        # bug 20261110-165535-d71b: every pre-dashboard podman call is bounded
 use JSON::PP ();          # parse backpack.json + write the approved install-set
 use Errno ();              # 04-run-panel-ledger-truth: %! (EPERM) for _pid_alive's kill(0,...) probe
 use File::Path qw(make_path);
@@ -1530,6 +1531,121 @@ sub _launch_assemble_key {
     return '';
 }
 
+# =====================================================================
+# Bounded podman calls (bug report 20261110-165535-d71b)
+# =====================================================================
+#
+# On 2026-11-10 the WSL VM under podman wedged and a bare-backtick
+# `podman image inspect` hung the launch forever at "skills, plugins and MCP:
+# pending", with nothing on screen to tell it from a slow build. Every podman
+# call from launch start until the dashboard is up now goes through
+# BoundedRun: quick queries get a wall clock, builds and installs an
+# inactivity watchdog (limits and their reasons live in BoundedRun::limits).
+#
+# A call that runs out of time FAILS THE STAGE it belongs to, through the same
+# _launch_fail + _fail_visibly path every other launch failure takes, with
+# BoundedRun::unresponsive_lines' message and remedy ladder. That is fatal
+# only while $LAUNCH_PODMAN_FATAL is set, i.e. before the dashboard stage:
+# the dashboard has its own degraded states ("container unreachable", [l]
+# relaunch), and a helper it shares with the launch (container_status,
+# _run_timed) just reports failure there instead of exiting.
+my $LAUNCH_PODMAN_FATAL    = 1;
+my $LAUNCH_WAIT_LAST_PAINT = 0;
+
+sub _is_podman_cmd {
+    my ($c) = @_;
+    return (defined $c && defined $PODMAN && $c eq $PODMAN) ? 1 : 0;
+}
+
+# _launch_wait_tick($elapsed) -- BoundedRun's on_tick. A stage that is waiting
+# on podman repaints nothing by itself, so without this the elapsed time the
+# stage row shows would freeze at whatever it said when the call began. At
+# most one repaint a second, and only while the launch frame is up.
+sub _launch_wait_tick {
+    my $now = time;
+    return 0 if $now == $LAUNCH_WAIT_LAST_PAINT;
+    $LAUNCH_WAIT_LAST_PAINT = $now;
+    return 0 unless $LAUNCH_HOST && ($LAUNCH_HOST->{mode} // '') eq 'tui' && $LAUNCH_HOST->{active};
+    return _launch_repaint();
+}
+
+# _launch_current_stage() -> the stage a failure belongs to: the active one,
+# else the next pending one (work between two stages belongs to the one it is
+# preparing), else 'preflight'.
+sub _launch_current_stage {
+    for my $want ('active', 'pending') {
+        for my $s (@{ $LAUNCH_STAGES || [] }) {
+            next unless ref $s eq 'HASH';
+            return $s->{id} if ($s->{state} // '') eq $want;
+        }
+    }
+    return 'preflight';
+}
+
+# _podman_unresponsive_fail(\%result, $cmd) -- never returns.
+sub _podman_unresponsive_fail {
+    my ($r, $cmd) = @_;
+    $LAUNCH_PODMAN_FATAL = 0;   # nothing on the way out may recurse into here
+    my $stage = _launch_current_stage();
+    my @lines = BoundedRun::unresponsive_lines(
+        cmd     => $cmd,
+        reason  => $r->{reason},
+        limit   => $r->{limit},
+        stage   => tui::LaunchScreens::STAGE_LABEL($stage),
+        windows => $WINDOWS_FAMILY ? 1 : 0);
+    log_ev('launch_failed', { reason => 'podman not responding', stage => $stage,
+                              cmd => BoundedRun::describe($cmd), bound => $r->{reason},
+                              limit => $r->{limit}, reaped => $r->{reaped} });
+    _launch_fail($stage, 'podman is not responding', undef);
+    _fail_visibly(@lines);
+    LaunchLog::close_log($LAUNCH_LOG);
+    SandboxLock::release_all();
+    reset_terminal();
+    exit 1;
+}
+
+# _bounded_run(kind => K, cmd => ..., %BoundedRun_opts) -> \%result, with $?
+# set from it. An explicit timeout/idle_timeout overrides the kind's default.
+sub _bounded_run {
+    my (%o) = @_;
+    my $kind = delete $o{kind};
+    my %lim  = BoundedRun::limits($kind, \%ENV);
+    my $r = BoundedRun::run(%lim, %o,
+                            windows => ($WINDOWS_FAMILY ? 1 : 0),
+                            on_tick => \&_launch_wait_tick);
+    if ($r->{timed_out}) {
+        log_ev('podman_timeout', { cmd => BoundedRun::describe($o{cmd}), bound => $r->{reason},
+                                   limit => $r->{limit}, reaped => $r->{reaped},
+                                   fatal => ($LAUNCH_PODMAN_FATAL ? 1 : 0) });
+        _podman_unresponsive_fail($r, $o{cmd}) if $LAUNCH_PODMAN_FATAL;
+    }
+    $? = $r->{rc};
+    return $r;
+}
+
+# _qx_bounded($shell_cmd, $kind) -> stdout, $? set. The drop-in for a podman
+# backtick: same shell string, same redirections, now with a bound.
+sub _qx_bounded {
+    my ($cmd, $kind) = @_;
+    my $r = _bounded_run(kind => (defined $kind ? $kind : 'query'), cmd => $cmd);
+    my $out = $r->{out};
+    $? = $r->{rc};
+    return $out;
+}
+
+# _preflight_podman_probe() -- ONE responsiveness probe, before anything else
+# touches podman, so a wedged VM fails at the first stage rather than wherever
+# the first unbounded call happened to be. `version` with a server field is
+# the cheapest call that must cross into the VM. Only a TIMEOUT fails here: a
+# quick "cannot connect" is a stopped machine, which the image probe below
+# already handles by starting it.
+sub _preflight_podman_probe {
+    my $r = _bounded_run(kind => 'probe',
+                         cmd  => [ $PODMAN, 'version', '--format', '{{.Server.Version}}' ]);
+    log_ev('podman_probe', { rc => ($r->{rc} >> 8), elapsed => sprintf('%.2f', $r->{elapsed} // 0) });
+    return $r;
+}
+
 # _capture_out_err(@cmd) -> ($rc, $stdout, $stderr)
 #
 # LIST FORM, never a shell string: exec'd directly, so there is no quoting to
@@ -1541,6 +1657,13 @@ sub _launch_assemble_key {
 sub _capture_out_err {
     my (@cmd) = @_;
     return (-1, '', 'no command given') unless @cmd;
+
+    # podman: bounded (bug 20261110-165535-d71b). The streams are still kept
+    # apart; BoundedRun captures each to its own file.
+    if (_is_podman_cmd($cmd[0])) {
+        my $r = _bounded_run(kind => BoundedRun::podman_kind(@cmd[1 .. $#cmd]), cmd => \@cmd);
+        return ($r->{rc}, $r->{out}, $r->{err});
+    }
 
     my ($err_fh, $err_path) = File::Temp::tempfile('ccpraxis-launch-XXXXXX', TMPDIR => 1, UNLINK => 0);
     close($err_fh) if $err_fh;
@@ -1875,10 +1998,31 @@ sub _container_sampler_release_global { eval { _container_sampler_stop($CONTAINE
 sub _tx_write    { my ($fh, $b) = @_; return 0 unless $fh; print {$fh} $b; return 1; }
 sub _tee_display { my ($b) = @_; print STDOUT $b; return 1; }
 
+#
+# A podman command is BOUNDED (bug 20261110-165535-d71b) and always captured:
+# its kind comes from BoundedRun::podman_kind unless a leading { kind => ... }
+# hashref names it -- the backpack install is an `exec` that must get the
+# inactivity watchdog, not the 180 s wall clock an `exec touch` gets.
 sub _tee_system {
+    my $opt = (ref $_[0] eq 'HASH') ? shift : {};
     my @cmd = @_;
     my $host_active = ($LAUNCH_HOST && $LAUNCH_HOST->{mode} eq 'tui' && $LAUNCH_HOST->{active}) ? 1 : 0;
     my $has_tx = $TRANSCRIPT ? 1 : 0;
+    if (@cmd && _is_podman_cmd($cmd[0])) {
+        my $tx = $TRANSCRIPT;
+        my $tx_sink = sub { _tx_write($tx, $_[0]) };
+        my $display_sink = $host_active
+            ? sub { tui::LaunchScreens::stream_line($LAUNCH_HOST, $_[0]) }
+            : \&_tee_display;
+        my $r = _bounded_run(
+            kind      => (defined $opt->{kind} ? $opt->{kind} : BoundedRun::podman_kind(@cmd[1 .. $#cmd])),
+            cmd       => \@cmd,
+            merge     => 1,
+            on_output => sub { tui::LaunchScreens::fanout([ $tx_sink, $display_sink ], $_[0]) });
+        # Spawn failure (no fork) -> the old uncaptured run, as below.
+        return system(@cmd) if $r->{rc} == -1 && !defined $r->{pid};
+        return $r->{rc};
+    }
     # With the frame up we must capture even when there is no transcript: a
     # child with inherited stdio paints straight over it.
     return system(@cmd) unless tui::LaunchScreens::tee_should_fork($host_active, $has_tx);
@@ -1967,7 +2111,7 @@ sub ensure_ccpraxis_data_dir {
                       substr(md5_of_string($PROJECT_PATH), 0, 8));
             }
             if (_container_exists($name)) {
-                my $st = `$PODMAN inspect --format '{{.State.Status}}' "$name" 2>/dev/null`;
+                my $st = _qx_bounded(qq{$PODMAN inspect --format '{{.State.Status}}' "$name" 2>/dev/null});
                 chomp $st if defined $st;
                 $st = '' unless defined $st;
                 if ($st eq 'running') {
@@ -1980,7 +2124,7 @@ sub ensure_ccpraxis_data_dir {
                 # data tree (the thing we're about to move) is untouched, and
                 # the next launch recreates the container against the new path.
                 print _c_step("Reaping stale container holding the old data dir: $name ($st)"), "\n";
-                system($PODMAN, 'rm', '-f', $name);
+                _tee_system($PODMAN, 'rm', '-f', $name);
                 log_ev('migrate_reap_container', { container => $name, state => $st });
             }
         }
@@ -2111,6 +2255,7 @@ sub _rmtree {
 # ever being delivered.
 sub _teardown_and_exit {
     my ($sig_label, $code) = @_;
+    eval { BoundedRun::kill_active() };   # a Ctrl-C mid-podman-call leaves no child behind
     tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
     _stderr_capture_drain();
     log_ev('signal', { sig => $sig_label });
@@ -2133,7 +2278,7 @@ $SIG{TERM} = sub { _teardown_and_exit('TERM', 143) };
 # release, sampler release, lock release), which is the entry point for H2
 # step 3 (owner dies without ever running _resources_sampler_release_global).
 $SIG{HUP}  = $SIG{TERM};
-END { tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); _keepawake_release_global(); _resources_sampler_release_global(); _spend_sampler_release_global(); _container_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all() }
+END { eval { BoundedRun::kill_active() }; tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST; _stderr_capture_drain(); _keepawake_release_global(); _resources_sampler_release_global(); _spend_sampler_release_global(); _container_sampler_release_global(); LaunchLog::close_log($LAUNCH_LOG); _close_transcript(); SandboxLock::release_all() }
 
 SandboxLock::acquire($LOCK_DIR, windows => $WINDOWS_FAMILY) or do {
     print STDERR "ERROR: another claude-sandbox is doing setup for this project (lock held > 10s at $LOCK_DIR).\n";
@@ -2187,12 +2332,21 @@ if ($LAUNCH_MODE eq 'tui') {
         # identical either way -- a screen must not have two shapes.
         heartbeat => sub { _launch_heartbeat_tick() },
         render    => \&_launch_render_frame,
+        # The clock the stage rows read their elapsed time from.
+        now       => sub { time },
     );
     $LAUNCH_HOST->{stages} = $LAUNCH_STAGES;
     tui::LaunchScreens::host_enter($LAUNCH_HOST);
-    _launch_stage_begin('preflight');
-    _launch_stage_end('preflight', 'ok');
 }
+
+# PREFLIGHT IS REAL WORK NOW (bug 20261110-165535-d71b). It used to begin and
+# end on consecutive lines with nothing between them, so a wedged podman was
+# first met by the unbounded image probe further down, after "preflight
+# checks ok" had already been painted. The stage now spans the podman
+# responsiveness probe here and the image/machine probe below; it ends after
+# that block. Begun in plain mode too, so a failure there is attributed to it.
+_launch_stage_begin('preflight');
+_preflight_podman_probe();
 
 # B1: open the per-launch log now that the lock is held. Best-effort — a failure
 # leaves $LAUNCH_LOG undef and every log_ev() becomes a no-op (the launch still
@@ -2470,13 +2624,11 @@ sub _ensure_machine_ready {
 my ($PODMAN_HOST_MEM, $PODMAN_MEM_CONTROLLER);
 sub _podman_host_mem_bytes {
     return $PODMAN_MEM_CONTROLLER ? $PODMAN_HOST_MEM : undef if defined $PODMAN_HOST_MEM;
-    my $out = '';
-    if (open my $fh, '-|', $PODMAN, 'info', '--format',
-            '{{.Host.MemTotal}} {{range .Host.CgroupControllers}}{{.}},{{end}}') {
-        local $/;
-        $out = <$fh> // '';
-        close $fh;
-    }
+    # _capture_out_err, not an open-pipe: it is bounded for podman (bug
+    # 20261110-165535-d71b), and podman's stderr no longer lands on the frame.
+    my (undef, $out) = _capture_out_err($PODMAN, 'info', '--format',
+        '{{.Host.MemTotal}} {{range .Host.CgroupControllers}}{{.}},{{end}}');
+    $out = '' unless defined $out;
     my ($mem, $ctl) = $out =~ /\A\s*(\d+)\s*(\S*)/;
     $PODMAN_HOST_MEM       = $mem // 0;
     $PODMAN_MEM_CONTROLLER = (defined $ctl && $ctl =~ /(?:\A|,)memory,/) ? 1 : 0;
@@ -2559,13 +2711,10 @@ sub ensure_project_image {
     my ($spec, $force, $container_name) = @_;
     return $IMAGE_LATEST unless $spec && $spec->{image};
     my $base_id = do {
-        open my $fh, '-|', $PODMAN, 'image', 'inspect', '--format', '{{.Id}}', $IMAGE_LATEST
-            or die "cannot run $PODMAN: $!\n";
-        local $/;
-        my $out = <$fh> // '';
-        close $fh;
+        my ($rc, $out) = _capture_out_err($PODMAN, 'image', 'inspect', '--format', '{{.Id}}', $IMAGE_LATEST);
+        $out = '' unless defined $out;
         $out =~ s/\s+\z//;
-        $? == 0 ? $out : '';
+        $rc == 0 ? $out : '';
     };
     unless (length $base_id) {
         _launch_fail('image', 'shared image missing before the project layer', 1);
@@ -2578,14 +2727,7 @@ sub ensure_project_image {
     my $hash = ProjectSandbox::image_hash($PROJECT_PATH, $spec, $base_id);
     my $tag  = ProjectSandbox::image_tag($container_name, $hash);
     # Quiet existence probe: `image inspect` prints the whole image JSON on success.
-    my $have;
-    {
-        open my $null, '>', File::Spec->devnull;
-        open my $save_out, '>&', \*STDOUT; open my $save_err, '>&', \*STDERR;
-        open STDOUT, '>&', $null; open STDERR, '>&', $null;
-        $have = system($PODMAN, 'image', 'inspect', $tag) == 0;
-        open STDOUT, '>&', $save_out; open STDERR, '>&', $save_err;
-    }
+    my $have = do { my ($rc) = _capture_out_err($PODMAN, 'image', 'inspect', $tag); $rc == 0 };
     if ($have && !$force) {
         log_ev('project_image_reuse', { tag => $tag });
         return $tag;
@@ -2696,7 +2838,7 @@ my $IMAGE_EXISTS;
     File::Path::make_path(dirname($build_lock));
     my $got_build_lock = SandboxLock::acquire($build_lock, timeout => 600, windows => $WINDOWS_FAMILY);
     # fail-open: proceed even if !$got_build_lock
-    my $probe = `$PODMAN image inspect $IMAGE_LATEST 2>&1`;
+    my $probe = _qx_bounded(qq{$PODMAN image inspect $IMAGE_LATEST 2>&1});
     $IMAGE_EXISTS = ($? == 0) ? 1 : 0;
     SandboxLock::release($build_lock);
 
@@ -2728,10 +2870,12 @@ my $IMAGE_EXISTS;
         }
         # Reachable now -- re-probe, since the earlier answer was about a dead
         # socket rather than about the image.
-        `$PODMAN image inspect $IMAGE_LATEST 2>&1`;
+        _qx_bounded(qq{$PODMAN image inspect $IMAGE_LATEST 2>&1});
         $IMAGE_EXISTS = ($? == 0) ? 1 : 0;
     }
 }
+# Preflight began before the podman probe (see _preflight_podman_probe's call).
+_launch_stage_end('preflight', 'ok');
 
 # =====================================================================
 # Container name (generate + persist)
@@ -2773,7 +2917,7 @@ my $CONTAINER_NAME;
 {
     my $state = '';
     if (_container_exists($CONTAINER_NAME)) {
-        $state = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
+        $state = _qx_bounded(qq{$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null});
         chomp $state if defined $state;
         $state //= '';
     }
@@ -3272,7 +3416,7 @@ sub _host_only_mask_signature {
 # document to stdout).
 sub _container_exists {
     my $name = shift;
-    `$PODMAN inspect "$name" 2>&1`;
+    _qx_bounded(qq{$PODMAN inspect "$name" 2>&1});
     return $? == 0;
 }
 
@@ -3306,7 +3450,7 @@ sub container_config_shape_violations {
         . q{{{end}}{{range .Config.Env}}ENV {{.}}}
         . qq{\n}
         . q{{{end}}};
-    my $out = `$PODMAN inspect --format '$format' "$name" 2>/dev/null`;
+    my $out = _qx_bounded(qq{$PODMAN inspect --format '$format' "$name" 2>/dev/null});
     return () if $? != 0;
     return () unless defined $out && length $out;
 
@@ -3330,7 +3474,7 @@ sub enforce_container_config_shape {
     return unless @violations;
 
     my @codes = map { $_->{code} } @violations;
-    my $st = `$PODMAN inspect --format '{{.State.Status}}' "$name" 2>/dev/null`;
+    my $st = _qx_bounded(qq{$PODMAN inspect --format '{{.State.Status}}' "$name" 2>/dev/null});
     my $st_ok = ($? == 0);
     chomp $st if defined $st;
     $st = '' unless defined $st;
@@ -3391,7 +3535,7 @@ sub _enumerate_inuse_host_ports {
     # would MISS them and their block would be handed out again -> collision.
     # Name-matching catches them regardless of image; over-matching only wastes a
     # block (harmless, Decision #4), under-matching collides.
-    my $names_raw = `$PODMAN ps -a --format "{{.Names}}" 2>/dev/null`;
+    my $names_raw = _qx_bounded(qq{$PODMAN ps -a --format "{{.Names}}" 2>/dev/null});
     return () unless defined $names_raw && length $names_raw;
 
     my @host_ports;
@@ -3408,7 +3552,7 @@ sub _enumerate_inuse_host_ports {
         # which Decision #5 then cannot fix. .HostConfig.PortBindings is the
         # persisted -p mapping and survives stop. ($p/$c are Go-template vars —
         # backslash-escaped so Perl does not interpolate them.)
-        my $ports_raw = `$PODMAN inspect --format '{{range \$p,\$c := .HostConfig.PortBindings}}{{range \$c}}{{.HostPort}} {{end}}{{end}}' "$name" 2>/dev/null`;
+        my $ports_raw = _qx_bounded(qq{$PODMAN inspect --format '{{range \$p,\$c := .HostConfig.PortBindings}}{{range \$c}}{{.HostPort}} {{end}}{{end}}' "$name" 2>/dev/null});
         next unless defined $ports_raw;
         push @host_ports, map { $_ + 0 } ($ports_raw =~ /(\d+)/g);
     }
@@ -3553,7 +3697,7 @@ my $do_rebuild = $PLAN->{rebuild};
         # concurrent launcher may have just built it, and a second identical
         # build helps nobody. An explicit rebuild always builds -- that is what
         # was asked for.
-        my $still_missing = do { `$PODMAN image inspect $IMAGE_LATEST 2>&1`; $? != 0 };
+        my $still_missing = do { _qx_bounded(qq{$PODMAN image inspect $IMAGE_LATEST 2>&1}); $? != 0 };
         if ($do_rebuild || $still_missing) {
             _launch_stage_begin('image');
             build_image();
@@ -4375,10 +4519,10 @@ if (-f "$CLAUDE_DATA/git-ssh-command.sh") {
 # user-facing links. Captured at create-time; goes stale only if WSL
 # restarts before the user re-launches.
 if ($WINDOWS_FAMILY && $PODMAN =~ /podman/i) {
-    my $machine = `$PODMAN machine inspect --format "{{.Name}}" 2>/dev/null`;
+    my $machine = _qx_bounded(qq{$PODMAN machine inspect --format "{{.Name}}" 2>/dev/null});
     chomp $machine;
     $machine = 'podman-machine-default' unless $machine;
-    my $ip = `wsl -d $machine -- sh -c "ip -4 addr | grep -oE 'inet [0-9.]+' | grep -v '127.0.0.1' | head -1 | cut -d' ' -f2" 2>/dev/null`;
+    my $ip = _qx_bounded(qq{wsl -d $machine -- sh -c "ip -4 addr | grep -oE 'inet [0-9.]+' | grep -v '127.0.0.1' | head -1 | cut -d' ' -f2" 2>/dev/null});
     chomp $ip;
     push @EXTRA_ENV, '-e', "SANDBOX_HOST_IP=$ip" if $ip =~ /^\d+\.\d+\.\d+\.\d+$/;
 }
@@ -4929,18 +5073,18 @@ sub ensure_git_credential_helper {
 # fine here.)
 sub find_orphan_claudes {
     return () unless _container_exists($CONTAINER_NAME);
-    my $state = `$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null`;
+    my $state = _qx_bounded(qq{$PODMAN inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null});
     chomp $state if defined $state;
     return () unless defined $state && $state eq 'running';
 
     # Gather (pid, rchar, etime_seconds) for each claude in container.
-    my $listing = `$PODMAN exec "$CONTAINER_NAME" bash -c '
+    my $listing = _qx_bounded(qq{$PODMAN exec "$CONTAINER_NAME" bash -c '
         for pid in \$(pgrep -x claude 2>/dev/null); do
             rchar=\$(awk "/^rchar:/{print \\\$2}" /proc/\$pid/io 2>/dev/null)
             etime=\$(ps -o etimes= -p \$pid 2>/dev/null | tr -d " ")
             echo "\$pid \$rchar \$etime"
         done
-    ' 2>/dev/null`;
+    ' 2>/dev/null});
     my @candidates;
     for my $line (split /\n/, ($listing // '')) {
         my ($pid, $rchar, $etime) = split /\s+/, $line;
@@ -4955,7 +5099,7 @@ sub find_orphan_claudes {
     sleep 2;
     my @orphans;
     for my $cand (@candidates) {
-        my $now = `$PODMAN exec "$CONTAINER_NAME" sh -c "awk '/^rchar:/{print \\\$2}' /proc/$cand->{pid}/io 2>/dev/null"`;
+        my $now = _qx_bounded(qq{$PODMAN exec "$CONTAINER_NAME" sh -c "awk '/^rchar:/{print \\\$2}' /proc/$cand->{pid}/io 2>/dev/null"});
         chomp $now;
         if (defined $now && length $now && $now eq $cand->{rchar}) {
             push @orphans, $cand->{pid};
@@ -5019,7 +5163,7 @@ sub kill_orphan_claudes_if_user_confirms {
         return;
     }
     for my $pid (@orphans) {
-        system($PODMAN, 'exec', $CONTAINER_NAME, 'kill', '-9', $pid);
+        _bounded_run(kind => 'mutate', cmd => [$PODMAN, 'exec', $CONTAINER_NAME, 'kill', '-9', $pid]);
     }
     print _c_ok("Killed orphan claude(s)."), "\n\n";
 }
@@ -5060,7 +5204,7 @@ sub container_status {
     return '' unless defined $name && length $name;
     my $cmd = join(' ', map { _shell_quote($_) }
                         ($PODMAN, 'inspect', '--format', '{{.State.Status}}', $name));
-    my $s = `$cmd 2>/dev/null`;
+    my $s = _qx_bounded("$cmd 2>/dev/null");
     chomp $s if defined $s;
     return defined $s ? $s : '';
 }
@@ -5405,7 +5549,7 @@ if (! _container_exists($CONTAINER_NAME)) {
             for my $path (@stray) {
                 _rmtree($path);
             }
-            system($PODMAN, 'rm', '-f', $CONTAINER_NAME);
+            _bounded_run(kind => 'mutate', cmd => [$PODMAN, 'rm', '-f', $CONTAINER_NAME]);
             SandboxLock::release($LOCK_DIR);
             reset_terminal();
             exit 1;
@@ -5566,7 +5710,7 @@ my $port_in_use = sub {
     my ($status) = @_;
     return 0 if $status == 0;
     return $_s03_port_in_use_cache{$status} if exists $_s03_port_in_use_cache{$status};
-    my $out = `$PODMAN start "$CONTAINER_NAME" 2>&1`;
+    my $out = _qx_bounded(qq{$PODMAN start "$CONTAINER_NAME" 2>&1}, 'mutate');
     my $r = (defined $out
         && $out =~ /EADDRINUSE|address already in use|port is already allocated|already in use/i) ? 1 : 0;
     $_s03_port_in_use_cache{$status} = $r;
@@ -5685,15 +5829,15 @@ my $_s03_probe_state = sub {
     my $container_state = (defined $raw && length $raw) ? lc($raw) : 'unknown';
     my $image_present = 1;
     if ($container_state eq 'exited') {
-        my $img = `$PODMAN inspect --format '{{.Image}}' "$CONTAINER_NAME" 2>/dev/null`;
+        my $img = _qx_bounded(qq{$PODMAN inspect --format '{{.Image}}' "$CONTAINER_NAME" 2>/dev/null});
         chomp $img if defined $img;
         $image_present = (defined $img && length $img
-            && system("$PODMAN image inspect \"$img\" >/dev/null 2>&1") == 0) ? 1 : 0;
+            && do { _qx_bounded("$PODMAN image inspect \"$img\" >/dev/null 2>&1"); $? } == 0) ? 1 : 0;
     }
     my $exec_probe_ok = 1;
     if ($container_state eq 'running') {
-        my $bash_rc = system("$PODMAN exec \"$CONTAINER_NAME\" /bin/bash -c 'exit 0' >/dev/null 2>&1");
-        my $curl_rc = system("$PODMAN exec \"$CONTAINER_NAME\" curl --version >/dev/null 2>&1");
+        my $bash_rc = do { _qx_bounded("$PODMAN exec \"$CONTAINER_NAME\" /bin/bash -c 'exit 0' >/dev/null 2>&1", 'mutate'); $? };
+        my $curl_rc = do { _qx_bounded("$PODMAN exec \"$CONTAINER_NAME\" curl --version >/dev/null 2>&1", 'mutate'); $? };
         $exec_probe_ok = ($bash_rc == 0 && $curl_rc == 0) ? 1 : 0;
     }
     return { machine_ok => $machine_ok, container_state => $container_state,
@@ -6084,7 +6228,9 @@ echo "Installing backpack items..."
 perl /root/.claude/backpack.pl install /root/.claude/.backpack-install-set.json --declared /root/.claude/backpack.json
 BASH
             _tx("\n--- backpack install (approved subset: @{[scalar @BACKPACK_APPROVED_ITEMS]} items) ---\n");
-            my $install_rc = _tee_system($PODMAN, 'exec', $CONTAINER_NAME,
+            # { kind => 'stream' }: arbitrary installs, healthy for as long as they
+            # keep printing -- the inactivity watchdog, never the exec wall clock.
+            my $install_rc = _tee_system({ kind => 'stream' }, $PODMAN, 'exec', $CONTAINER_NAME,
                 'bash', '-c', $install_script);
             unlink $set_host;   # transient; don't leave the subset lying in claude-home
             # backpack.pl's exit code distinguishes "an item's install/verify
@@ -6119,6 +6265,9 @@ BASH
 else {
     _launch_stage_end('install', 'skipped');
 }
+# From here a podman timeout is the dashboard's to show (its own degraded
+# states), no longer a launch failure -- see _bounded_run.
+$LAUNCH_PODMAN_FATAL = 0;
 _launch_stage_begin('dashboard');
 
 # =====================================================================
@@ -6155,6 +6304,10 @@ enter_dashboard();   # never returns (loops until the user exits)
 # reap window starts fresh, then run the dashboard (raw-ANSI TUI when the
 # terminal supports it, else the plain heartbeat loop).
 sub enter_dashboard {
+    # Every manager path funnels through here, including the bare-attach one
+    # that never reaches the 'dashboard' stage: past this point a podman
+    # timeout is a degraded dashboard state, not a launch failure.
+    $LAUNCH_PODMAN_FATAL = 0;
     log_ev('manager_ready', { container => $CONTAINER_NAME });
     # Self-heal .claude.json's onboarding bypass on EVERY manager entry (fresh
     # create, start-of-stopped, or bare-attach to an already-running container).
@@ -6933,24 +7086,24 @@ sub enter_dashboard {
     exit($rc // 0);
 }
 
-# _run_timed($cmd, $secs) — backtick $cmd but bound it to a wall-clock
-# ceiling so a wedged podman can't hang the caller forever. Best-effort:
-# alarm()/SIGALRM interrupts our wait on POSIX, but (like the resource
-# probes documented at :3348-3352) podman's CLI has no timeout flag of its
-# own and a blocking backtick isn't portably interruptible, so on platforms
-# where SIGALRM doesn't break a pending backtick (e.g. native Windows perl)
-# this degrades to a no-op bound -- the same accepted gap as those probes,
-# not a new one. Returns whatever the backtick produced, or undef on timeout.
+# _run_timed($cmd, $secs) -- backtick $cmd but bound it to a wall-clock
+# ceiling so a wedged podman can't hang the caller forever. Returns whatever
+# the command printed, or undef on timeout.
+#
+# This WAS alarm()/SIGALRM around a backtick, documented as degrading to "a
+# no-op bound" where SIGALRM cannot break a pending backtick -- which includes
+# this host. It now runs through BoundedRun (bug 20261110-165535-d71b), which
+# polls a child it can actually kill, so the bound holds on Windows too. Before
+# the dashboard a timeout here fails the launch stage like any other podman
+# timeout; from the dashboard it still just returns undef.
 sub _run_timed {
     my ($cmd, $secs) = @_;
-    my $out;
-    eval {
-        local $SIG{ALRM} = sub { die "timeout\n" };
-        alarm($secs);
-        $out = `$cmd`;
-    };
-    alarm(0);
-    return $@ ? undef : $out;
+    my $r = _bounded_run(kind => 'query', cmd => $cmd,
+                         timeout => ((defined $secs && $secs =~ /\A\d+\z/ && $secs > 0) ? $secs : 30));
+    return undef if $r->{timed_out};
+    my $out = $r->{out};
+    $? = $r->{rc};
+    return $out;
 }
 
 # _machine_state() -> the podman-machine reading, as one of the six words
