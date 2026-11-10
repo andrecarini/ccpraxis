@@ -6735,16 +6735,44 @@ sub run {
                         _log($log, 'ledger_status_lost', { package => $pkg, target => 'pending',
                               reason => ($BpWrite::LAST_RESULT && $BpWrite::LAST_RESULT->{reason}) || '?' });
                     }
+                    # A park set by a coordinator that is STILL ALIVE is escalated
+                    # once per (coordinator pid, status). Its process may outlive
+                    # the park by an hour (acxpraxis-step-2 03, 2026-11-05: ended its
+                    # turn waiting on a background job). The resolver's answer to a
+                    # self-park is `relaunch`, which bp-resolve.pl rightly finds moot
+                    # while that coordinator lives, and archives -- leaving the
+                    # package awaiting a human with nothing queued, so the next tick
+                    # filed again: 23 paid resolver judges in 51 minutes, 22 moot
+                    # with why=coordinator-live. Filing again is right only once
+                    # something that matters changed: the coordinator exits (the
+                    # park is now a real stop, and a relaunch is no longer moot), a
+                    # different coordinator holds the package, or the status moves.
+                    # Kept in the registry, like chronic_scoping_filed, so an
+                    # orchestrator restart does not re-file either.
+                    my $cpid = $pid->{$pkg};
+                    my $coord_live = (defined $cpid && length $cpid && $pid_alive->($cpid)) ? 1 : 0;
+                    if ($coord_live) {
+                        my $prev = ref $reg->{$pkg} eq 'HASH' ? $reg->{$pkg}{orphan_escalated} : undef;
+                        next if ref $prev eq 'HASH'
+                             && ($prev->{pid} // '') eq $cpid && ($prev->{status} // '') eq $st;
+                    }
                     my $next = ledger_next_action($bpdir, $pkg);
                     _log($log, 'orphan_escalation', { package => $pkg, status => $st,
                         detail => 'awaiting-human with no queued decision (coordinator self-park) — escalating' });
-                    queue_needs_you($runs, {
+                    my $filed = queue_needs_you($runs, {
                         package => $pkg, blueprint => $bp, kind => 'stuck-package', category => 'unclassified',
                         question => "Package '$pkg' was set to '$st' by its coordinator with no escalation filed for you. "
                                   . "Read its '## Next action' (it may address an instruction to the orchestrator, e.g. a write_set change), then relaunch with guidance / accept / drop.",
                         context  => ($next // "orphaned '$st' status — no escalation existed; filed by the orchestrator so the run doesn't go silent"),
                         created_at => $now,
                     });
+                    # Only a record that reached disk holds further filing; a failed
+                    # write is retried next tick as before.
+                    if ($filed && $coord_live) {
+                        my $mark = { pid => "$cpid", status => $st };
+                        _upd_pkg($runs, $log, $pkg, { orphan_escalated => $mark });
+                        $reg->{$pkg}{orphan_escalated} = $mark if ref $reg->{$pkg} eq 'HASH';
+                    }
                 }
             }
 
