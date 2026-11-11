@@ -2780,6 +2780,12 @@ sub _multiline_blocks {
     return 0 unless ref($state) eq 'HASH';
     return 0 unless ref($state->{runs}) eq 'ARRAY';
     my $now = _tree_now($state);
+    # Two or more blocks are drawn with a blank row between them (2026-11-11),
+    # so the panel is taller than its blueprint count even when every block is
+    # one line -- and an unbudgeted panel then pushed its own "+N more
+    # blueprints" line off the bottom (claude-code-panel.t Behavior14). The
+    # budget is what drops the blank rows first.
+    return 1 if (grep { ref($_) eq 'HASH' } @{ $state->{runs} }) >= 2;
     for my $r (@{ $state->{runs} }) {
         next unless ref($r) eq 'HASH';
         my $block = _run_block($r, $now, undef);
@@ -4269,6 +4275,28 @@ sub screen {
     };
 }
 
+# compose_state(\%state, $rows, $cols) -> \%state: the state compose() really
+# draws, with the two height-derived budgets below filled in. PUBLIC, so the
+# Activity-capacity predictor (Dashboard::_fixed_region_height) lays out the
+# same Blueprints body the frame does -- with the budget a short panel drops
+# its blank rows between blocks, and a predictor that measured the unbudgeted
+# body over-counted the fixed region (wrap-width-regressions.t, 2026-11-11).
+sub compose_state {
+    my ($state, $rows, $cols) = @_;
+    return $state unless ref($state) eq 'HASH';
+    if (!defined $state->{blueprint_rows_max}) {
+        my $h = (defined($rows) && !ref($rows) && $rows =~ /\A\d+\z/) ? $rows : 0;
+        my $budget = int($h / 3);
+        $budget = 3 if $budget < 3;
+        $state = { %$state, blueprint_rows_max => $budget };
+    }
+    if (!defined($state->{blueprint_body_rows}) && _multiline_blocks($state)) {
+        my $cap = _blueprints_capacity($state, $rows, $cols);
+        $state = { %$state, blueprint_body_rows => $cap } if defined $cap;
+    }
+    return $state;
+}
+
 sub compose {
     my ($state, $rows, $cols) = @_;
 
@@ -4284,23 +4312,8 @@ sub compose {
     # empty below them), while a short terminal still gets a Blueprints panel
     # that cannot crowd out everything beneath it. A caller that has already
     # set blueprint_rows_max wins -- this only supplies a default.
-    if (ref($state) eq 'HASH' && !defined $state->{blueprint_rows_max}) {
-        my $h = (defined($rows) && !ref($rows) && $rows =~ /\A\d+\z/) ? $rows : 0;
-        my $budget = int($h / 3);
-        $budget = 3 if $budget < 3;
-        $state = { %$state, blueprint_rows_max => $budget };
-    }
-
-    # Derive the Blueprints panel's ROW budget (package 07, spec S2.7) --
-    # distinct from blueprint_rows_max above, which caps RUNS, never rows
-    # (t/79 Behavior13/15 pin that meaning; it is not reopened here). A
-    # caller-supplied blueprint_body_rows wins, exactly as blueprint_rows_max
-    # does. No probe is composed when _multiline_blocks is false -- that is
-    # the common case (no running run with a tree) and it must cost nothing.
-    if (ref($state) eq 'HASH' && !defined($state->{blueprint_body_rows}) && _multiline_blocks($state)) {
-        my $cap = _blueprints_capacity($state, $rows, $cols);
-        $state = { %$state, blueprint_body_rows => $cap } if defined $cap;
-    }
+    # (both budgets: compose_state, above, shared with the Activity predictor)
+    $state = compose_state($state, $rows, $cols);
 
     # BANNERS NO LONGER PARTICIPATE IN LAYOUT AT ALL.
     #

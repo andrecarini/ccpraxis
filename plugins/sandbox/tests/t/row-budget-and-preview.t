@@ -1354,7 +1354,10 @@ for my $f (@AC1_FIXTURES) {
 # --- AC23 --------------------------------------------------------------
 {
     my $tree_state = base_state(runs => [ tree_run_1pkg() ]);
-    my $no_tree_state = base_state(runs => runs_n(3));
+    # 2026-11-11: ONE single-line run. Two or more blocks now have a blank row
+    # between them, which makes the panel multi-row (and budgeted) by design,
+    # so the "no multi-row body -> no probe" case needs a single block.
+    my $no_tree_state = base_state(runs => runs_n(1));
     my @cases = (
         [ 'rows=0',      $tree_state, 0, 120 ],
         [ 'rows=-1',     $tree_state, -1, 120 ],

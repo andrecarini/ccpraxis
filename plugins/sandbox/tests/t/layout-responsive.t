@@ -174,7 +174,10 @@ my $ac56_R = { title => 'R', lines => [ 'r1' ] };
         "AC-7: compose_frame(24,$below) -- every row is exactly $below display columns");
     my $both_below = grep { $_->{text} =~ /$RULE_FILL_RE Run / && $_->{text} =~ /$RULE_FILL_RE Blueprints / } @$fbelow;
     is($both_below, 0, "AC-7: 24x$below -- no single row contains BOTH \"-- Run\" and \"-- Blueprints\" (still stacked)");
-    my ($run_below) = grep { $_->{text} =~ /^$RULE_FILL_RE Run (?:$RULE_FILL_RE)+$/ } @$fbelow;
+    # 2026-11-11: the Run title carries its freshness ("Run . <1m"), so an
+    # optional "<dot> <age> " suffix sits between the name and the fill.
+    my $dot_re = quotemeta(Theme::glyph('sep.dot') // '');
+    my ($run_below) = grep { $_->{text} =~ /^$RULE_FILL_RE Run (?:$dot_re [^ ]+(?: [^ ]+)? )?(?:$RULE_FILL_RE)+$/ } @$fbelow;
     ok($run_below, "AC-7: 24x$below -- some row matches /^-- Run <rule.h fill>\$/");
     is(Dashboard::display_width($run_below->{text}), $below, "AC-7: that row is exactly $below display columns") if $run_below;
 

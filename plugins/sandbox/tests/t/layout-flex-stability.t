@@ -75,7 +75,9 @@ sub geometry {
         # it is continuous with its own filler. Both ends of the match are
         # therefore U+2500. Written as the escape rather than a literal because
         # this file must not `use utf8`.
-        while ($t =~ /\x{2500}\s+([A-Za-z][A-Za-z ]*?)\s+\x{2500}/g) { push @out, "$1\@$i" }
+        # A title may carry a suffix after a middle dot (2026-11-11: Run and
+        # Resources show their freshness there, "Resources . sampling...").
+        while ($t =~ /\x{2500}\s+([A-Za-z][A-Za-z ]*?)(?:\s+\x{b7}[^\x{2500}]*?)?\s+\x{2500}/g) { push @out, "$1\@$i" }
     }
     return join(' | ', @out);
 }
@@ -195,8 +197,10 @@ sub blank_tail {
 
     my $f = Dashboard::compose_frame(state(), 40, 110);
     my $txt = join("\n", map { plain($_) } @$f);
-    like($txt, qr/sampling - no reading yet/,
-        'and Resources SAYS it has no reading rather than silently not being there');
+    # 2026-11-11: the no-reading state moved from a body row into the title.
+    my $dot = Theme::glyph('sep.dot') // '';
+    like($txt, qr/Resources \Q$dot\E sampling/,
+        'and Resources SAYS it has no reading rather than silently not being there (its title: "Resources . sampling...")');
     # AMENDED BY t02-spend-persistence (blueprint tui-operator-feedback). The
     # literal it pinned, "no snapshot", is gone: that phrase described OUR
     # plumbing rather than the account, and read as though the provider had

@@ -2006,6 +2006,11 @@ sub _fixed_region_height {
     # normalisation has to happen HERE, one level up, exactly as
     # _fixed_panels already normalises $cols before use.
     $cols = 80 if !defined $cols || ref($cols) || $cols !~ /^-?\d+(?:\.\d+)?$/ || $cols < 1;
+    # With $rows known, lay out the state compose() really draws: its derived
+    # Blueprints budgets change that panel's body (a budgeted body drops the
+    # blank rows between blocks before any content), and so its height.
+    $state = tui::DashboardScreen::compose_state($state, $rows, $cols)
+        if defined($rows) && !ref($rows) && $rows =~ /\A\d+\z/;
     my $panels = tui::DashboardScreen::panels($state, $cols);
     return 0 unless ref($panels) eq 'ARRAY' && @$panels;
 
@@ -3336,7 +3341,8 @@ sub run_recover_stages {
 #            \e[5~ PGUP  \e[6~ PGDN
 #       SS3  \eOA..D  \eOH \eOF   (application cursor mode)
 #     -> UP DOWN RIGHT LEFT HOME END PGUP PGDN. Any other COMPLETE sequence
-#     (focus \e[I \e[O, function keys, a terminal report) is dropped whole.
+#     (window-activation reports \e[I \e[O, function keys, a terminal
+#     report) is dropped whole.
 #   * ESC + an ordinary byte is Alt+that byte: the byte, as before.
 # Without $settle (a caller with no blocking read) only bytes already queued
 # are looked at, as before.
