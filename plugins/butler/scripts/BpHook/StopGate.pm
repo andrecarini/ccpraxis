@@ -1185,7 +1185,48 @@ sub _coordinator {
     {
         $reason = 'the held ids are not running background subagents';
     }
+    my $shell = eval { _coordinator_shell_task($p) };
+    $reason .= "; $shell is a background shell, which claude -p kills about 5 s after the turn ends, "
+             . "so it cannot be held: wait for it in the foreground "
+             . "(coordinator-protocol, \"Waiting on a long command\")"
+        if defined $shell;
     return _deny_coordinator($sid, $p, $reason);
+}
+
+# ---------------------------------------------------------------------------
+# _coordinator_shell_task($p) -> the id of the first running background
+# task in the payload that is not a subagent and not a butler-hold call,
+# else undef (bug 20261104-215435-9b1e).
+#
+# A coordinator is a headless `claude -p`. When its turn ends, Claude Code's
+# print-mode wind-down (2.1.282) keeps the process only while a background
+# subagent or workflow runs; every background shell is killed after a
+# 5000 ms grace. So a hold on a shell task, or a stop that leaves a long
+# command auto-backgrounded, would end the wait by killing the work. The
+# holder rule above therefore never counts one, and this names the shell in
+# the refusal so the coordinator waits in the foreground instead of trying
+# to hold it again. It also catches a subagent that returned while a command
+# it started still runs: that command shows here as a shell of its own.
+# The holder itself is a running shell too, so a task whose payload command
+# is a butler-hold call, or that the transcript shows as one, is skipped.
+# ---------------------------------------------------------------------------
+sub _coordinator_shell_task {
+    my ($p) = @_;
+    return undef unless ref $p eq 'HASH' && ref $p->{background_tasks} eq 'ARRAY';
+    my $launches;
+    for my $e (@{ $p->{background_tasks} }) {
+        next unless ref $e eq 'HASH';
+        next unless defined $e->{status} && !ref $e->{status} && $e->{status} eq 'running';
+        next unless defined $e->{id} && !ref $e->{id} && $e->{id} =~ /\A[A-Za-z0-9_-]{1,64}\z/;
+        my $type = (defined $e->{type} && !ref $e->{type}) ? $e->{type} : '';
+        next if $type eq 'subagent' || $type eq 'workflow';
+        next if defined $e->{command} && !ref $e->{command}
+             && defined BpHook::sole_invocation($e->{command}, 'butler-hold');
+        $launches //= (eval { BpHook::holder_launches($p) } || {});
+        next if exists $launches->{ $e->{id} };
+        return $e->{id};
+    }
+    return undef;
 }
 
 # ---------------------------------------------------------------------------

@@ -178,17 +178,17 @@ Getting the *awaiting* half wrong is how a coordinator burns an entire turn budg
 nothing: a field package once grep-looped on a sentinel that had existed for over an hour, was
 warm-relaunched four times, and its work was already green the whole time.
 
-**The pattern: for coordinators and interactive drivers only (never a one-shot worker or judge —
-see above), launch in the background, end the turn, resume on the notification.** When
-you start work you cannot get an answer from within a few seconds — a long build, a long-running
-script, anything you'd otherwise be tempted to sit and watch — launch it with
-`run_in_background`, then **end your turn**. Do not re-invoke a tool to check on it, do not poll
-its output, do not watch it grow. The completion notification comes back to you on its own, in a
-later turn, and that is when you resume. You are notified when it completes — you never have to
-go looking. This is a multi-turn pattern only: a headless one-shot process (a judge, a
-Task-dispatched worker) has no later turn, so `guard-bash.sh` denies `run_in_background`
-mechanically whenever `BP_LEDGER` is set, except the continuity holder (see "Waiting on a
-background subagent").
+**The pattern: launch in the background, end the turn, resume on the notification.** What you
+launch in the background differs by session. An **interactive driver** launches a long build or
+script with `run_in_background`, then **ends its turn**. A **coordinator** is a headless
+`claude -p`: it never backgrounds a Bash command (`guard-bash.sh` denies `run_in_background`
+mechanically whenever `BP_LEDGER` is set, except the continuity holder). Its only background work
+is a **subagent** (see "Waiting on a background subagent"); a long *command* it waits for in the
+foreground (see "Waiting on a long command"). Either way: do not re-invoke a tool to check on
+background work, do not poll its output, do not watch it grow. The completion notification comes
+back to you on its own, in a later turn, and that is when you resume. You are notified when it
+completes — you never have to go looking. A headless one-shot process (a judge, a Task-dispatched
+worker) has no later turn at all, which is why it gets the opposite rule above.
 
 **Foreground is the documented default for validation.** Anything that finishes in a couple of
 minutes or less — your test suite, `bp-ledger.pl` calls, a lint pass — belongs in the
@@ -248,7 +248,7 @@ The `liveness proof` cell below draws only from this closed vocabulary:
 | `Task return` | the Task tool returned; the dispatch is over by construction |
 | `completion notification` | the completion notification of a `run_in_background` Bash job (interactive drivers) or of a held background subagent (coordinators and drivers) |
 | `foreground exit code` | you ran it inline and read `$?` in the same turn |
-| `pid_alive` | `BpResumption::pid_alive`, called directly |
+| `pid_alive` | `BpResumption::pid_alive` called directly, or a foreground `tail --pid`/`kill -0` on the pid that call started |
 | `NONE` | no liveness proof exists for this shape — legal **only** on a `BANNED` row |
 
 The wait-shape table's columns are fixed:
@@ -266,12 +266,16 @@ The sanctioned and banned shapes:
 | a background subagent dispatch held by the holder (coordinators and drivers) | the dispatched subagent | `completion notification` | SANCTIONED |
 | foreground validation run | the command you ran | `foreground exit code` | SANCTIONED |
 | a recorded pid, checked live | the process that pid names | `pid_alive` | SANCTIONED |
+| a long command, started detached and waited on in bounded foreground calls (coordinators) | the process that pid names | `pid_alive` | SANCTIONED |
+| a background Bash task, held or left running at the end of a coordinator turn | the backgrounded job | `NONE` | BANNED |
+| a subagent that returned while a command it started still runs, held | the subagent's command | `NONE` | BANNED |
 | naked existence read as completion — test -f on a dispatch report | the worker you dispatched | `NONE` | BANNED |
 | naked sentinel wait — an absent sentinel read as "still running" | the process that must write the sentinel | `NONE` | BANNED |
 | naked pid-file read — a recorded pid read as a live process | the process that pid named | `NONE` | BANNED |
 
-The three `BANNED` rows come from real cases: the report-stub row is `06-l1-reaudit`, the sentinel
-row is `03-scorer-rich`, and the pid-file row is `02-rich-extraction`.
+The `BANNED` rows come from real cases: the report-stub row is `06-l1-reaudit`, the sentinel
+row is `03-scorer-rich`, the pid-file row is `02-rich-extraction`, and the two background rows are
+bug `20261104-215435-9b1e` (an acxpraxis coordinator waiting on `make check`).
 
 #### Waiting on a background subagent
 
@@ -282,9 +286,51 @@ To wait: dispatch the worker in the background, run `butler-hold <agent id>` wit
 `run_in_background: true` only when `butler-continuity status` shows `holder: none` (otherwise
 run it in the foreground, which extends the holder), and end the turn; its completion wakes you.
 A hold on anything that is not a running background subagent counts for nothing.
+Never hold a Bash task id, nor a subagent that returned while its own command runs: when your turn
+ends, `claude -p` kills every background shell. Wait on a long command in the foreground instead.
 `butler-continuity off` and `off-confirm` refuse in a coordinator; `emergency-stop` files a bug report but does not end it.
 A denied stop prints a stop token for the holder line above; use it as printed.
 <!-- continuity:end -->
+
+#### Waiting on a long command
+
+This is the one recommended shape for a validation command (`make check`, a full suite) that may
+run longer than one Bash call. Three facts of Claude Code (2.1.282, the sandbox's version) rule out
+every other shape:
+
+- **A Bash call has a ceiling.** Its `timeout` is at most 600000 ms. With
+  `CLAUDE_AUTO_BACKGROUND_TASKS=1` (set in the sandbox's settings) a command still running at its
+  timeout is not killed: it is moved to the background and the call returns. A foreground Agent
+  dispatch is moved to the background the same way after 120 s.
+- **A coordinator's background shell dies with its turn.** When a `claude -p` turn ends, the process
+  stays up only while a background subagent or workflow runs, and kills every background shell after
+  a 5 s grace. So the Stop gate never counts a held Bash task: allowing that stop would kill the
+  command. Its refusal names the shell when it sees one.
+- **A subagent does not shield the command.** A worker told to run it in the foreground hits the
+  same ceiling, ends its turn with the command backgrounded, and reads `completed`. Holding it counts
+  for nothing, and its command is a shell that your turn's end kills too.
+
+So start the command detached, so that no turn's end can kill it and its pid is known, then wait in
+the foreground in calls that each end before the ceiling. Start it, in one Bash call:
+
+```bash
+setsid nohup sh -c 'make check > "$1/check.log" 2>&1; echo $? > "$1/check.rc"' sh "$BP_REPORT_DIR" </dev/null >/dev/null 2>&1 &
+echo "pid=$!"
+```
+
+Record the pid in the ledger's attempt log, so a resumed session can check it. Then wait, in a
+**foreground** Bash call with `timeout: 600000`, substituting the pid:
+
+```bash
+timeout 540 tail --pid=<pid> -f /dev/null; if [ -s "$BP_REPORT_DIR/check.rc" ]; then echo "exit=$(cat "$BP_REPORT_DIR/check.rc")"; elif kill -0 <pid> 2>/dev/null; then echo running; else echo "died without an exit code"; fi
+```
+
+`tail --pid` blocks on the live process itself, so each call is a liveness check, not a poll of
+bookkeeping, and it returns at 540 s, before the 600 s ceiling, so it is never moved to the
+background. Repeat that same call only while it prints `running`: each repeat comes more than 300 s
+after the last, so the repeat guard does not count it, and a 30-minute command costs about four
+turns. On `exit=<n>`, read `check.log` once. On `died without an exit code`, the command was
+killed; re-run it, and never read the missing code as a pass.
 
 #### Existence is not completion
 

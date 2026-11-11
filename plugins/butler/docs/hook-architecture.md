@@ -980,6 +980,16 @@ ledger does not exist; status '<s>' is not terminal; the ledger is <n>m stale (l
 held ids are not running background subagents. If no token could be minted, the holder line omits
 `--token <token>`; the ledger path needs no token.
 
+On the ledger and holder paths (not the pause paths), when the payload lists a running background
+task that is neither a subagent nor a workflow nor a butler-hold call, `<reason>` gains
+`; <id> is a background shell, which claude -p kills about 5 s after the turn ends, so it cannot be
+held: wait for it in the foreground (coordinator-protocol, "Waiting on a long command")` (bug
+20261104-215435-9b1e). The holder rule never counts a shell for a coordinator, by design: Claude
+Code 2.1.282's print-mode wind-down keeps `-p` alive after the final result only while a background
+subagent or workflow runs, and kills every background shell after a 5000 ms grace, so allowing the
+stop would kill the very command being waited on. An interactive session survives the end of a turn,
+which is why the non-coordinator rule can trust a live holder on any item.
+
 ```
 Coordinator stop refused: <reason>. Stop token: <token>
 Waiting on a background subagent? Hold it, as a background Bash tool call:
