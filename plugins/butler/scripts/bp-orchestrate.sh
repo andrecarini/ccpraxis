@@ -53,6 +53,16 @@ fi
 
 export CCPRAXIS_DATA_DIR="$(bp_data_dir)"
 
+# bug 6568: a plain `podman exec <ctr> bash -lc '...'` (or any login/exec shell
+# that skipped the sandbox's interactive profile) may not have /root/.local/bin
+# — where claude actually lives — on PATH. Resolve it from the known sandbox
+# location BEFORE the self-test, and BEFORE launching the detached orchestrator
+# below (bp-launch.sh/bp-judge.sh, spawned later by bp-orchestrator.pl, inherit
+# THIS process's PATH, not the caller's). This never skips or weakens the
+# self-test — it only widens where claude may be found; the refusal below still
+# fires, with the searched paths named, if claude truly isn't installed.
+bp_ensure_claude_on_path || true
+
 # A8 hooks self-test (Decision #31): before launching any worker, assert LIVE that
 # a worker subagent's out-of-scope edit is actually DENIED — the write-containment
 # that A4's graceful-gate depends on. Cached after the first pass (keyed by the

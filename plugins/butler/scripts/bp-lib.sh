@@ -181,6 +181,59 @@ require_cmd() {
   done
 }
 
+# ----------------------------------------------------- sandbox claude PATH ----
+# bug 6568: a plain `podman exec <ctr> bash -lc '...'` shell (or any exec/login
+# shell that didn't source the sandbox's interactive profile) does not have
+# /root/.local/bin on PATH, so a bare `command -v claude` fails even though
+# claude IS installed there -- it's just not resolvable from THIS shell. The
+# self-test must still run (never skipped, never weakened); the gap is only
+# that butler's own entry points shouldn't depend on the caller's PATH to find
+# a binary the sandbox itself installed at a known location.
+
+# bp_find_claude_in CANDIDATES_COLON_LIST -> prints the first candidate dir
+# that contains an executable `claude`, exit 0; prints nothing and exits 1 if
+# none do. Pure and side-effect-free (never touches PATH) so it is directly
+# unit-testable: takes the candidate list as an argument instead of reading a
+# global, and never shells out beyond `[ -x ... ]`.
+bp_find_claude_in() {
+  local pats="$1" dir
+  local IFS=':'
+  # shellcheck disable=SC2086
+  for dir in $pats; do
+    [ -n "$dir" ] || continue
+    if [ -x "$dir/claude" ]; then printf '%s\n' "$dir"; return 0; fi
+  done
+  return 1
+}
+
+# Default search list for a sandbox-installed claude: the real install dir
+# (/root/.local/bin, per the bug report) plus $HOME/.local/bin for robustness
+# if HOME ever differs from /root in a future image. Overridable for tests.
+BP_CLAUDE_PATH_CANDIDATES="${BP_CLAUDE_PATH_CANDIDATES:-/root/.local/bin:${HOME:-}/.local/bin}"
+
+# bp_ensure_claude_on_path — sandbox-only. If `claude` is not already
+# resolvable via the caller's PATH, search BP_CLAUDE_PATH_CANDIDATES and
+# prepend the first hit so the rest of this process (and anything it execs)
+# can find it. Never touches PATH on the host: it no-ops unless IS_SANDBOX=1
+# or BP_ALLOW_HOST=1, mirroring bp_require_sandbox's own gate, so calling it
+# defensively from a host code path is always safe. On total failure it does
+# NOT exit -- it leaves PATH untouched, names every directory it searched on
+# stderr, and returns 1 so the caller's own require_cmd failure still fires
+# (the refusal itself must never be skipped or weakened).
+bp_ensure_claude_on_path() {
+  command -v claude >/dev/null 2>&1 && return 0
+  if [ "${IS_SANDBOX:-}" != "1" ] && [ "${BP_ALLOW_HOST:-}" != "1" ]; then
+    return 1
+  fi
+  local found
+  if found=$(bp_find_claude_in "$BP_CLAUDE_PATH_CANDIDATES"); then
+    export PATH="$found:$PATH"
+    return 0
+  fi
+  echo "butler: claude not found on PATH, and not in any of: ${BP_CLAUDE_PATH_CANDIDATES//:/, }" >&2
+  return 1
+}
+
 # bp_require_sandbox — butler coordinators are detached Linux headless `claude -p`
 # processes (setsid/nohup/flock); they only work inside the rootless-Podman
 # sandbox. Refuse on the host deterministically rather than fail obscurely.

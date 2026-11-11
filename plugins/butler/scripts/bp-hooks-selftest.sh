@@ -92,6 +92,14 @@ main() {
 
   bp_require_sandbox
 
+  # bug 6568: a bare exec/login shell inside the sandbox may not have
+  # /root/.local/bin (where claude actually lives) on PATH -- e.g. a plain
+  # `podman exec <ctr> bash -lc '...'`. Resolve it from a known sandbox
+  # location BEFORE computing the cache key (which shells out to `claude
+  # --version`) and before the prerequisite check below. This never skips or
+  # weakens the check itself -- it only widens where claude may be found.
+  bp_ensure_claude_on_path || true
+
   local MARKER KEY
   MARKER="$(bp_data_dir)/.hooks-selftest-pass"
   KEY=$(selftest_cache_key)
