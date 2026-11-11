@@ -30,7 +30,7 @@ Sandbox-only: the fleet is detached `claude -p` coordinators (`setsid`/`nohup`/`
    ```
    /butler:reporter $0
    ```
-   Closing this session does **not** stop the run — the orchestrator is detached and survives on the container's dashboard heartbeat. Recovery after a container restart is automatic on the next `bp-orchestrate.sh` (it continues, never duplicates).
+   Closing this session does **not** stop the run — the orchestrator is detached and survives on the container's dashboard heartbeat. It does **not** survive the container: a reap, a host shutdown or a recreate kills it, and **nothing restarts it on its own** — not the launcher, not the container entrypoint, not a session hook. After the container comes back, someone has to run `/butler:dispatch-fleet <bp>` (or `bp-orchestrate.sh <bp>`) again. That re-run is where recovery is automatic: it clears a stale `runs/.shutdown`, the resume-sweep relaunches interrupted coordinators warm or cold, and the marker flock means it continues the run rather than duplicating it.
 
 <!-- continuity:begin -->
 Fleet coordinators wait on background subagents through `butler-hold` and stop only on a
