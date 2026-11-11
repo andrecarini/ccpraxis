@@ -175,8 +175,13 @@ sub verdict_decision {
     my $parsed = $poll->{parsed};
     my $u5 = $parsed->{five_hour}{utilization};
     my $u7 = $parsed->{seven_day}{utilization};
-    my $b5 = BpGovern::burn_per_sec($samples5);
-    my $b7 = BpGovern::burn_per_sec($samples7);
+    # Same windowed estimator as the fleet (BpGovern::pause_burn_per_sec), so the two governors
+    # cannot disagree on what a sample history means. The CLI passes no samples (one poll per
+    # invocation), so in production this is undef and only the soft ceiling trips; the samples
+    # path is the tested seam. A projection trip here still waits for the reset: drive-solo
+    # has no re-check loop, and its soft ceilings already sit below the fleet's.
+    my $b5 = BpGovern::pause_burn_per_sec($samples5);
+    my $b7 = BpGovern::pause_burn_per_sec($samples7);
     my $p5 = BpGovern::should_pause($u5, $b5, $t->{drain}, $t->{ceil5});
     my $p7 = BpGovern::should_pause($u7, $b7, $t->{drain}, $t->{ceil7});
 

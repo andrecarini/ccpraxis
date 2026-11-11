@@ -2338,18 +2338,28 @@ sub usage_decision {
     return { action => 'pause-contract', problems => $probs } unless $ok;
     my $u5 = $parsed->{five_hour}{utilization};
     my $u7 = $parsed->{seven_day}{utilization};
-    my $b5 = BpGovern::burn_per_sec($s5);
-    my $b7 = BpGovern::burn_per_sec($s7);
-    my $p5 = BpGovern::should_pause($u5, $b5, $t->{drain}, $t->{ceil5});
-    my $p7 = BpGovern::should_pause($u7, $b7, $t->{drain}, $t->{ceil7});
+    # The pause decision reads the WINDOWED burn (BpGovern::pause_burn_per_sec), not the
+    # two-point slope: on 2026-11-11 one 27->33 step after 30 flat minutes projected to 89 and
+    # slept the fleet for 3.5h. The cadence keeps its own two-point slope inside next_cadence.
+    my $b5 = BpGovern::pause_burn_per_sec($s5);
+    my $b7 = BpGovern::pause_burn_per_sec($s7);
+    my $k5 = BpGovern::pause_trigger($u5, $b5, $t->{drain}, $t->{ceil5});
+    my $k7 = BpGovern::pause_trigger($u7, $b7, $t->{drain}, $t->{ceil7});
     my $trip5 = BpGovern::trip_point($b5, $t->{drain}, $t->{ceil5});
     my $trip7 = BpGovern::trip_point($b7, $t->{drain}, $t->{ceil7});
     my $cadence = BpGovern::next_cadence($s5, $trip5, $s7, $trip7);
-    if ($p5 || $p7) {
-        my $w = $p5 ? 'five_hour' : 'seven_day';
+    if ($k5 || $k7) {
+        # A window AT its ceiling wins over one that only projects across it: the ceiling
+        # pause is the reset-bound wait, and reporting the projection instead would let the
+        # orchestrator re-check, and resume, into a window that is already full.
+        my $w = ($k5 // '') eq 'ceiling' ? 'five_hour'
+              : ($k7 // '') eq 'ceiling' ? 'seven_day'
+              : $k5                      ? 'five_hour'
+              :                            'seven_day';
         return {
             action   => 'pause-usage',
             window   => $w,
+            trigger  => ($w eq 'five_hour' ? $k5 : $k7),
             resets_at=> BpGovern::iso_to_epoch($parsed->{$w}{resets_at}),
             util     => { five => $u5, seven => $u7 },
             cadence  => $cadence,
@@ -2717,14 +2727,30 @@ sub choose_jitter {
     $rand //= rand();
     return int($lo + $rand * ($hi - $lo));
 }
+#
+# $trigger (optional) is BpGovern::pause_trigger's answer for the window that paused:
+#   'ceiling'    current >= ceiling. Only the reset brings relief: relaunch at resets_at +
+#                jitter, exactly as before.
+#   'projection' current < ceiling, the burn FORECAST tripped. A forecast is re-checked, not
+#                slept on: relaunch_at = now + $recheck_secs (no jitter; the herd the jitter
+#                spreads only forms at a reset). The run loop re-polls usage no later than
+#                relaunch_at, and a poll that still trips re-writes the pause and pushes
+#                relaunch_at forward, so reaching relaunch_at means the latest poll no longer
+#                projected across the ceiling. On 2026-11-11 a projection-only trip at 33% slept
+#                ~3.5h to the reset; this is the bound on that cost.
+# Absent $trigger keeps today's reset-based payload (and writes no trigger key).
+use constant PROJECTION_RECHECK_SECS => 300;
 sub paused_payload {
-    my ($resets_at, $now, $jitter_secs, $reason) = @_;
-    my $relaunch = (defined $resets_at ? $resets_at : $now) + ($jitter_secs // 0);
+    my ($resets_at, $now, $jitter_secs, $reason, $trigger, $recheck_secs) = @_;
+    my $relaunch = (defined $trigger && $trigger eq 'projection')
+        ? $now + ($recheck_secs // PROJECTION_RECHECK_SECS)
+        : (defined $resets_at ? $resets_at : $now) + ($jitter_secs // 0);
     return {
         reason      => ($reason // 'usage'),
         resets_at   => $resets_at,
         relaunch_at => $relaunch,
         created_at  => $now,
+        (defined $trigger ? (trigger => $trigger) : ()),
     };
 }
 # --- ready to auto-resume? Only time-based (usage/telemetry-with-time) pauses
@@ -4343,7 +4369,9 @@ sub _tunables_base {
         # machine awake (pause_holds_awake). Operator, 2026-11-01: 32 hours.
         pause_horizon => $ENV{BP_PAUSE_HORIZON_SECS} // BpAwakeConst::FLEET_PAUSE_HORIZON(),
         drain      => $ENV{BP_DRAIN_SECS}         // 600,
-        max_par    => $ENV{BP_MAX_PARALLEL}       // 2,
+        # seconds a projection-only usage pause waits before it is re-evaluated (paused_payload)
+        projection_recheck => $ENV{BP_PROJECTION_RECHECK_SECS} // PROJECTION_RECHECK_SECS,
+        max_par   => $ENV{BP_MAX_PARALLEL}       // 2,
         cap        => $ENV{BP_ATTEMPT_CAP}        // 5,
         flat       => $ENV{BP_FLAT_SECS}          // 600,
         watch_tick => $ENV{BP_WATCH_TICK}         // 10,
@@ -5049,16 +5077,30 @@ sub run {
                     $tele_fail = 0;
                     push @s5, [ $now, $u->{usage}{five_hour}{utilization} ];
                     push @s7, [ $now, $u->{usage}{seven_day}{utilization} ];
-                    @s5 = @s5[-5 .. -1] if @s5 > 5;
-                    @s7 = @s7[-5 .. -1] if @s7 > 5;
+                    # Keep a burn WINDOW of history, not the last 5 samples: at the usual 60s
+                    # cadence five samples are ~4 minutes, too short for pause_burn_per_sec.
+                    @s5 = BpGovern::trim_samples(\@s5);
+                    @s7 = BpGovern::trim_samples(\@s7);
                     my $d = usage_decision($u->{usage}, \@s5, \@s7, $t);
                     $next_usage = $now + ($d->{cadence} // 300);
                     if (($d->{action} // '') eq 'pause-usage') {
-                        my $jit = choose_jitter($t->{jit_lo}, $t->{jit_hi});
-                        my $pp = paused_payload($d->{resets_at}, $now, $jit, 'usage');
-                        write_paused($runs, $pp);
-                        _log($log, 'pause', { reason => 'usage', window => $d->{window}, resets_at => $pp->{resets_at}, relaunch_at => $pp->{relaunch_at}, util => $d->{util} });
-                        $paused = $pp;
+                        my $trigger = $d->{trigger} // 'ceiling';
+                        # A projection trip never REPLACES a pause that waits on something
+                        # firmer: a manual pause (a human), or a ceiling/legacy usage pause (the
+                        # reset). Re-writing either as a short projection pause would resume the
+                        # fleet past it in minutes. A telemetry pause (cleared on recovery) or an
+                        # earlier projection pause may be replaced; the latter is how a burn that
+                        # keeps tripping pushes its re-check forward.
+                        my $keep = $paused && $trigger eq 'projection'
+                            && ($paused->{manual}
+                                || (($paused->{reason} // '') eq 'usage' && ($paused->{trigger} // 'ceiling') ne 'projection'));
+                        unless ($keep) {
+                            my $jit = choose_jitter($t->{jit_lo}, $t->{jit_hi});
+                            my $pp = paused_payload($d->{resets_at}, $now, $jit, 'usage', $trigger, $t->{projection_recheck});
+                            write_paused($runs, $pp);
+                            _log($log, 'pause', { reason => 'usage', trigger => $trigger, window => $d->{window}, resets_at => $pp->{resets_at}, relaunch_at => $pp->{relaunch_at}, util => $d->{util} });
+                            $paused = $pp;
+                        }
                     } elsif (($d->{action} // '') eq 'pause-contract') {
                         _enter_pause_manual($runs, $log, 'usage-contract',
                             { package => '_fleet', blueprint => $bp, kind => 'contract-drift',
@@ -5108,6 +5150,18 @@ sub run {
                     }
                     $paused = read_paused($runs);
                 }
+            }
+
+            # A projection pause is only as good as its re-check: the poll MUST run no later
+            # than relaunch_at, so that on the tick the pause comes due the poll (above) runs
+            # first and either re-writes the pause (still tripping) or leaves it to lapse in
+            # PAUSE GATING below (no longer tripping). Without this clamp a slow cadence could
+            # let the pause lapse on a reading many minutes old. If that poll fails, the pause
+            # still lapses, and the telemetry-failure path takes over exactly as it would for
+            # an unpaused fleet.
+            if ($paused && !$paused->{manual} && ($paused->{trigger} // '') eq 'projection'
+                    && defined $paused->{relaunch_at} && $next_usage > $paused->{relaunch_at}) {
+                $next_usage = $paused->{relaunch_at};
             }
 
             # ---- LIVE TUNABLES: re-read runs/.tunables every tick so max_par can
@@ -5216,7 +5270,8 @@ sub run {
             my $resume_pending = ($paused && !$paused->{manual}) ? 1 : 0;
             if ($paused) {
                 if (!$shutdown && resume_ready($paused, $now)) {
-                    _log($log, 'auto_resume', { reason => $paused->{reason}, resets_at => $paused->{resets_at} });
+                    _log($log, 'auto_resume', { reason => $paused->{reason}, resets_at => $paused->{resets_at},
+                                                (defined $paused->{trigger} ? (trigger => $paused->{trigger}) : ()) });
                     clear_pause($runs);
                     $paused = undef; $resume_pending = 0;
                     # fall through into the watch/launch section: a cleared pause

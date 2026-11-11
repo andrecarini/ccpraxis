@@ -7,7 +7,8 @@
 #
 # Decisions encoded here:
 #   #8  burn-rate-adaptive poll cadence
-#   #9  derived trip point BELOW the ceiling (pause before the wall)
+#   #9  derived trip point BELOW the ceiling (pause before the wall), fed a WINDOWED burn
+#       estimate (pause_burn_per_sec) and labelled by trigger (pause_trigger)
 #   #11 token refresh timing (1-2h band; cross the 1h floor unrefreshed -> pause)
 #   usage resets_at is ISO-8601 (A0) -> epoch for the runs/.paused contract
 #
@@ -35,6 +36,10 @@ use constant {
 # time-ordered). Uses the most recent two points. undef if <2 samples, no dt, or the
 # sample span is under BURN_MIN_SPAN_S (too short a window to trust a slope from —
 # b30: "unknown" has exactly one definition, shared with window_cadence).
+#
+# This is the CADENCE's slope. The pause decision no longer uses it: since 2026-11-11 the
+# orchestrator and the usage gate hand should_pause pause_burn_per_sec (below), because a
+# two-point slope turns one jump into a sustained rate. See the comment above that sub.
 sub burn_per_sec {
     my ($s) = @_;
     return undef unless ref $s eq 'ARRAY' && @$s >= 2;
@@ -60,6 +65,108 @@ sub should_pause {
     my ($current, $burn, $drain_secs, $ceiling) = @_;
     $burn = 0 if !defined $burn || $burn < 0;
     return ($current + $burn * $drain_secs >= $ceiling) ? 1 : 0;
+}
+
+# ---- the PAUSE decision's burn estimate (2026-11-11 incident) ------------------------------
+#
+# burn_per_sec above is a two-point slope and stays that way: window_cadence and its oracles
+# (t/usage-poll-cadence, t/bp-govern-decision-functions) are built on it. It must NOT feed the
+# pause decision any more. On 2026-11-11 the 5h window sat flat at 27% for 30+ minutes, polled
+# every ~64s; one poll then read 33% (very likely the operator's own interactive session --
+# usage is account-wide). Two points made that 6%/64s, and 33 + (6/64)*600 = 89 >= 85 paused
+# the fleet and slept it until the window reset: ~3.5 hours idle at 33% utilisation. One step
+# was read as a sustained rate.
+#
+# pause_burn_per_sec is the estimate should_pause gets instead. It is the LARGER of two rates:
+#
+#   window rate     (newest - anchor) / dt, where anchor is the newest sample at least
+#                   BURN_WINDOW_S older than the newest one. A one-off step is spread over the
+#                   whole window: the incident's 6 points over 15+ minutes is ~4 points of
+#                   projection, not 56. A burn that has lasted a whole window reads at its true
+#                   rate, so the Decision #9 trip point (ceiling - burn*drain) is unchanged for
+#                   it: +1%/min still trips at 75 against 85, exactly as before.
+#
+#   sustained rate  the SMALLER of the last two interval slopes (needs 3 samples). A single step
+#                   has one fast interval next to a flat one, so its min is ~0 and it is filtered
+#                   out; a real fast onset shows up in both intervals and trips within two polls,
+#                   without waiting for the window to fill. This is the safety half: the window
+#                   alone would let a 3%/min onset run to ~75 before tripping; with this term it
+#                   trips at ~66, one poll later than the old two-point estimator did.
+#
+# SHORT HISTORY (span < BURN_WINDOW_S: right after start, or after the samples were reset) is
+# where the earlier incident lives -- the governor that paused TOO LATE. "Unknown" must never
+# collapse to zero burn here, because should_pause reads undef as zero and declines to pause.
+# So with a short history the anchor is simply the OLDEST sample and the slope is NOT discounted
+# for the missing time: the rate over the history that really exists is the best available
+# estimate, and with exactly two samples it is identical to the old two-point slope. That is
+# deliberately conservative -- a single step in the first minute after start can still pause --
+# and its cost is now bounded: a projection-only pause re-checks within minutes (the
+# orchestrator's projection recheck) instead of sleeping to the reset. Only fewer than two
+# samples (or no positive dt) is undef, and then current >= ceiling still trips on its own.
+#
+# A gap (suspend, long cadence) needs no special case: the anchor is then the sample before the
+# gap and the rate is the real average across it.
+use constant {
+    BURN_WINDOW_S    => 900,     # 15 minutes
+    BURN_SAMPLES_MAX => 64,      # retention cap for trim_samples (60s polls: 16 per window)
+};
+
+sub pause_burn_per_sec {
+    my ($s, $window) = @_;
+    $window //= BURN_WINDOW_S;
+    return undef unless ref $s eq 'ARRAY' && @$s >= 2;
+    my $new = $s->[-1];
+
+    my $anchor;
+    for (my $i = $#$s - 1; $i >= 0; $i--) {
+        if ($new->[0] - $s->[$i][0] >= $window) { $anchor = $s->[$i]; last; }
+    }
+    $anchor //= $s->[0];                          # short history: everything we have, undiscounted
+
+    my @rates;
+    my $dt = $new->[0] - $anchor->[0];
+    push @rates, ($new->[1] - $anchor->[1]) / $dt if $dt > 0;
+
+    if (@$s >= 3) {
+        my ($x, $y, $z) = @{$s}[-3, -2, -1];
+        my ($d1, $d2) = ($y->[0] - $x->[0], $z->[0] - $y->[0]);
+        if ($d1 > 0 && $d2 > 0) {
+            my ($r1, $r2) = (($y->[1] - $x->[1]) / $d1, ($z->[1] - $y->[1]) / $d2);
+            push @rates, ($r1 < $r2 ? $r1 : $r2);
+        }
+    }
+    return undef unless @rates;
+    my ($max) = sort { $b <=> $a } @rates;
+    return $max;                                  # %/sec, may be <= 0
+}
+
+# trim_samples(\@samples [, $window]) -> list. The retention rule for the orchestrator's sample
+# buffers: keep every sample inside the window plus the newest one at or beyond it (the anchor
+# pause_burn_per_sec needs), and never fewer than 3 (the sustained rate needs 3). Capped at
+# BURN_SAMPLES_MAX. The previous rule was "last 5", which at the usual 60s cadence held only
+# ~4 minutes and could never give a 15-minute window.
+sub trim_samples {
+    my ($s, $window) = @_;
+    $window //= BURN_WINDOW_S;
+    return () unless ref $s eq 'ARRAY' && @$s;
+    my $newest = $s->[-1][0];
+    my $start = 0;
+    for (my $i = $#$s; $i >= 0; $i--) {
+        if ($newest - $s->[$i][0] >= $window) { $start = $i; last; }
+    }
+    $start = @$s - 3 if @$s - $start < 3 && @$s >= 3;
+    $start = @$s - BURN_SAMPLES_MAX if @$s - $start > BURN_SAMPLES_MAX;
+    $start = 0 if $start < 0;
+    return @{$s}[$start .. $#$s];
+}
+
+# pause_trigger(current, burn, drain, ceiling) -> 'ceiling' | 'projection' | undef.
+# Which rule tripped, because the two need different waits: at or above the ceiling only the
+# window reset brings relief; below it, the trip was a forecast, and a forecast is re-checked.
+sub pause_trigger {
+    my ($current, $burn, $drain_secs, $ceiling) = @_;
+    return 'ceiling' if $current >= $ceiling;
+    return should_pause($current, $burn, $drain_secs, $ceiling) ? 'projection' : undef;
 }
 
 # The derived trip level (for headroom math / display): ceiling - burn*drain.
