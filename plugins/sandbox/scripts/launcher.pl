@@ -5078,13 +5078,13 @@ sub find_orphan_claudes {
     return () unless defined $state && $state eq 'running';
 
     # Gather (pid, rchar, etime_seconds) for each claude in container.
-    my $listing = _qx_bounded(qq{$PODMAN exec "$CONTAINER_NAME" bash -c '
-        for pid in \$(pgrep -x claude 2>/dev/null); do
-            rchar=\$(awk "/^rchar:/{print \\\$2}" /proc/\$pid/io 2>/dev/null)
-            etime=\$(ps -o etimes= -p \$pid 2>/dev/null | tr -d " ")
-            echo "\$pid \$rchar \$etime"
-        done
-    ' 2>/dev/null});
+    # One line on purpose: a multi-line qq{} body reads as hard-wrapped output
+    # to no-hard-wrapped-output.t, and bash -c needs no line breaks.
+    my $probe = q{for pid in $(pgrep -x claude 2>/dev/null); do }
+              . q{rchar=$(awk "/^rchar:/{print \$2}" /proc/$pid/io 2>/dev/null); }
+              . q{etime=$(ps -o etimes= -p $pid 2>/dev/null | tr -d " "); }
+              . q{echo "$pid $rchar $etime"; done};
+    my $listing = _qx_bounded(qq{$PODMAN exec "$CONTAINER_NAME" bash -c '$probe' 2>/dev/null});
     my @candidates;
     for my $line (split /\n/, ($listing // '')) {
         my ($pid, $rchar, $etime) = split /\s+/, $line;
