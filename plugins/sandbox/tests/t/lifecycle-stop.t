@@ -350,7 +350,7 @@ sub _seq_order_ok {
     # footer_legend does NOT exist yet -- every call is wrapped in eval so a
     # missing sub degrades to a clean per-assertion FAIL, not a fatal abort.
     my $t1 = eval { tui::DashboardScreen::_footer_legend(200) };
-    is($t1, ' [c] launch Claude Code  [s] stop runs  [x] full shutdown  [up/down] scroll  [r] reload  [q] quit',
+    is($t1, ' [c] launch Claude Code  [s] stop runs  [x] full shutdown  [f] fleets  [up/down] scroll  [r] reload  [q] quit',
         'AC-5: footer_legend(200) is the pinned T1 string, byte-for-byte');
 
     my $at80 = eval { tui::DashboardScreen::_footer_legend(80) };
@@ -358,7 +358,7 @@ sub _seq_order_ok {
         'AC-5: footer_legend(80) still contains "[c] launch Claude Code" (T2, per spec B5)');
 
     my $t3 = eval { tui::DashboardScreen::_footer_legend(40) };
-    is($t3, ' [c] launch  [s] stop  [x] shutdown  [r] reload  [q] quit',
+    is($t3, ' [c] launch  [s] stop  [x] shutdown  [f] fleets  [r] reload  [q] quit',
         'AC-5: footer_legend(40) is the pinned T3 string, byte-for-byte');
 
     for my $tier ([$t1, 200], [$at80, 80], [$t3, 40]) {

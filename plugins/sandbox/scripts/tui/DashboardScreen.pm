@@ -542,16 +542,20 @@ sub _first_probe_reason {
     return $fallback;
 }
 
-sub snapshot_spans {
+# _snapshot_verdict(%res) -> (text, role) | () -- the one reading of a
+# snapshot's state, shared by snapshot_spans (the old labelled row, kept for
+# its callers and tests) and resources_alert_spans (the body line that
+# replaced it, 2026-11-11).
+sub _snapshot_verdict {
     my ($res) = @_;
-    return [] unless ref($res) eq 'HASH';
-    return [] unless exists $res->{snapshot_state};
+    return () unless ref($res) eq 'HASH';
+    return () unless exists $res->{snapshot_state};
 
     my $state = $res->{snapshot_state};
     my $age   = $res->{snapshot_age};
     my $age_numeric = defined($age) && !ref($age) && $age =~ /^-?\d+(?:\.\d+)?$/;
 
-    my ($text, $role);
+    my ($text, $role, $kind) = (undef, undef, 'alert');
     if (!defined $state) {
         $text = 'undef (unrecognised)';
         $role = 'state.warn';
@@ -576,6 +580,7 @@ sub snapshot_spans {
             $text .= ' - ' . $why if defined $why && length $why;
             $role = 'state.crit';
         } else {
+            $kind = ($n > 0) ? 'partial' : 'fresh';
             $text = 'fresh';
             $text .= ', ' . fmt_duration($age) . ' old' if $age_numeric;
             if ($n > 0) {
@@ -586,6 +591,7 @@ sub snapshot_spans {
             $role = 'state.ok';
         }
     } elsif ($state eq 'stale') {
+        $kind = 'stale';
         $text = 'STALE - last written';
         $text .= ' ' . fmt_duration($age) . ' ago' if $age_numeric;
         $text .= '; values withheld';
@@ -604,10 +610,119 @@ sub snapshot_spans {
         $role = 'state.warn';
     }
 
+    return ($text, $role, $kind);
+}
+
+sub snapshot_spans {
+    my ($res) = @_;
+    my ($text, $role) = _snapshot_verdict($res);
+    return [] unless defined $text;
     return [
         { text => gutter('snapshot'), role => 'text.muted' },
         { text => $text, role => $role },
     ];
+}
+
+# ===========================================================================
+# PANEL FRESHNESS IN THE TITLE (operator, 2026-11-11). The Resources panel's
+# `snapshot` row and the Run panel's `heartbeat` row are gone; how fresh each
+# panel is now rides its title rule:
+#
+#   - Resources . <1m --...         fresh, the age in text.muted
+#   - Resources . stale 12m --...   stale (the Resources reader's own
+#                                   snapshot_state verdict), in state.warn
+#   - Resources . sampling... --...   no snapshot has been written yet
+#   - Run . <1m --...               the dashboard's last heartbeat
+#   - Run . stale 6m --...          no heartbeat for HEARTBEAT_STALE_SECS
+#
+# Ages use _block_elapsed, the one-unit format the Blueprints panel already
+# uses, so a title stays short enough for the narrow 45|76 split.
+#
+# The long texts the snapshot row used to carry (a sampler that died or
+# stalled, a snapshot with no readings, an unreadable one) do not fit a title.
+# They become ONE body line, resources_alert_spans, present only while such a
+# condition holds.
+# ===========================================================================
+
+# The dashboard heartbeats every 120s (Dashboard::run beat_interval); one this
+# old means the loop has missed two in a row and is closing on the container's
+# 600s idle reap (container/heartbeat.sh), which is when the operator needs to
+# know. There was no threshold before: the row only ever printed the age.
+use constant HEARTBEAT_STALE_SECS => 300;
+
+sub _title_dot {
+    my $d = Theme::glyph('sep.dot'); $d = '-' unless defined $d && length $d;
+    return $d;
+}
+
+# resources_title_suffix(\%state) -> \@spans. PUBLIC, pure, total.
+sub resources_title_suffix {
+    my ($state) = @_;
+    $state = {} unless ref($state) eq 'HASH';
+    my $r = $state->{resources};
+    my $dot = _title_dot();
+    unless (ref($r) eq 'HASH') {
+        my $e = Theme::glyph('ellipsis'); $e = '...' unless defined $e && length $e;
+        return [ { text => "$dot sampling$e", role => 'text.muted' } ];
+    }
+    my $st  = $r->{snapshot_state};
+    my $age = $r->{snapshot_age};
+    my $age_txt = (defined($age) && !ref($age) && $age =~ /\A\d+(?:\.\d+)?\z/) ? _block_elapsed($age) : undef;
+    if (defined($st) && !ref($st) && $st eq 'fresh') {
+        return [ { text => "$dot " . (defined $age_txt ? $age_txt : 'fresh'), role => 'text.muted' } ];
+    }
+    if (defined($st) && !ref($st) && $st eq 'stale') {
+        return [ { text => $dot, role => 'text.muted' },
+                 { text => ' stale' . (defined $age_txt ? " $age_txt" : ''), role => 'state.warn' } ];
+    }
+    if (defined($st) && !ref($st) && $st eq 'failed') {
+        return [ { text => $dot, role => 'text.muted' }, { text => ' unreadable', role => 'state.crit' } ];
+    }
+    return [] unless exists $r->{snapshot_state};
+    return [ { text => $dot, role => 'text.muted' }, { text => ' ?', role => 'state.warn' } ];
+}
+
+# resources_alert_spans(\%state) -> \@spans (one body line) or [] when there
+# is nothing wrong. PUBLIC, pure, total.
+#   no snapshot yet  the sampler's own FAILED / STALLED text (sampler_wait_spans
+#                    without its label); [] while it is simply still sampling
+#   a snapshot       its verdict when that is anything but fresh-and-complete
+#                    or stale (the title already says those): no readings,
+#                    N facts unavailable, unreadable, unrecognised
+sub resources_alert_spans {
+    my ($state) = @_;
+    $state = {} unless ref($state) eq 'HASH';
+    my $r = $state->{resources};
+    unless (ref($r) eq 'HASH') {
+        my $w = sampler_wait_spans($state->{resources_sampler});
+        my $v = (ref($w) eq 'ARRAY' && @$w >= 2) ? $w->[1] : undef;
+        return [] unless ref($v) eq 'HASH' && defined($v->{role}) && $v->{role} ne 'text.muted';
+        return [ { text => $v->{text}, role => $v->{role} } ];
+    }
+    my ($text, $role, $kind) = _snapshot_verdict($r);
+    return [] unless defined $text;
+    return [] if $kind eq 'fresh' || $kind eq 'stale';
+    if ($kind eq 'partial') {
+        # "fresh, <1m old, 2 facts unavailable - why": the freshness half is
+        # the title's now; the body keeps only what is missing and why.
+        $text =~ s/\Afresh(?:, [^,]* old)?, //;
+        $role = 'state.warn';
+    }
+    return [ { text => $text, role => $role } ];
+}
+
+# run_title_suffix(\%state) -> \@spans. PUBLIC, pure, total. [] while no
+# heartbeat has been taken (beat_age undef), as the row it replaces was absent.
+sub run_title_suffix {
+    my ($state) = @_;
+    $state = {} unless ref($state) eq 'HASH';
+    my $age = $state->{beat_age};
+    return [] unless defined($age) && !ref($age) && $age =~ /\A\d+(?:\.\d+)?\z/;
+    my $dot = _title_dot();
+    return [ { text => $dot, role => 'text.muted' },
+             { text => ' stale ' . _block_elapsed($age), role => 'state.warn' } ]
+        if $age >= HEARTBEAT_STALE_SECS();
+    return [ { text => "$dot " . _block_elapsed($age), role => 'text.muted' } ];
 }
 
 # ===========================================================================
@@ -1598,6 +1713,20 @@ sub _package_name_spans {
     return [ { text => $name, role => 'name.package' } ];
 }
 
+# _attempt_spans(\%p) -> \@spans | undef. "attempt N/M" from attempt 2 on
+# (warn on the last one); shared by live and not-started package rows, so a
+# blocked package on its second attempt says so too (2026-11-11).
+sub _attempt_spans {
+    my ($p) = @_;
+    return undef unless ref($p) eq 'HASH';
+    my ($att, $cap) = ($p->{attempt}, $p->{attempt_cap});
+    my $att_n = (defined($att) && !ref($att) && $att =~ /\A\d{1,10}\z/) ? $att + 0 : undef;
+    my $cap_n = (defined($cap) && !ref($cap) && $cap =~ /\A\d{1,10}\z/) ? $cap + 0 : undef;
+    return undef unless defined($att_n) && $att_n >= 2 && defined($cap_n);
+    return [ { text => 'attempt ', role => 'text.muted' },
+             { text => "$att_n/$cap_n", role => ($att_n >= $cap_n ? 'state.warn' : 'text.primary') } ];
+}
+
 # _package_row($p, $name, $now, $paused) -> \%row. One ACTIVE package as row
 # STRUCTURE (laid out later by _layout_panel):
 #   { kind, dot => [glyph, role], name => Str, name_spans => \@spans,
@@ -1625,11 +1754,7 @@ sub _package_row {
     $step = _bound_display($p->{status}, 32) unless defined $step;
     $step = 'running' unless defined $step;
 
-    my $attempt;
-    if (defined($att_n) && $att_n >= 2 && defined($cap_n)) {
-        $attempt = [ { text => 'attempt ', role => 'text.muted' },
-                     { text => "$att_n/$cap_n", role => ($att_n >= $cap_n ? 'state.warn' : 'text.primary') } ];
-    }
+    my $attempt = _attempt_spans($p);
 
     my $total;
     my $ca = _alive_flag($p->{coordinator_alive});
@@ -1809,6 +1934,7 @@ sub _package_rows {
                 # Not started: the whole strip, nothing current.
                 push @out, { kind => 'package', dot => [ 'thread.blocked', 'state.warn' ], name => $name,
                              name_spans => _package_name_spans($name), aside => $aside,
+                             attempt => _attempt_spans($p),
                              strip => _strip_of($p->{pipeline}, undef) };
             }
             elsif ($status eq 'running' || $status eq 'converging' || $status eq 'reviewing'
@@ -1874,18 +2000,41 @@ sub _blueprint_line {
     my $total = _nonneg_int($s->{packages_total});
 
     my $icon = Theme::glyph('icon.blueprints'); $icon = '' unless defined $icon;
-    my @spans = ( { text => "$icon ", role => 'accent' }, { text => $bp, role => 'accent' },
+    # bp_name / bp_count mark the two spans _layout_rows aligns across the
+    # panel (one name width, one count width); _blueprint_line_rows drops
+    # every key but text and role, so the marks never reach a frame.
+    my @spans = ( { text => "$icon ", role => 'accent' }, { text => $bp, role => 'accent', bp_name => 1 },
                   { text => '   ', role => 'text.muted', brk => 1 } );
     push @spans, @{ _meter_spans($done, $total, 'gauge.full', 'gauge.empty') };
-    push @spans, { text => '  ' . "$done/$total", role => 'text.primary' };
+    push @spans, { text => '  ' . "$done/$total", role => 'text.primary', bp_count => 1 };
 
     my ($drv, $drv_live) = _driver_spans($s, $now);
+    # FLEET STATUS (fleet_status above). Only a fleet that is NOT up changes
+    # anything here, and only two things: the driver dot of an operator stop
+    # is the idle dot, not the crash cross (it was asked for), and a fleet
+    # with no driver evidence left at all still names its orchestrator, so
+    # "stopped" always sits beside the thing that stopped.
+    my $fs = fleet_status($s);
+    my $fs_down = ($fs && $fs->{state} =~ /\A(?:stopped|stopping|settled)\z/) ? 1 : 0;
+    if ($fs && $fs->{state} eq 'stopped') {
+        my $gname = $fs->{by_operator} ? 'status.idle' : 'status.crit';
+        my $grole = $fs->{by_operator} ? 'text.muted'  : 'state.crit';
+        my $g = Theme::glyph($gname); $g = '' unless defined $g;
+        if (@$drv) { $drv = [ { text => $g, role => $grole }, @{$drv}[1 .. $#$drv] ]; }
+        else       { $drv = [ { text => $g, role => $grole }, { text => ' orchestrator', role => 'text.muted' } ]; }
+    }
     if (@$drv) {
-        push @spans, { text => '   ', role => 'text.muted', brk => 1 }, @$drv;
+        # bp_drv: _align_blueprint_spans pads the driver to one panel-wide
+        # width so the state words after it share a column.
+        push @spans, { text => '   ', role => 'text.muted', brk => 1 }, map { { %$_, bp_drv => 1 } } @$drv;
     }
 
     my $state = (defined($s->{state}) && !ref($s->{state}) && length($s->{state})) ? $s->{state} : '?';
-    if ($state eq 'paused') {
+    if ($fs_down) {
+        my ($w, $r) = fleet_words($fs);
+        push @spans, { text => '   ', role => 'text.muted', brk => 1 }, { text => $w, role => $r };
+    }
+    elsif ($state eq 'paused') {
         # Decision 11 C4 (binding): the pause slot uses thread.idle, NEVER
         # title.paused -- the same bytes (U+23F8 with its pad, so the text
         # reads "<pause>  5h limit", two spaces), but title.* glyphs are reserved for the window
@@ -1918,6 +2067,72 @@ sub _blueprint_line {
         push @spans, { text => '   ', role => 'text.muted', brk => 1 }, { text => "$triage triage", role => 'text.muted' };
     }
     return { kind => 'blueprint', spans => \@spans, name_w => tui::Layout::display_width($bp) };
+}
+
+# ===========================================================================
+# FLEET STATUS (operator, 2026-11-11: "Maybe the TUI should just show if fleet
+# is running or not and let me start or stop them, but don't start
+# automatically upon just launching the tui").
+#
+# fleet_status($s) -> undef | { state, by_operator, action }. PUBLIC, pure,
+# total. undef unless the summary carries RunState's `fleet` evidence (a
+# runs/registry.json exists). Otherwise exactly one of:
+#
+#   running   the orchestrator is alive (or its marker is present and its
+#             liveness cannot be judged -- unknown is never called stopped)
+#   paused    the same, with runs/.paused: a usage pause it resumes itself
+#   stopping  the same, with runs/.shutdown: a graceful stop is draining
+#   stopped   no orchestrator is running while unsettled packages remain.
+#             by_operator is 1 when runs/.stopped-by-operator says the
+#             operator asked for it, so it never reads as a crash
+#   settled   no orchestrator, and every package is done or dropped
+#             (BpState's "all delivered")
+#
+# action is what the [f] fleet screen offers: 'stop' for running/paused,
+# 'start' for stopped, undef for stopping/settled. Nothing here, or anywhere
+# in the dashboard, starts a fleet by itself: 'start' is only ever offered.
+# ===========================================================================
+sub _fleet_settled {
+    my ($s) = @_;
+    my @p = (ref($s->{packages}) eq 'ARRAY') ? grep { ref($_) eq 'HASH' } @{ $s->{packages} } : ();
+    return 0 unless @p;
+    for my $p (@p) {
+        my $st = (defined($p->{status}) && !ref($p->{status})) ? $p->{status} : '';
+        return 0 unless $st eq 'done' || $st eq 'dropped';
+    }
+    return 1;
+}
+
+sub fleet_status {
+    my ($s) = @_;
+    return undef unless ref($s) eq 'HASH' && ref($s->{fleet}) eq 'HASH';
+    my $f        = $s->{fleet};
+    my $state    = (defined($s->{state}) && !ref($s->{state})) ? $s->{state} : '';
+    my $alive    = _alive_flag($s->{orchestrator_alive});
+    my $marker   = (defined($s->{orchestrator_pid}) && !ref($s->{orchestrator_pid})) ? 1 : 0;
+    my $shutdown = $f->{shutdown} ? 1 : 0;
+    my $up = (defined($alive) && $alive == 1) || (!defined($alive) && $marker);
+    if ($up) {
+        return { state => 'stopping', by_operator => ($f->{operator_stop} ? 1 : 0), action => undef } if $shutdown;
+        return { state => 'paused',  by_operator => 0, action => 'stop' } if $state eq 'paused';
+        return { state => 'running', by_operator => 0, action => 'stop' };
+    }
+    return { state => 'settled', by_operator => 0, action => undef } if _fleet_settled($s);
+    return { state => 'stopped', by_operator => ($f->{operator_stop} ? 1 : 0), action => 'start' };
+}
+
+# fleet_words(\%fleet_status) -> (text, role) for the blueprint line's state
+# slot and the fleet screen's state column. Paused and running are not here:
+# they keep the line's existing pause text and green driver.
+sub fleet_words {
+    my ($fs) = @_;
+    return ('', 'text.muted') unless ref($fs) eq 'HASH' && defined($fs->{state});
+    my $st = $fs->{state};
+    return ('stopping', 'state.warn')       if $st eq 'stopping';
+    return ('stopped by you', 'state.warn') if $st eq 'stopped' && $fs->{by_operator};
+    return ('stopped', 'state.crit')        if $st eq 'stopped';
+    return ('settled', 'text.muted')        if $st eq 'settled';
+    return ($st, (_run_state_role_map()->{$st} // 'text.muted'));
 }
 
 # _run_block_parts($s, $now) -> { head => \%blueprint_line, rows => \@rows }.
@@ -1991,87 +2206,272 @@ sub _layout_panel {
 sub _layout_rows {
     my ($parts, $cols, $mode, $wnum, $dw, $glyph, $cell_of) = @_;
 
-    # Each row's step cell and aside for this mode, computed once.
+    # Each row's step cell and status for this mode, computed once. The
+    # STATUS is what the row says after its step (operator, 2026-11-11: one
+    # status column): its step time when it has one -- a time always wins --
+    # else its reason (next, parked, blocked, no checklist, waiting on <dep>).
     my @cell;
     for my $bi (0 .. $#$parts) {
         for my $r (@{ $parts->[$bi]{rows} || [] }) {
             my ($content, $aside) = $cell_of->($mode, $r, $cols->[$bi]);
-            push @{ $cell[$bi] }, [ $content, $aside ];
+            my $status = defined($r->{time}) ? { text => $r->{time}, role => 'text.muted' }
+                       : defined($aside)     ? { text => $aside,     role => 'text.waiting' }
+                       :                       undef;
+            push @{ $cell[$bi] }, [ $content, $status ];
         }
     }
 
-    my ($D, $N, $T, $S, $U) = (1, 0, 0, 0, 0);
-    my $has_aside = 0;
+    # Column widths, panel-wide. V, the status column, is as wide as the
+    # longest SHORT status (STATUS_COL_MAX at most); `waiting on <dep>` is the
+    # one long value: it runs on past V on a row with no attempt counter and
+    # is cut to V on a row that has one, so `attempt N/M` always starts in one
+    # column.
+    my ($D, $N, $T, $S, $V) = (1, 0, 0, 0, 0);
+    my ($any_status, $long_with_attempt) = (0, 0);
     for my $bi (0 .. $#$parts) {
         my $ri = 0;
         for my $r (@{ $parts->[$bi]{rows} || [] }) {
-            my ($content, $aside) = @{ $cell[$bi][ $ri++ ] };
+            my ($content, $status) = @{ $cell[$bi][ $ri++ ] };
             my $gw = $dw->($glyph->($r->{dot}[0]));
             $D = $gw if $gw > $D;
             my $nw = $dw->($r->{name});
             $N = $nw if $nw > $N;
             my $tw = $dw->($r->{total}); $T = $tw if $tw > $T;
             my $sw = $content ? tui::Frame::spans_width($content) : 0; $S = $sw if $sw > $S;
-            my $uw = $dw->($r->{time}); $U = $uw if $uw > $U;
-            $has_aside = 1 if defined $aside;
+            next unless $status;
+            $any_status = 1;
+            if ($status->{text} =~ /\Awaiting on /) {
+                $long_with_attempt = 1 if ref($r->{attempt}) eq 'ARRAY';
+                next;
+            }
+            my $vw = $dw->($status->{text}); $V = $vw if $vw > $V;
         }
     }
-    my $has_time_col = $U > 0 || $has_aside;
+    $V = STATUS_COL_MAX() if $V > STATUS_COL_MAX() || $long_with_attempt;
+
+    # $build->($xp) -> (\@rows_by_block, $fits): every package row, with $xp
+    # extra columns before the status column. $fits is 0 when that extra
+    # pushes a row that fitted $wnum past it.
+    my $build = sub {
+        my ($xp) = @_;
+        my @by_block;
+        my $fits = 1;
+        for my $bi (0 .. $#$parts) {
+            my @rows;
+            my $ri = 0;
+            for my $r (@{ $parts->[$bi]{rows} || [] }) {
+                my ($content, $status) = @{ $cell[$bi][ $ri++ ] };
+                my $g = $glyph->($r->{dot}[0]);
+                my @spans = ( { text => '  ', role => 'text.muted' }, { text => $g, role => $r->{dot}[1] },
+                              { text => ' ' x ($D - $dw->($g) + 1), role => 'text.muted' } );
+                my $attempt = (ref($r->{attempt}) eq 'ARRAY') ? $r->{attempt} : undef;
+                my $st = $status;
+                if ($st && $attempt && $dw->($st->{text}) > $V) {
+                    $st = { %$st, text => _clip_name($st->{text}, $V) };
+                }
+                # [width, \@spans|undef, separator, align, carries $xp]. Every
+                # cell is left-aligned except the total, which right-aligns
+                # its durations.
+                my @cells;
+                push @cells, [ $T, (defined($r->{total}) ? [ { text => $r->{total}, role => 'text.muted' } ] : undef), ' ', 'r', 0 ] if $T;
+                push @cells, [ $S, $content, '   ', 'l', 0 ] if $S;
+                push @cells, [ $V, ($st ? [ $st ] : undef), '   ' . (' ' x $xp), 'l', 1 ] if $any_status;
+                push @cells, [ 0, $attempt, '   ' . ($any_status ? '' : ' ' x $xp), 'l', !$any_status ] if $attempt;
+                my $last = -1;
+                for my $i (0 .. $#cells) { $last = $i if ref($cells[$i][1]) eq 'ARRAY'; }
+
+                push @spans, @{ $r->{name_spans} };
+                if ($last >= 0) {
+                    my $pad = $N - $dw->($r->{name});
+                    push @spans, { text => ' ' x $pad, role => 'text.muted' } if $pad > 0;
+                }
+                my $affected = 0;
+                for my $i (0 .. $last) {
+                    my ($w, $c, $sep, $align, $carries) = @{ $cells[$i] };
+                    $affected = 1 if $carries;
+                    my $cw = $c ? tui::Frame::spans_width($c) : 0;
+                    my $fill = ($w > $cw) ? $w - $cw : 0;
+                    if ($align eq 'r') {
+                        push @spans, { text => $sep . (' ' x $fill), role => 'text.muted' };
+                        push @spans, @$c if $c;
+                    } else {
+                        push @spans, { text => $sep, role => 'text.muted' };
+                        push @spans, @$c if $c;
+                        push @spans, { text => ' ' x $fill, role => 'text.muted' } if $fill > 0 && $i < $last;
+                    }
+                }
+                if ($xp && $affected && defined $wnum) {
+                    my $w = tui::Frame::spans_width(\@spans);
+                    $fits = 0 if $w > $wnum && ($w - $xp) <= $wnum;
+                }
+                push @rows, { kind => $r->{kind}, spans => \@spans };
+            }
+            push @by_block, \@rows;
+        }
+        return (\@by_block, $fits);
+    };
+
+    my ($BN, $CW, $DRV) = _blueprint_columns($parts, $wnum, $dw);
+    my @heads = map { _align_blueprint_spans($_->{head}{spans}, $BN, $CW, $DRV, $dw) } @$parts;
+
+    # ONE STATUS COLUMN TOP TO BOTTOM (operator, 2026-11-11). The blueprint
+    # line's state words (stopped, settled, the pause text) and the package
+    # rows' status column are moved to the same column -- whichever starts
+    # further left is pushed right -- but only when nothing that fitted the
+    # width stops fitting. Otherwise each keeps its own column. With no known
+    # width (a bare unit call) nothing can be judged to fit, so the two keep
+    # their own columns.
+    my $P = 2 + $D + 1 + $N + ($T ? 1 + $T : 0) + ($S ? 3 + $S : 0) + 3;
+    my $B;
+    for my $h (@heads) {
+        my $b = _blueprint_state_col($h);
+        $B = $b if defined $b;
+    }
+    my ($xp, $xb) = (0, 0);
+    if (defined($B) && $any_status && defined($wnum)) {
+        if    ($B > $P) { $xp = $B - $P; }
+        elsif ($P > $B) { $xb = $P - $B; }
+    }
+    my ($rows_by_block, $fits) = $build->($xp);
+    ($rows_by_block) = $build->(0) if $xp && !$fits;
+    if ($xb) {
+        my @try = map { _align_blueprint_spans($_->{head}{spans}, $BN, $CW, $DRV, $dw, $xb) } @$parts;
+        my $ok = 1;
+        if (defined $wnum) {
+            for my $i (0 .. $#try) {
+                my ($old, $new) = (tui::Frame::spans_width($heads[$i]), tui::Frame::spans_width($try[$i]));
+                $ok = 0 if $old <= $wnum && $new > $wnum;
+            }
+        }
+        @heads = @try if $ok;
+    }
 
     my @out;
     for my $bi (0 .. $#$parts) {
-        my $b = $parts->[$bi];
-        my @lines;
-        my $head = $b->{head};
+        my $head = $parts->[$bi]{head};
         # A wrapped blueprint line continues under its meter -- or at the
         # plain two-column indent when the name alone is half the width.
-        my $head_hang = 2 + ($head->{name_w} // 0) + 3;
+        my $head_hang = 2 + (defined($BN) ? $BN : ($head->{name_w} // 0)) + 3;
         $head_hang = 2 if defined($wnum) && $head_hang > int($wnum / 2);
-        push @lines, _blueprint_line_rows($head->{spans}, $wnum, $head_hang);
-
-        my $ri = 0;
-        for my $r (@{ $b->{rows} || [] }) {
-            my ($content, $aside) = @{ $cell[$bi][ $ri++ ] };
-            my $g = $glyph->($r->{dot}[0]);
-            my @spans = ( { text => '  ', role => 'text.muted' }, { text => $g, role => $r->{dot}[1] },
-                          { text => ' ' x ($D - $dw->($g) + 1), role => 'text.muted' } );
-
-            # The cells after the name, in column order: [width, align, \@spans|undef, sep].
-            my @cells;
-            push @cells, [ $T, 'r', (defined($r->{total}) ? [ { text => $r->{total}, role => 'text.muted' } ] : undef), ' ' ] if $T;
-            push @cells, [ $S, 'l', $content, '   ' ] if $S;
-            if (defined $aside) {
-                push @cells, [ 0, 'l', [ { text => $aside, role => 'text.waiting' } ], '   ' ];
-            }
-            else {
-                push @cells, [ $U, 'r', (defined($r->{time}) ? [ { text => $r->{time}, role => 'text.muted' } ] : undef), '   ' ] if $has_time_col;
-                push @cells, [ 0, 'l', $r->{attempt}, '   ' ] if ref($r->{attempt}) eq 'ARRAY';
-            }
-            my $last = -1;
-            for my $i (0 .. $#cells) { $last = $i if ref($cells[$i][2]) eq 'ARRAY'; }
-
-            push @spans, @{ $r->{name_spans} };
-            if ($last >= 0) {
-                my $pad = $N - $dw->($r->{name});
-                push @spans, { text => ' ' x $pad, role => 'text.muted' } if $pad > 0;
-            }
-            for my $i (0 .. $last) {
-                my ($w, $align, $content, $sep) = @{ $cells[$i] };
-                my $cw = $content ? tui::Frame::spans_width($content) : 0;
-                my $fill = ($w > $cw) ? $w - $cw : 0;
-                if ($align eq 'r') {
-                    push @spans, { text => $sep . (' ' x $fill), role => 'text.muted' };
-                    push @spans, @$content if $content;
-                }
-                else {
-                    push @spans, { text => $sep, role => 'text.muted' };
-                    push @spans, @$content if $content;
-                    push @spans, { text => ' ' x $fill, role => 'text.muted' } if $fill > 0 && $i < $last;
-                }
-            }
-            push @lines, { kind => $r->{kind}, spans => \@spans };
-        }
+        my @lines = ( _blueprint_line_rows($heads[$bi], $wnum, $head_hang), @{ $rows_by_block->[$bi] } );
         push @out, { hang => $head_hang, row_hang => 2 + $D + 1, lines => \@lines };
+    }
+    return \@out;
+}
+
+# STATUS_COL_MAX -- the widest the package rows' status column grows.
+use constant STATUS_COL_MAX => 12;
+
+# _blueprint_state_col(\@aligned_spans) -> the display column where the
+# line's state/pause/decision words start, or undef when the line has none.
+sub _blueprint_state_col {
+    my ($sp) = @_;
+    return undef unless ref($sp) eq 'ARRAY';
+    my ($k) = grep { $sp->[$_]{bp_drv} } reverse 0 .. $#$sp;
+    ($k) = grep { $sp->[$_]{bp_count} } 0 .. $#$sp unless defined $k;
+    return undef unless defined($k) && $k + 1 < $#$sp;
+    return tui::Frame::spans_width([ @{$sp}[0 .. $k + 1] ]);
+}
+
+# THE BLUEPRINT-LINE COLUMNS (operator, 2026-11-11: the meter, the count and
+# the driver started in a different column on every blueprint line). Every
+# blueprint line in the panel gets ONE name width and ONE count width, the way
+# the package rows already share theirs, so the meter, the `d/t` count and
+# the driver/state start in the same column on every line.
+#
+# BP_NAME_MAX = 24. Blueprint names are longer than package names (no number
+# prefix, several words: `fleet-observability`, `acxpraxis-step-2` are 16-19,
+# the longest in use here ~22), so 16 would cut ordinary names. 24 keeps every
+# name seen so far whole, and is still small enough that the longest line
+# this panel draws -- icon 2 + name 24 + meter 18 + count 5 + driver 21 +
+# pause text 29 = 99 -- fits a 121-column terminal with room to spare.
+use constant BP_NAME_MAX     => 24;
+
+# _blueprint_columns(\@parts, $width, $dw) -> ($BN, $CW, $DRV): the panel-wide
+# name, count and driver widths. Every blueprint line pads its name to $BN,
+# its count to $CW and its driver (dot, word, uptime) to $DRV -- a line with
+# no driver (settled, solo) pads by $DRV + 3 instead -- so the meter, the
+# count and the state/pause words each start in ONE column. $BN starts at the
+# widest (capped) name. With a known width it then SHRINKS until no line that
+# fit on one row unpadded (name capped) is pushed past the width by the
+# padding -- alignment never makes a line wrap that did not wrap before; the
+# name cap does the shrinking (down to 2 columns: one character and the
+# ellipsis). A line that already did not fit wraps as before.
+sub _blueprint_columns {
+    my ($parts, $wnum, $dw) = @_;
+    my ($BN, $CW, $DRV) = (0, 0, 0);
+    my @m;
+    for my $p (@$parts) {
+        my $sp = (ref($p->{head}) eq 'HASH' && ref($p->{head}{spans}) eq 'ARRAY') ? $p->{head}{spans} : [];
+        my ($n) = grep { $_->{bp_name} } @$sp;
+        my ($ci) = grep { $sp->[$_]{bp_count} } 0 .. $#$sp;
+        next unless $n && defined $ci;
+        my $nw = $dw->($n->{text});
+        my $cw = $dw->($sp->[$ci]{text});
+        my $drw = 0; $drw += $dw->($_->{text}) for grep { $_->{bp_drv} } @$sp;
+        my ($last_drv) = grep { $sp->[$_]{bp_drv} } reverse 0 .. $#$sp;
+        my $after = defined($last_drv) ? ($last_drv < $#$sp) : ($ci < $#$sp);
+        my $capped = $nw > BP_NAME_MAX() ? BP_NAME_MAX() : $nw;
+        push @m, { all => tui::Frame::spans_width($sp), nw => $nw, name => $capped, count => $cw,
+                   drv => $drw, has_drv => defined($last_drv) ? 1 : 0, after => $after ? 1 : 0 };
+        $BN  = $capped if $capped > $BN;
+        $CW  = $cw  if $cw  > $CW;
+        $DRV = $drw if $drw > $DRV;
+    }
+    return (undef, undef, undef) unless @m;
+    if (defined $wnum) {
+        my $want = $BN;
+        for my $x (@m) {
+            my $natural = $x->{all} - $x->{nw} + $x->{name};
+            next unless $natural <= $wnum;                               # fit before
+            my $pad = 0;
+            if ($x->{after}) {
+                $pad += $CW - $x->{count};
+                $pad += $x->{has_drv} ? ($DRV - $x->{drv}) : ($DRV ? $DRV + 3 : 0);
+            } elsif ($x->{has_drv}) {
+                $pad += $CW - $x->{count};
+            }
+            my $final = $natural - $x->{name} + $BN + $pad;
+            $BN -= ($final - $wnum) if $final > $wnum;
+        }
+        # The no-new-wrap rule beats any minimum width; the only floor is
+        # what can still show a name at all, and it never widens a column
+        # past the widest name present.
+        $BN = ($want < 2 ? $want : 2) if $BN < 2;
+    }
+    return ($BN, $CW, $DRV);
+}
+
+# _align_blueprint_spans(\@spans, $BN, $CW, $DRV, $dw) -> \@spans: the name
+# cut to $BN with the theme's ellipsis and padded to it, the count padded to
+# $CW, the driver padded to $DRV (or, with no driver, the count padded by
+# $DRV + 3 more), then $XB more before the state words (the shared status
+# column, _layout_rows). No trailing pad on whatever ends the line.
+sub _align_blueprint_spans {
+    my ($spans, $BN, $CW, $DRV, $dw, $XB) = @_;
+    $XB = 0 unless defined($XB) && $XB =~ /\A\d+\z/;
+    return $spans unless defined $BN && ref($spans) eq 'ARRAY';
+    my @out = map { { %$_ } } @$spans;
+    my ($last_drv) = grep { $out[$_]{bp_drv} } reverse 0 .. $#out;
+    my $drw = 0; $drw += $dw->($_->{text}) for grep { $_->{bp_drv} } @out;
+    for my $i (0 .. $#out) {
+        my $s = $out[$i];
+        if ($s->{bp_name}) {
+            my $t = _clip_name($s->{text}, $BN);
+            my $pad = $BN - $dw->($t);
+            $s->{text} = $t . (' ' x ($pad > 0 ? $pad : 0));
+        }
+        elsif ($s->{bp_count} && $i < $#out) {
+            my $pad = $CW - $dw->($s->{text});
+            $s->{text} .= ' ' x $pad if $pad > 0;
+            $s->{text} .= ' ' x ($DRV + 3) if !defined($last_drv) && $DRV;
+            $s->{text} .= ' ' x $XB if !defined($last_drv);
+        }
+        elsif (defined($last_drv) && $i == $last_drv && $i < $#out) {
+            my $pad = $DRV - $drw;
+            $s->{text} .= ' ' x $pad if $pad > 0;
+            $s->{text} .= ' ' x $XB;
+        }
     }
     return \@out;
 }
@@ -2140,6 +2540,9 @@ sub _panel_blocks {
     return _layout_panel([ grep { defined } map { _run_block_parts($_, $now) } @$summaries ], $width);
 }
 
+# _gap_row() -> \@spans: the blank row between two blueprint blocks.
+sub _gap_row { return [ { text => '', role => 'text.muted' } ]; }
+
 # _run_summary_lines(\@runs, $max_rows) -- one pre-wrapped BLOCK per
 # blueprint (ruling A: the blueprint line, driver line, package/agent/judge/
 # next lines), not one row -- a block can and routinely does span several
@@ -2165,7 +2568,12 @@ sub _run_summary_lines {
     my $shown = (@summaries < $max_rows) ? scalar(@summaries) : $max_rows;
 
     my @out;
+    my $first = 1;
     for my $block (@{ _panel_blocks([ @summaries[0 .. $shown - 1] ], $now, $width) }) {
+        # ONE BLANK LINE BETWEEN BLUEPRINT BLOCKS (operator, 2026-11-11). It is
+        # the first thing a short panel gives up (see _select_rows).
+        push @out, _gap_row() unless $first;
+        $first = 0;
         for my $line (@{ $block->{lines} || [] }) {
             push @out, @{ _line_rows($block, $line, $width) };
         }
@@ -2191,10 +2599,8 @@ sub _run_body {
     # an absent beat_age/uptime would sail past is_absent and render a
     # spurious "heartbeat : n/a ago" / "uptime : n/a ago" row instead of
     # being suppressed. Do not delete these as "obviously redundant".
-    if (defined $state->{beat_age}) {
-        my $r = row({ label => 'heartbeat', value => [ { text => fmt_duration($state->{beat_age}) . ' ago', role => 'text.primary' } ] });
-        push @lines, $r if @$r;
-    }
+    # The heartbeat row is gone (2026-11-11): its age is the Run title's now
+    # (run_title_suffix).
     if (defined $state->{uptime}) {
         my $r = row({ label => 'uptime', value => [ { text => fmt_duration($state->{uptime}), role => 'text.primary' } ] });
         push @lines, $r if @$r;
@@ -2543,7 +2949,10 @@ sub _blueprints_row_plan {
     # blueprint line now, so it survives exactly as long as that line does.
     my %kind_pri = ( blueprint => 1, package => 3, judge => 4, next => 5 );
 
+    my $first = 1;
     for my $block (@{ _panel_blocks([ @summaries[0 .. $shown - 1] ], $now, $width) }) {
+        push @entries, { spans => _gap_row(), pri => 6, kind => 'gap', parent => undef } unless $first;
+        $first = 0;
         my $bp_anchor;
         for my $line (@{ $block->{lines} || [] }) {
             my $pri = $kind_pri{ $line->{kind} // '' } // 9;
@@ -2603,7 +3012,12 @@ sub _select_rows {
     # anchor's closure cost below. Excluding it here is what makes a
     # multi-line logical row a single unit rather than two same-tier rows
     # that could be admitted separately, one row short of each other.
-    my @candidates = grep { ref($entries->[$_]) eq 'HASH' && !$entries->[$_]{cont_of} } (0 .. $#$entries);
+    # The blank rows between blocks (kind gap) are not candidates either:
+    # they are admitted last, and only when every content row made it, so
+    # a short panel gives up its spacing before any content.
+    my @gaps = grep { ref($entries->[$_]) eq 'HASH' && ($entries->[$_]{kind} // '') eq 'gap' } (0 .. $#$entries);
+    my %is_gap = map { $_ => 1 } @gaps;
+    my @candidates = grep { ref($entries->[$_]) eq 'HASH' && !$entries->[$_]{cont_of} && !$is_gap{$_} } (0 .. $#$entries);
     my %tier;
     push @{ $tier{ _entry_pri($entries, $_) } }, $_ for @candidates;
 
@@ -2645,6 +3059,13 @@ sub _select_rows {
             $kept{$_} = 1 for @need;
             $spent += $cost;
         }
+    }
+    # All or none: a panel with blank rows between SOME blocks and not others
+    # reads as two different layouts.
+    if (!grep { !$kept{$_} } @candidates) {
+        my $c = 0;
+        $c += _row_cost($entries->[$_]{spans}, $width) for @gaps;
+        if ($spent + $c <= $budget) { $kept{$_} = 1 for @gaps; }
     }
     return [ sort { $a <=> $b } keys %kept ];
 }
@@ -2692,18 +3113,46 @@ sub _blueprints_body {
     return _blueprints_body_today($state, $cols) unless ref($plan) eq 'ARRAY' && @$plan;
 
     my $width = _blueprints_body_width($cols);
-    my $total = 0;
-    $total += _row_cost($_->{spans}, $width) for @$plan;
-    return _blueprints_body_today($state, $cols) if $total <= $cap;
-
-    my $reserve = _row_cost(_collapse_notice(scalar @$plan), $width);
-    my $keep = _select_rows($plan, $cap - $reserve, $width);
-    $keep = [] unless ref($keep) eq 'ARRAY';
-    my $hidden = scalar(@$plan) - scalar(@$keep);
+    my ($keep, $hidden) = _blueprints_collapse($plan, $cap, $width);
+    return _blueprints_body_today($state, $cols) unless defined $keep;
 
     my @out = map { $plan->[$_]{spans} } @$keep;
-    push @out, _collapse_notice($hidden);
+    push @out, _collapse_notice($hidden) if $hidden > 0;
     return \@out;
+}
+
+# _blueprints_collapse(\@plan, $cap, $width) -> (undef, 0) when the whole plan
+# fits (nothing to collapse), else (\@keep_indices, $hidden). The one place
+# that decides it, shared with scripts/tui-preview.pl's capture report.
+#   1. everything fits                         -> undef (today's pipeline)
+#   2. the content fits once the blank rows
+#      between blocks go                       -> every content row, and as
+#                                                 many gaps as still fit; no
+#                                                 notice (nothing is hidden)
+#   3. otherwise                               -> _select_rows under the
+#                                                 notice's reserve; $hidden
+#                                                 counts CONTENT rows only
+sub _blueprints_collapse {
+    my ($plan, $cap, $width) = @_;
+    return (undef, 0) unless ref($plan) eq 'ARRAY' && @$plan;
+    my ($total, $content, $content_n) = (0, 0, 0);
+    for my $e (@$plan) {
+        my $c = _row_cost($e->{spans}, $width);
+        $total += $c;
+        next if ($e->{kind} // '') eq 'gap';
+        $content += $c;
+        $content_n++;
+    }
+    return (undef, 0) if $total <= $cap;
+    if ($content <= $cap) {
+        my $keep = _select_rows($plan, $cap, $width);
+        return ((ref($keep) eq 'ARRAY' ? $keep : []), 0);
+    }
+    my $reserve = _row_cost(_collapse_notice($content_n), $width);
+    my $keep = _select_rows($plan, $cap - $reserve, $width);
+    $keep = [] unless ref($keep) eq 'ARRAY';
+    my $kept_content = grep { ($plan->[$_]{kind} // '') ne 'gap' } @$keep;
+    return ($keep, $content_n - $kept_content);
 }
 
 # ===========================================================================
@@ -3054,8 +3503,9 @@ sub _resources_body {
     return [] unless ref($r) eq 'HASH';
     my @lines;
 
-    my $snap = snapshot_spans($r);
-    push @lines, $snap if ref($snap) eq 'ARRAY' && @$snap;
+    # The snapshot row is gone (2026-11-11): its freshness is the panel title's
+    # (resources_title_suffix) and a fault is panels()' one alert line
+    # (resources_alert_spans), so the body opens with the readings.
 
     # MACHINE AND PODMAN ARE NO LONGER HERE. They describe the podman
     # installation, not a live reading, and the operator moved them into the Run
@@ -3333,7 +3783,7 @@ sub panels {
     #
     # DERIVED, not picked: the label column and its gutter, plus room for the
     # longest value this panel actually renders.
-    push @out, { title => 'Run', lines => _run_body($state),
+    push @out, { title => 'Run', title_suffix => run_title_suffix($state), lines => _run_body($state),
                  min_cols => tui::Meter::LABEL_COL_WIDTH() + 3 + 30, uneven_ok => 1 };
 
     # RESOURCES IS ALWAYS PRESENT, for the same reason the geometry is fixed.
@@ -3349,15 +3799,18 @@ sub panels {
     if (ref($state->{resources}) eq 'HASH') {
         # uneven_ok: Resources would rather sit beside Run at whatever width its
         # min_cols demands than be pushed onto its own row. See tui::Layout::place.
-        push @out, { title => 'Resources', lines => _resources_body($state->{resources}),
+        my $alert = resources_alert_spans($state);
+        push @out, { title => 'Resources', title_suffix => resources_title_suffix($state),
+                     lines => [ (@$alert ? ($alert) : ()), @{ _resources_body($state->{resources}) } ],
                      min_cols => tui::Meter::min_width(), uneven_ok => 1 };
     } else {
         # No snapshot has EVER been written. Until t01 this branch rendered one
         # hardcoded sentence whatever the reason, so a sampler that failed to
         # fork looked exactly like one that started two seconds ago -- which is
         # what the operator saw, unchanged, indefinitely.
-        push @out, { title => "Resources", uneven_ok => 1,
-                     lines => [ sampler_wait_spans($state->{resources_sampler}) ],
+        my $alert = resources_alert_spans($state);
+        push @out, { title => "Resources", uneven_ok => 1, title_suffix => resources_title_suffix($state),
+                     lines => [ @$alert ? ($alert) : () ],
                      min_cols => tui::Meter::min_width() };
     }
 
@@ -3463,10 +3916,14 @@ sub panels {
 sub _footer_legend {
     my ($cols) = @_;
     $cols = 200 if !defined $cols;
+    # [f] fleets (fleet-control, 2026-11-11) rides every tier that has room
+    # for it; the 75-column tier stays as it was so an 80-column terminal
+    # keeps "[c] launch Claude Code" (lifecycle-stop.t AC-5).
     my @tiers = (
-        ' [c] launch Claude Code  [s] stop runs  [x] full shutdown  [up/down] scroll  [r] reload  [q] quit',
+        ' [c] launch Claude Code  [s] stop runs  [x] full shutdown  [f] fleets  [up/down] scroll  [r] reload  [q] quit',
+        ' [c] launch Claude Code  [s] stop runs  [x] shutdown  [f] fleets  [r] reload  [q] quit',
         ' [c] launch Claude Code  [s] stop runs  [x] shutdown  [r] reload  [q] quit',
-        ' [c] launch  [s] stop  [x] shutdown  [r] reload  [q] quit',
+        ' [c] launch  [s] stop  [x] shutdown  [f] fleets  [r] reload  [q] quit',
     );
     for my $t (@tiers) {
         return $t if tui::Layout::display_width($t) <= $cols;

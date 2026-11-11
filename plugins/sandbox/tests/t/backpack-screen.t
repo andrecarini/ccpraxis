@@ -347,8 +347,13 @@ is_deeply([ Dashboard::dispatch_key('b', 'relaunch') ], [ 'cancel-relaunch', '' 
         is(Dashboard::_assemble_esc("\e", sub { @feed_b ? shift @feed_b : undef }), 'DOWN',
             'AC-H7: ESC [ B assembles to DOWN');
         my @feed_c = ('[', 'C');
-        is(Dashboard::_assemble_esc("\e", sub { @feed_c ? shift @feed_c : undef }), undef,
-            'AC-H7: ESC [ C (an unrecognised final letter) assembles to undef');
+        # 2026-11-11: the shared parser now names RIGHT/LEFT (and Home/End/
+        # PgUp/PgDn); a screen with no use for them ignores the token.
+        is(Dashboard::_assemble_esc("\e", sub { @feed_c ? shift @feed_c : undef }), 'RIGHT',
+            'AC-H7: ESC [ C assembles to RIGHT');
+        my @feed_i = ('[', 'I');
+        is(Dashboard::_assemble_esc("\e", sub { @feed_i ? shift @feed_i : undef }), undef,
+            'AC-H7: ESC [ I (an unrecognised final letter) assembles to undef');
         is(Dashboard::_assemble_esc("\e", sub { undef }), "\e",
             'AC-H7: a lone ESC (nothing more to read) stays "\\e"');
         my @feed_z = ('z');

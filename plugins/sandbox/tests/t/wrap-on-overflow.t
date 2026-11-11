@@ -673,10 +673,12 @@ SKIP: {
         # The marker rides in the BLUEPRINT name, not the package name: since
         # 2026-11-05 (operator) a package name is drawn at most 16 columns
         # wide and cut with an ellipsis by design, so it can no longer carry
-        # an overflowing row. The blueprint name is never cut; its line wraps.
+        # an overflowing row. Since 2026-11-11 (operator) the blueprint name
+        # is capped too (BP_NAME_MAX, one name column across the panel), so
+        # the marker rides in the pause reason, which is drawn whole and wraps.
         my $state = {
             project_name => 'p', container => 'c', status => 'running',
-            runs => [ { blueprint => $marker_text, state => 'running',
+            runs => [ { blueprint => 'bp', state => 'paused', paused_reason => $marker_text,
                         packages_done => 1, packages_total => 3,
                         current_package => 'pkg' } ],
         };

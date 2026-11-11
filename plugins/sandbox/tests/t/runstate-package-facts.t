@@ -271,12 +271,16 @@ sub mk_ledger {
 # the comment above: this file's own AC1/AC28 are unrelated to package
 # 01-run-blocks, so the lists are widened in lockstep rather than left to
 # fail on an unrelated struct change.
+# Widened 23 -> 24 by fleet-control (operator, 2026-11-11): `fleet`, undef
+# unless runs/registry.json exists, else { shutdown, operator_stop,
+# operator_stop_at } -- the evidence DashboardScreen::fleet_status judges.
 my @SUMMARY_KEYS = qw(
     blueprint runs_dir state orchestrator_pid orchestrator_alive orchestrator_started_at
     paused_manual paused_reason packages_total packages_done current_package
     running_coordinators escalations_waiting inbox_waiting triage_waiting packages
     run_agents thread thread_events
     paused_window relaunch_at relaunch_local next_package
+    fleet
 );
 # Widened 10 -> 12 (operator request 2026-11-04, Blueprints panel activity
 # rows): coordinator_alive / coordinator_started_at carry the registry pid

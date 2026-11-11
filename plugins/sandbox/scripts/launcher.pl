@@ -6522,6 +6522,8 @@ sub enter_dashboard {
         }
     }
 
+    # Raw console reads for the dashboard: Term::ReadKey, logged under CCPRAXIS_KEYLOG.
+    my $KEY_RAW = Dashboard::keylog_reader(sub { my ($t) = @_; return eval { Term::ReadKey::ReadKey(defined $t ? $t : -1) } });
     my $rc = Dashboard::run(
         color     => 1,
         # The two t11 seams. Dashboard.pm contains no system/exec/fork and
@@ -6608,33 +6610,17 @@ sub enter_dashboard {
             $STDERR_CAPTURE_FH   = undef;
             reset_terminal();
         },
+        # THE ONE KEY PARSER (2026-11-11): an ESC is assembled by
+        # Dashboard::_assemble_esc, the parser every screen shares, with a
+        # blocking read as its settle seam -- this console delivers a
+        # sequence in pieces, and the old 20 ms inline wait read a split DOWN
+        # arrow as a lone ESC, which closed the [f] screen. Every raw read
+        # goes through Dashboard::keylog_reader, so CCPRAXIS_KEYLOG=<path>
+        # records exactly what the terminal sent.
         read_key  => sub {
-            my $k = Term::ReadKey::ReadKey(-1);   # non-blocking poll
+            my $k = $KEY_RAW->(-1);   # non-blocking poll
             return undef unless defined $k;
-            if ($k eq "\e") {
-                # Assemble an arrow escape sequence into a token the dashboard
-                # understands: UP/DOWN scroll the Activity panel. A lone ESC (no
-                # following bytes) falls through as "\e" (inert in dispatch_key).
-                my $k2 = Term::ReadKey::ReadKey(0.02);
-                if (defined $k2 && ($k2 eq '[' || $k2 eq 'O')) {
-                    my $k3 = Term::ReadKey::ReadKey(0.02);
-                    if (defined $k3) {
-                        return 'UP'   if $k3 eq 'A';
-                        return 'DOWN' if $k3 eq 'B';
-                        if ($k3 =~ /[0-9]/) {   # drain a numeric CSI (e.g. \e[5~)
-                            while (defined(my $d = Term::ReadKey::ReadKey(0.01))) {
-                                last if $d !~ /[0-9;]/;
-                            }
-                        }
-                        return undef;   # other arrows / CSI: ignore
-                    }
-                }
-                # ESC + a non-CSI byte (e.g. Alt+key): surface that byte rather
-                # than dropping it. A lone ESC (k2 undef) falls through as inert.
-                return $k2 if defined $k2;
-                return "\e";
-            }
-            return $k;
+            return Dashboard::_assemble_esc($k, sub { $KEY_RAW->(-1) }, sub { $KEY_RAW->($_[0]) });
         },
         # s15-input-latency: the interruptible tail-wait seam. Built on
         # BLOCKING Term::ReadKey::ReadKey($timeout) with a VARIABLE timeout --
@@ -6652,7 +6638,9 @@ sub enter_dashboard {
         # ESC/arrow sequence is a hard failure, not cosmetic.
         wait_input => sub {
             my ($timeout) = @_;
-            return Term::ReadKey::ReadKey($timeout);
+            my $k = Term::ReadKey::ReadKey($timeout);
+            Dashboard::keylog_read($k, $timeout);   # CCPRAXIS_KEYLOG: the raw read, or its timeout
+            return $k;
         },
         term_size => sub {
             my @s = eval { Term::ReadKey::GetTerminalSize() };
@@ -7081,6 +7069,36 @@ sub enter_dashboard {
         bp_remove => sub {
             return BackpackOps::remove($_[0], host_file => $bp_host_file, backpack_pl => $BACKPACK_HOST_PL);
         },
+        # fleet-control (operator, 2026-11-11): the [f] screen's seams. The
+        # dashboard NEVER starts a fleet on its own -- fleet_start is reached
+        # only from tui::FleetScreen after the operator's [enter] and [y].
+        # Both actions reset $last_inspect so the next gather re-reads the
+        # run markers instead of serving the 10s cache.
+        fleet_load  => sub { return _gather_runs($PROJECT_PATH) },
+        fleet_start => sub {
+            my ($row, $progress) = @_;
+            my $bp = ref($row) eq 'HASH' ? $row->{blueprint} : undef;
+            log_ev('fleet_start', { blueprint => $bp });
+            local $ENV{MSYS2_ARG_CONV_EXCL} = '*' if $WINDOWS_FAMILY;   # /project, /root/... must reach podman verbatim
+            my $r = Dashboard::fleet_start(
+                bp => $bp, podman => $PODMAN, container => $CONTAINER_NAME,
+                runs_dir => (ref($row) eq 'HASH' ? $row->{runs_dir} : undef),
+                runner  => sub { return BoundedRun::run(@_, windows => ($WINDOWS_FAMILY ? 1 : 0)) },
+                on_tick => sub { eval { $progress->($_[0]) } if ref($progress) eq 'CODE' });
+            log_ev('fleet_start_done', { blueprint => $bp, ok => $r->{ok}, rc => $r->{rc},
+                                         timed_out => $r->{timed_out}, elapsed => $r->{elapsed},
+                                         detail => $r->{detail} });
+            $last_inspect = 0;
+            return $r;
+        },
+        fleet_stop => sub {
+            my ($row) = @_;
+            my $bp = ref($row) eq 'HASH' ? $row->{blueprint} : undef;
+            my $r = Dashboard::fleet_stop(runs_dir => (ref($row) eq 'HASH' ? $row->{runs_dir} : undef));
+            log_ev('fleet_stop', { blueprint => $bp, ok => $r->{ok}, detail => $r->{detail} });
+            $last_inspect = 0;
+            return $r;
+        },
     );
     _keepawake_release_global();   # drop the wake-lock on clean dashboard exit
     exit($rc // 0);
@@ -7211,6 +7229,12 @@ sub _lifecycle_run {
         status_cb       => $progress,
         log_cb          => sub { log_ev($_[0], $_[1]) },
         signal_runs     => sub {
+            # fleet-control: [s]/[x] are the operator stopping every live
+            # fleet, so each one is recorded as an operator stop BEFORE its
+            # .shutdown lands -- otherwise the dashboard would show the fleets
+            # it was told to stop as if they had crashed.
+            my $sum = eval { RunState::summarize("$PROJECT_PATH/.ccpraxis-local-data/blueprints") } || [];
+            Dashboard::mark_operator_stop($_) for Dashboard::operator_stop_targets($sum);
             return Dashboard::write_shutdown_signals(Dashboard::shutdown_targets($PROJECT_PATH));
         },
         quiet_probe     => sub {

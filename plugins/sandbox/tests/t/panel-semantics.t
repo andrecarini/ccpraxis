@@ -312,7 +312,9 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
     # separately by AC7 below). Deliberately NOT a row-count assertion
     # (Decision 15): each row is checked by name/content at its position,
     # never by counting scalar(@{ $run->{lines} }).
-    my @rlabels = ('heartbeat', 'uptime', 'busy-lease', 'keep-awake', 'needs you');
+    # 2026-11-11 (panel freshness in the title): the heartbeat row left the
+    # body for the Run title (run_title_suffix), so the rows start at uptime.
+    my @rlabels = ('uptime', 'busy-lease', 'keep-awake', 'needs you');
     for my $i (0 .. $#rlabels) {
         my $line = $run->{lines}[$i];
         is(ref($line), 'ARRAY', "AC1: Run line $i ('$rlabels[$i]') is an ARRAY ref of spans");
@@ -327,11 +329,13 @@ sub _live_gutter_label { return tui::DashboardScreen::gutter($_[0]); }
     # exact assertion AC-F5 and this AC used to disagree about -- AC-F5
     # wins, and re-deriving via Dashboard::fmt_age is how AC2 keeps its
     # claim without re-pinning a literal).
-    is($run->{lines}[0][1]{role}, tui::DashboardScreen::theme_role('value'), 'AC2: heartbeat value role is value when beat_age defined (now in Run)');
-    is($run->{lines}[0][1]{text}, Dashboard::fmt_age(12) . ' ago',
-        'AC2: heartbeat text is fmt_age(...) . " ago" (now in Run)');
-    is($run->{lines}[1][1]{role}, tui::DashboardScreen::theme_role('value'), 'AC2: uptime value role is value when uptime defined (now in Run)');
-    is($run->{lines}[1][1]{text}, Dashboard::fmt_age(3660),
+    # The heartbeat now rides the Run title: "Run . <1m" for beat_age 12.
+    is(join('', map { $_->{text} } @{ $run->{title_suffix} || [] }),
+        (Theme::glyph('sep.dot') // '') . ' <1m', 'AC2: the heartbeat age is the Run title suffix when beat_age defined');
+    ok(!(grep { ref($_) eq 'ARRAY' && defined($_->[0]{text}) && $_->[0]{text} eq _live_gutter_label('heartbeat') } @{ $run->{lines} }),
+        'AC2: and no heartbeat row remains in the Run body');
+    is($run->{lines}[0][1]{role}, tui::DashboardScreen::theme_role('value'), 'AC2: uptime value role is value when uptime defined (now in Run)');
+    is($run->{lines}[0][1]{text}, Dashboard::fmt_age(3660),
         'AC2: uptime text is fmt_age(...), NOT fmt_hms (AC-F5, now in Run)');
 
     # AC5 (+ AC2's project claim, folded in here for the same reason): the

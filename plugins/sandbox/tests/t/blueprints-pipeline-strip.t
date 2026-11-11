@@ -145,7 +145,7 @@ my $MOCK_RUN = run(packages => \@MOCK);
     my $r = texts(rows([$MOCK_RUN]));
     my $strip8 = 'sco spe tes imp val rev fix';
     my @want = (
-        S(2) . G('status.ok')      . ' 03-make-and-hoo' . G('ellipsis') . ' 12h' . S(3) . S(4) . 'spe tes imp val rev fix' . S(4) . S(3) . ' 3h' . S(3) . 'attempt 2/5',
+        S(2) . G('status.ok')      . ' 03-make-and-hoo' . G('ellipsis') . ' 12h' . S(3) . S(4) . 'spe tes imp val rev fix' . S(4) . S(3) . '3h' . S(10) . S(3) . 'attempt 2/5',
         S(2) . G('status.ok')      . ' 12-model-merge'  . S(2)          . '  4h' . S(3) . $strip8 . S(4) . S(3) . '41m',
         S(2) . G('status.idle')    . ' 01-execution-po' . G('ellipsis') . S(4)   . S(3) . $strip8 . ' hnd',
         S(2) . G('thread.blocked') . ' 14-fold-results' . S(1)          . S(4)   . S(3) . $strip8 . S(4) . S(3) . 'waiting on 15',
@@ -168,14 +168,19 @@ my $MOCK_RUN = run(packages => \@MOCK);
     is(col($r->[1], 'spe') - $col0, 4, '3: 03\'s skipped scout is blank space in the sco column (spe still in its column)');
     like($r->[1], qr/12h {7}spe/, '3: ... the blank cell is spaces');
     unlike(join("\n", @$r), qr/\bui\b/, '3: a column skipped by every row (ui) is dropped');
-    # 5: the time column is right-aligned after the strip, attempt after it.
-    is(col($r->[1], ' 3h') + 3, col($r->[2], '41m') + 3, '5: the step times are right-aligned in one column');
+    # 5 (2026-11-11): ONE status column after the strip, LEFT-aligned: step
+    # times, reasons and no checklist all start in it.
+    is(col($r->[1], '3h'), col($r->[2], '41m'), '5: the step times are left-aligned in one column');
     # 6: the reason starts in the time slot and does not widen it.
     is(col($r->[4], 'waiting'), col($r->[2], '41m'), '6: "waiting on 15" starts where the step time starts');
-    is(col($r->[5], 'no checklist'), col($r->[2], '41m'), '7: "no checklist" starts where the step time starts');
-    my $no_wait = run(packages => [ @MOCK[0 .. 2] ]);
-    is(col(texts(rows([$no_wait]))->[1], 'attempt'), col($r->[1], 'attempt'),
-        '6/7: neither reason widens the time column (attempt stays put without them)');
+    is(col($r->[5], 'no checklist'), col($r->[2], '41m'), '7: "no checklist" starts in the status column too');
+    # The attempt column follows the status column, which is as wide as the
+    # longest SHORT status: here no checklist (12); without it the longest
+    # time (41m, 3).
+    is(col($r->[1], 'attempt'), col($r->[2], '41m') + 12 + 3, '6/7: attempt starts after the 12-wide status column');
+    my $no_wait = texts(rows([ run(packages => [ @MOCK[0 .. 2] ]) ]));
+    is(col($no_wait->[1], 'attempt'), col($no_wait->[2], '41m') + 3 + 3, '6/7: without the reasons the status column is as wide as the longest time');
+    unlike($r->[4], qr/\x{2026}|\xe2\x80\xa6/, '6: "waiting on 15" on a row with no attempt is never cut');
 }
 
 # ===========================================================================
@@ -201,10 +206,11 @@ my $MOCK_RUN = run(packages => \@MOCK);
         pkg(name => '01-b', alive => 1, pipeline => pl('sx      ', handoff => ' '),
             agents => [ agent(id => 'v', role => 'worker', worker_type => 'bp-implementer', age => 600) ]) ]);
     my $r = texts(rows([ $a, $b ]));
-    like($r->[1], qr/01-a   sco spe tes imp val rev fix {8}2m\z/, '2: block one has no ui and no hnd column');
-    like($r->[3], qr/01-b   spe tes imp val rev fix ui  hnd   10m\z/,
+    like($r->[1], qr/01-a   sco spe tes imp val rev fix {7}2m\z/, '2: block one has no ui and no hnd column');
+    is($r->[2], '', '2: one blank row separates the two blocks (2026-11-11)');
+    like($r->[4], qr/01-b   spe tes imp val rev fix ui  hnd   10m\z/,
         '2: block two keeps ui and hnd, and drops sco -- skipped by every row of ITS block, though block one draws it');
-    is(col($r->[1], '2m') + 2, col($r->[3], '10m') + 3, '2: the step time column lines up across blocks');
+    is(col($r->[1], '2m'), col($r->[4], '10m'), '2: the step time column starts in one column across blocks');
     my $dup = RunState::_scan_pipeline(ledger([ 'Review one', 'x' ], [ 'Review two', ' ' ]));
     is_deeply([ map { $_->{key} } @{ tui::DashboardScreen::_strip_of($dup, undef) } ], [ 'review', 'review#2' ],
         '2: a word used twice in one ledger keeps two columns');
@@ -273,7 +279,7 @@ my $MOCK_RUN = run(packages => \@MOCK);
     my $narrow = texts(rows([$MOCK_RUN], $W - 1));
     my ($a) = grep { /03-make/ } @$narrow;
     ok(defined($a) && $a !~ /\bspe\b/, '9: one column narrower, the strip is gone');
-    like($a // '', qr/implementation\s+3h   attempt 2\/5\z/, '9: ... replaced by the step word, time and attempt kept');
+    like($a // '', qr/implementation\s+3h\s+attempt 2\/5\z/, '9: ... replaced by the step word, time and attempt kept');
     my ($w) = grep { /14-fold/ } @$narrow;
     like($w // '', qr/14-fold-results\s+waiting on 15\z/, '9: ... a waiting row shows only its reason, as before the strip');
     ok(!(grep { dw($_) > $W - 1 } @$narrow[1 .. $#$narrow]), '9: every fallback row fits');

@@ -35,6 +35,18 @@
 #              unknown, container-gone, an unrecognised string...)
 #   [S]        status back to automatic
 #   [a]        release the pin, back to automatic
+#   [f]        the FLEET SCREEN, as in the dashboard, over simulated fleets:
+#              start shows ~5 s of progress then runs (sandbox-reaper's start
+#              FAILS, to show the failure); stop goes stopping -> stopped by
+#              you. In memory only; nothing is run or written.
+#              Inside it: [f] back to the panel, [q] quits the preview; ESC
+#              does nothing (it is never a command anywhere in this TUI).
+#   [x]        not simulated (a hint says so); [s] stays the status cycler
+#
+# CCPRAXIS_KEYLOG=<path> (or tui-preview.ps1 --keylog <path>) appends every raw
+# console read, every assembled key sequence and every key -> action to <path>.
+#
+# In Windows Terminal start it with scripts	ui-preview.ps1 (colour, perl).
 #
 # [d] is dismiss here because [d] is dismiss in the real dashboard
 # (Dashboard::dispatch_key). A preview that teaches a different key than the
@@ -50,6 +62,20 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+# A BACKSLASHED PATH DEFEATS FindBin under Git-for-Windows perl: started as
+# `perl C:\Development\ccpraxis\scripts\tui-preview.pl` (what a PowerShell
+# wrapper naturally passes), $Bin came out as the CWD and nothing loaded.
+# Measured 2026-11-11. Take the directory from __FILE__ with the slashes
+# normalised instead -- the launcher's own BEGIN does the same.
+BEGIN {
+    # Only when this file IS the program: a test that require()s it owns
+    # $FindBin::Bin, and rewriting it would point the test somewhere else.
+    if (__FILE__ eq $0 && !-f "$FindBin::Bin/tui-preview.pl") {
+        my $f = __FILE__;
+        $f =~ s{\\}{/}g;
+        $FindBin::Bin = ($f =~ m{\A(.*)/[^/]*\z}) ? $1 : '.';
+    }
+}
 use lib "$Bin/../plugins/sandbox/scripts";
 
 require Dashboard;
@@ -58,6 +84,7 @@ require tui::Layout;
 require tui::DashboardScreen;
 require tui::Meter;
 require Theme;
+require Time::HiRes;   # the fleet simulation's clock (sim_advance / sim_runner), never synth_state's
 
 my $HAVE_READKEY = eval { require Term::ReadKey; 1 } ? 1 : 0;
 
@@ -464,6 +491,12 @@ sub synth_runs {
                                        ? { wday => 'Mon', hhmm => '18:05', day => '03', mon => 'Nov' }
                                        : undef,
             next_package             => $running ? sprintf('pkg-preview-%d-%02d', $i, scalar(@$packages)) : undef,
+            # fleet-control: RunState's 24th key, present for key-set parity
+            # (row-budget-and-preview.t AC36) but undef, so the phase sweep
+            # renders exactly as before and its measured collapse geometries
+            # (AC47) still collapse. Fleet states have their own fixed
+            # scenario: --scenario fleet (synth_fleet_runs).
+            fleet                    => undef,
         };
     }
     return \@out;
@@ -509,7 +542,10 @@ sub synth_operator_runs {
                  owner => { kind => 'orchestrator', id => $bp, alive => 1, activity_at => undef, armed => 1 } };
     };
     my %common = (paused_manual => 0, escalations_waiting => 0, triage_waiting => 0,
-                  thread_events => [], current_package => undef);
+                  thread_events => [], current_package => undef,
+                  # fleet-control: both orchestrator-driven runs are fleets with
+                  # no stop markers; the drive-solo run below overrides it to undef.
+                  fleet => { shutdown => 0, operator_stop => 0, operator_stop_at => undef });
     return [
         { %common, blueprint => 'acxpraxis-step-2', runs_dir => '/tmp/ccpraxis-preview-runs/acxpraxis-step-2',
           state => 'paused', orchestrator_pid => 4101, orchestrator_alive => 1,
@@ -558,18 +594,138 @@ sub synth_operator_runs {
         { %common, blueprint => 'tui-operator-feedback', runs_dir => '/tmp/ccpraxis-preview-runs/tui-operator-feedback',
           state => 'running', orchestrator_pid => undef, orchestrator_alive => undef, orchestrator_started_at => undef,
           paused_reason => undef, paused_window => undef, relaunch_at => undef, relaunch_local => undef,
-          packages_total => 6, packages_done => 2, running_coordinators => 0, inbox_waiting => 0,
+          packages_total => 8, packages_done => 2, running_coordinators => 0, inbox_waiting => 0,
           packages => [
               # A UI package (its ui step is not skipped), and one whose ledger
               # has no readable checklist (04-legend: no pipeline).
               $pkg->(name => '03-pipeline-strip', step_word => 'spec', pipeline => _synth_pipeline('spec', ui => 1),
                      agents => [ $ag->('c4', 'coordinator', 'coordinator', 5_400), $ag->('w4', 'worker', 'bp-architect', 400) ]),
               $pkg->(name => '04-legend', step_word => 'scout', agents => []),
+              # 2026-11-11: thicker, so the panel's columns can be judged here
+              # too -- a second attempt with a live worker, a waiting package
+              # and a parked one.
+              $pkg->(name => '05-help-overlay', step_word => 'tests', attempt => 2,
+                     pipeline => _synth_pipeline('tests', ui => 1),
+                     agents => [ $ag->('c5', 'coordinator', 'coordinator', 2_000), $ag->('w5', 'worker', 'bp-test-writer', 180) ]),
+              $pkg->(name => '06-keymap-docs', status => 'blocked', waits_on => '05-help-overlay',
+                     pipeline => _synth_pipeline(undef)),
+              $pkg->(name => '07-colour-audit', status => 'parked', pipeline => _synth_pipeline('review')),
           ],
           run_agents => [],
           thread => { name => 'drive-tui', state => 'live', done => 2, total => 6, doing => [], current => undef, next => undef,
                       owner => { kind => 'session', id => 's1', alive => undef, activity_at => $now - 120, armed => 1 } },
-          next_package => undef },
+          next_package => undef, fleet => undef },
+    ];
+}
+
+# synth_fleet_runs() -> \@runs. `--scenario fleet` (fleet-control, operator
+# 2026-11-11): one fleet in each state the blueprint line and the [f] screen
+# distinguish -- running, paused on the 5-hour limit, stopped after a crash,
+# stopped by the operator, settled -- plus a drive-solo run, which is not a
+# fleet and must not be listed on the [f] screen. Same rules: SYNTH_NOW only.
+sub synth_fleet_runs {
+    my $now = SYNTH_NOW();
+    my $ag = sub {
+        my ($id, $role, $wt, $age) = @_;
+        return { id => $id, role => $role, worker_type => $wt, started_at => $now - $age,
+                 budget_seconds => 1800, stale_after_seconds => 7200 };
+    };
+    # $pkg->(name, status, step_word, %o): o = pipe (\@pipeline), alive, started,
+    # attempt, agents, waits_on. Every package carries RunState's 13 keys.
+    my $pkg = sub {
+        my ($name, $status, $word, %o) = @_;
+        return { name => $name, status => $status, attempt => $o{attempt} // 1, attempt_cap => 5,
+                 step => undef, steps_pending => undef, next_action => undef, agents => $o{agents} // [],
+                 step_word => $word, waits_on => $o{waits_on}, pipeline => $o{pipe},
+                 coordinator_alive => $o{alive}, coordinator_started_at => $o{started} };
+    };
+    my $thread = sub {
+        my ($bp, $alive) = @_;
+        return { name => "fleet-$bp", state => 'live', done => 0, total => 0, doing => [],
+                 current => undef, next => undef,
+                 owner => { kind => 'orchestrator', id => $bp, alive => $alive, activity_at => undef, armed => 1 } };
+    };
+    my $no_stop = { shutdown => 0, operator_stop => 0, operator_stop_at => undef,
+                    last_seen_at => undef, last_seen_local => undef };
+    my %c = (paused_manual => 0, escalations_waiting => 0, triage_waiting => 0, inbox_waiting => 0,
+             thread_events => [], current_package => undef, run_agents => [], running_coordinators => 0,
+             paused_reason => undef, paused_window => undef, relaunch_at => undef, relaunch_local => undef,
+             next_package => undef);
+    my $P = \&_synth_pipeline;
+    return [
+        # RUNNING: live coordinators with workers (total + step time), one on
+        # attempt 3, a skipped scout, a 9-step ledger at handoff, a package
+        # waiting on another, and the next one up.
+        { %c, blueprint => 'payments-ledger', runs_dir => '/tmp/ccpraxis-preview-runs/payments-ledger',
+          state => 'running', orchestrator_pid => 5101, orchestrator_alive => 1,
+          orchestrator_started_at => $now - (6 * 3600 + 5 * 60), running_coordinators => 3,
+          packages_total => 7, packages_done => 2, thread => $thread->('payments-ledger', 1), inbox_waiting => 1,
+          next_package => '06-reconcile-job',
+          packages => [
+              $pkg->('03-make-and-hooks', 'running', 'implementation', alive => 1, started => $now - 4_100, attempt => 3,
+                     pipe => $P->('implementation', skip => ['scout']),
+                     agents => [ $ag->('w1', 'worker', 'bp-implementer', 1_260) ]),
+              $pkg->('04-ledger-schema', 'running', 'review', alive => 1, started => $now - 2_400,
+                     pipe => $P->('review'), agents => [ $ag->('w2', 'worker', 'bp-reviewer', 300) ]),
+              $pkg->('05-release-notes', 'running', 'handoff', alive => 1, started => $now - 600,
+                     pipe => $P->('handoff', handoff => 1)),
+              $pkg->('07-payout-api', 'blocked', undef, waits_on => '04-ledger-schema', pipe => $P->(undef)),
+              $pkg->('06-reconcile-job', 'pending', 'scout', pipe => $P->(undef)),
+          ],
+          fleet => $no_stop },
+        # PAUSED on the 5-hour limit: coordinators gone, packages mid-flight.
+        { %c, blueprint => 'fleet-observability', runs_dir => '/tmp/ccpraxis-preview-runs/fleet-observability',
+          state => 'paused', orchestrator_pid => 5102, orchestrator_alive => 1,
+          orchestrator_started_at => $now - (30 * 3600), paused_reason => 'usage', paused_window => 'five_hour',
+          relaunch_at => $now + 2 * 3600, relaunch_local => { wday => 'Thu', hhmm => '02:00', day => '01', mon => 'Jan' },
+          packages_total => 4, packages_done => 1, thread => $thread->('fleet-observability', 1),
+          next_package => '04-alert-rules',
+          packages => [
+              $pkg->('02-usage-sampler', 'running', 'tests', alive => 0, pipe => $P->('tests')),
+              $pkg->('03-spend-panel', 'running', 'validation', alive => 0, attempt => 2,
+                     pipe => $P->('validation', skip => ['scout'], ui => 1)),
+              $pkg->('04-alert-rules', 'pending', 'scout', pipe => $P->(undef)),
+          ],
+          fleet => $no_stop },
+        # STOPPED after a crash: orchestrator dead, work left mid-step.
+        { %c, blueprint => 'sandbox-reaper', runs_dir => '/tmp/ccpraxis-preview-runs/sandbox-reaper',
+          state => 'stale', orchestrator_pid => 5103, orchestrator_alive => 0, orchestrator_started_at => undef,
+          packages_total => 5, packages_done => 2, thread => $thread->('sandbox-reaper', 0),
+          packages => [
+              $pkg->('03-orphan-scan', 'running', 'fix-batch', alive => 0, attempt => 4, pipe => $P->('fix-batch')),
+              $pkg->('04-winpid-map', 'running', 'spec', alive => 0, pipe => $P->('spec')),
+              $pkg->('05-kill-verify', 'blocked', undef, waits_on => '04-winpid-map', pipe => $P->(undef)),
+          ],
+          # the orchestrator log last written 3h12m before SYNTH_NOW: "crashed 12:04"
+          fleet => { %$no_stop, last_seen_at => $now - (3 * 3600 + 12 * 60),
+                     last_seen_local => { wday => 'Thu', hhmm => '12:04', day => '01', mon => 'Jan' } } },
+        # STOPPED BY THE OPERATOR: a parked package and one not started.
+        { %c, blueprint => 'theme-tokens', runs_dir => '/tmp/ccpraxis-preview-runs/theme-tokens',
+          state => 'parked', orchestrator_pid => undef, orchestrator_alive => undef, orchestrator_started_at => undef,
+          packages_total => 4, packages_done => 2, thread => $thread->('theme-tokens', 0),
+          next_package => '04-glyph-audit',
+          packages => [
+              $pkg->('03-gauge-palette', 'parked', undef, pipe => $P->('review', ui => 1)),
+              $pkg->('04-glyph-audit', 'pending', 'scout', pipe => $P->(undef)),
+          ],
+          fleet => { shutdown => 1, operator_stop => 1, operator_stop_at => $now - 900 } },
+        # SETTLED: every package done.
+        { %c, blueprint => 'statusline-rework', runs_dir => '/tmp/ccpraxis-preview-runs/statusline-rework',
+          state => 'idle', orchestrator_pid => undef, orchestrator_alive => undef, orchestrator_started_at => undef,
+          packages_total => 3, packages_done => 3, thread => undef,
+          packages => [ map { $pkg->($_, 'done', undef, pipe => $P->(undef)) } qw(01-segments 02-colours 03-tests) ],
+          fleet => $no_stop },
+        # A drive-solo run: not a fleet; one live package from the dispatch log.
+        { %c, blueprint => 'tui-operator-feedback', runs_dir => '/tmp/ccpraxis-preview-runs/tui-operator-feedback',
+          state => 'running', orchestrator_pid => undef, orchestrator_alive => undef, orchestrator_started_at => undef,
+          packages_total => 4, packages_done => 1, fleet => undef, next_package => '03-legend',
+          thread => { name => 'drive-tui', state => 'live', done => 1, total => 4, doing => [], current => undef, next => undef,
+                      owner => { kind => 'session', id => 's1', alive => undef, activity_at => $now - 120, armed => 1 } },
+          packages => [
+              $pkg->('02-pipeline-strip', 'running', 'implementation', pipe => $P->('implementation', ui => 1),
+                     agents => [ $ag->('c9', 'coordinator', 'coordinator', 3_600), $ag->('w9', 'worker', 'bp-implementer', 540) ]),
+              $pkg->('03-legend', 'pending', 'scout', pipe => $P->(undef)),
+          ] },
     ];
 }
 
@@ -654,7 +810,11 @@ sub synth_state {
         # own cadence), so they are separate here.
         title_spinner_idx => $phase % Theme::SPINNER_FRAMES(),
         resources        => synth_resources($phase),
-        runs             => ($SCENARIO eq 'operator') ? synth_operator_runs() : synth_runs($n_runs, $phase),
+        # sim_apply: the [f] screen's simulated starts/stops (%FLEET_SIM, in
+        # memory). Empty -- always, for --dump -- it returns the runs as given.
+        runs             => sim_apply(($SCENARIO eq 'operator') ? synth_operator_runs()
+                          : ($SCENARIO eq 'fleet')    ? synth_fleet_runs()
+                          :                             synth_runs($n_runs, $phase)),
         thread_events    => synth_thread_events($phase),
         backpack         => { items => ($phase % 8), pending => ($phase % 5) },
         oauth_remaining  => 7 * 3600 + 21 * 60 - ($phase * 60),
@@ -795,17 +955,10 @@ sub capture_report {
     # sub's own comment) -- the `$bp_total <= $bp_cap` check below already
     # supplies the correct "nothing to collapse" shortcut.
     if (defined($bp_cap) && $bp_cap >= 1 && defined($bp_plan_n) && $bp_plan_n > 0) {
+        # The same decision _blueprints_body makes (2026-11-11: blank rows
+        # between blocks go first and are never counted as hidden).
         my $bp_width = tui::DashboardScreen::_blueprints_body_width($main);
-        my $bp_total = 0;
-        $bp_total += tui::DashboardScreen::_row_cost($_->{spans}, $bp_width) for @$bp_plan;
-        if ($bp_total <= $bp_cap) {
-            $bp_hidden = 0;
-        } else {
-            my $bp_reserve = tui::DashboardScreen::_row_cost(
-                tui::DashboardScreen::_collapse_notice($bp_plan_n), $bp_width);
-            my $bp_keep = tui::DashboardScreen::_select_rows($bp_plan, $bp_cap - $bp_reserve, $bp_width);
-            $bp_hidden = $bp_plan_n - (ref($bp_keep) eq 'ARRAY' ? scalar(@$bp_keep) : 0);
-        }
+        (undef, $bp_hidden) = tui::DashboardScreen::_blueprints_collapse($bp_plan, $bp_cap, $bp_width);
     }
     push @out, sprintf("blueprints    capacity %s  plan %s  hidden %s",
         defined($bp_cap)     ? $bp_cap     : 'n/a',
@@ -923,14 +1076,206 @@ sub render_plain {
     return join("\n", @out) . "\n";
 }
 
+# render_fleet_modal($state, $rows, $cols, $mode) -> the [f] fleet screen as
+# plain text (fleet-control). Real composition: tui::FleetScreen::compose over
+# the synthetic runs, the same call the modal's paint makes. 'fleet' is the
+# list with the cursor on the first stopped fleet; 'fleet-confirm' is the same
+# with [enter] pressed, i.e. the start confirm armed. No seam is wired, so
+# nothing could start even if a key were pressed.
+sub render_fleet_modal {
+    my ($state, $rows, $cols, $mode) = @_;
+    require tui::FleetScreen;
+    my $ss = tui::FleetScreen::init(runs => $state->{runs}, now => SYNTH_NOW(), spend => $main::SIM_SPEND);
+    # 'fleet': the paused fleet (the operator's sketch); 'fleet-confirm': the
+    # first stopped one, with [enter] pressed (the start confirm in place).
+    my $want = ($mode eq 'fleet-confirm') ? 'stopped' : 'paused';
+    my $i = 0;
+    for my $r (@{ $ss->{rows} }) {
+        last if $r->{fs}{state} eq $want;
+        $i++;
+    }
+    $ss->{cursor} = $i < @{ $ss->{rows} } ? $i : 0;
+    tui::FleetScreen::dispatch_key($ss, "\r") if $mode eq 'fleet-confirm';
+    my @out;
+    for my $cell (@{ tui::FleetScreen::compose($ss, $rows, $cols) }) {
+        my $t = defined $cell->{text} ? $cell->{text} : '';
+        $t =~ s/\e\[[0-9;]*m//g;
+        $t =~ s/\s+\z//;
+        push @out, $t;
+    }
+    return join("\n", @out) . "\n";
+}
+
+# ---------------------------------------------------------------------------
+# THE FLEET SCREEN, SIMULATED (operator, 2026-11-11: see and test the
+# fleet-control UX interactively, on the fake data).
+#
+# [f] in the interactive preview opens the REAL tui::FleetScreen over the
+# synthetic runs. Start and stop go through the same seams the dashboard
+# wires, with the I/O replaced:
+#
+#   start  Dashboard::fleet_start itself -- argv builder, timeout, result
+#          shaping -- with an injected RUNNER that never executes anything:
+#          it ticks on_tick for $SIM_START_SECS (the progress banner and its
+#          elapsed counter), then answers like bp-orchestrate.sh. One fleet,
+#          $SIM_FAIL_FLEET, answers like a failed hooks self-test.
+#   stop   nothing is written: the fleet is marked "stopping" in memory and
+#          turns "stopped by you" $SIM_STOP_SECS later.
+#
+# Everything lives in %FLEET_SIM, in memory: restarting the preview resets
+# it. synth_state reads %FLEET_SIM but never the clock; the clock-driven
+# step (stopping -> stopped) happens in sim_advance, called from the loop
+# and from the screen's own reload, never from synth_state.
+# ---------------------------------------------------------------------------
+our %FLEET_SIM;                       # blueprint -> { state => running|stopping|stopped_op, since => epoch }
+our $SIM_START_SECS = 5;
+our $SIM_STOP_SECS  = 3;
+our $SIM_FAIL_FLEET = 'sandbox-reaper';
+our $SIM_NOW   = sub { Time::HiRes::time() };
+our $SIM_SLEEP = sub { select(undef, undef, undef, $_[0]) };
+our @SIM_RUNNER_CALLS;
+# The usage figures the fleet screen's facts line shows (SpendPanel::status's shape).
+our $SIM_SPEND = { claude => { state => 'ok', windows => [ { name => 'five_hour', text => '85%' },
+                                                           { name => 'seven_day', text => '40%' } ] } };                # every argv the fake runner was handed (tests read it)
+
+# sim_apply(\@runs) -> \@runs: copies, with %FLEET_SIM's overrides applied.
+# Pure: no clock.
+sub sim_apply {
+    my ($runs) = @_;
+    return $runs unless ref($runs) eq 'ARRAY' && %FLEET_SIM;
+    my @out;
+    for my $r (@$runs) {
+        my $o = (ref($r) eq 'HASH' && defined $r->{blueprint}) ? $FLEET_SIM{ $r->{blueprint} } : undef;
+        unless ($o) { push @out, $r; next }
+        my %s = %$r;
+        my %f = (ref($s{fleet}) eq 'HASH') ? %{ $s{fleet} } : (shutdown => 0, operator_stop => 0, operator_stop_at => undef);
+        if ($o->{state} eq 'running') {
+            %s = (%s, state => 'running', orchestrator_pid => 7001, orchestrator_alive => 1,
+                  orchestrator_started_at => SYNTH_NOW() - 30, paused_reason => undef, paused_window => undef,
+                  relaunch_at => undef, relaunch_local => undef);
+            %f = (%f, shutdown => 0, operator_stop => 0, operator_stop_at => undef);
+        } elsif ($o->{state} eq 'stopping') {
+            %s = (%s, state => 'parked', orchestrator_alive => 1, orchestrator_pid => ($s{orchestrator_pid} // 7001));
+            %f = (%f, shutdown => 1, operator_stop => 1, operator_stop_at => SYNTH_NOW());
+        } else {   # stopped_op
+            %s = (%s, state => 'parked', orchestrator_alive => undef, orchestrator_pid => undef,
+                  orchestrator_started_at => undef);
+            %f = (%f, shutdown => 1, operator_stop => 1, operator_stop_at => SYNTH_NOW());
+        }
+        $s{fleet} = \%f;
+        push @out, \%s;
+    }
+    return \@out;
+}
+
+# sim_advance() -- the clock-driven half: a stop finishes after $SIM_STOP_SECS.
+sub sim_advance {
+    my $t = $SIM_NOW->();
+    for my $o (values %FLEET_SIM) {
+        $o->{state} = 'stopped_op' if $o->{state} eq 'stopping' && $t - $o->{since} >= $SIM_STOP_SECS;
+    }
+}
+
+# sim_runner(%o) -- BoundedRun::run's contract, executing nothing.
+sub sim_runner {
+    my (%o) = @_;
+    push @SIM_RUNNER_CALLS, $o{cmd};
+    my $bp = (ref($o{cmd}) eq 'ARRAY') ? $o{cmd}[-1] : '';
+    my $t0 = $SIM_NOW->();
+    while (1) {
+        my $e = $SIM_NOW->() - $t0;
+        last if $e >= $SIM_START_SECS;
+        eval { $o{on_tick}->($e) } if ref($o{on_tick}) eq 'CODE';
+        $SIM_SLEEP->(0.2);
+    }
+    my $elapsed = $SIM_NOW->() - $t0;
+    if (defined $SIM_FAIL_FLEET && $bp eq $SIM_FAIL_FLEET) {
+        return { rc => 6 << 8, timed_out => 0, elapsed => $elapsed, err => '',
+                 out => "bp-orchestrate: hooks self-test failed - refusing to start the fleet (subagent write-containment is unverified, #31).\n" };
+    }
+    return { rc => 0, timed_out => 0, elapsed => $elapsed, err => '',
+             out => "orchestrator started for $bp (pid 7001) - observe with /butler:reporter $bp\n" };
+}
+
+# fleet_sim_seams() -> the load/start/stop seams tui::FleetScreen takes.
+sub fleet_sim_seams {
+    return (
+        load  => sub { sim_advance(); return sim_apply(synth_state_runs()) },
+        start => sub {
+            my ($row, $progress) = @_;
+            my $r = Dashboard::fleet_start(bp => $row->{blueprint}, podman => 'podman', container => 'claude-preview-sim',
+                                           runner => \&sim_runner, env => {},
+                                           on_tick => sub { eval { $progress->($_[0]) } if ref($progress) eq 'CODE' });
+            $FLEET_SIM{ $row->{blueprint} } = { state => 'running', since => $SIM_NOW->() } if $r->{ok};
+            return $r;
+        },
+        stop  => sub {
+            my ($row) = @_;
+            $FLEET_SIM{ $row->{blueprint} } = { state => 'stopping', since => $SIM_NOW->() };
+            return { ok => 1, detail => 'simulated: its coordinators park after their current step' };
+        },
+    );
+}
+
+# synth_state_runs() -> the runs the current scenario draws (unmodified).
+sub synth_state_runs {
+    return ($SCENARIO eq 'operator') ? synth_operator_runs() : synth_fleet_runs();
+}
+
+# run_fleet_modal(%io) -- open the real fleet screen with the simulated
+# seams. %io: read_key, wait_key, term_size, out, max_ticks (tests script
+# them; the interactive loop passes the terminal's).
+sub run_fleet_modal {
+    my (%io) = @_;
+    require tui::FleetScreen;
+    my %seams = fleet_sim_seams();
+    return tui::FleetScreen::run(
+        runs => sim_apply(synth_state_runs()), %seams, now => SYNTH_NOW(), spend => $SIM_SPEND,
+        render => sub { Dashboard::render_frame($_[0], $_[1], { color => 1 }) },
+        tick => 0.2, reload_ticks => 5,
+        %io,
+    );
+}
+
+# preview_special_key($k, \%ctx) -> 1 when $k was handled here. The keys that
+# are the dashboard's own: [f] opens the fleet screen; [x] (full shutdown) is
+# not simulated and says so -- [s] stays the preview's status cycler.
+sub preview_special_key {
+    my ($k, $ctx) = @_;
+    return 0 unless defined $k;
+    if ($k eq 'f') {
+        $ctx->{open_fleets}->() if ref($ctx->{open_fleets}) eq 'CODE';
+        return 1;
+    }
+    if ($k eq 'x') {
+        $ctx->{toast}->(' [x] full shutdown is not simulated here ([s] cycles the container status); use [f] to stop a fleet ')
+            if ref($ctx->{toast}) eq 'CODE';
+        return 1;
+    }
+    return 0;
+}
+
 my $RAW = 0;
 sub raw_on  { return unless $HAVE_READKEY; eval { Term::ReadKey::ReadMode(3) }; $RAW = 1 }
 sub raw_off { return unless $RAW; eval { Term::ReadKey::ReadMode(0) }; $RAW = 0 }
 
+# raw_key($timeout) -- one raw console read (-1: non-blocking), logged under
+# CCPRAXIS_KEYLOG by the dashboard's own Dashboard::keylog_reader.
+my $RAW_KEY;
+sub raw_key {
+    my ($t) = @_;
+    $RAW_KEY ||= Dashboard::keylog_reader(sub {
+        my ($w) = @_;
+        return undef unless $HAVE_READKEY;
+        my $k = eval { Term::ReadKey::ReadKey(defined $w ? $w : -1) };
+        return defined $k ? $k : undef;
+    });
+    return $RAW_KEY->($t);
+}
 sub read_key {
-    return undef unless $HAVE_READKEY;
-    my $k = eval { Term::ReadKey::ReadKey(-1) };
-    return defined $k ? $k : undef;
+    my $k = raw_key(-1);
+    Dashboard::keylog('key', "preview $k") if defined($k) && $ENV{CCPRAXIS_KEYLOG};
+    return $k;
 }
 
 # Restore the terminal on EVERY exit path. A preview that leaves the screen in
@@ -960,7 +1305,9 @@ sub usage {
     return join '',
         "usage: perl scripts/tui-preview.pl          interactive; needs a terminal\n",
         "       perl scripts/tui-preview.pl --dump WxH[,WxH...] [--phase N] [--runs N] [--status N]\n",
-        "                                   [--scenario operator] [--report]\n";
+        "                                   [--scenario operator|fleet] [--report]\n",
+        "                                   [--modal fleet|fleet-confirm]   (the [f] screen, --dump only)\n",
+        "       powershell -File scripts\\tui-preview.ps1 [same arguments]   (Windows Terminal, colour)\n";
 }
 
 sub main {
@@ -972,6 +1319,7 @@ sub main {
     my $dump_phase = 0;
     my $dump_runs;
     my $dump_status = 0;
+    my $dump_modal = '';   # fleet-control: --modal fleet|fleet-confirm renders the [f] screen
     my @argv = @ARGV;
     while (@argv) {
         my $a = shift @argv;
@@ -981,6 +1329,7 @@ sub main {
         elsif ($a eq '--report')  { $report_mode = 1 }
         elsif ($a eq '--status')  { $dump_status = int(shift(@argv) // 0) }
         elsif ($a eq '--scenario') { $SCENARIO = shift(@argv) // '' }
+        elsif ($a eq '--modal')   { $dump_modal = shift(@argv) // '' }
         elsif ($a eq '--help' || $a eq '-h') { print usage(); return }
         else { print STDERR "tui-preview: unknown argument '$a'\n", usage(); exit 2 }
     }
@@ -992,6 +1341,7 @@ sub main {
             # --report gives the same text [c] captures; plain --dump gives just
             # the frame, so two geometries can be diffed without the numbers
             # changing on every line.
+            if (length $dump_modal) { print render_fleet_modal($st, $r, $c, $dump_modal); next }
             print $report_mode ? capture_report($st, $r, $c, $dump_phase, \%DISMISSED)
                                : render_plain($st, $r, $c, 0, $dump_phase);
         }
@@ -1010,6 +1360,10 @@ sub main {
 
     my ($cols, $rows) = term_size();
 
+    # As launcher.pl does: raw bytes, unbuffered, so each frame reaches the
+    # console whole and at once.
+    binmode STDOUT, ':raw';
+    $| = 1;
     raw_on();
     $ENTERED_ALT = 1;
     print "\e[?1049h\e[?25l\e[2J\e[H";
@@ -1027,8 +1381,44 @@ sub main {
     # about a second so [c] is not silent, then gives the row back.
     my ($toast, $toast_until) = ('', 0);
 
+    # NO COLOUR IS A CONFIGURATION FACT, SO SAY IT. Theme reads TERM /
+    # COLORTERM / WT_SESSION / CCPRAXIS_COLOR; when none of them asks for
+    # colour the preview renders monochrome, which looked like a rendering
+    # bug. scripts/tui-preview.ps1 sets CCPRAXIS_COLOR in Windows Terminal.
+    if (Theme::capability() eq 'none') {
+        $toast = ' no colour: TERM=' . ($ENV{TERM} // 'unset') . ', WT_SESSION ' . ($ENV{WT_SESSION} ? 'set' : 'unset')
+               . ' -- set CCPRAXIS_COLOR=truecolor (scripts/tui-preview.ps1 does) ';
+        $toast_until = 60;
+    }
+    # The dashboard's own [f] (fleet screen, simulated) and [x] (a hint).
+    my $quit_req = 0;
+    my %special = (
+        open_fleets => sub {
+            # The keys go through the dashboard's own parser
+            # (Dashboard::_assemble_esc, the reads logged under CCPRAXIS_KEYLOG),
+            # both the non-blocking poll and the timed wait.
+            my $res = run_fleet_modal(
+                read_key  => sub { my $k = raw_key(-1);
+                                   return defined $k ? Dashboard::_assemble_esc($k, sub { raw_key(-1) }, sub { raw_key($_[0]) }) : undef },
+                wait_key  => sub { my $k = raw_key($_[0]);
+                                   return defined $k ? Dashboard::_assemble_esc($k, sub { raw_key(-1) }, sub { raw_key($_[0]) }) : undef },
+                term_size => \&term_size,
+                out       => sub { print $_[0] if length $_[0] },
+                keylog    => sub { Dashboard::keylog('key', "fleets $_[0] -> $_[1]") },
+            );
+            $prev = undef;    # the modal owned the screen: repaint in full
+            $quit_req = 1 if ref($res) eq 'HASH' && $res->{quit};   # [q] in the screen quits the preview
+        },
+        toast => sub { $toast = $_[0]; $toast_until = $tick + 24; $prev = undef },
+    );
+
     while (1) {
         my $k = read_key();
+        sim_advance();
+        if (defined $k && preview_special_key($k, \%special)) {
+            $k = undef;
+        }
+        last if $quit_req;
         if (defined $k) {
             last if $k eq 'q' || $k eq "\003";
             if    ($k eq 'c')  { $capture = 1 }

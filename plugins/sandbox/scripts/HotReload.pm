@@ -59,6 +59,7 @@ my @RELOADABLE = qw(
     tui::Screen
     tui::DashboardScreen
     tui::BackpackScreen
+    tui::FleetScreen
     tui::LaunchScreens
     Dashboard
     SpendPanel

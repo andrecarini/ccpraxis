@@ -402,11 +402,21 @@ bp_strip_shell_noise() {
 # (so we never yank the signal out from under a run that is honoring it). A genuine
 # shutdown is re-signalled by the heartbeat if the manager is actually gone; the
 # usage .paused marker is intentionally left alone (auto-resume honors its window).
+#
+# The same goes for runs/.stopped-by-operator, the record the sandbox dashboard
+# writes (before .shutdown) when the operator stops a fleet, so a stopped fleet
+# is never read as a crashed one. An explicit (re)dispatch is the operator
+# starting it again; a record left behind would make the next crash read as
+# "stopped by you".
 bp_clear_stale_shutdown() {
   local runs="$1"
   if [ -e "$runs/.shutdown" ]; then
     rm -f "$runs/.shutdown"
     echo "bp-orchestrate: cleared a stale .shutdown marker (prior graceful-reap)"
+  fi
+  if [ -e "$runs/.stopped-by-operator" ]; then
+    rm -f "$runs/.stopped-by-operator"
+    echo "bp-orchestrate: cleared the operator-stop record (an explicit start supersedes it)"
   fi
   return 0
 }

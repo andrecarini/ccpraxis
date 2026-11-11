@@ -2462,6 +2462,37 @@ sub summarize_dir {
     my $alive = _orchestrator_alive($runs_dir, $orchestrator_pid);
     my $dead  = (defined($alive) && !$alive) ? 1 : 0;   # ONLY a positive "checked and dead"
 
+    # fleet-control (operator, 2026-11-11: "show if fleet is running or not
+    # and let me start or stop them"): the 24th run-level key. undef unless
+    # this blueprint has a FLEET run -- a runs/registry.json, which only the
+    # orchestrator's launches write, or a runs/.orchestrator marker, which
+    # covers a fleet started moments ago that has not launched a package yet
+    # -- so a drive-solo or never-run blueprint is not offered a fleet start. Evidence only, no verdict: the
+    # running/paused/stopped/settled judgement is DashboardScreen::fleet_status.
+    #   shutdown          runs/.shutdown exists (a graceful stop is under way
+    #                     or has finished)
+    #   operator_stop     runs/.stopped-by-operator exists: the operator asked
+    #                     for this stop, so a dead orchestrator is not a crash
+    #   operator_stop_at  that marker's `at` epoch, when it carries a sane one
+    my $fleet;
+    if ($has_runs && (-f "$runs_dir/registry.json" || $has_orch)) {
+        my $op_path = "$runs_dir/.stopped-by-operator";
+        my $op = -e $op_path ? 1 : 0;
+        my $op_at;
+        if ($op) {
+            my $rec = _read_json_capped($op_path);
+            my $at  = (ref($rec) eq 'HASH') ? $rec->{at} : undef;
+            $op_at = $at + 0 if defined($at) && !ref($at) && $at =~ /\A\d{1,12}\z/ && $at > 0;
+        }
+        # last_seen_at: runs/orchestrator.log's mtime -- a live orchestrator
+        # appends to it every tick, so for a dead one it is the last moment
+        # anything was known to be running (the fleet screen's "crashed
+        # HH:MM"). last_seen_local: its host-local parts (_local_parts).
+        my $seen = _mtime("$runs_dir/orchestrator.log");
+        $fleet = { shutdown => ($has_shutdown ? 1 : 0), operator_stop => $op, operator_stop_at => $op_at,
+                   last_seen_at => $seen, last_seen_local => (defined($seen) ? _local_parts($seen) : undef) };
+    }
+
     my $state = $has_shutdown                        ? 'parked'
               : (($has_orch || $has_paused) && $dead) ? 'stale'
               : $has_paused                           ? 'paused'
@@ -2614,6 +2645,8 @@ sub summarize_dir {
         relaunch_at             => $relaunch_at,
         relaunch_local          => $relaunch_local,
         next_package            => $next_package,
+        # fleet-control: the 24th run-level key (see $fleet above).
+        fleet                   => $fleet,
     };
 }
 

@@ -79,8 +79,14 @@ sub STATUS_KINDS {
 # this TUI. An operator arriving with dashboard reflexes presses it and nothing
 # happens, which is the correct outcome for a key whose meaning does not exist
 # on this screen.
+#
+# [b] back, [q] quit (operator, 2026-11-11): the same pattern as the [f] fleet
+# screen -- the key that opened the screen closes it, [q] quits the whole TUI
+# exactly as the dashboard's own [q] does, and ESC is never a command.
 sub FOOTER_LEGEND {
-    return '[k/j] move  [a] approve  [x] drop  [y] confirm  [q/ESC] quit';
+    my $u = Theme::glyph('arrow.up');   $u = '^' unless defined $u && length $u;
+    my $d = Theme::glyph('arrow.down'); $d = 'v' unless defined $d && length $d;
+    return "[$u$d] move   [a] approve   [x] drop   [y] confirm   [b] back   [q] quit";
 }
 
 # STATE_LABEL($approved) -> 'approved'|'pending'. Total: any hostile input
@@ -244,7 +250,10 @@ sub dispatch_key {
     # on a genuine close($fh) and does not fire on this literal), so the
     # rename lands cleanly. Report the broken guard, fix the guard, then make
     # the change -- never work around the guard.
-    return 'close' if $key eq 'q' || $key eq "\e";
+    # [b] closes (back to the dashboard), [q] quits the TUI; ESC -- alone, or
+    # any sequence Dashboard::_assemble_esc could not name -- does nothing.
+    return 'close' if $key eq 'b';
+    return 'quit'  if $key eq 'q';
 
     my $rows_ref = (ref($ss->{rows}) eq 'ARRAY') ? $ss->{rows} : [];
     my $total    = scalar @$rows_ref;
@@ -389,6 +398,10 @@ sub apply {
     if ($action eq 'close') {
         return 1;
     }
+    if ($action eq 'quit') {
+        $ss->{quit} = 1;
+        return 1;
+    }
 
     # 'move', '', and anything else: no status change, no mutation (the
     # status persists until another approve/confirm-drop/drop/cancel-drop
@@ -479,6 +492,7 @@ sub run {
         next unless defined($key) && length("$key");   # an idle poll: try again
 
         my $action = dispatch_key($ss, $key);
+        eval { $seams{keylog}->($key, (length $action ? $action : '(none)')) } if ref($seams{keylog}) eq 'CODE';
         my $done   = apply($ss, $action, \%seams);
         # MEDIUM-2: the instant a drop confirm ARMS (never on any other
         # action -- dispatch_key's own confirm-branch, rule 2, always
@@ -503,6 +517,7 @@ sub run {
 
     return {
         closed   => $closed ? 1 : 0,
+        quit     => $ss->{quit} ? 1 : 0,
         approved => $ss->{approved} || 0,
         dropped  => $ss->{dropped}  || 0,
         failures => $ss->{failures} || 0,

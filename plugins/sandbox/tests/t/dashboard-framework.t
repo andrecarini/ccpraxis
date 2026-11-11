@@ -419,7 +419,10 @@ my %st = (
     my $fbelow = Dashboard::compose_frame(\%st, 24, $below);
     my $both_below = grep { $_->{text} =~ /$RULE_FILL_RE Run / && $_->{text} =~ /$RULE_FILL_RE Blueprints / } @$fbelow;
     is($both_below, 0, "compose (s05): 24x$below -- no row carries both panel titles (still stacked)");
-    my ($run_below) = grep { $_->{text} =~ /^$RULE_FILL_RE Run (?:$RULE_FILL_RE)+$/ } @$fbelow;
+    # 2026-11-11: the Run title carries the heartbeat age ("Run . <1m"), so
+    # the optional "<dot> <age> " suffix sits between the name and the fill.
+    my $dot_re = quotemeta(Theme::glyph('sep.dot') // '');
+    my ($run_below) = grep { $_->{text} =~ /^$RULE_FILL_RE Run (?:$dot_re [^ ]+(?: [^ ]+)? )?(?:$RULE_FILL_RE)+$/ } @$fbelow;
     ok($run_below, "compose (s05): 24x$below -- a row matches /^-- Run <rule.h fill>\$/ (dash-filled full width)");
     is(Dashboard::display_width($run_below->{text}), $below, "compose (s05): that row is exactly $below display columns")
         if $run_below;

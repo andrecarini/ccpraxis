@@ -435,6 +435,8 @@ my @SUMMARY_KEYS_19 = (@SUMMARY_KEYS_17, 'thread', 'thread_events');
 # as the 17->19 comment above -- this file's own ACs are unrelated to
 # package 01-run-blocks.
 my @SUMMARY_KEYS_23 = (@SUMMARY_KEYS_19, 'paused_window', 'relaunch_at', 'relaunch_local', 'next_package');
+# Widened 23 -> 24 by fleet-control (operator, 2026-11-11): `fleet`, see RunState.
+my @SUMMARY_KEYS_24 = (@SUMMARY_KEYS_23, q{fleet});
 
 my @PKG_KEYS_8 = qw(agents attempt attempt_cap name next_action status step steps_pending);
 # Widened 10 -> 12 by the 2026-11-04 Blueprints panel change (operator
@@ -452,8 +454,8 @@ my @FORBIDDEN_AGENT_KEYS = qw(
 sub assert_17_keys {
     my ($s, $label) = @_;
     ok(is_hashref($s), "$label: summary is a hashref") or return;
-    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS_23 ],
-        "$label: AC1 [AT-8 amended, 16->17; package-13 widened 17->19; package-01-run-blocks widened 19->23] -- exactly the 23 run-level keys, incl. run_agents/thread/thread_events/paused_window/relaunch_at/relaunch_local/next_package");
+    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS_24 ],
+        "$label: AC1 [AT-8 amended, 16->17; package-13 widened 17->19; package-01-run-blocks widened 19->23; fleet-control 23->24] -- exactly the 24 run-level keys, incl. run_agents/thread/thread_events/paused_window/relaunch_at/relaunch_local/next_package");
     ok(is_arrayref($s->{run_agents}), "$label: AT-8 -- run_agents is an ARRAY ref, never undef");
 }
 
@@ -591,7 +593,7 @@ use_ok('RunState');
         # @SUMMARY_KEYS gained paused_window/relaunch_at/relaunch_local/
         # next_package, another driver-authorised widening of the exact
         # same literal this assertion reads.
-        is(scalar(@names), 23, 'AC43: t/45 @SUMMARY_KEYS holds all 23 names (AT-8 + package-13 + package-01-run-blocks widenings)');
+        is(scalar(@names), 24, q{AC43: t/45 @SUMMARY_KEYS holds all 24 names (AT-8 + package-13 + package-01-run-blocks + fleet-control widenings)});
         ok(!(grep { $_ eq 'agents' } @names), q{AC43: t/45 @SUMMARY_KEYS contains no 'agents'});
     }
     else {

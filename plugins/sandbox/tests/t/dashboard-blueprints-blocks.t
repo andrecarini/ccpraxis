@@ -163,9 +163,9 @@ my @F1_LINES = (
     G('icon.blueprints') . ' acxpraxis-step-2' . S(3) . M(5, 14) . S(2) . '5/14' . S(3) . G('status.ok') . ' orchestrator 3h'
         . S(3) . G('thread.idle') . ' 7d limit' . SD() . 'until Mon 18:05',
     S(2) . G('status.ok') . ' 05-checks-erlang' . ' 1h' . S(3) . 'tests' . S(12) . S(3) . '12m',
-    S(2) . G('status.warn') . ' 10-model-journa' . E() . ' ' . S(2) . S(3) . 'implementation' . S(3) . S(3) . '41m'
+    S(2) . G('status.warn') . ' 10-model-journa' . E() . ' ' . S(2) . S(3) . 'implementation' . S(3) . S(3) . '41m' . S(1)
         . S(3) . 'attempt 5/5',
-    S(2) . G('status.judge') . ' whole blueprint' . S(1) . ' ' . S(2) . S(3) . 'conformance judge' . S(3) . ' 4m',
+    S(2) . G('status.judge') . ' whole blueprint' . S(1) . ' ' . S(2) . S(3) . 'conformance judge' . S(3) . '4m',
     S(2) . G('arrow.right') . ' 03-make-and-hoo' . E() . ' ' . S(2) . S(3) . S(17) . S(3) . 'next',
 );
 
@@ -350,7 +350,9 @@ my @F4_LINES = (
     # status. No step and no time anywhere, so those columns take no space.
     my @lines = (
         G('icon.blueprints') . ' bp-blocked' . S(3) . M(2, 5) . S(2) . '2/5' . S(3) . 'running',
-        S(2) . G('thread.blocked') . ' 03-gamma' . S(3) . 'waiting on 20261002-120000-abcd',
+        # 2026-11-11: 03-gamma is on attempt 2, so its waiting on is cut to the
+        # 12-column status column and the attempt follows in its own column.
+        S(2) . G('thread.blocked') . ' 03-gamma' . S(3) . 'waiting on ' . E() . S(3) . 'attempt 2/5',
         S(2) . G('thread.blocked') . ' 04-delta' . S(3) . 'blocked',
     );
     my $rows = eval { tui::DashboardScreen::_run_summary_lines([$F7], undef, undef, $NOW) };
@@ -525,8 +527,11 @@ my ($F12_A, $F12_B);
     # anywhere (07-wide-package-name -> 16 columns), so block A's short '01-x'
     # is padded to it, and A's 'next' aside starts where the step time starts.
     my @lines = (
-        G('icon.blueprints') . ' a' . S(3) . M(0, 1) . S(2) . '0/1' . S(3) . 'idle',
+        # 2026-11-11 (operator): the blueprint-name column is ONE width across
+        # the panel too, so 'a' is padded to 'longer-blueprint-name' (21).
+        G('icon.blueprints') . ' a' . S(20) . S(3) . M(0, 1) . S(2) . '0/1' . S(3) . 'idle',
         S(2) . G('arrow.right') . ' 01-x' . S(12) . S(3) . S(5) . S(3) . 'next',
+        '',   # one blank row between blueprint blocks (2026-11-11)
         G('icon.blueprints') . ' longer-blueprint-name' . S(3) . M(2, 4) . S(2) . '2/4' . S(3) . 'running',
         S(2) . G('status.idle') . ' 07-wide-package' . E() . S(3) . 'tests',
     );
@@ -535,7 +540,7 @@ my ($F12_A, $F12_B);
     ok(!$err, 'AC12 precondition: _run_summary_lines([A,B]) does not die') or diag("  \$\@ = $err");
     is_deeply(rows_text($rows), \@lines, 'AC12: F12 (two blueprints, different name widths) renders byte-exact');
   SKIP: {
-        skip('no rows', 3) unless ref($rows) eq 'ARRAY' && @$rows >= 4;
+        skip('no rows', 3) unless ref($rows) eq 'ARRAY' && @$rows >= 5;
         my $col_of = sub {
             my ($row, $word) = @_;
             my $t = tui::Frame::spans_text($row);
@@ -544,9 +549,11 @@ my ($F12_A, $F12_B);
         };
         # Step column: 2 indent + 2 dot slot + 16 name + 3 = col 23 (no total
         # column in this panel). The time slot: 23 + 5 + 3 = col 31.
-        is($col_of->($rows->[3], 'tests'), 23, 'AC12: block B\'s step word starts at the panel step column (23)');
-        is($col_of->($rows->[1], 'next'), 31, 'AC12: block A\'s aside starts at the panel time column (31), past B\'s step column');
-        is($col_of->($rows->[1], '01-x'), $col_of->($rows->[3], '07-wide'), 'AC12: both blocks\' names start in the same column');
+        is($col_of->($rows->[4], 'tests'), 23, 'AC12: block B\'s step word starts at the panel step column (23)');
+        # 2026-11-11 (one status column): a reason starts in the panel's
+        # status column, after every step word.
+        is($col_of->($rows->[1], 'next'), 31, 'AC12: block A\'s reason starts in the panel status column (31), past B\'s step column');
+        is($col_of->($rows->[1], '01-x'), $col_of->($rows->[4], '07-wide'), 'AC12: both blocks\' names start in the same column');
     }
 }
 
@@ -703,7 +710,7 @@ my ($F12_A, $F12_B);
             next unless $step{$i};
             is($dw->(substr($t, 0, index($t, $step{$i}))), 26, "AC16 (F1): row $i step word starts at column 26");
             my $ti = index($t, $time{$i}, index($t, $step{$i}) + length($step{$i}));
-            is($dw->(substr($t, 0, $ti + length($time{$i}))), 49, "AC16 (F1): row $i step time ends at column 49");
+            is($dw->(substr($t, 0, $ti)), 46, "AC16 (F1): row $i step time starts at column 46 (left-aligned, 2026-11-11)");
         }
     }
 }
@@ -809,8 +816,10 @@ my ($F12_A, $F12_B);
             # 100 and 140 (AC19's spec text) every F1 row must be a PREFIX of
             # exactly one frame row -- not merely contain its words in order.
             if ($cols == 100 || $cols == 140) {
+                my $bw = tui::DashboardScreen::_blueprints_body_width($cols);
+                my $at_w = [ map { tui::Frame::spans_text($_) } @{ tui::DashboardScreen::_run_summary_lines([$F1], undef, $bw, $NOW) } ];
                 for my $i (0 .. $#F1_LINES) {
-                    my $line = $F1_LINES[$i];
+                    my $line = $at_w->[$i];
                     my @hits = grep { index($_, $line) == 0 } @frame_text;
                     is(scalar(@hits), 1,
                         "AC19 (cols=$cols): F1 row L" . ($i + 1) . " is a prefix (index==0) of exactly one frame row");
@@ -998,13 +1007,17 @@ my ($F12_A, $F12_B);
         # F1_LINES: bp-blocked's 'waiting on' aside is in the panel, and F1's
         # own columns are unchanged by it (it has no step and no time). The
         # rows are spelled out in full.
+        my $XP = tui::Layout::display_width(substr($F1_LINES[0], 0, index($F1_LINES[0], G('thread.idle'))))
+               - tui::Layout::display_width(substr($F1_LINES[1], 0, index($F1_LINES[1], '12m')));
         my @P = (
             $F1_LINES[0],
-            S(2) . G('status.ok') . ' 05-checks-erlang' . ' 1h' . S(3) . 'tests' . S(12) . S(3) . '12m',
-            S(2) . G('status.warn') . ' 10-model-journa' . E() . ' ' . S(2) . S(3) . 'implementation' . S(3) . S(3) . '41m'
+            S(2) . G('status.ok') . ' 05-checks-erlang' . ' 1h' . S(3) . 'tests' . S(12) . S(3) . S($XP) . '12m',
+            S(2) . G('status.warn') . ' 10-model-journa' . E() . ' ' . S(2) . S(3) . 'implementation' . S(3) . S(3) . S($XP) . '41m' . S(1)
                 . S(3) . 'attempt 5/5',
-            G('icon.blueprints') . ' bp-blocked' . S(3) . M(2, 5) . S(2) . '2/5' . S(3) . 'running',
-            S(2) . G('thread.blocked') . ' 03-gamma' . S(8) . ' ' . S(2) . S(3) . S(17) . S(3) . 'waiting on 20261002-120000-abcd',
+            # 2026-11-11: one name width (acxpraxis-step-2, 16) and one count
+            # width ('5/14', 4) across the panel's blueprint lines.
+            G('icon.blueprints') . ' bp-blocked' . S(6) . S(3) . M(2, 5) . S(2) . '2/5' . S(1) . S(17 + 3) . S(3) . 'running',   # no driver: the state word still starts in the panel state column, after "<dot> orchestrator 3h" (17)
+            S(2) . G('thread.blocked') . ' 03-gamma' . S(8) . ' ' . S(2) . S(3) . S(17) . S(3) . S($XP) . 'waiting on 20261002-120000-abcd',
         );
         my ($width, $ewidth) = call1('_blueprints_body_width', 120);
       SKIP: {

@@ -857,10 +857,21 @@ sub cell_sig {
 # row that has to stay readable, and a missing junction glyph is a cosmetic
 # seam, not a corrupted caption. The caller cannot generally know whether a
 # given column will collide, so the decision belongs here.
+#
+# $suffix (optional, operator 2026-11-11: panel freshness moves into the
+# title) is an arrayref of { text, role } spans drawn right after the title
+# text and before the rule fill -- "- Resources . <1m --...". Each span keeps
+# its own role (an age in text.muted, "stale 12m" in state.warn); its text
+# goes through safe() like the title's. Absent or empty: the line is exactly
+# what it always was.
 sub panel_title_line {
-    my ($title, $w, $junctions) = @_;
+    my ($title, $w, $junctions, $suffix) = @_;
     my $rule_glyph = Theme::glyph('rule.h');
     $rule_glyph = '-' if !defined $rule_glyph || !length $rule_glyph;
+    my @suffix = (ref($suffix) eq 'ARRAY')
+        ? map { { text => safe($_->{text}), role => (defined($_->{role}) ? $_->{role} : DEFAULT_ROLE()) } }
+          grep { ref($_) eq 'HASH' && defined($_->{text}) && length($_->{text}) } @$suffix
+        : ();
     # THE LEAD GLYPH IS RULE, NOT TEXT. It used to be part of one span with the
     # title, carrying DEFAULT_ROLE -- correct when the lead was the ASCII '-- '
     # caption, wrong the moment it became a rule glyph: the single '-' to the
@@ -876,6 +887,10 @@ sub panel_title_line {
         { text => $rule_glyph,                    role => 'rule' },
         { text => ' ' . safe($title) . ' ',       role => DEFAULT_ROLE() },
     );
+    if (@suffix) {
+        push @spans, @suffix, { text => ' ', role => 'rule' };
+        $lead .= join('', map { $_->{text} } @suffix) . ' ';
+    }
     my $lead_w = tui::Layout::display_width($lead);
     my $target_w = (!defined $w || ref($w) || $w !~ /^-?\d+(?:\.\d+)?$/) ? 0 : int($w);
     if ($target_w > $lead_w) {

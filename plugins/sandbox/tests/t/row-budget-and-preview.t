@@ -559,7 +559,8 @@ for my $f (@AC1_FIXTURES) {
         ok(defined($pi), 'AC3 precondition: a row carrying the pause reason exists');
         is($pe->{kind}, 'blueprint', "AC3: the pause-reason row's kind is 'blueprint' (ruling B/G: the reason moved onto the blueprint line)") if defined $pi;
         is($pe->{pri}, 1, 'AC3: the pause-reason (blueprint) row has pri 1') if defined $pi;
-        my @non_s25_kind = grep { ref($_) eq 'HASH' && $_->{kind} !~ /^(?:blueprint|overflow|driver|package|judge|next)\z/ } @$plan;
+        my @non_s25_kind = grep { ref($_) eq 'HASH' && $_->{kind} !~ /^(?:blueprint|overflow|driver|package|judge|next|gap)\z/ } @$plan;
+        # +gap (2026-11-11): the blank row between two blueprint blocks.
         is(scalar(@non_s25_kind), 0, 'AC3: no plan row uses a kind outside S2.5\'s six (no coordinator/worker/cur/partial/run/other survives)');
     }
 }
@@ -787,8 +788,10 @@ for my $f (@AC1_FIXTURES) {
     # two physical rows.
     my @pkgs = map {
         { name => "zqxm4-$_-dispatch-log-write-path-and-hardening", status => 'blocked',
+# attempt 1 (2026-11-11): a long waiting on is cut only on a row with an
+          # attempt counter, and this fixture needs it to run on and wrap.
           waits_on => "escalation-$_-waiting-on-the-operator-answer-xyz",
-          attempt => 2, attempt_cap => 5, step_word => 'implementation', agents => [] }
+          attempt => 1, attempt_cap => 5, step_word => 'implementation', agents => [] }
     } (1 .. 7);
     my $run = tree_run(blueprint => 'zqxm4-run', packages => \@pkgs);
     my $s = base_state(runs => [ $run ]);
@@ -1014,7 +1017,11 @@ for my $f (@AC1_FIXTURES) {
                 ok(defined($overflow_i) && $overflow_i < $#$body,
                     'AC16: "+N more blueprint(s)" appears BEFORE the collapse notice');
                 my ($hidden) = row_text($body->[-1]) =~ /\+(\d+) rows? hidden/;
-                is($hidden, scalar(@$plan) - (scalar(@$body) - 1),
+                # 2026-11-11: blank rows between blocks (kind gap) go first and
+                # are never counted as hidden: CONTENT rows only.
+                my $content_plan = grep { ($_->{kind} // q{}) ne q{gap} } @$plan;
+                my $content_kept = grep { row_text($_) ne q{} } @{$body}[0 .. $#$body - 1];
+                is($hidden, $content_plan - $content_kept,
                     'AC16: the notice\'s count equals @plan - @kept exactly (numerically, not by regex alone)');
             }
         }
@@ -1698,9 +1705,10 @@ SKIP: {
                 current_package running_coordinators escalations_waiting inbox_waiting
                 triage_waiting packages run_agents
                 thread thread_events
-                paused_window relaunch_at relaunch_local next_package);
+                paused_window relaunch_at relaunch_local next_package
+                fleet);
             my $r = $running[0];
-            is_deeply([ sort keys %$r ], [ sort @RUN_KEYS ], 'AC36: a running synth_runs element has EXACTLY the 23 run-level keys RunState emits (set equality)');
+            is_deeply([ sort keys %$r ], [ sort @RUN_KEYS ], 'AC36: a running synth_runs element has EXACTLY the 24 run-level keys RunState emits (set equality)');
             my $pkgs = $r->{packages};
             ok(ref($pkgs) eq 'ARRAY' && @$pkgs, 'AC36 precondition: the running element carries a non-empty packages array');
           SKIP: {
@@ -2103,7 +2111,11 @@ SKIP: {
 # (hidden 5) the first narrow one.
 for my $case (
     { geom => q(200x40), phase => 11, label => q(wide, side column) },
-    { geom => '120x35', phase => 7, label => 'narrow, no side column' },
+    # RE-SELECTED 2026-11-11 (panel freshness: the Run panel lost its
+    # heartbeat row, so every narrow frame gained one row of room): phase 7
+    # no longer collapses at 120x35 (measured: no notice row); phase 8
+    # (hidden 7, notice 7) is now the first narrow one that does.
+    { geom => '120x35', phase => 8, label => 'narrow, no side column' },
 ) {
     my ($out, $rc);
     {

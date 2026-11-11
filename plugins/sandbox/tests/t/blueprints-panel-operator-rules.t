@@ -271,12 +271,14 @@ my $RUNNING = { %$PAUSED, state => 'running', paused_reason => undef, paused_win
     # Columns: dot slot 2, name N=8, total T=3 ('<1m'), step S=14, time U=3 ('45m').
     is($t->[1], S(2) . G('status.ok') . ' 01-alpha' . '  3h' . S(3) . 'implementation' . S(3) . '45m' . S(3) . 'attempt 2/5',
         '7: "<dot> <name> <total>   <step word>   <step time>   attempt N/M", times right-aligned');
-    is($t->[4], S(2) . G('status.ok') . ' 07-gamma' . ' <1m' . S(3) . 'tests' . S(9) . S(3) . '<1m',
+    # $t->[3] is the blank row between the two blocks (2026-11-11).
+    is($t->[3], '', '7: one blank row separates the two blueprint blocks');
+    is($t->[5], S(2) . G('status.ok') . ' 07-gamma' . ' <1m' . S(3) . 'tests' . S(9) . S(3) . '<1m',
         '7: a row in ANOTHER blueprint uses the same columns, and attempt 1 shows no counter');
     my $col = sub { my ($s, $w) = @_; my $i = index($s, $w); return $i < 0 ? -1 : dw(substr($s, 0, $i + length $w)); };
-    is($col->($t->[1], '3h'), $col->($t->[4], '<1m'), '7: the total column ends in the same column across blueprints');
+    is($col->($t->[1], '3h'), $col->($t->[5], '<1m'), '7: the total column ends in the same column across blueprints');
     my $u_end = $col->($t->[1], '45m');
-    is(dw($t->[4]), $u_end, '7: the step-time column ends in the same column across blueprints');
+    is(dw($t->[5]), $u_end, '7: the step-time column ends in the same column across blueprints');
     like($t->[1], qr/attempt 2\/5\z/, '7: the attempt counter is labelled "attempt"');
 
     # The not-started row: its reason is in the step-time slot, muted italic,

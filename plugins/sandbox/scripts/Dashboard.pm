@@ -1374,6 +1374,12 @@ sub dispatch_key {
     # token is introduced, so the :2024 whitelist above needs no entry and
     # has nothing to forget.
     return ('backpack', '')           if $key eq 'b';
+    # fleet-control (operator, 2026-11-11): 'f' opens the fleet screen, which
+    # lists the fleet runs and offers start/stop behind a confirm. Lowercase-
+    # only for the same reason as 'b': 'F' is the End key's CSI final byte
+    # (\e[F). Opening the screen does nothing by itself -- in particular it
+    # never starts a fleet.
+    return ('fleets', '')             if $key eq 'f';
     # t03-banner-dismiss S2.3: dismiss the backpack-install-warning banner.
     # Lowercase-only, deliberately -- same rationale as 'b' above: 'D' is the
     # LEFT arrow's CSI final byte (\e[D), so an uppercase alias risks firing
@@ -2323,6 +2329,171 @@ sub write_shutdown_signals {
 }
 
 # ===========================================================================
+# fleet-control (operator, 2026-11-11): start and stop ONE fleet from the [f]
+# screen. Nothing here runs on its own; launcher.pl wires these into the
+# fleet_start/fleet_stop seams and tui::FleetScreen calls them only after the
+# operator's [enter] + [y].
+# ===========================================================================
+
+# The marker that records a stop as the operator's own. bp-orchestrate.sh
+# (bp_clear_stale_shutdown) clears it on the next explicit start.
+sub OPERATOR_STOP_MARKER { return '.stopped-by-operator' }
+
+# Where bp-orchestrate.sh lives inside the container: the ccpraxis-local
+# marketplace mount (launcher.pl's directory-source marketplace loop).
+sub FLEET_ORCHESTRATE_PATH {
+    return '/root/.claude/plugins/marketplaces/ccpraxis-local/butler/scripts/bp-orchestrate.sh';
+}
+
+# The container's working directory (Containerfile WORKDIR, the project mount).
+sub FLEET_WORKDIR { return '/project' }
+
+# The start's wall-clock bound. Generous on purpose: on a fresh container the
+# hooks self-test runs a real headless check and has taken minutes, and it is
+# silent while it does (--quiet), so an inactivity watchdog would be wrong.
+# SANDBOX_FLEET_START_TIMEOUT (digits) overrides.
+sub FLEET_START_TIMEOUT {
+    my ($env) = @_;
+    $env = \%ENV unless ref($env) eq 'HASH';
+    my $v = $env->{SANDBOX_FLEET_START_TIMEOUT};
+    return ($v + 0) if defined($v) && $v =~ /\A\d+\z/ && $v > 0;
+    return 900;
+}
+
+# valid_fleet_name($bp) -> 1|0. A blueprint name as it may cross into a
+# command line: a plain directory name, never an option, never a path.
+sub valid_fleet_name {
+    my ($bp) = @_;
+    return 0 unless defined($bp) && !ref($bp);
+    return ($bp =~ /\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\z/) ? 1 : 0;
+}
+
+# fleet_start_argv($podman, $container, $bp) -> \@argv | undef. List form, no
+# shell on the host. Inside the container bash puts /root/.local/bin (where
+# claude lives) in front of the container's own PATH -- a bare `podman exec`
+# does not have it (bug 6568; bp-orchestrate.sh's bp_ensure_claude_on_path is
+# the second line of defence) -- then execs the script with the blueprint as
+# its only argument, passed positionally so nothing is spliced into the
+# script text.
+sub fleet_start_argv {
+    my ($podman, $container, $bp) = @_;
+    return undef unless defined($podman) && length($podman) && defined($container) && length($container);
+    return undef unless valid_fleet_name($bp);
+    return [ $podman, 'exec', '-w', FLEET_WORKDIR(), $container,
+             'bash', '-c', 'export PATH="/root/.local/bin:$PATH"; exec bash "$0" "$@"',
+             FLEET_ORCHESTRATE_PATH(), $bp ];
+}
+
+sub _last_line {
+    my ($t) = @_;
+    return '' unless defined $t;
+    my @l = grep { /\S/ } split /\r?\n/, $t;
+    my $s = @l ? $l[-1] : '';
+    $s =~ s/[\x00-\x1f\x7f]/ /g;
+    $s =~ s/\A\s+|\s+\z//g;
+    return length($s) > 200 ? substr($s, 0, 200) . '...' : $s;
+}
+
+# fleet_start(%o) -> { ok, rc, detail, timed_out, elapsed, argv }.
+#   bp, podman, container   what to start, and where
+#   runs_dir                the fleet's runs/ on the host (optional): on a
+#                           successful start its operator-stop marker is
+#                           removed, so the record cannot outlive the stop
+#                           even when the container still runs an older
+#                           bp-orchestrate.sh that does not clear it
+#   runner                  REQUIRED coderef with BoundedRun::run's contract
+#                           (cmd, timeout, on_tick) -- injected, so this
+#                           module spawns nothing itself
+#   on_tick                 called with the elapsed seconds while it runs
+#   env                     for FLEET_START_TIMEOUT (default %ENV)
+sub fleet_start {
+    my (%o) = @_;
+    my $res = { ok => 0, rc => -1, detail => '', timed_out => 0, elapsed => 0, argv => undef };
+    unless (valid_fleet_name($o{bp})) { $res->{detail} = 'not a blueprint name'; return $res }
+    unless (ref($o{runner}) eq 'CODE') { $res->{detail} = 'no command runner wired'; return $res }
+    my $argv = fleet_start_argv($o{podman}, $o{container}, $o{bp});
+    unless ($argv) { $res->{detail} = 'no container to run it in'; return $res }
+    $res->{argv} = $argv;
+    my $limit = FLEET_START_TIMEOUT($o{env});
+    my $r = $o{runner}->(cmd => $argv, timeout => $limit, merge => 1,
+                         on_tick => (ref($o{on_tick}) eq 'CODE' ? $o{on_tick} : sub { }));
+    $r = {} unless ref($r) eq 'HASH';
+    $res->{rc}        = defined($r->{rc}) ? $r->{rc} : -1;
+    $res->{timed_out} = $r->{timed_out} ? 1 : 0;
+    $res->{elapsed}   = $r->{elapsed} // 0;
+    my $last = _last_line(join("\n", grep { defined } $r->{out}, $r->{err}));
+    if ($res->{timed_out}) {
+        $res->{detail} = "no answer after ${limit}s, so it was stopped; the fleet may still come up - check again";
+    }
+    elsif ($res->{rc} == 0) {
+        $res->{ok} = 1;
+        $res->{detail} = $last;
+        if (defined($o{runs_dir}) && length($o{runs_dir})) {
+            unlink "$o{runs_dir}/" . OPERATOR_STOP_MARKER();
+        }
+    }
+    else {
+        my $code = $res->{rc} > 0 ? ($res->{rc} >> 8) : $res->{rc};
+        $res->{detail} = "exit $code" . (length($last) ? " - $last" : '');
+    }
+    return $res;
+}
+
+# fleet_stop(%o) -> { ok, detail }. Butler's own graceful stop, scoped to one
+# fleet: runs/.shutdown, the marker the orchestrator and every coordinator's
+# shutdown gate already honour (each coordinator parks after its current step,
+# then the orchestrator winds down; nothing is killed). Written FIRST is the
+# operator-stop record, so there is no instant at which the fleet is stopping
+# without the record that it was asked to.
+#   runs_dir   the fleet's runs/ on the host (required; must hold registry.json
+#              or an .orchestrator marker -- RunState's own fleet evidence)
+#   now        epoch for the record's `at` (default time)
+sub fleet_stop {
+    my (%o) = @_;
+    my $runs = $o{runs_dir};
+    return { ok => 0, detail => 'no runs directory' } unless defined($runs) && length($runs) && -d $runs;
+    return { ok => 0, detail => 'not a fleet run (no registry.json, no orchestrator marker)' }
+        unless -f "$runs/registry.json" || -e "$runs/.orchestrator";
+    my $now = (defined($o{now}) && $o{now} =~ /\A\d+\z/) ? $o{now} : time;
+    my $ok = mark_operator_stop($runs, $now);
+    return { ok => 0, detail => "could not record the stop - $ok" } unless $ok eq '1';
+    open(my $fh, '>', "$runs/.shutdown") or return { ok => 0, detail => "could not write .shutdown - $!" };
+    close $fh;
+    return { ok => 1, detail => 'its coordinators park after their current step' };
+}
+
+# mark_operator_stop($runs_dir, $now) -> '1' | error text. Atomic: tmp+rename.
+sub mark_operator_stop {
+    my ($runs, $now) = @_;
+    $now = time unless defined($now) && $now =~ /\A\d+\z/;
+    my $path = "$runs/" . OPERATOR_STOP_MARKER();
+    my $tmp  = "$path.tmp.$$";
+    open(my $fh, '>', $tmp) or return "$!";
+    print {$fh} JSON::PP->new->canonical(1)->encode({ v => 1, at => $now + 0, by => 'dashboard' }), "\n";
+    close($fh) or do { my $e = "$!"; unlink $tmp; return $e };
+    rename($tmp, $path) or do { my $e = "$!"; unlink $tmp; return $e };
+    return '1';
+}
+
+# operator_stop_targets(\) -> the runs/ dirs [s] stop-runs and [x]
+# full-shutdown are stopping a fleet that is UP in: every RunState summary
+# whose fleet_status offers 'stop' (running or paused). Only those are
+# recorded as operator stops -- a fleet that had already died before the key
+# was pressed keeps reading as stopped, not as something the operator did.
+sub operator_stop_targets {
+    my ($runs) = @_;
+    return () unless ref($runs) eq 'ARRAY';
+    my @out;
+    for my $s (@$runs) {
+        my $fs = tui::DashboardScreen::fleet_status($s);
+        next unless $fs && defined($fs->{action}) && $fs->{action} eq 'stop';
+        next unless defined($s->{runs_dir}) && !ref($s->{runs_dir}) && -d $s->{runs_dir};
+        push @out, $s->{runs_dir};
+    }
+    return @out;
+}
+
+# ===========================================================================
 # s11-lifecycle-stop: stop-runs / full-shutdown staged driver (spec 08 S2.3-6)
 # ===========================================================================
 
@@ -3146,24 +3317,125 @@ sub run_recover_stages {
 # sequence -> undef, ESC + a non-CSI byte (Alt+key) -> that byte, a lone ESC
 # (nothing more to read) -> "\e". No branch's outcome changed by the
 # extraction; the call site below is now a one-line call.
+#
+# $settle (optional, 2026-11-11) is a coderef taking a timeout that returns
+# the next byte or undef -- a BLOCKING read with a limit. With it, this is the
+# one key-sequence parser of the TUI (the dashboard loop, [b], [f], the
+# preview), and it is built for a console that delivers a sequence in pieces:
+#
+#   * the operator, Windows Terminal, 2026-11-11: "I pressed f then as I was
+#     navigating down it went back to the main panel". A DOWN arrow's \e
+#     arrived on its own and read as a lone ESC, which closes a screen. A
+#     50 ms wait for the rest was not enough on that console.
+#   * so a lone ESC is ESC only after LONE_ESC_SECS (200 ms, well above the
+#     usual 25-100 ms ESCDELAY) of silence. Every byte after that is waited
+#     for up to SEQ_BYTE_SECS too: a sequence that has started is completed,
+#     never mistaken for ESC, and a sequence cut off half way is DROPPED.
+#   * recognised, with or without modifiers (\e[1;5B is still DOWN):
+#       CSI  \e[A..D  \e[H \e[F   \e[1~ \e[7~ HOME  \e[4~ \e[8~ END
+#            \e[5~ PGUP  \e[6~ PGDN
+#       SS3  \eOA..D  \eOH \eOF   (application cursor mode)
+#     -> UP DOWN RIGHT LEFT HOME END PGUP PGDN. Any other COMPLETE sequence
+#     (focus \e[I \e[O, function keys, a terminal report) is dropped whole.
+#   * ESC + an ordinary byte is Alt+that byte: the byte, as before.
+# Without $settle (a caller with no blocking read) only bytes already queued
+# are looked at, as before.
+#
+# With CCPRAXIS_KEYLOG set, every assembled sequence is logged (keylog below).
+use constant LONE_ESC_SECS => 0.2;
+use constant SEQ_BYTE_SECS => 0.2;
+use constant ESC_SETTLE_SECS => LONE_ESC_SECS;   # the old name, kept for callers
+my %CSI_FINAL = (A => 'UP', B => 'DOWN', C => 'RIGHT', D => 'LEFT', H => 'HOME', F => 'END');
+my %CSI_TILDE = (1 => 'HOME', 7 => 'HOME', 4 => 'END', 8 => 'END', 5 => 'PGUP', 6 => 'PGDN');
 sub _assemble_esc {
-    my ($key, $read_key) = @_;
+    my ($key, $read_key, $settle) = @_;
     return $key unless defined $key && $key eq "\e";
-    my $k2 = $read_key->();
-    if (defined $k2 && ($k2 eq '[' || $k2 eq 'O')) {
-        my $k3 = $read_key->();
-        if (defined $k3) {
-            if    ($k3 eq 'A') { return 'UP'; }
-            elsif ($k3 eq 'B') { return 'DOWN'; }
-            else               { return undef; }   # unrecognized CSI: drop, like launcher.pl
-        }
-        return undef;   # incomplete sequence
-    } elsif (defined $k2) {
-        # ESC + a non-CSI byte (Alt+key): surface that byte rather than
-        # dropping it, mirroring launcher.pl.
-        return $k2;
+    my @got = ("\e");
+    my $next = sub {
+        my ($wait) = @_;
+        my $k = $read_key->();
+        $k = $settle->($wait) if !(defined($k) && length $k) && ref($settle) eq 'CODE';
+        return undef unless defined($k) && length $k;
+        push @got, $k;
+        return $k;
+    };
+    my $done = sub { my ($out) = @_; keylog('seq', _hexb(join '', @got) . ' -> ' . (defined $out ? ($out eq "\e" ? 'ESC' : $out) : 'dropped')); return $out; };
+    my $k2 = $next->(LONE_ESC_SECS());
+    return $done->("\e") unless defined $k2;             # silence: a real ESC
+    if ($k2 eq 'O') {                                     # SS3
+        my $k3 = $next->(SEQ_BYTE_SECS());
+        return $done->(undef) unless defined $k3;
+        return $done->($CSI_FINAL{$k3}) if exists $CSI_FINAL{$k3};
+        return $done->(undef);
     }
-    return "\e";   # lone ESC (no k2): stays inert in dispatch_key.
+    if ($k2 eq '[') {                                     # CSI: params, intermediates, final
+        my $params = '';
+        my $n = 0;
+        while ($n++ < 32) {
+            my $c = $next->(SEQ_BYTE_SECS());
+            return $done->(undef) unless defined $c;      # cut off: drop, never ESC
+            if ($c =~ /\A[\x30-\x3f\x20-\x2f]\z/) { $params .= $c; next; }
+            if ($c =~ /\A[\x40-\x7e]\z/) {
+                return $done->($CSI_FINAL{$c}) if exists $CSI_FINAL{$c};
+                if ($c eq '~') {
+                    my ($p1) = $params =~ /\A(\d+)/;
+                    return $done->($CSI_TILDE{$p1}) if defined($p1) && exists $CSI_TILDE{$p1};
+                }
+                return $done->(undef);                    # unknown, complete: dropped whole
+            }
+            return $done->(undef);                        # not a CSI byte: drop
+        }
+        return $done->(undef);
+    }
+    # ESC + a non-CSI byte (Alt+key): surface that byte rather than
+    # dropping it, mirroring launcher.pl.
+    return $done->($k2);
+}
+
+# keylog($what, $detail) -- the opt-in raw input log (2026-11-11). With
+# CCPRAXIS_KEYLOG=<path>, appends "<local time with ms> <what> <detail>".
+# The launcher and the preview log every raw read (`read <hex>`, or
+# `timeout <secs>`), _assemble_esc logs each sequence it assembled, and the
+# screens log the key and the action it became. Off (nothing touched) unless
+# the variable is set.
+sub keylog {
+    my ($what, $detail) = @_;
+    my $p = $ENV{CCPRAXIS_KEYLOG};
+    return unless defined($p) && length($p);
+    my $t = Time::HiRes::time();
+    my @l = localtime(int $t);
+    my $ts = sprintf('%02d:%02d:%02d.%03d', $l[2], $l[1], $l[0], int(($t - int $t) * 1000));
+    if (open(my $fh, '>>', $p)) {
+        print {$fh} "$ts $what" . (defined($detail) && length($detail) ? " $detail" : '') . "\n";
+        close $fh;
+    }
+    return;
+}
+
+# _hexb($bytes) -> "1b 5b 42".
+sub _hexb { my ($s) = @_; return join(' ', map { sprintf('%02x', ord $_) } split //, (defined $s ? $s : '')); }
+
+# keylog_read($byte, $timeout, $label) -- log one raw read: its bytes in hex
+# (one line per read, so the read boundaries show), or the timeout it hit.
+sub keylog_read {
+    my ($k, $t, $label) = @_;
+    return unless defined($ENV{CCPRAXIS_KEYLOG}) && length($ENV{CCPRAXIS_KEYLOG});
+    $label = 'read' unless defined $label;
+    if (defined($k) && length $k)        { keylog($label, _hexb($k)); }
+    elsif (defined $t && $t =~ /\A[\d.]+\z/ && $t > 0) { keylog("$label-timeout", sprintf('%.3fs', $t)); }
+    return;
+}
+
+# keylog_reader($raw) -> a reader that logs each raw read. $raw is a coderef
+# taking a timeout (-1 / none for non-blocking) and returning a byte or undef.
+sub keylog_reader {
+    my ($raw, $label) = @_;
+    return sub {
+        my ($t) = @_;
+        my $k = $raw->($t);
+        keylog_read($k, $t, $label);
+        return $k;
+    };
 }
 
 sub run {
@@ -3234,6 +3506,16 @@ sub run {
     my $hot_reload         = (ref($o{hot_reload})         eq 'CODE') ? $o{hot_reload}         : undef;
     my $hot_reload_pending = (ref($o{hot_reload_pending}) eq 'CODE') ? $o{hot_reload_pending} : undef;
     my $launcher_changed   = (ref($o{launcher_changed}) eq q{CODE}) ? $o{launcher_changed} : undef;
+    # fleet-control: the [f] modal seam and its three action seams. With none
+    # wired, the screen still lists the fleets from the last gather and
+    # reports start/stop as unavailable. fleet_start is the ONLY path in the
+    # dashboard that starts a fleet, and it is reached only from the screen,
+    # after an explicit [enter] and [y] (fleet-control-no-autostart.t).
+    my $fleet_screen = (ref($o{fleet_screen}) eq 'CODE') ? $o{fleet_screen}
+        : sub { require tui::FleetScreen; tui::FleetScreen::run(%{$_[0]}) };
+    my $fleet_load  = (ref($o{fleet_load})  eq 'CODE') ? $o{fleet_load}  : undef;
+    my $fleet_start = (ref($o{fleet_start}) eq 'CODE') ? $o{fleet_start} : undef;
+    my $fleet_stop  = (ref($o{fleet_stop})  eq 'CODE') ? $o{fleet_stop}  : undef;
     my $bp_load       = (ref($o{bp_load})   eq 'CODE') ? $o{bp_load}   : undef;
     my $bp_save       = (ref($o{bp_save})   eq 'CODE') ? $o{bp_save}   : undef;
     my $bp_remove     = (ref($o{bp_remove}) eq 'CODE') ? $o{bp_remove} : undef;
@@ -3665,6 +3947,7 @@ sub run {
                     $drained++;
                     my $pending_was_armed = ($pending ne '');
                     my ($action, $np) = dispatch_key($key, $pending);
+                    keylog('key', "dashboard $key -> " . (length $action ? $action : '(none)')) if $ENV{CCPRAXIS_KEYLOG};
                     $pending = $np;
                     if ($action eq 'quit') { $rc = 0; $quit = 1; last; }
                     elsif ($action eq 'launch') {
@@ -3768,15 +4051,16 @@ sub run {
                             items     => $items,
                             load      => $bp_load,  save => $bp_save,  remove => $bp_remove,
                             read_key  => $next_key,
-                            wait_key  => sub { _assemble_esc($wait_input->($_[0]), $read_key) },
+                            wait_key  => sub { _assemble_esc($wait_input->($_[0]), $read_key, $wait_input) },
                             term_size => $term_size,  out => $out,
                             render    => sub { render_frame($_[0], $_[1], { color => $color }) },
                             tick      => $tick_int,   max_ticks => $bp_max_ticks,
                             # MEDIUM-1: keeps the container alive while the modal
                             # blocks this loop -- see $modal_heartbeat above.
                             heartbeat => $modal_heartbeat,
+                            keylog    => sub { keylog('key', "backpack $_[0] -> $_[1]") },
                         };
-                        eval { $backpack_screen->($ctx) };
+                        my $bres = eval { $backpack_screen->($ctx) };
                         if ($@) {
                             my $e = $@; $e =~ s/\s+/ /g;
                             $state{lifecycle} = { active => 0, mode => 'backpack', index => 0, total => 0,
@@ -3788,7 +4072,47 @@ sub run {
                         $out->(render_frame($prev, $bframe, { color => $color }));
                         $prev = $bframe;
                         $last_frame_sig = undef;
+                        # [q] inside the screen quits the TUI exactly as [q] here does.
+                        if (ref($bres) eq 'HASH' && $bres->{quit}) { $rc = 0; $quit = 1; }
                         last;   # stop draining; keys pressed after the modal wait for the next tick
+                    }
+                    elsif ($action eq 'fleets') {
+                        # fleet-control: the [f] modal, wired exactly like [b]
+                        # above -- it owns the screen for the call, keeps the
+                        # container (and host wake-lock) alive through
+                        # $modal_heartbeat, and never quits the dashboard.
+                        my $ctx = {
+                            runs      => (ref($state{runs}) eq 'ARRAY' ? $state{runs} : []),
+                            load      => $fleet_load, start => $fleet_start, stop => $fleet_stop,
+                            # a stopping fleet turns stopped while the screen is open
+                            reload_ticks => 5,
+                            # the clock the "when" words are read against, and the
+                            # usage figures, both from the state the panel just drew
+                            now       => (defined($state{now}) ? $state{now} : int($now->())),
+                            spend     => $state{spend},
+                            read_key  => $next_key,
+                            wait_key  => sub { _assemble_esc($wait_input->($_[0]), $read_key, $wait_input) },
+                            term_size => $term_size,  out => $out,
+                            render    => sub { render_frame($_[0], $_[1], { color => $color }) },
+                            tick      => $tick_int,   max_ticks => $bp_max_ticks,
+                            heartbeat => $modal_heartbeat,
+                            keylog    => sub { keylog('key', "fleets $_[0] -> $_[1]") },
+                        };
+                        my $fres = eval { $fleet_screen->($ctx) };
+                        if ($@) {
+                            my $e = $@; $e =~ s/\s+/ /g;
+                            $state{lifecycle} = { active => 0, mode => 'fleets', index => 0, total => 0,
+                                                   detail => $e, summary => "screen failed - $e" };
+                        }
+                        $prev       = undef;   # the modal owned the screen: the next paint must be FULL
+                        $last_state = undef;   # a fleet may have started or stopped: re-gather next tick
+                        my $fframe = compose_frame(\%state, $rows, $cols);
+                        $out->(render_frame($prev, $fframe, { color => $color }));
+                        $prev = $fframe;
+                        $last_frame_sig = undef;
+                        # [q] inside the screen quits the TUI exactly as [q] here does.
+                        if (ref($fres) eq 'HASH' && $fres->{quit}) { $rc = 0; $quit = 1; }
+                        last;
                     }
                     elsif ($action eq 'dismiss-install-warning') {
                         # t03-banner-dismiss S2.4: two writes, not one -- the
@@ -3901,7 +4225,7 @@ sub run {
                     # sequence. 07-backpack-screen S2.3: this is now the
                     # extracted _assemble_esc, unchanged in outcome, so the
                     # backpack modal's wait_key seam can reuse the same logic.
-                    $wk = _assemble_esc($wk, $read_key);
+                    $wk = _assemble_esc($wk, $read_key, $wait_input);
                     if (defined $wk && length $wk) {
                         $pushback_key = $wk;
                         my ($quit2, $scroll_dirty2) = $do_drain->();

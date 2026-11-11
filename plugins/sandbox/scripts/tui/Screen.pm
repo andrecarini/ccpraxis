@@ -265,7 +265,9 @@ sub _render_panel {
         return { text => tui::Frame::spans_text(\@spans), role => $cell->{role}, spans => \@spans };
     };
 
-    my $title_spans = tui::Frame::panel_title_line($panel->{title}, $content_w, $junctions);
+    # title_suffix: optional spans after the title text (panel freshness,
+    # "Resources . <1m") -- see tui::Frame::panel_title_line.
+    my $title_spans = tui::Frame::panel_title_line($panel->{title}, $content_w, $junctions, $panel->{title_suffix});
     push @out, $edge->(
         { text => tui::Frame::spans_text($title_spans), role => 'text.primary', spans => $title_spans },
         # The title rule IS the top border, so the column where the separator

@@ -344,12 +344,16 @@ sub field       { my ($h, $k) = @_; return is_hashref($h) ? $h->{$k} : $FAILED; 
 # relaunch_at, relaunch_local and next_package are ALWAYS present (closed
 # key set discipline, same as every earlier widening), undef when their
 # source is absent.
+# Widened 23 -> 24 by fleet-control (operator, 2026-11-11): `fleet`, undef
+# unless runs/registry.json exists, else { shutdown, operator_stop,
+# operator_stop_at } -- the evidence DashboardScreen::fleet_status judges.
 my @SUMMARY_KEYS = qw(
     blueprint runs_dir state orchestrator_pid orchestrator_alive orchestrator_started_at
     paused_manual paused_reason packages_total packages_done current_package
     running_coordinators escalations_waiting inbox_waiting triage_waiting packages
     run_agents thread thread_events
     paused_window relaunch_at relaunch_local next_package
+    fleet
 );
 
 # EVENT_KEYS -- the 11 always-present keys of one %event element inside
@@ -361,7 +365,7 @@ my @EVENT_KEYS = qw(thread id at epoch event actor session task from to reason);
 sub assert_summary_shape {
     my ($s, $label) = @_;
     ok(is_hashref($s), "$label: summary is a hashref") or return;
-    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS ], "$label: exactly the 23 S2.1+AT-8+package-13+package-01-run-blocks keys, no more, no fewer");
+    is_deeply([ sort keys %$s ], [ sort @SUMMARY_KEYS ], "$label: exactly the 24 S2.1+AT-8+package-13+package-01-run-blocks+fleet-control keys, no more, no fewer");
     ok(defined($s->{blueprint}) && !ref($s->{blueprint}) && length($s->{blueprint}), "$label: blueprint is a non-empty Str");
     ok(defined($s->{runs_dir})  && !ref($s->{runs_dir})  && length($s->{runs_dir}),  "$label: runs_dir is a non-empty Str");
     # Widened by blueprint unified-tui-design-system package
@@ -458,6 +462,12 @@ sub assert_summary_shape {
         "$label: relaunch_local definedness tracks relaunch_at definedness");
     ok(!defined($s->{next_package}) || (!ref($s->{next_package}) && length($s->{next_package})),
         "$label: next_package is undef or a non-empty Str");
+    # fleet-control: undef, or a HASH of exactly shutdown/operator_stop/operator_stop_at.
+    ok(!defined($s->{fleet}) || is_hashref($s->{fleet}), "$label: fleet is undef or a HASH");
+    if (is_hashref($s->{fleet})) {
+        is_deeply([ sort keys %{ $s->{fleet} } ], [ sort qw(shutdown operator_stop operator_stop_at last_seen_at last_seen_local) ],
+            "$label: fleet has exactly shutdown/operator_stop/operator_stop_at/last_seen_at/last_seen_local");
+    }
 }
 
 # ===========================================================================

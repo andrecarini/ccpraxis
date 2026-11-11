@@ -588,12 +588,13 @@ is(Dashboard::display_width("a\tb"), 2,
         if $header_row;
 
     # -- (b)/(c) structural regression guard, re-pointed onto the Run
-    # panel's still-current "heartbeat" row instead of the deleted
-    # container row --
-    my ($body_row) = grep { $_->{text} =~ /heartbeat/ } @$frame;
-    ok($body_row, "AC-16 setup RETARGETED: found the Run panel's heartbeat body row in the composed frame");
+    # panel's "uptime" row (it was the heartbeat row until 2026-11-11, when
+    # the heartbeat moved into the Run title; uptime is built by the same
+    # row() call shape) --
+    my ($body_row) = grep { $_->{text} =~ /^uptime\s/ } @$frame;
+    ok($body_row, "AC-16 setup RETARGETED: found the Run panel's uptime body row in the composed frame");
   SKIP: {
-        skip 'AC-16 structural checks require the heartbeat body row to exist', 6
+        skip 'AC-16 structural checks require the uptime body row to exist', 6
             unless $body_row;
         is($body_row->{role}, 'text.primary',
             "AC-16 RETARGETED: a row()-composed panel line's row role is 'text.primary' (was 'body' -- spec 06 S2.1)");
