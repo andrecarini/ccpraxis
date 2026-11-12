@@ -349,6 +349,42 @@ sub _relaunch_already_holds {
     return undef;
 }
 
+# _requeue_after_widen(\%ctx, \%rec, $id) -> 1 requeued | 0 left alone.
+#
+# Bug 20261112-120628-9d26. A coordinator parks a package `blocked` to ask for a
+# write_set widening, and the widening was all a widen verdict applied: the
+# ledger stayed `blocked` with nothing queued, so the next tick's orphan
+# reconciler filed it again, and a second (often a third) paid resolver judge
+# answered `relaunch` before the package moved. Seen four times on 2026-11-12
+# (acxpraxis-step-2 package 15, Decisions 36, 37, 39 and the sim-exempt files).
+# The widening WAS the answer the park asked for, so the package goes back to
+# `pending` with its attempt counter reset, as a relaunch would leave it; the
+# orchestrator's watchdog relaunches it next tick.
+#
+# Left alone (0): the ledger is not blocked/parked, the coordinator is still
+# alive (the setter's own gate refuses then; that coordinator reads its widened
+# write_set itself), or any write fails -- the orphan reconciler is still there
+# behind this, so a failure costs a judge, never a stall.
+sub _requeue_after_widen {
+    my ($ctx, $rec, $id) = @_;
+    my $pkg = ref $rec eq 'HASH' ? $rec->{package} : undef;
+    return 0 unless defined $pkg && $pkg =~ /\A[A-Za-z0-9._-]+\z/;
+    my ($bpdir, $runs) = ($ctx->{bpdir}, $ctx->{runs});
+    return 0 unless defined $bpdir && defined $runs;
+    return 0 if defined _relaunch_already_holds($bpdir, $pkg);
+    my $txt = BpOrch::_read_file("$bpdir/packages/$pkg.md");
+    return 0 unless defined $txt && $txt =~ /\A---\s*\n(.*?)\n---/s;
+    return 0 unless $1 =~ /^status:\s*(?:blocked|parked)\s*$/m;
+    my $ok = eval {
+        BpOrch::_set_ledger_status($bpdir, $pkg, 'pending', { runs => $runs, log => $ctx->{log} })
+    };
+    return 0 unless $ok;
+    eval { BpOrch::update_registry_pkg($runs, $pkg, { attempt => 0 }) };
+    _rlog($ctx->{log}, 'escalation_resolve_widen_requeued', { decision => $id, package => $pkg })
+        if $ctx->{log};
+    return 1;
+}
+
 # ---------------------------------------------------------------------------
 # _dispatch_action(\%verdict, \%rec, $id, \%ctx) -> exit-code-shaped integer
 # (0 == succeeded). Reaches every one of the four bounded actions WITHOUT
@@ -412,12 +448,14 @@ sub _dispatch_action {
         # same breath) goes through the Decision-gated typed path instead.
         if (defined $verdict->{decision}) {
             my ($ok, $why) = _widen_with_decision($verdict, $rec, $id, $ctx, $path);
-            return 0 if $ok;
+            if ($ok) { _requeue_after_widen($ctx, $rec, $id); return 0; }
             $ctx->{needs_human} = $why if defined $why;
             return 1;
         }
-        return _run_quiet($^X, "$SELF_DIR/bp-answer-escalation.pl", $bp,
+        my $wrc = _run_quiet($^X, "$SELF_DIR/bp-answer-escalation.pl", $bp,
             '--decision', $id, '--widen-write-set', $path, '--bp-dir', $bpdir);
+        _requeue_after_widen($ctx, $rec, $id) if $wrc == 0;
+        return $wrc;
     }
     if ($action eq 'edit-depends-on') {
         my $deps = $verdict->{deps} // $verdict->{depends_on} // '';
