@@ -44,6 +44,11 @@
 # CLI: bp-answer-escalation.pl <blueprint> --decision <id|file|path>
 #                            [--action relaunch|reset|accept|drop|resume]
 #                            [--note "text"]
+#                            [--answered-by operator|escalation-resolver]
+#                                                       # who decided; the default is the
+#                                                       # operator. bp-resolve.pl passes
+#                                                       # escalation-resolver, so its note
+#                                                       # lands as "## Agent decision"
 #                            [--widen-write-set PATH]   # b17: additive-only write_set
 #                                                       # widening, through bp-ledger.pl
 #                            [--set-write-set VALUE]    # b17: ALWAYS refused (narrowing/
@@ -295,6 +300,24 @@ sub widen_write_set {
     run_op('widen-write-set', $ledger, sub { return _write_set_splice($_[0], $newpath) });
 }
 
+# Who answered, as the ledger states it (bug 20261112-132220-5b54). Pure.
+# 'escalation-resolver' is the one agent answerer; anything else, including undef,
+# is the operator, which keeps every existing caller's wording unchanged.
+our @ANSWERERS = ('operator', 'escalation-resolver');
+sub _by_agent { my ($by) = @_; return (defined $by && $by eq 'escalation-resolver') ? 1 : 0 }
+sub decision_heading {
+    my ($by) = @_;
+    return _by_agent($by) ? '## Agent decision (resolve)' : '## Human decision (resolve)';
+}
+sub decision_lead {
+    my ($by, $action) = @_;
+    return _by_agent($by)
+        ? "The escalation resolver, an agent and not the operator, reviewed this package's park "
+          . "and chose to **$action** it. The operator has not seen this decision; it is not an "
+          . "operator ruling and must never be cited as one"
+        : "A human reviewed this package's park and chose to **$action** it";
+}
+
 # Append (idempotently) the human's resolution to a package ledger as a corrective
 # section the relaunched coordinator will read. Mirrors BpOrch::_apply_harvest_findings
 # in shape.
@@ -317,8 +340,16 @@ sub widen_write_set {
 #
 # Returns 'lock-timeout' when the ledger lock could not be taken within
 # _lock_wait_secs() (nothing written); undef otherwise, as before.
+#
+# $by says WHO answered: 'operator' (the default: a human, through the reporter or
+# the inbox bridge) or 'escalation-resolver' (bp-resolve.pl applying an agent's
+# verdict). The two must never read alike. Until bug 20261112-132220-5b54 every
+# answer was written as "A human reviewed this package's park", so a resolver's own
+# relaunch guidance landed in the ledger as an operator ruling; the next resolver
+# read it there and refused to route a genuine product question to the operator,
+# citing a ruling the operator never made.
 sub append_human_decision {
-    my ($bpdir, $pkg, $note, $action) = @_;
+    my ($bpdir, $pkg, $note, $action, $by) = @_;
     return unless defined $note && length $note;
     my $f = "$bpdir/packages/$pkg.md";
     my $lock_p = BpWrite::lock_path($f);
@@ -327,9 +358,9 @@ sub append_human_decision {
     open my $r, '<:raw', $f or do { flock($lk, LOCK_UN); close $lk; return };
     local $/; my $txt = <$r>; close $r;
     unless (defined $txt) { flock($lk, LOCK_UN); close $lk; return; }
-    $txt =~ s/\n*## Human decision \(resolve\).*?(?=\n## |\z)//s;   # drop any prior block
-    my $sec = "\n\n## Human decision (resolve)\n\n"
-            . "A human reviewed this package's park and chose to **$action** it with this guidance:\n\n"
+    $txt =~ s/\n*## (?:Human|Agent) decision \(resolve\).*?(?=\n## |\z)//s;   # drop any prior block
+    my $sec = "\n\n" . decision_heading($by) . "\n\n"
+            . decision_lead($by, $action) . " with this guidance:\n\n"
             . "$note\n\n"
             . "Apply it, then re-run your own tests/review before reporting done.\n";
     $txt .= $sec;
@@ -359,11 +390,11 @@ sub append_human_decision {
 # writer here would both duplicate that logic and break b17's oracle, which pins
 # this script's raw-writer count at exactly one (the audit-record writer above).
 sub update_next_action_with_note {
-    my ($bpdir, $pkg, $note, $action) = @_;
+    my ($bpdir, $pkg, $note, $action, $by) = @_;
     return unless defined $note && length $note;
     my $ledger = "$bpdir/packages/$pkg.md";
     return unless -f $ledger;
-    my $body = "A human reviewed this package's park and chose to **$action** it. Their guidance:\n\n"
+    my $body = decision_lead($by, $action) . ". " . (_by_agent($by) ? 'Its' : 'Their') . " guidance:\n\n"
              . "$note\n\n"
              . "Apply it, then re-run your own tests/review before reporting done.";
     my $ledger_pl = "$SELF_DIR/bp-ledger.pl";
@@ -722,7 +753,7 @@ sub _lift_turn_starved_pause {
 
 unless (caller) {
     require JSON::PP;
-    my ($bp, $bpdir, $decision, $package, $action, $note, $widen_write_set, $set_write_set);
+    my ($bp, $bpdir, $decision, $package, $action, $note, $widen_write_set, $set_write_set, $answered_by);
     # e02 §2.7: --list is a new, standalone, READ-ONLY surface (mutates nothing).
     my ($list_mode, $category_arg);
     # t07: --sweep is a second standalone surface. Unlike --list it MUTATES,
@@ -758,6 +789,7 @@ unless (caller) {
         elsif ($arg eq '--package')         { $package         = $need->('--package'); }
         elsif ($arg eq '--action')          { $action          = $need->('--action'); }
         elsif ($arg eq '--note')            { $note            = $need_free->('--note'); }
+        elsif ($arg eq q{--answered-by})     { $answered_by     = $need->(q{--answered-by}); }
         elsif ($arg eq '--widen-write-set') { $widen_write_set = $need->('--widen-write-set'); }
         elsif ($arg eq '--set-write-set')   { $set_write_set   = $need->('--set-write-set'); }
         elsif ($arg eq '--list')            { $list_mode       = 1; }
@@ -790,7 +822,12 @@ unless (caller) {
                    . "       bp-answer-escalation.pl sweep --bp-dir DIR                              # e06: archive settled escalations + close their inbox items (no-op while an orchestrator is live)\n"
                    . "  --widen-write-set PATH   ADD path to the package's write_set (additive only, via bp-ledger.pl)\n"
                    . "  --set-write-set VALUE    always refused: replacing/narrowing write_set is not supported\n"
-                   . "  --action not-mine        (--decision mode only) re-queue the escalation in place as 'implementation' with --note, for the resolver\n";
+                   . "  --action not-mine        (--decision mode only) re-queue the escalation in place as 'implementation' with --note, for the resolver\n"
+                   . "  --answered-by WHO        operator (default) | escalation-resolver: who decided, as the ledger will say\n";
+        exit 2;
+    }
+    if (defined $answered_by && !grep { $_ eq $answered_by } @ANSWERERS) {
+        print STDERR "bp-answer-escalation: --answered-by must be one of: @ANSWERERS (got '$answered_by')\n";
         exit 2;
     }
 
@@ -1092,7 +1129,7 @@ unless (caller) {
         # is gone. append_human_decision() itself already no-ops when $note is undef.
         # Bounded lock (todo 41890000): this is the FIRST ledger write of the
         # answer, so a lock timeout here defers with nothing written at all.
-        my $ah = append_human_decision($bpdir, $pkg, $note, $plan->{action});
+        my $ah = append_human_decision($bpdir, $pkg, $note, $plan->{action}, $answered_by);
         _refuse_lock_timeout($pkg, $kind, $plan->{family}, $plan->{action})
             if defined $ah && $ah eq 'lock-timeout';
         # b18: put the answer where the resume prompt actually points (see
@@ -1109,7 +1146,7 @@ unless (caller) {
         # It is surfaced in the JSON on stdout rather than on stderr: callers capture this
         # script's combined output and parse stdout as JSON, so any stderr line -- including
         # our own -- would corrupt what it is meant to warn about.
-        $next_action_updated = update_next_action_with_note($bpdir, $pkg, $note, $plan->{action});
+        $next_action_updated = update_next_action_with_note($bpdir, $pkg, $note, $plan->{action}, $answered_by);
         # A lock timeout on the ledger (todo 41890000) defers the whole answer
         # rather than reporting next_action_updated=false: the audit block
         # above has landed, but both writers are idempotent (the audit block

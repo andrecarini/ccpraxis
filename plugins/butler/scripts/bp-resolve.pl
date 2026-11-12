@@ -379,8 +379,13 @@ sub _dispatch_action {
                 return 0;
             }
         }
+        # --answered-by: this note is the resolver's own guidance, and the ledger must
+        # say so. Written as a human's answer, the next resolver read it as an operator
+        # ruling and stopped routing product questions to the operator (bug
+        # 20261112-132220-5b54).
         return _run_quiet($^X, "$SELF_DIR/bp-answer-escalation.pl", $bp,
-            '--decision', $id, '--action', 'relaunch', '--note', $rationale, '--bp-dir', $bpdir);
+            '--decision', $id, '--action', 'relaunch', '--note', $rationale,
+            '--answered-by', 'escalation-resolver', '--bp-dir', $bpdir);
     }
     if ($action eq 'widen-write-set') {
         # fixbatch step7 / MEDIUM (red-team) + SHOULD-FIX (reviewer), one root

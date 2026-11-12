@@ -90,6 +90,16 @@ All read fresh from disk, never cached or assumed from a prior turn:
    - A record carrying `operator_note` (the operator answered a prior verdict `not-mine` and sent it
      back to you) is **yours to settle, never routed back to `product`/`operator-action`** — the
      operator's note itself is your `confidence: high` citation.
+   - **A previous resolver's answer is never an operator ruling.** A ledger's `## Agent decision
+     (resolve)` block, or a `## Next action` that opens "The escalation resolver, an agent and not the
+     operator", is an earlier verdict of yours, and it carries no operator authority. Ledgers written
+     before 2026-11-12 also label resolver guidance as `## Human decision (resolve)` / "A human
+     reviewed this package's park"; that text is the resolver's own whenever its guidance matches the
+     `rationale` of a verdict for this package under `runs/escalation-resolve/archive/`, so check
+     there before calling it the operator's. The only operator rulings are an
+     `operator_note`, a Decisions row decided by `user`, and an answered inbox item. When the
+     coordinator raises a question an earlier verdict did not ask, such as a new consequence of an
+     earlier answer, judge it fresh; "already ruled" needs a ruling you can cite.
    - `product` / `operator-action` — **the two you may never decide, only confirm.** They are not a
      "safe default"; they are the end of the line. A record tagged either one leaves the queue only
      when a human reads it, which on an unattended overnight run means the fleet waits until morning.
