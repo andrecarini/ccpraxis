@@ -130,7 +130,7 @@ All read fresh from disk, never cached or assumed from a prior turn:
    evidence that the matter sits within the agents' purview. "I do not know which test to add" is a
    coordinator's next step, never the operator's.
 5. **The action vocabulary, if and only if you are resolving with `confidence: high`:** exactly one of
-   `relaunch` | `widen-write-set` | `edit-depends-on` | `author-ledger`. **Never `accept` or `drop`,
+   `relaunch` | `widen-write-set` | `narrow-test-paths` | `edit-depends-on` | `author-ledger`. **Never `accept` or `drop`,
    under any circumstance, for any category** — those are irreversible-in-spirit calls that stay
    human-only unconditionally, not something a citation can ever qualify you for.
 
@@ -143,6 +143,16 @@ All read fresh from disk, never cached or assumed from a prior turn:
      the action for "the package needs to touch one more file". Add `decision` (below) when the
      widening should be recorded as a blueprint Decision with its reason — for instance when you are
      granting something else in the same breath. It does not itself relaunch the package.
+   - `narrow-test-paths` — SHRINK an existing ledger's `test_paths` (`test_paths`, a list, and
+     `decision`, both required). This is the action for "the oracle boundary covers code the
+     implementer must write": a `test_paths` naming a whole source directory makes the write guard
+     treat every file in it as a test, and the coordinator cannot re-scope its own oracle. Every path
+     you list must lie inside the current `test_paths`: equal to an entry, or under an entry ending in
+     `/`, usually that directory's `test/` subdirectory. The apply step records `decision` as a
+     Decisions row naming the new paths, applies them with `bp-ledger.pl set-test-paths`, and returns
+     the package to `pending` for a relaunch. A path outside the current set is refused and goes to
+     the operator, because moving the oracle elsewhere is not a narrowing. `relaunch` alone never fixes
+     this park: nothing a coordinator can do changes its own `test_paths`.
    - `edit-depends-on` — change the package's row in blueprint.md's status table (`deps`).
    - `author-ledger` — **ONLY for a package that has NO ledger file at all** (`packages/<pkg>.md`
      absent). It creates the ledger from the blueprint's own `### <package>` section (its `write_set`,
@@ -173,9 +183,10 @@ Write exactly one JSON object to **verdict_path** (and nothing else to it):
 ```json
 {
   "category": "product | operator-action | conformance | oracle | scoping | implementation",
-  "action": "relaunch | widen-write-set | edit-depends-on | author-ledger",
+  "action": "relaunch | widen-write-set | narrow-test-paths | edit-depends-on | author-ledger",
   "path": "<REQUIRED when action is widen-write-set — the exact write_set entry to add, e.g. a directory or file path such as p/blk9/. Never a citation, never a file:line, never anything containing ':'>",
-  "decision": "<OPTIONAL, widen-write-set only — one line recorded as a new blueprint.md Decisions row (decided by agent) before the widening; see below>",
+  "decision": "<OPTIONAL for widen-write-set, REQUIRED for narrow-test-paths — one line recorded as a new blueprint.md Decisions row (decided by agent) before the change; see below>",
+  "test_paths": ["<REQUIRED when action is narrow-test-paths — the complete new test_paths, each entry inside the current ones, e.g. models/budget/test/>"],
   "confidence": "high | low",
   "evidence": "<citation resolving the SPECIFIC disputed fact — file:line, ledger section, or Decisions row>",
   "rationale": "<one-line: why this classifies where it does>",

@@ -18,7 +18,7 @@ The blueprint directory path. Read `blueprint.md` and every ledger under `packag
 - **Undefined terms** — names, acronyms, system references used as if known.
 - **Phantom decisions** — constraints referenced ("per the earlier decision") with no matching Decisions row.
 - **Untestable done criteria** — anything a coordinator couldn't verify mechanically from disk.
-- **Write-set hazards** — overlaps between packages eligible to run in parallel; write sets that obviously miss files the scope implies.
+- **Write-set hazards** — overlaps between packages eligible to run in parallel; write sets that obviously miss files the scope implies. Also a `test_paths` entry equal to (or a parent of) a `write_set` directory that holds code the scope edits: the write guard treats every file under a test path as TEST, so the implementer could write none of it. Ask for the test subdirectory instead.
 - **Hidden dependencies** — package A's inputs are produced by package B without a `depends_on` edge.
 - **Write-set-implied checks** — REQUIRED pass. **You cannot run it, and you must not pretend to.**
 

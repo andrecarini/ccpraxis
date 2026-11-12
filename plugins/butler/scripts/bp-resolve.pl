@@ -44,10 +44,11 @@ my $SELF_DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; abs_path($f) // $f 
 require "$SELF_DIR/bp-orchestrator.pl";   # BpOrch:: -- @CATEGORIES, queue_needs_you, _read_json, _log, ...
 require "$SELF_DIR/bp-write-guard.pl";    # BpWrite::guarded_write -- used only by _author_ledger
 
-# The four bounded action verbs this package may ever dispatch. 'accept'/
-# 'drop' are NEVER in this set -- that bright line is enforced unconditionally
-# in verdict_in_bounds below, checked before anything else.
-my @VALID_ACTIONS = ('relaunch', 'widen-write-set', 'edit-depends-on', 'author-ledger');
+# The bounded action verbs this package may ever dispatch. 'accept'/'drop'
+# are NEVER in this set -- that bright line is enforced unconditionally in
+# verdict_in_bounds below, checked before anything else. narrow-test-paths
+# (bug 20261112-214934-365f) only ever shrinks the oracle boundary.
+my @VALID_ACTIONS = ('relaunch', 'widen-write-set', 'narrow-test-paths', 'edit-depends-on', 'author-ledger');
 my %VALID_ACTION  = map { $_ => 1 } @VALID_ACTIONS;
 
 # The four categories the resolver may ACT on (never product/operator-action,
@@ -162,7 +163,7 @@ sub verdict_in_bounds {
         unless grep { $_ eq $cat } @BpOrch::CATEGORIES;
     if ($RESOLVER_OWNED{$cat}) {
         return (0, 'a resolver-owned category requires an action') unless defined $act;
-        return (0, "action '$act' is outside {relaunch,widen-write-set,edit-depends-on,author-ledger}")
+        return (0, "action '$act' is outside {" . join(',', @VALID_ACTIONS) . "}")
             unless $VALID_ACTION{$act};
     }
     return (1, undef);
@@ -366,7 +367,8 @@ sub _relaunch_already_holds {
 # write_set itself), or any write fails -- the orphan reconciler is still there
 # behind this, so a failure costs a judge, never a stall.
 sub _requeue_after_widen {
-    my ($ctx, $rec, $id) = @_;
+    my ($ctx, $rec, $id, $what) = @_;
+    $what = 'widen' unless defined $what && $what =~ /\A[a-z]+\z/;
     my $pkg = ref $rec eq 'HASH' ? $rec->{package} : undef;
     return 0 unless defined $pkg && $pkg =~ /\A[A-Za-z0-9._-]+\z/;
     my ($bpdir, $runs) = ($ctx->{bpdir}, $ctx->{runs});
@@ -380,9 +382,92 @@ sub _requeue_after_widen {
     };
     return 0 unless $ok;
     eval { BpOrch::update_registry_pkg($runs, $pkg, { attempt => 0 }) };
-    _rlog($ctx->{log}, 'escalation_resolve_widen_requeued', { decision => $id, package => $pkg })
+    _rlog($ctx->{log}, "escalation_resolve_${what}_requeued", { decision => $id, package => $pkg })
         if $ctx->{log};
     return 1;
+}
+
+# _narrow_test_paths(\%verdict, \%rec, $id, \%ctx) -> (1, undef) applied |
+# (0, undef) malformed verdict (the resolver's to redo) | (0, $why) refused,
+# for the operator.
+#
+# Bug 20261112-214934-365f. The commonest park in acxpraxis-step-2 (ten
+# packages, Decisions 20-30 and 43): a ledger's test_paths names a whole source
+# directory, the write guard then classifies every file in it as TEST, and the
+# implementer cannot write the code its scope requires. The coordinator cannot
+# re-scope its own oracle, and until now the resolver could only `relaunch`,
+# which changes nothing, so the package parked again.
+#
+# The verdict carries `test_paths` (a list, or one colon-separated string) and
+# a required `decision`. Every new path must lie inside the CURRENT test_paths
+# (equal to an entry, or under an entry ending in '/'): this only ever shrinks
+# the oracle boundary. Moving it anywhere else is a different question and goes
+# to the operator. Applied as two typed calls, the way widen-with-decision is:
+# bp-blueprint.pl add-decision (decided by agent, the new paths named
+# verbatim), then bp-ledger.pl set-test-paths --decision N.
+sub _narrow_test_paths {
+    my ($verdict, $rec, $id, $ctx) = @_;
+    my $bpdir = $ctx->{bpdir};
+    my $pkg   = ref $rec eq 'HASH' ? $rec->{package} : undef;
+    return (0, undef) unless defined $pkg && $pkg =~ /\A[A-Za-z0-9._-]+\z/;
+    my $dtext = $verdict->{decision};
+    return (0, undef) unless defined $dtext && !ref $dtext && _has_visible_text($dtext);
+    $dtext =~ s/\s+/ /g;
+    $dtext =~ s/\A | \z//g;
+    return (0, undef) if $dtext =~ /\|/ || index($dtext, 'depends_on') >= 0;
+
+    my $raw = $verdict->{test_paths};
+    my @new = ref $raw eq 'ARRAY' ? @$raw : (defined $raw && !ref $raw ? split(/:/, $raw) : ());
+    @new = grep { length } map { my $p = defined $_ && !ref $_ ? $_ : ''; $p =~ s/\A\s+|\s+\z//g; $p } @new;
+    return (0, undef) unless @new;
+    my %seen;
+    @new = grep { !$seen{$_}++ } @new;
+    for my $p (@new) {
+        return (0, undef) if $p =~ m{\A(?:/|[A-Za-z]:(?:[\\/]|\z))}
+                          || $p =~ /[|\r\n:`]/
+                          || $p =~ m{(?:\A|/)\.\.(?:/|\z)}
+                          || $p =~ m{\A(?:\*+|\*\*/\*|\.|\./)\z};
+    }
+
+    my $ledger = "$bpdir/packages/$pkg.md";
+    return (0, "packages/$pkg.md does not exist, so there are no test_paths to narrow") unless -f $ledger;
+    my $ltxt = BpOrch::_read_file($ledger);
+    my ($fm) = defined $ltxt ? $ltxt =~ /\A---\s*\n(.*?)\n---/s : ();
+    my ($old_raw) = defined $fm ? $fm =~ /^test_paths:[ \t]*(.*?)[ \t]*$/m : ();
+    my @old = grep { length } split /:/, ($old_raw // '');
+    return (0, "${pkg}'s ledger has no test_paths to narrow") unless @old;
+    my @outside = grep {
+        my $p = $_;
+        !grep { $p eq $_ || (substr($_, -1) eq '/' && index($p, $_) == 0) } @old;
+    } @new;
+    return (0, "narrow-test-paths may only shrink ${pkg}'s test_paths (" . join(':', @old)
+             . "), and these lie outside it: " . join(', ', @outside)
+             . ". Moving the oracle boundary elsewhere is a question for the operator.") if @outside;
+    my %old = map { $_ => 1 } @old;
+    return (0, undef) if @new == @old && !grep { !$old{$_} } @new;   # no change: a malformed verdict
+
+    my $bpmd = "$bpdir/blueprint.md";
+    my $txt  = BpOrch::_read_file($bpmd);
+    return (0, 'cannot read blueprint.md to record the Decision') unless defined $txt;
+    my $did = _next_decision_id($txt);
+    return (0, "blueprint.md has no Decisions table to record the narrowing of ${pkg}'s test_paths in; "
+             . "narrow them by hand with bp-ledger.pl set-test-paths once a Decision names the paths")
+        unless defined $did;
+
+    my $row = "$dtext (bp-escalation-resolver, escalation $id: narrows $pkg test_paths to "
+            . join(', ', map { "`$_`" } @new) . ')';
+    my ($rc, $err) = _run_capture($^X, "$SELF_DIR/bp-blueprint.pl", 'add-decision',
+        '--file', $bpmd, '--id', $did, '--text', $row, '--decided', 'agent');
+    return (0, "recording Decision $did in blueprint.md was refused (exit $rc): $err; nothing was changed")
+        if $rc;
+    local $ENV{BP_LEDGER_LOCK_TIMEOUT} = $ENV{BP_LEDGER_LOCK_TIMEOUT} // 10;
+    ($rc, $err) = _run_capture($^X, "$SELF_DIR/bp-ledger.pl", 'set-test-paths',
+        '--ledger', $ledger, '--decision', $did, map { ('--path', $_) } @new);
+    return (0, "Decision $did was recorded in blueprint.md, but narrowing ${pkg}'s test_paths was refused "
+             . "(exit $rc): $err") if $rc;
+    _rlog($ctx->{log}, 'escalation_resolve_narrowed_test_paths',
+        { decision => $id, package => $pkg, test_paths => \@new, blueprint_decision => $did }) if $ctx->{log};
+    return (1, undef);
 }
 
 # ---------------------------------------------------------------------------
@@ -456,6 +541,12 @@ sub _dispatch_action {
             '--decision', $id, '--widen-write-set', $path, '--bp-dir', $bpdir);
         _requeue_after_widen($ctx, $rec, $id) if $wrc == 0;
         return $wrc;
+    }
+    if ($action eq 'narrow-test-paths') {
+        my ($ok, $why) = _narrow_test_paths($verdict, $rec, $id, $ctx);
+        if ($ok) { _requeue_after_widen($ctx, $rec, $id, 'narrow'); return 0; }
+        $ctx->{needs_human} = $why if defined $why;
+        return 1;
     }
     if ($action eq 'edit-depends-on') {
         my $deps = $verdict->{deps} // $verdict->{depends_on} // '';
