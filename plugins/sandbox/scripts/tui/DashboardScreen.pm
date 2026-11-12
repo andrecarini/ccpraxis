@@ -1768,11 +1768,19 @@ sub _package_row {
     }
 
     my $strip = _strip_of($p->{pipeline}, (_package_is_live($p, $now) ? 'step.current' : 'step.current.idle'));
+    # An active package whose every drawn step is ticked has no current step,
+    # so its strip reads as a finished pipeline beside a live dot -- which an
+    # operator took for "stopped at imp" (acxpraxis-step-2 package 15,
+    # 2026-11-12, reopened after a failed harvest with its old ticks intact).
+    # Say so in the status slot; a live worker's time still wins it.
+    my $all_ticked = (ref($strip) eq 'ARRAY'
+                      && !grep { defined($_->{role}) && $_->{role} ne 'text.muted' } @$strip) ? 1 : 0;
     return { kind => 'package', dot => [ $gname, $grole ], name => $name,
              name_spans => _package_name_spans($name),
              total => $total, step => { text => $step, role => 'text.primary' },
              strip => $strip, no_checklist => ($strip ? 0 : 1),
-             time => _oldest_elapsed($now, @live_workers), aside => undef, attempt => $attempt };
+             time => _oldest_elapsed($now, @live_workers),
+             aside => ($all_ticked ? 'all steps ticked' : undef), attempt => $attempt };
 }
 
 # ===========================================================================

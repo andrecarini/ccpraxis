@@ -41,6 +41,10 @@
 # or did not apply and records that on the step line as a fixed marker (grammar at
 # parse_pipeline_skip_marker), plus an attempt-log entry, in the same atomic write.
 #
+# `untick-step --from N --reason R` is rework: it unticks every done step numbered N
+# or above (skipped/n/a-marked steps stay as they are) and records which, and why, in
+# one attempt-log entry, in the same atomic write. Nothing to untick is a no-op.
+#
 # Exit codes (an interface, fixed): 0 success, 2 validation rejection (byte-identical
 # file), 3 usage/argument error (nothing read), 4 I/O/lock/atomicity failure
 # (byte-identical), 5 target region not found (byte-identical).
@@ -2037,6 +2041,74 @@ sub op_tick_step {
     });
 }
 
+# untick-step --ledger L --from N --reason R
+#
+# Rework. A package that reached the end of its pipeline and is then reopened (a
+# failed harvest audit, an operator reset with new scope) keeps every box ticked,
+# so its step strip reads "finished" next to a live coordinator and the next step
+# is invisible (acxpraxis-step-2 package 15, 2026-11-12). This unticks every
+# DONE step numbered N or above, in one atomic write, with one attempt-log entry
+# naming the steps and why. Steps carrying a skipped/n/a marker are left alone:
+# their marker is a recorded judgement, not progress, and re-deciding it is
+# tick-step --force-remark's job. Nothing to untick is a no-op (exit 0).
+#
+# Unticking is not regress for the orchestrator: snapshot_progressed counts only
+# an INCREASE in ticks as progress, and a relaunch always moves the status, so a
+# coordinator that unticks then ticks again is never judged stuck by this.
+sub splice_untick_from {
+    my ($B, $N) = @_;
+    my $loc = locate_section($B, qr/^##\s+Pipeline\b/m);
+    return (undef, '## Pipeline section not found', []) unless $loc;
+    my $infence = 0;
+    my (@edits, @unticked, $seen);
+    each_line_with_offset($B, $loc->{body_start}, $loc->{body_end}, sub {
+        my ($line, $off, $len, $has_nl) = @_;
+        if (is_fence_line($line)) { $infence = !$infence; return undef }
+        return undef if $infence;
+        return undef unless $line =~ /^(\s*-\s*\[)([ xX])\]\s*(\d+)\.(.*?)(\r?)$/s;
+        my ($pre, $box, $n, $rest) = ($1, $2, $3 + 0, $4);
+        $seen = 1;
+        return undef if $n < $N;
+        return undef unless $box eq 'x' || $box eq 'X';
+        $rest =~ s/\s+\z//;
+        my (undef, $kind) = parse_pipeline_skip_marker($rest);
+        return undef if defined $kind;
+        push @edits, $off + length($pre);
+        push @unticked, $n;
+        return undef;
+    });
+    return (undef, 'no numbered step lines found in ## Pipeline', []) unless $seen;
+    my $new = $B;
+    substr($new, $_, 1) = ' ' for reverse @edits;
+    return ($new, undef, \@unticked);
+}
+
+sub op_untick_step {
+    my @args = @_;
+    my %opt;
+    my $ok;
+    { local $SIG{__WARN__} = sub { };
+      $ok = GetOptionsFromArray(\@args, \%opt, 'ledger=s', 'from=s', 'reason=s'); }
+    arg_error('untick-step', 'unrecognised option') unless $ok;
+    arg_error('untick-step', 'unexpected extra arguments: ' . join(' ', @args)) if @args;
+    arg_error('untick-step', 'missing required --ledger') unless defined $opt{ledger};
+    arg_error('untick-step', 'missing required --from') unless defined $opt{from};
+    arg_error('untick-step', "'--from $opt{from}' is not a positive integer without a leading zero")
+        unless $opt{from} =~ /\A[1-9]\d*\z/;
+    my ($reason, $why) = normalize_skip_reason($opt{reason});
+    arg_error('untick-step', $why) unless defined $reason;
+
+    run_op('untick-step', $opt{ledger}, sub {
+        my ($B) = @_;
+        my ($new, $notfound, $steps) = splice_untick_from($B, $opt{from} + 0);
+        return (undef, $notfound) unless defined $new;
+        return ($B, undef) unless @$steps;
+        my $entry = '- ' . iso_now() . " $EMDASH Rework: step" . (@$steps > 1 ? 's ' : ' ')
+                  . join(', ', @$steps) . " unticked: $reason";
+        return splice_insert_entry($new, qr/^##\s+Decisions & attempt log\b/m, $entry);
+    });
+}
+
 # _reaccept_covers_shrink($r5, $delta, $comparable) -> 0|1. A shrink is
 # settled only by a step-5 reaccept, with a reason, whose OWN recorded delta
 # names every description that vanished (so the reaccept was made knowing
@@ -3966,6 +4038,7 @@ my %DISPATCH = (
     'migrate-depends-on' => \&op_migrate_depends_on,
     'append-attempt'   => \&op_append_attempt,
     'tick-step'        => \&op_tick_step,
+    'untick-step'      => \&op_untick_step,
     'set-next-action'  => \&op_set_next_action,
     'add-output'       => \&op_add_output,
     'set-escalation'   => \&op_set_escalation,

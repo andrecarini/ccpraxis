@@ -61,6 +61,7 @@ The eight operations:
 ```
 bp-ledger.pl set-status       --ledger P --status S
 bp-ledger.pl tick-step        --ledger P --step N [(--skipped | --na) --reason R [--force-remark]]
+bp-ledger.pl untick-step      --ledger P --from N --reason R
 bp-ledger.pl append-attempt   --ledger P (--text T | --text-file F | --text -)
 bp-ledger.pl set-next-action  --ledger P --body B
 bp-ledger.pl add-output       --ledger P --text T
@@ -666,6 +667,8 @@ section above for the manual-bracket alternative this signal does not replace.
 ## Resumption
 
 If the ledger shows prior progress when you start: this is a resumption. Verify every artifact in `## Outputs` exists on disk, re-run the last recorded validation, then execute `## Next action`. Never redo verified work; never trust unverified claims — including your predecessor's.
+
+**Rework unticks first.** When the package comes back with new work after its pipeline was finished (a failed harvest, a reset or relaunch with new scope, a decision that changes what was built), run `untick-step --from <first step you will redo> --reason '<what is being redone and why>'` before dispatching anything. It unticks every done step from there on (skipped and n/a markers stay) and records it in the attempt log. Without it the ledger still reads as finished, so the operator's panel shows no current step beside a live coordinator, and harvest cannot tell old ticks from new ones. Then tick each step again as it really completes.
 
 ## Terminal ritual
 
