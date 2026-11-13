@@ -51,6 +51,7 @@ sub hung_repo {
 
 no warnings 'once';
 local $BpCheckpoint::GIT_TIMEOUT = 3;
+local $ENV{BP_CHECKPOINT_COMMIT_TIMEOUT} = 3;   # the commit has its own cap (bug 20261113-155619-da9f)
 
 # 1. The killed git's own lock is removed.
 {

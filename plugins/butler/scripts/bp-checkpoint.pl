@@ -57,6 +57,20 @@ my $BP_CHECKPOINT_DIR = dirname(do { (my $f = __FILE__) =~ s{\\}{/}g; Cwd::abs_p
 our $DETAIL_MAX = 200;                 # `detail` is one trimmed line, at most this long
 our $PKG_MAX    = 120;                 # a package id is a slug; a subject line is not a ledger cell
 our $GIT_TIMEOUT = 30;                 # seconds a single git child may take before it is killed
+# The commit is the one git call that runs the project's own hooks, and a
+# project's pre-commit hook is the project's business: acxpraxis's (lefthook ->
+# make check-fast) takes 44-50 s, so under the 30 s cap every checkpoint of
+# acxpraxis-step-2 package 14 was killed for 8+ hours on 2026-11-13 and its
+# finished work could never land (bug 20261113-155619-da9f). The commit gets its
+# own cap, BP_CHECKPOINT_COMMIT_TIMEOUT seconds (default 180, clamped to
+# 1..1800). The watch loop does block for that long, so it is a cap, not a
+# budget: a hook that needs more than a few minutes belongs in a pre-push hook.
+our $GIT_COMMIT_TIMEOUT_DEFAULT = 180;
+sub commit_timeout {
+    my $v = $ENV{BP_CHECKPOINT_COMMIT_TIMEOUT};
+    return $GIT_COMMIT_TIMEOUT_DEFAULT unless defined $v && $v =~ /\A\d{1,5}\z/;
+    return $v < 1 ? 1 : $v > 1800 ? 1800 : $v + 0;
+}
 our $OUT_MAX    = 1 << 20;             # captured git output we are willing to hold in memory
 our $INDEX_LOCK;                       # this checkpoint's <gitdir>/index.lock, once known (see _git)
 
@@ -534,6 +548,7 @@ sub checkpoint {
     # 2026-11-02: four checkpoints of one package lost that way over 12 minutes.
     # Drop the named entry and retry, at most once per staged entry.
     for (0 .. scalar @staged) {
+        local $GIT_TIMEOUT = commit_timeout();   # the repo's hooks run inside this one call
         ($cout, $crc) = _git($root, '-c', 'user.email=butler@localhost', '-c', 'user.name=butler',
                              'commit', '-q', '-m', $msg, '--', @staged);
         last if _git_broke($crc) || (defined $crc && $crc == 0);
