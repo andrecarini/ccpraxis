@@ -547,18 +547,66 @@ sub checkpoint {
     # with "pathspec '<dir>' did not match any file(s) known to git". Measured
     # 2026-11-02: four checkpoints of one package lost that way over 12 minutes.
     # Drop the named entry and retry, at most once per staged entry.
-    for (0 .. scalar @staged) {
-        local $GIT_TIMEOUT = commit_timeout();   # the repo's hooks run inside this one call
-        ($cout, $crc) = _git($root, '-c', 'user.email=butler@localhost', '-c', 'user.name=butler',
-                             'commit', '-q', '-m', $msg, '--', @staged);
-        last if _git_broke($crc) || (defined $crc && $crc == 0);
-        my ($bad) = (defined $cout ? $cout : '') =~ /pathspec '([^']*)' did not match any file\(s\) known to git/;
-        last unless defined $bad && grep { $_ eq $bad } @staged;
-        @staged = grep { $_ ne $bad } @staged;
-        push @unmatched, $bad;
+    #
+    # THE COMMIT IS BUILT IN A TEMPORARY INDEX, not with `git commit -- <paths>`
+    # (bug filed 2026-11-13). A pathspec commit rebuilds the named paths from the
+    # WORKING TREE on top of HEAD, and a sandboxed repo runs with
+    # core.filemode=false (a bind mount shows every file 777), so the mode git
+    # records is HEAD's: an exec bit set the only way such a repo can set one,
+    # `git update-index --chmod=+x`, lives in the index alone and could never be
+    # committed. acxpraxis-step-2 package 14 staged 43 such changes and lost
+    # them at every checkpoint. The temporary index starts at HEAD and takes,
+    # for the write-set paths only, exactly the entries `git add -A` just put in
+    # the real index (modes included), and drops the paths it removed: the same
+    # write-set-only commit as before, with the index's modes. The repo's hooks
+    # see it as the staged state (GIT_INDEX_FILE is inherited).
+    my $tmpidx = "$gitdir/index.bp-checkpoint.$$";
+    unlink $tmpidx;
+    my $tmp_env = _git_path($tmpidx);
+    {
+        my ($hd, $hdrc) = _git($root, 'rev-parse', '-q', '--verify', 'HEAD^{commit}');
+        my $born = (defined $hdrc && $hdrc == 0) ? 1 : 0;
+        local $ENV{GIT_INDEX_FILE} = $tmp_env;
+        my ($o, $rc) = _git($root, 'read-tree', ($born ? 'HEAD' : '--empty'));
+        if (_git_broke($rc) || $rc != 0) { unlink $tmpidx; return _fail($r, _git_broke($rc) ? _broke_reason($rc) : 'commit-failed', _detail($o, $root), 3) }
+        my (@info, @remove, @keep);
+        for my $p (@staged) {
+            local $ENV{GIT_INDEX_FILE};
+            delete $ENV{GIT_INDEX_FILE};                       # the REAL index
+            my ($ls, $lrc) = _git($root, 'ls-files', '-s', '-z', '--', $p);
+            my @ent = grep { length } split /\0/, (defined $ls ? $ls : '');
+            my %in;
+            for my $e (@ent) {
+                my ($mode, $sha, undef, $path) = $e =~ /\A(\d+) ([0-9a-f]+) (\d)\t(.*)\z/s or next;
+                $in{$path} = 1;
+                push @info, "$mode,$sha,$path";
+            }
+            my @head;
+            if ($born) {
+                my ($ht, undef) = _git($root, 'ls-tree', '-r', '-z', '--name-only', 'HEAD', '--', $p);
+                @head = grep { length } split /\0/, (defined $ht ? $ht : '');
+            }
+            push @remove, grep { !$in{$_} } @head;
+            if (!@ent && !@head) { push @unmatched, $p; next }   # e.g. an empty directory
+            push @keep, $p;
+        }
+        @staged = @keep;
         $r->{staged} = \@staged;
-        return _noop($r, 'all-pathspecs-unmatched') unless @staged;
+        unless (@staged) { unlink $tmpidx; return _noop($r, 'all-pathspecs-unmatched') }
+        while (my @chunk = splice(@info, 0, 200)) {
+            my ($uo, $urc) = _git($root, 'update-index', '--add', map { ('--cacheinfo', $_) } @chunk);
+            if (_git_broke($urc) || $urc != 0) { unlink $tmpidx; return _fail($r, 'commit-failed', _detail($uo, $root), 3) }
+        }
+        while (my @chunk = splice(@remove, 0, 200)) {
+            my ($uo, $urc) = _git($root, 'update-index', '--force-remove', '--', @chunk);
+            if (_git_broke($urc) || $urc != 0) { unlink $tmpidx; return _fail($r, 'commit-failed', _detail($uo, $root), 3) }
+        }
+        local $GIT_TIMEOUT = commit_timeout();   # the repo's hooks run inside this one call
+        local $INDEX_LOCK  = "$tmpidx.lock";     # a killed commit holds THIS lock, not the real index's
+        ($cout, $crc) = _git($root, '-c', 'user.email=butler@localhost', '-c', 'user.name=butler',
+                             'commit', '-q', '-m', $msg);
     }
+    unlink $tmpidx, "$tmpidx.lock";
     # A child that never ran to completion is NOT a commit: `$? >> 8` reads a
     # signal-killed git as 0, which would report `committed` (with the previous
     # HEAD as its sha) for a commit that does not exist.
