@@ -52,6 +52,7 @@ our $BREAK_GLASS_HINT_AT = 2;    # refusals in a row before the Write-tool escap
 our $FAR_OFFER_TTL          = 1800;          # seconds an offer record stays valid (A.2.1)
 our $FAR_RELAUNCH_MAX_AHEAD = 366 * 86400;   # sanity cap on relaunch_at - now
 our $FAR_REASON_MAX_BYTES   = 200;           # butler-continuity off's --reason cap
+our $AWAIT_OFFER_DIR        = 'butler-awaiting-operator';   # G11a offer records, same shape and TTL
 
 my %BREAK_GLASS_ACTION = (off => 1);
 my %SHELL_TOOL         = (Bash => 1, PowerShell => 1);
@@ -138,6 +139,7 @@ sub run {
     # snapshot is cleared and before G8 decides the stop. Best-effort: never
     # changes the verdict.
     eval { _clear_far_offers($sid, $p, time()) };
+    eval { _clear_far_offers($sid, $p, time(), $AWAIT_OFFER_DIR) };
 
     # G8: a live own holder allows.
     if (BpHook::holder_live($sid, $p)) {
@@ -180,6 +182,12 @@ sub run {
            . "letting the stop through with continuity on (session $sid)\n";
         return 0;
     }
+
+    # G8d: AWAITING THE OPERATOR (bug 20261116-130711-f800; operator ruling
+    # 2026-11-16). Only DECIDED here; acted on after G10 below, because its
+    # text needs the stop token. See awaiting_operator for what counts.
+    my $await = eval { awaiting_operator($sid, $p, $launches) };
+    my $await_thread = (ref $await eq 'HASH' && defined $await->{thread}) ? $await->{thread} : '<thread>';
 
     # G9b: THE REFUSAL CAP (bug 20261021-202419-bf19). Every escape above is a
     # shell command; a session whose shell is broken (a PreToolUse hook that
@@ -253,6 +261,53 @@ sub run {
         }
     }
 
+    # G11a: AWAITING-OPERATOR HANDOFF (bug 20261116-130711-f800). A
+    # supervising session whose every remaining step waited on the
+    # operator's inbox answers was forced through 239 hold cycles over 62
+    # hours, for nothing. Operator ruling 2026-11-16: continuity is on while
+    # there is work to do and off when there is none, and "everything left
+    # waits on a question only the operator can answer" is no work left, the
+    # same as "all done". So when G8d's condition holds, the gate does not
+    # offer a hold: it denies with a handoff text modelled on the far-pause
+    # branch -- the items named, the off with a gate-minted reason, TaskStop
+    # for any watcher -- and leaves continuity on until the session runs off
+    # and the disarm judge, reading the offer record and each item file,
+    # agrees. Either step failing (reason too long, record not written) falls
+    # back to the ordinary texts below, which still carry the hint.
+    if (ref $await eq 'HASH' && $await->{qualifies}) {
+        my $now = time();
+        my $reason = awaiting_operator_reason($t, $await->{blocked});
+        my $ok = defined $reason
+              && eval { _write_await_offer($sid, $p, $t, $reason, $await, $now) };
+        if ($ok) {
+            my @items = _await_items($await->{blocked});
+            my $handoff = join(' ', map {
+                "the operator must answer inbox item $_->{item}"
+                    . (length($_->{title}) ? " (\"$_->{title}\")" : '')
+                    . ($_->{own} ? '' : " in $_->{project}") . ';'
+            } @items) . ' that answer resumes the work.';
+            my @watch = map { $_->{id} } @{ $await->{work} || [] };
+            eval { BpHook::set_running_snapshot($sid, $await->{work}) } if @watch;
+            my $log_text = "thread $await->{thread}: " . join(', ', map {
+                "task $_->{task} blocked on inbox $_->{item}" . ($_->{own} ? '' : " (in $_->{project})")
+            } @{ $await->{blocked} }) . "; off offered ($t)";
+            eval { BpHook::log_reason($sid, 'gate', 'awaiting-operator', $log_text, $p->{cwd}) };
+            return BpHook::deny(
+                "Continuity is on for this session and everything left waits on the operator: "
+                    . join(', ', map { "task $_->{task} blocked on inbox item $_->{item}" } @{ $await->{blocked} })
+                    . ". Stop token: $t",
+                "Handoff: $handoff",
+                "That is no work left to do: do not hold for it. Turn continuity off (two steps: off mints an OTP, then off-confirm with it), as a Bash tool call:",
+                "  butler-continuity off --reason '$reason' --token $t",
+                "Once off-confirm succeeds, stop any watcher you started with the TaskStop tool"
+                    . (@watch ? ' (' . join(', ', @watch) . ')' : '')
+                    . ": left running, it keeps waking this session.",
+                "End your turn with the Handoff line above.",
+                @glass,
+            );
+        }
+    }
+
     # G11 (spec 38 sec 2.3, Decision 128): the text is built from the
     # session's running work. While work runs, the RUNNING text names the
     # work and offers hold, or off when it is no longer needed.
@@ -309,6 +364,7 @@ sub run {
             "  butler-hold --token $t " . join(' ', @shown),
             "If that work is no longer needed and everything is done, turn continuity off, as a Bash tool call:",
             "  butler-continuity off --reason '<what is done>' --token $t",
+            _awaiting_operator_hint($await_thread),
             # No break-glass offer here. While work runs the way out is a
             # hold (Decision 128), and a session that cannot hold still
             # reaches the refusal cap, or the idle text once the work ends.
@@ -320,8 +376,276 @@ sub run {
         "  butler-hold --token $t <id> [<id> ...]",
         "All work done? Turn continuity off (two steps: off mints an OTP, then off-confirm with it), as a Bash tool call:",
         "  butler-continuity off --reason '<what is done>' --token $t", "(Genuine ccpraxis/Claude-Code defect, not just finished work? butler-continuity emergency-stop --reason '<the actual defect>' instead -- not a normal option.)",
+        # The hint gives way to the break-glass lines: with them the idle text
+        # is already at stop-gate.sh's 13-line budget, and a session whose
+        # shell is failing has a tooling problem before an operator one.
+        (@glass ? () : _awaiting_operator_hint($await_thread)),
         @glass,
     );
+}
+
+# _awaiting_operator_hint($thread) -> two deny lines (bug 20261116-130711-f800):
+# what a session waiting only on the operator does instead of holding. They
+# name the exact steps G8d checks, so following them is what makes the gate
+# offer the off (G11a, whose text also names the watchers to TaskStop).
+# Two lines keep the idle text at Decision 8's 8 lines; the session's thread
+# is named only when the command line still fits the 160-character budget.
+sub _awaiting_operator_hint {
+    my ($thread) = @_;
+    my $cmd = sub {
+        my ($th) = @_;
+        return "  almanac thread status $th <task> blocked; almanac thread edit $th <task> --blocked-on <inbox-id>";
+    };
+    my $line = (defined $thread && length $thread) ? $cmd->($thread) : undef;
+    $line = $cmd->('<thread>') unless defined $line && length($line) <= 160;
+    return (
+        "Waiting only on the operator? That is no work left; never hold for it. Mark your task blocked on its inbox item, end the turn, and the gate offers the off:",
+        $line,
+    );
+}
+
+# ---------------------------------------------------------------------------
+# AWAITING THE OPERATOR (G8d decides, G11a acts; bug 20261116-130711-f800,
+# operator ruling 2026-11-16: "Being blocked on a question that really needs
+# me and there is no way to progress: that means there is no work left to do
+# and the appropriate answer would be disarming continuity.")
+#
+# awaiting_operator($sid, $p, $launches) -> { qualifies, thread, blocked,
+# work, why } | undef. NEVER dies (an internal error -> undef, which the
+# gate treats as "does not qualify": fail toward today's texts).
+#
+# qualifies is 1 only when ALL of these hold:
+#   - the session has an attached almanac thread in the project of
+#     $p->{cwd} (Almanac::Thread::attached_thread: live, owned by $sid);
+#   - none of its unlinked tasks is `doing` (a linked task carries a package
+#     status, not a task status, and cannot carry blocked_on, so linked tasks
+#     are not consulted either way);
+#   - at least one unlinked task is `blocked` with a blocked_on that resolves
+#     to an inbox item whose status is `unanswered` -- resolved in the
+#     thread's own project first, then across the projects in steward's
+#     machine-local registry (a supervisor's thread often waits on another
+#     project's inbox). An id found nowhere does not count;
+#   - no SUBAGENT is running (BpHook::running_work type `subagent`): a
+#     subagent is real work of this session, and the ordinary text offers to
+#     hold it. A plain background task does not block the offer; the handoff
+#     text tells the session to TaskStop it.
+# thread is the attached thread's name whenever one was found, so the deny
+# text can name it; blocked lists { task, item, title, path, project, own }
+# per qualifying task; work is the session's running work.
+# ---------------------------------------------------------------------------
+our $AWAIT_MAX_ROOTS = 256;    # registry roots one Stop may probe for an inbox id
+
+sub awaiting_operator {
+    my ($sid, $p, $launches) = @_;
+    my $r = eval { _awaiting_operator($sid, $p, $launches) };
+    return $@ ? undef : $r;
+}
+
+sub _load_almanac_thread {
+    return 1 if $INC{'Almanac/Thread.pm'};
+    my $dir = "$SELF_DIR/../../../almanac/scripts";
+    return 0 unless -f "$dir/Almanac/Thread.pm";
+    local @INC = ($dir, @INC);
+    require Almanac::Thread;
+    return 1;
+}
+
+sub _awaiting_operator {
+    my ($sid, $p, $launches) = @_;
+    return undef unless ref $p eq 'HASH';
+    return undef unless _load_almanac_thread();
+    my %O;
+    $O{cwd} = $p->{cwd} if defined $p->{cwd} && !ref $p->{cwd} && length $p->{cwd};
+
+    my $thread = Almanac::Thread::attached_thread(session => $sid, %O);
+    return { qualifies => 0, thread => undef, blocked => [], why => 'no thread' } unless defined $thread;
+    my $res = { qualifies => 0, thread => $thread, blocked => [] };
+
+    my $tasks = Almanac::Thread::tasks($thread, %O);
+    return { %$res, why => 'tasks unreadable' } unless ref $tasks eq 'ARRAY';
+    my @unlinked = grep { ref $_ eq 'HASH' && !$_->{linked} } @$tasks;
+    return { %$res, why => 'a task is doing' }
+        if grep { defined $_->{status} && $_->{status} eq 'doing' } @unlinked;
+
+    my @cand = grep {
+        defined $_->{status} && $_->{status} eq 'blocked'
+            && defined $_->{blocked_on} && !ref $_->{blocked_on} && length $_->{blocked_on}
+    } @unlinked;
+    return { %$res, why => 'no task blocked on an inbox item' } unless @cand;
+
+    my $own_root = Almanac::Thread::project_root(%O);
+    my $other_roots;    # read lazily: only when an id is not in this project
+    my %memo;
+    for my $tk (@cand) {
+        my $id = $tk->{blocked_on};
+        $memo{$id} //= _resolve_inbox_item($id, $own_root, \$other_roots) || { found => 0 };
+        my $hit = $memo{$id};
+        next unless $hit->{found} && $hit->{status} eq 'unanswered';
+        push @{ $res->{blocked} }, { task => $tk->{id}, item => $id, title => $hit->{title},
+            path => $hit->{path}, project => $hit->{root}, own => $hit->{own} };
+    }
+    return { %$res, why => 'no blocking inbox item is unanswered' } unless @{ $res->{blocked} };
+
+    my @work = BpHook::running_work($sid, $p, $launches);
+    if (my @agents = grep { defined $_->{type} && $_->{type} eq 'subagent' } @work) {
+        return { %$res, why => 'subagent running: ' . join(', ', map { $_->{id} } @agents) };
+    }
+    $res->{work} = \@work;
+    $res->{qualifies} = 1;
+    return $res;
+}
+
+# _await_items(\@blocked) -> one entry per distinct inbox item, first-seen order.
+sub _await_items {
+    my ($blocked) = @_;
+    my (%seen, @out);
+    for my $b (@{ $blocked || [] }) {
+        next if $seen{ $b->{item} }++;
+        push @out, $b;
+    }
+    return @out;
+}
+
+# awaiting_operator_reason($t, \@blocked) -> string | undef, pure. The
+# compact --reason the off and the offer record both carry:
+# "awaiting operator, offer <t>: <id>, <id>". undef when it would exceed
+# butler-continuity off's 200-byte cap (ids and token are ASCII).
+sub awaiting_operator_reason {
+    my ($t, $blocked) = @_;
+    my @items = _await_items($blocked);
+    return undef unless @items && defined $t;
+    my $r = "awaiting operator, offer $t: " . join(', ', map { $_->{item} } @items);
+    return undef if length($r) > $FAR_REASON_MAX_BYTES;
+    return $r;
+}
+
+# _write_await_offer($sid, $p, $t, $reason, $await, $now) -> 1|0. Writes
+# DD/butler-awaiting-operator/<t>.json atomically (temp+rename): the record
+# the disarm judge Reads to check the off it is asked to approve -- the
+# reason, a validity window, and each item with the path of its inbox file
+# (so the judge can Read the item itself, wherever its project is, rather
+# than trust the claim). Same shape and TTL as the far-pause offer record.
+sub _write_await_offer {
+    my ($sid, $p, $t, $reason, $await, $now) = @_;
+    return 0 unless defined $t && $t =~ /\A[0-9a-f]{8}\z/;
+    my $dd = eval { BpHook::data_dir($p) };
+    return 0 unless defined $dd && length $dd;
+    my $dir = "$dd/$AWAIT_OFFER_DIR";
+    unless (-d $dir) {
+        eval { require File::Path; File::Path::make_path($dir) };
+    }
+    return 0 unless -d $dir;
+
+    my $chars = sub { my $v = $_[0]; $v = '' unless defined $v; utf8::decode($v) unless utf8::is_utf8($v); $v };
+    my @items = map {
+        { id => $_->{item}, title => $chars->($_->{title}), status => 'unanswered',
+          path => $chars->($_->{path}), project => $chars->($_->{project}), tasks => [] }
+    } _await_items($await->{blocked});
+    for my $it (@items) {
+        $it->{tasks} = [ map { $_->{task} } grep { $_->{item} eq $it->{id} } @{ $await->{blocked} } ];
+    }
+    my $doc = {
+        v => 1, session_id => $sid, offer => $t, reason => $reason, thread => $await->{thread},
+        written_at => $now, written_at_utc => _fp_utc($now),
+        valid_until_utc => _fp_utc($now + $FAR_OFFER_TTL),
+        items => \@items,
+    };
+    my $json = eval { JSON::PP->new->utf8->canonical->encode($doc) };
+    return 0 unless defined $json;
+
+    my $path = "$dir/$t.json";
+    my $tmp  = "$path.tmp.$$";
+    my $ok   = 0;
+    if (open(my $fh, '>:raw', $tmp)) {
+        if (print({$fh} $json) && close($fh) && rename($tmp, $path)) {
+            $ok = 1;
+        }
+    }
+    unless ($ok) { unlink $tmp if -f $tmp; return 0; }
+    return 1;
+}
+
+# _resolve_inbox_item($id, $own_root, \$other_roots) -> { found => 1, status,
+# title, path, root, own } | { found => 0 }. The thread's own project wins;
+# otherwise the first registered project holding the id (sorted, bounded).
+# Both the current `inbox` store and the legacy `decision` one are read,
+# never migrated: a hook only reads. A store that cannot be opened is skipped.
+sub _resolve_inbox_item {
+    my ($id, $own_root, $others_ref) = @_;
+    if (defined $own_root) {
+        my $h = _inbox_item_in($id, $own_root);
+        return { %$h, found => 1, root => $own_root, own => 1 } if $h;
+    }
+    $$others_ref //= [ _registry_roots($own_root) ];
+    for my $root (@$$others_ref) {
+        my $h = _inbox_item_in($id, $root);
+        return { %$h, found => 1, root => $root, own => 0 } if $h;
+    }
+    return { found => 0 };
+}
+
+# _inbox_item_in($id, $root) -> { status ('' when it has none), title, path }
+# or undef when $root holds no such item or cannot be read.
+sub _inbox_item_in {
+    my ($id, $root) = @_;
+    for my $type (qw(inbox decision)) {
+        my $h = eval {
+            my $store = Almanac::Store->open(scope => 'project', type => $type, root => $root);
+            return undef unless -d $store->dir && $store->exists($id);
+            my $rec = $store->read($id);
+            my $f = (ref $rec eq 'HASH' && ref $rec->{fields} eq 'HASH') ? $rec->{fields} : {};
+            my $title = defined $f->{title} && !ref $f->{title} ? $f->{title} : '';
+            utf8::decode($title) unless utf8::is_utf8($title);
+            $title =~ s/[\x00-\x1f\x7f"]/ /g;
+            $title = substr($title, 0, 80) . '...' if length($title) > 80;
+            return { status => (defined $f->{status} ? $f->{status} : ''), title => $title,
+                     path => (defined $rec->{path} ? $rec->{path} : $store->dir . "/$id.md") };
+        };
+        return $h if ref $h eq 'HASH';
+    }
+    return undef;
+}
+
+# _registry_roots($own_root) -> project roots from steward's machine-local
+# registry (<home>/.claude/claude-code-vault/.registry-local.json, the one
+# `almanac bug collect` and /pending walk), as bytes, sorted, existing
+# directories only, the thread's own root left out, at most
+# $AWAIT_MAX_ROOTS. An absent or malformed registry yields none.
+sub _registry_roots {
+    my ($own_root) = @_;
+    my $home = Almanac::Store::_resolve_home();
+    my $path = "$home/.claude/claude-code-vault/.registry-local.json";
+    return () unless -f $path;
+    open(my $fh, '<:raw', $path) or return ();
+    local $/;
+    my $bytes = <$fh>;
+    close $fh;
+    return () unless defined $bytes && length $bytes && length $bytes <= 4 * 1024 * 1024;
+    my $j = eval { JSON::PP->new->utf8->decode($bytes) };
+    return () unless ref $j eq 'HASH' && ref $j->{projects} eq 'HASH';
+    my $fold = ($^O =~ /\A(?:MSWin32|cygwin|msys)\z/) ? 1 : 0;
+    my $key = sub {
+        my ($r) = @_;
+        my $c = Almanac::Store::_canonical_path($r);
+        $c = $r unless defined $c;
+        return $fold ? lc $c : $c;
+    };
+    my %seen;
+    $seen{ $key->($own_root) } = 1 if defined $own_root;
+    my @out;
+    for my $slug (sort keys %{ $j->{projects} }) {
+        my $e = $j->{projects}{$slug};
+        next unless ref $e eq 'HASH' && defined $e->{path} && !ref $e->{path} && length $e->{path};
+        my $r = $e->{path};
+        utf8::encode($r) if utf8::is_utf8($r);
+        $r =~ s{\\}{/}g;
+        $r =~ s{/+\z}{} if length($r) > 1;
+        next unless -d $r;
+        next if $seen{ $key->($r) }++;
+        push @out, $r;
+        last if @out >= $AWAIT_MAX_ROOTS;
+    }
+    return @out;
 }
 
 # ---------------------------------------------------------------------------
@@ -496,11 +820,15 @@ sub _write_far_offer {
 # expired ($FAR_OFFER_TTL past its own written_at); a *.tmp.* file is never
 # touched. No-op when DD is undefined or the dir does not exist. Never dies
 # (callers wrap it in eval anyway).
+#
+# The awaiting-operator offer records (G11a) live in their own directory with
+# the same shape and TTL, and are swept by the same rule: pass $subdir.
 sub _clear_far_offers {
-    my ($sid, $p, $now) = @_;
+    my ($sid, $p, $now, $subdir) = @_;
+    $subdir = 'butler-far-pause' unless defined $subdir;
     my $dd = eval { BpHook::data_dir($p) };
     return unless defined $dd && length $dd;
-    my $dir = "$dd/butler-far-pause";
+    my $dir = "$dd/$subdir";
     return unless -d $dir;
     opendir(my $dh, $dir) or return;
     my @entries = readdir($dh);

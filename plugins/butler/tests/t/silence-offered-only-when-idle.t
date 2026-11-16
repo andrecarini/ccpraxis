@@ -305,6 +305,8 @@ Waiting on a subagent or background task? Hold it, as a background Bash tool cal
 All work done? Turn continuity off (two steps: off mints an OTP, then off-confirm with it), as a Bash tool call:
   butler-continuity off --reason '<what is done>' --token $t
 (Genuine ccpraxis/Claude-Code defect, not just finished work? butler-continuity emergency-stop --reason '<the actual defect>' instead -- not a normal option.)
+Waiting only on the operator? That is no work left; never hold for it. Mark your task blocked on its inbox item, end the turn, and the gate offers the off:
+  almanac thread status <thread> <task> blocked; almanac thread edit <thread> <task> --blocked-on <inbox-id>
 TXT
 }
 
@@ -324,6 +326,8 @@ Hold it, as a background Bash tool call; the holder wakes this session when the 
   butler-hold --token $t $l3
 If that work is no longer needed and everything is done, turn continuity off, as a Bash tool call:
   butler-continuity off --reason '<what is done>' --token $t
+Waiting only on the operator? That is no work left; never hold for it. Mark your task blocked on its inbox item, end the turn, and the gate offers the off:
+  almanac thread status <thread> <task> blocked; almanac thread edit <thread> <task> --blocked-on <inbox-id>
 TXT
 }
 
@@ -389,7 +393,7 @@ my ($AC12_ROOT, $AC12_SID);
     my $t = token_of($res->{err});
     ok(defined $t, 'AC-12: a Stop token was minted') or diag("stderr:\n$res->{err}");
     is($res->{err}, running_text($t // 'xxxxxxxx', 'a1'), 'AC-12: stderr is exactly the RUNNING text for a1');
-    is(scalar(lines_of($res->{err})), 5, 'AC-12: exactly 5 lines');
+    is(scalar(lines_of($res->{err})), 7, 'AC-12: exactly 7 lines (5, plus the 2-line awaiting-operator hint)');
     unlike($res->{err}, qr/silence/, 'AC-12: the RUNNING text contains no "silence"');
     ok(-f snap_path($root, $sid), 'AC-12: running/<sid> exists');
     my $j = read_json_file(snap_path($root, $sid));
@@ -451,7 +455,7 @@ my ($AC12_ROOT, $AC12_SID);
     is($res->{rc}, 2, 'AC-15: exit 2');
     my $t = token_of($res->{err}) // 'xxxxxxxx';
     my @l = lines_of($res->{err});
-    is(scalar(@l), 5, 'AC-15: exactly 5 lines');
+    is(scalar(@l), 7, 'AC-15: exactly 7 lines (5, plus the 2-line awaiting-operator hint)');
     is($l[0] // '', "Continuity is on for this session and work is still running: r1, r2, r3, r4, r5, r6, r7, r8, and 2 more. Stop token: $t",
         'AC-15: line 1 lists r1..r8 then ", and 2 more"');
     is($l[2] // '', "  butler-hold --token $t r1 r2 r3 r4 r5 r6 r7 r8", 'AC-15: line 3 holds the first eight ids');

@@ -341,7 +341,7 @@ sub next_sid { return sprintf('sg1-%04x', ++$sidn) }
 }
 
 # ===========================================================================
-# S2 -- armed, no holder -> deny with the exact 7-line continuity text.
+# S2 -- armed, no holder -> deny with the exact 8-line continuity text.
 # ===========================================================================
 my ($S2_ROOT, $S2_SID, $S2_TOKEN);
 {
@@ -352,7 +352,7 @@ my ($S2_ROOT, $S2_SID, $S2_TOKEN);
     is($res->{rc}, 2, 'S2 (re-expresses the retired graceful-stop-gate coverage "gate-stop: no signal + non-terminal -> blocked"): subprocess exit 2');
     is($res->{out}, '', 'S2: stdout empty');
     my @lines = lines_of($res->{err});
-    is(scalar(@lines), 6, 'S2: stderr is exactly 6 lines') or diag("stderr:\n$res->{err}");
+    is(scalar(@lines), 8, 'S2: stderr is exactly 8 lines (6, plus the 2-line awaiting-operator hint)') or diag("stderr:\n$res->{err}");
     my ($tok) = ($lines[0] // '') =~ /Stop token: ([0-9a-f]{8})\z/;
     ok(defined $tok, 'S2: line 1 carries an 8-hex token') or diag($lines[0] // '');
     SKIP: {
@@ -367,6 +367,8 @@ Waiting on a subagent or background task? Hold it, as a background Bash tool cal
 All work done? Turn continuity off (two steps: off mints an OTP, then off-confirm with it), as a Bash tool call:
   butler-continuity off --reason '<what is done>' --token $tok
 (Genuine ccpraxis/Claude-Code defect, not just finished work? butler-continuity emergency-stop --reason '<the actual defect>' instead -- not a normal option.)
+Waiting only on the operator? That is no work left; never hold for it. Mark your task blocked on its inbox item, end the turn, and the gate offers the off:
+  almanac thread status <thread> <task> blocked; almanac thread edit <thread> <task> --blocked-on <inbox-id>
 TXT
         is($res->{err}, $expected, 'S2: stderr is exactly the updated continuity template (two-step off + emergency-stop mention) with the token substituted in all 3 places');
         like($res->{err}, qr/butler-hold/, 'S2: stderr contains butler-hold');

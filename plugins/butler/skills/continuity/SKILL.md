@@ -16,6 +16,11 @@ Explicit continuity arming for the current session. While armed, the one Stop ga
 a turn unless a holder is waiting on running work — this applies to any session, including one
 that is not a drive-solo run or the reporter.
 
+**The rule: continuity is on while there is work to do, and off when there is none** — either
+because it is all done, or because everything left waits on the operator (operator ruling
+2026-11-16). Never hold while waiting only on the operator: a hold just re-wakes the session every
+50 minutes for nothing (bug 20261116-130711-f800 counted 239 such wake-ups in 62 hours).
+
 ## Arming also keeps the machine awake — automatically
 
 An armed session is unattended work, so the two things that end it silently are held off for as long
@@ -62,7 +67,7 @@ Run these as plain Bash tool calls, arguments in single quotes.
   A judge checks the justification against the goal and the actual state (open bugs, todos, git, blueprint ledgers). If it approves, continuity
   turns off: it hands the thread off with the reason in its log, and stays off until an explicit `on`; a later director call does not re-arm it.
 - **Rejected:** the refusal carries the judge's reasoning (or says no verdict came) and continuity stays on. A code works once: act on the
-  reasoning, then run step 1 again for a fresh code; there is no retry limit. Disarm is not right for waiting on an operator answer, pausing between
+  reasoning, then run step 1 again for a fresh code; there is no retry limit. Disarm is not right for waiting on an operator answer while other work remains, pausing between
   steps, or stopping after one slice while more remains. A persistent process nobody is waiting on (a dev server, `tail -f`) is not work to hold; if nothing else is pending, off with a reason is the right move.
 - **Emergency stop is not a way to disarm:** `butler-continuity emergency-stop --reason '<the defect>' [--area <area>]` is only for a genuine defect in ccpraxis, Claude Code
   or another system that leaves no choice but to stop. One call, no code, no judge: it turns continuity off, files a bug report and is logged as an emergency stop. Never use it for finished work or to get past a rejection.
@@ -79,6 +84,7 @@ Run these as plain Bash tool calls, arguments in single quotes.
   (disarm with both steps before a `/clear`, or the old id still owns the thread). `--resume` keeps the arm.
 - **Questions:** never end a turn to wait for the operator. File one with `/almanac:inbox` (`almanac inbox file --title '<question>'`) and
   keep working; the operator answers it there, from any session.
+- **Waiting only on the operator** (nothing else can proceed) is no work left: never hold for it, disarm. Mark your thread task blocked on the item (`almanac thread status <thread> <task> blocked`, then `almanac thread edit <thread> <task> --blocked-on <inbox-id>`) and end the turn. With no task doing and no subagent running, the gate's refusal then offers the off (`--reason 'awaiting operator, offer ...'`); run it and off-confirm, TaskStop any watcher you started, and end with the Handoff line it prints. The judge approves it once it sees each item unanswered; the item may be in another registered project.
 - **Subagents:** cannot turn continuity on, off or emergency-stop, confirm a disarm, or hold; those refuse.
 <!-- continuity:end -->
 
@@ -95,8 +101,14 @@ that is actually about the work.
 Meanwhile: decide it yourself if it is not a product call
 (`.ccpraxis-local-data/guidance/escalate-product-decisions-only.md`), and carry
 on with everything that does not depend on the answer. If nothing can proceed,
-the honest report is that the work is finished pending an answer — turn
-continuity off with a reason (see "Using continuity") and say so.
+never hold for the answer: a hold only re-wakes the session every 50 minutes
+for nothing (bug 20261116-130711-f800 counted 239 such wake-ups in 62 hours).
+Everything left waiting on the operator means there is no work left to do, so
+the right move is to turn continuity off, exactly as when all the work is done.
+Mark the waiting task blocked on the inbox item and end the turn; the gate then
+offers that off, as the `Waiting only on the operator` line in "Using
+continuity" says. The operator's answer, in a later session or this one
+re-armed, is what resumes the work.
 
 ## Confirm to the user
 

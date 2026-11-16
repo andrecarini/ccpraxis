@@ -92,6 +92,49 @@ for my $s (
     else { print "## $title\n  no store at $dir\n\n" }
 }
 
+# Awaiting-operator offers (bug 20261116-130711-f800): every record the Stop
+# gate wrote when it offered an off because everything left waits on the
+# operator, with each named item's status read NOW from its own inbox file.
+# The item may sit in another project's inbox, which the judge cannot Read
+# from this project root; this is where it sees that item's live state.
+{
+    my @lines;
+    my $odir = "$data/butler-awaiting-operator";
+    if (opendir(my $dh, $odir)) {
+        require JSON::PP;
+        for my $e (sort grep { /\A[0-9a-f]{8}\.json\z/ } readdir $dh) {
+            my $doc = eval {
+                open(my $fh, '<:raw', "$odir/$e") or die "open\n";
+                local $/;
+                my $raw = <$fh>;
+                close $fh;
+                JSON::PP->new->utf8->decode($raw);
+            };
+            unless (ref $doc eq 'HASH' && ref $doc->{items} eq 'ARRAY') {
+                push @lines, "$e: unreadable";
+                next;
+            }
+            push @lines, "offer " . ($doc->{offer} // '?') . " (valid until " . ($doc->{valid_until_utc} // '?')
+                . "), reason: " . ($doc->{reason} // '?');
+            for my $it (@{ $doc->{items} }) {
+                next unless ref $it eq 'HASH' && defined $it->{id};
+                my $path = defined $it->{path} ? $it->{path} : '';
+                utf8::encode($path) if utf8::is_utf8($path);
+                # Only a real inbox store file of the item's own id counts: the
+                # record lives in the session's project and could be hand-made.
+                my $inbox = $path =~ m{/\.ccpraxis-local-data/almanac/(?:inbox|decision)/\Q$it->{id}\E\.md\z} ? 1 : 0;
+                my $fm = ($inbox && length $path) ? frontmatter($path) : undef;
+                my $live = !$inbox ? 'not an inbox item file'
+                         : !defined $fm ? 'missing' : ($fm->{status} // '(no status)');
+                my $title = ref $fm eq 'HASH' && defined $fm->{title} ? $fm->{title} : '';
+                push @lines, "  item $it->{id} [now: $live] $title (file: $path)";
+            }
+        }
+        closedir $dh;
+    }
+    section('Awaiting-operator offers (Stop gate), each item status read now from its inbox file', @lines);
+}
+
 # Blueprints: lifecycle from blueprint.md, package statuses from the ledgers.
 {
     my @lines;

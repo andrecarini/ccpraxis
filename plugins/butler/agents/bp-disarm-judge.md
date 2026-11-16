@@ -58,9 +58,30 @@ digest; spend tool calls only on a specific question it leaves open.
      under the project root (Read it) exists, has the same `relaunch_at`, and has no `"manual"`
      true; and that fleet's `relaunch_at_utc` is more than 32 h after the digest's time.
   5. Nothing else in the digest is work this session could still do.
-- **Reject** when the session is waiting on an operator answer it should have filed and kept
-  working past, pausing between steps, stopping after one slice while more remains, or when its
-  claims do not match what disk actually shows.
+- **Everything left waiting on the operator justifies going off, the same as "all the work is
+  done"** (operator ruling 2026-11-16: continuity is on while there is work to do and off when
+  there is none). When every remaining step is blocked on an unanswered operator inbox item that
+  is genuinely the operator's, and nothing else in the session's goal can progress, there is no
+  work left; approve the off. The Stop gate offers exactly that off; its reason reads
+  `awaiting operator, offer <id>: <item-id>, <item-id>`. Verify, never trust the claim; approve
+  only when every check below holds, and reject naming the first that fails:
+  1. The offer record `.ccpraxis-local-data/butler-awaiting-operator/<id>.json` under the project
+     root exists (Read it). No record means the gate never offered this off.
+  2. The record's `reason` is exactly the reason you were given, character for character.
+  3. The digest's first line is earlier than the record's `valid_until_utc`. With no digest
+     there is no time to compare: reject.
+  4. Every item the record names exists and is unanswered NOW: the digest's "Awaiting-operator
+     offers" section shows it as `[now: unanswered]` (read from the item's own inbox file, which
+     may be in another project). Any other value (`answered`, `missing`, `not an inbox item
+     file`) fails this check.
+  5. Each item is genuinely the operator's: a product decision, a manual check or a taste call,
+     not a technical question the session could settle itself from the code, the docs or a
+     measurement.
+  6. Nothing else in the digest is work this session could still do toward its goal.
+- **Reject** when the session is waiting on an operator answer while other work it could do
+  remains (it should have filed the question and kept working past it), pausing between steps,
+  stopping after one slice while more remains, or when its claims do not match what disk
+  actually shows.
 
 ## Tool limits
 

@@ -914,8 +914,8 @@ One tab-separated line per event, appended with `O_APPEND` by `butler-continuity
 ```
 
 Fields: ISO-8601 UTC time, session id, actor (`agent`, `operator`, `coordinator`, `gate` or `gc`), verb
-(`off`, `emergency-stop`, `break-glass-off`, `refusal-cap`, `holder-starting`, `holder-reaped`, `gc` or
-`fork-ok`), project root, and
+(`off`, `emergency-stop`, `break-glass-off`, `refusal-cap`, `holder-starting`, `holder-reaped`,
+`awaiting-operator`, `gc` or `fork-ok`), project root, and
 reason. A judged off logs `<reason>; goal: <goal>; justification: <text>; verdict:
 disarm-judge/<otp>.verdict.json`, each part cut to 70 characters; an emergency stop logs `<reason>; bug
 report: <id>`, or `bug report: FAILED (<error>)`. For `off` and `emergency-stop` the project root is
@@ -937,8 +937,9 @@ turning continuity off (Decision 1, Decision 6). An agent's off is the two-step 
 denial offers its first step and names the second. The two break-glass last resorts are described
 under "Break glass" below. The text is built from the session's running work (Decision 128). Exact
 text when an armed non-coordinator session stops with no live holder and nothing running (Decision 8:
-at most 8 lines, nothing else, no history). `<token>` is replaced by the token this denial minted, in
-all three places:
+at most 8 lines, nothing else, no history; the last two are the awaiting-operator hint, bug 20261116-130711-f800, which gives way
+to the break-glass lines when those show). `<token>` is replaced by
+the token this denial minted, in all three places; `<thread>` by the session's almanac thread when it has one:
 
 ```
 Continuity is on for this session and no holder is running. Stop token: <token>
@@ -947,6 +948,8 @@ Waiting on a subagent or background task? Hold it, as a background Bash tool cal
 All work done? Turn continuity off (two steps: off mints an OTP, then off-confirm with it), as a Bash tool call:
   butler-continuity off --reason '<what is done>' --token <token>
 (Genuine ccpraxis/Claude-Code defect, not just finished work? butler-continuity emergency-stop --reason '<the actual defect>' instead -- not a normal option.)
+Waiting only on the operator? That is no work left; never hold for it. Mark your task blocked on its inbox item, end the turn, and the gate offers the off:
+  almanac thread status <thread> <task> blocked; almanac thread edit <thread> <task> --blocked-on <inbox-id>
 ```
 
 When the payload's `background_tasks` lists running work (`running_work`), the text names it:
@@ -957,6 +960,8 @@ Hold it, as a background Bash tool call; the holder wakes this session when the 
   butler-hold --token <token> <ids>
 If that work is no longer needed and everything is done, turn continuity off, as a Bash tool call:
   butler-continuity off --reason '<what is done>' --token <token>
+Waiting only on the operator? That is no work left; never hold for it. Mark your task blocked on its inbox item, end the turn, and the gate offers the off:
+  almanac thread status <thread> <task> blocked; almanac thread edit <thread> <task> --blocked-on <inbox-id>
 ```
 
 `<ids>` is the first 8 ids, joined with `, ` on line 1 and with spaces on line 3; `<more>` is empty for
@@ -1020,11 +1025,15 @@ clear_running_snapshot(sid)              ; G7b: the snapshot describes only the 
 holder_live(sid, p)                      -> clear streak, allow
 starting_holder(p)                     -> clear streak, log holder-starting, allow  (G8b)
 holder_reaped(sid, p)                   -> clear streak, mark the reap seen, log holder-reaped, allow; continuity stays ON  (G8c)
+await = awaiting_operator(sid, p)       ; G8d: decided here, acted on at G11a (needs the token)
 streak = bump_streak(sid, p)             ; G9b: >= REFUSAL_CAP and the last shell call failed -> clear, log, allow
 t = mint_stop_token(sid)                 ; undef -> allow, one hook-errors.log line
+if await qualifies and its offer record is written
+                                         -> log awaiting-operator, deny(handoff text: off with the minted reason)  (G11a)
 work = running_work(sid, p)              ; G11
 if work: set_running_snapshot(sid, work) ; deny(running text with t)
 else:    deny(idle text with t, plus the break-glass lines when offered)
+; both deny texts end with the awaiting-operator hint (G8d) before any break-glass lines
 ```
 
 `stop_hook_active` is never read. It resets after a wake and is not a block counter (harness-facts
@@ -1119,6 +1128,51 @@ the reap no earlier than its `started_at`; when no butler-hold was launched afte
 the transcript offset of both the last refusal (`stop-refusals/<sid>`) and the last reap acted on
 (`stop-reaped/<sid>`, written on each such allow and removed by `gc_sessions`). One reap lets one stop
 through. Oracle: `plugins/butler/tests/t/stop-gate-reaped-holder.t`.
+
+### Awaiting the operator (G8d, G11a)
+
+Bug `20261116-130711-f800`: a supervising session waited 62 hours for the operator to answer two inbox
+items. Nothing could progress without the operator, yet the gate forced a hold cycle: 239 wake-ups, about
+3% of a week's usage, for nothing. Operator ruling 2026-11-16: continuity is on while there is work to do
+and off when there is none, and "everything left waits on a question only the operator can answer" is no
+work left, the same as "all the work is done". So the gate never offers a hold for it; it offers the off.
+
+G8d decides, before the refusal cap; G11a acts, once the stop token exists. The condition:
+
+- the session has an attached almanac thread (`butler-continuity on --thread/--new-thread`) in the
+  project of the payload `cwd`;
+- none of that thread's unlinked tasks is `doing` (linked package tasks carry a package status and no
+  `blocked_on`, so they are not consulted);
+- at least one task is `blocked` with a `blocked_on` naming an inbox item whose status is `unanswered`.
+  The id is looked up in the thread's own project first (the `inbox` store, then the legacy `decision`
+  one, read only, never migrated), then across the projects in steward's machine-local registry
+  (`~/.claude/claude-code-vault/.registry-local.json`, the one `almanac bug collect` and `/pending`
+  walk; at most 256 roots), because a supervisor's thread often waits on another project's inbox. An id
+  found nowhere does not count;
+- no subagent is running (`running_work` type `subagent`): a subagent is real work of the session, and
+  the running text offers to hold it. A plain background task does not block the offer.
+
+When it holds, the gate writes an offer record `<data>/butler-awaiting-operator/<token>.json` (session,
+reason, `valid_until_utc` 30 minutes out, and each item's id, title, inbox file path, project and the
+tasks blocked on it; swept like the far-pause records on every armed Stop), logs `awaiting-operator` to
+`reasons.log`, and denies with a handoff text modelled on the far-pause one: the tasks and items named, a
+`Handoff:` line saying what the operator must answer, `butler-continuity off --reason 'awaiting
+operator, offer <token>: <id>, ...' --token <token>` then off-confirm, TaskStop for any watcher (named),
+and "End your turn with the Handoff line above". Continuity stays armed until the session runs off. A
+reason over 200 bytes or a record that cannot be written falls back to the ordinary texts. Any error
+while deciding counts as "does not qualify".
+
+The disarm judge approves that off only after checking the record, the exact reason, the validity window,
+that every item is unanswered now, and that each is genuinely the operator's (`bp-disarm-judge.md`). The
+judge runs from the session's project root and cannot Read another project's inbox, so
+`bp-disarm-digest.pl` lists every offer record with each item's status read from its own inbox file at
+digest time (`[now: unanswered]`), and trusts only a path inside an `almanac/inbox` or `almanac/decision`
+store named for the item.
+
+Both ordinary deny texts end with a two-line hint for a session waiting only on the operator: mark the
+current task blocked on the item (`almanac thread status <thread> <task> blocked; almanac thread edit
+<thread> <task> --blocked-on <inbox-id>`, the session's thread named when it has one) and end the turn,
+after which the gate offers the off. Oracle: `plugins/butler/tests/t/stop-gate-awaiting-operator.t`.
 
 ## Operator off versus agent off
 
