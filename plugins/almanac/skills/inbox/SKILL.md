@@ -12,6 +12,11 @@ yourself and state the assumption.
 
 Filing returns immediately. Carry on with other work rather than waiting on an answer.
 
+Write the item so the operator could answer it without any explanation of files, paths, tools, tests
+or internal mechanics; if they could not, it is not theirs. A butler coordinator, its workers and a
+drive-solo worker cannot file here at all (guard-bash denies it): a coordinator writes a ledger
+escalation, which the escalation resolver judges, and a worker reports to whoever dispatched it.
+
 ## See what's waiting
 
 ```bash

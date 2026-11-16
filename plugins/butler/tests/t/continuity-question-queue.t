@@ -361,14 +361,18 @@ sub run_statusline_q {
 }
 
 # ===========================================================================
-# Q10/Q13 -- an armed session's AskUserQuestion is denied, files one joined
-# inbox item in the payload-cwd project (spec 01-inbox-rename AC17/AC29: deny
-# line 2 is "The question is filed as inbox item <id>."), stdout carries no
-# "continue":false; the question later appears in Almanac::Inbox's own
-# list_items for that project (the 'questions' verb no longer exists to
-# re-check it through the CLI, so this checks the store directly, per AC29).
+# Q10/Q13 -- an armed session's AskUserQuestion is denied, stdout carries no
+# "continue":false, and NOTHING is filed.
+#
+# AMENDED by bug 20261116-132008-3692. These used to pin that the deny filed
+# the joined question text as one inbox item (spec 01-inbox-rename
+# AC17/AC29: line 2 "The question is filed as inbox item <id>.") and that it
+# then appeared in Almanac::Inbox::list_items. That unclassified auto-filing
+# is how technical questions reached an operator who could not answer them,
+# so it is removed: the deny tells the session to decide itself and to file
+# deliberately, in product terms, only a product decision. The store checks
+# are inverted rather than dropped, so a return of auto-filing fails here.
 # ===========================================================================
-my ($Q10_PROJECT, $Q10_TITLE);
 {
     my $P = mk_project();
     GuardHarness::fresh_state();
@@ -380,29 +384,18 @@ my ($Q10_PROJECT, $Q10_TITLE);
     my @lines = split /\n/, $res->{err};
     pop @lines while @lines && $lines[-1] eq '';
     is(scalar(@lines), 4, 'Q10: stderr has 4 lines');
-    like($lines[1] // '', qr/^The question is filed as inbox item \S+\.$/, 'AC17/AC29: line 2 names the filed inbox item');
+    like($lines[1] // '', qr/^Nothing was filed\./, 'Q10: line 2 says nothing was filed');
     unlike($res->{out}, qr/"continue":false/, 'Q10: stdout carries no "continue":false');
 
-    $Q10_PROJECT = $P;
-    $Q10_TITLE   = "Which DB? | Deploy t\x{e9}st?";
     my $list = AD('list_items', root => $P);
-    ok((ref $list eq 'ARRAY'
-        && (grep { defined $_->{fields}{title} && $_->{fields}{title} eq $Q10_TITLE } @$list)),
-       'Q10: the two questions are joined by " | " into one filed title');
-}
-{
-    SKIP: {
-        skip 'Q13: Q10 did not produce a project to re-check', 1 unless defined $Q10_PROJECT;
-        # the 'questions' CLI verb is retired (AC22) -- re-check the store
-        # directly instead of round-tripping it through a CLI call.
-        my $list = AD('list_items', root => $Q10_PROJECT);
-        ok((ref $list eq 'ARRAY' && (grep { defined $_->{fields}{title} && $_->{fields}{title} eq $Q10_TITLE } @$list)),
-           'Q13: Q10\'s joined question is present in Almanac::Inbox::list_items for P with its exact title');
-    }
+    is((ref $list eq 'ARRAY' ? scalar(@$list) : 0), 0,
+       'Q13: Almanac::Inbox::list_items for P holds no item -- the question was not filed');
 }
 
 # ===========================================================================
-# Q11 -- BP_LEDGER set (coordinator), unarmed: denies, and files.
+# Q11 -- BP_LEDGER set (coordinator), unarmed: denies, files nothing, and
+# names the ledger escalation (AMENDED, bug 20261116-132008-3692: the
+# coordinator's channel is the escalation the resolver judges).
 # ===========================================================================
 {
     my $P = mk_project();
@@ -411,8 +404,9 @@ my ($Q10_PROJECT, $Q10_TITLE);
     my $res = ao(payload(session_id => $sid, cwd => $P, questions => ['Proceed?']),
         env => { CLAUDE_PROJECT_DIR => $P, BP_LEDGER => '/x/ledger.md' });
     is($res->{rc}, 2, 'Q11: BP_LEDGER set, unarmed, denies');
+    like($res->{err}, qr/bp-ledger\.pl set-escalation/, 'Q11: the deny names the ledger escalation');
     my $list = AD('list_items', root => $P);
-    ok((ref $list eq 'ARRAY' && (grep { $_->{fields}{title} eq 'Proceed?' } @$list)), 'Q11: the question is filed');
+    is((ref $list eq 'ARRAY' ? scalar(@$list) : 0), 0, 'Q11: nothing is filed');
 }
 
 # ===========================================================================
@@ -441,7 +435,9 @@ my ($Q10_PROJECT, $Q10_TITLE);
 
 # ===========================================================================
 # Q14 -- armed, with P/.ccpraxis-local-data/almanac blocked by a regular
-# file: still denies with "could not be filed", no crash text.
+# file: still denies, no crash text. (AMENDED, bug 20261116-132008-3692: the
+# guard no longer files, so there is no "could not be filed" variant; the
+# blocked store must simply make no difference to the deny.)
 # ===========================================================================
 {
     my $P = mk_project();
@@ -453,7 +449,7 @@ my ($Q10_PROJECT, $Q10_TITLE);
     my $res = ao(payload(session_id => $sid, cwd => $P, questions => ['Blocked?']),
         env => { CLAUDE_PROJECT_DIR => $P });
     is($res->{rc}, 2, 'Q14: armed, with almanac/ blocked by a regular file, still denies');
-    like($res->{err}, qr/could not be filed; note it in your report instead\.$/m, 'Q14: the could-not-be-filed line appears');
+    like($res->{err}, qr/^Nothing was filed\./m, 'Q14: the same nothing-was-filed deny as an unblocked store');
     unlike($res->{err}, qr/\bat\b.*\bline\b\s+\d+/, 'Q14: no Perl crash text (no "at <file> line N")');
 }
 
@@ -467,7 +463,7 @@ my ($Q10_PROJECT, $Q10_TITLE);
     ok(GuardHarness::arm($sid, 'manual'), 'Q15 setup: session armed');
     my $res = ao(payload(session_id => $sid, questions => ['No cwd at all?']), env => {});
     is($res->{rc}, 2, 'Q15: armed, no payload cwd, CLAUDE_PROJECT_DIR unset, denies');
-    like($res->{err}, qr/could not be filed; note it in your report instead\.$/m, 'Q15: the could-not-be-filed line appears');
+    like($res->{err}, qr/^Nothing was filed\./m, 'Q15: the nothing-was-filed deny (AMENDED: no could-not-be-filed variant any more)');
     is_deeply(real_state_snapshot(), $REAL_BEFORE,
        'Q15: the real repo store is unchanged immediately after this call (no fallback to the process cwd)');
 }
@@ -503,9 +499,10 @@ my ($Q10_PROJECT, $Q10_TITLE);
 # Q17 -- spec 01-inbox-rename 2.6: butler-continuity.pl no longer loads ANY
 # almanac store at all (ask/questions/answer and their loader are deleted
 # entirely) -- it never mentions Almanac::Decision:: or Almanac::Inbox::.
-# GuardAskOperator.pm still files (AC17/AC29): it mentions Almanac::Inbox::,
-# never Almanac::Decision::, and neither file mentions the retired
-# resolution machinery.
+# Neither file mentions the retired resolution machinery. AMENDED by bug
+# 20261116-132008-3692: GuardAskOperator.pm used to file (AC17/AC29) and so
+# had to mention Almanac::Inbox::; it no longer files the raw question, so
+# its code must now NOT reach the inbox store at all.
 # ===========================================================================
 {
     my $cc_src  = -f $CMD    ? (slurp($CMD)    // '') : '';
@@ -517,7 +514,8 @@ my ($Q10_PROJECT, $Q10_TITLE);
             unlike($src, qr/\Q$forbidden\E/, "Q17: $label never mentions $forbidden");
         }
     }
-    like($gao_src, qr/Almanac::Inbox::/, 'AC17/AC29: GuardAskOperator.pm mentions Almanac::Inbox::');
+    (my $gao_code = $gao_src) =~ s/^\s*#.*$//mg;
+    unlike($gao_code, qr/Almanac::Inbox::/, 'Q17: GuardAskOperator.pm code never calls Almanac::Inbox:: (no auto-filing)');
 }
 
 # ===========================================================================

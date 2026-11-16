@@ -189,7 +189,16 @@ my $ISO_RE = qr/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ/;
 
 # ===========================================================================
 # AO-1 -- an armed session (manual, driver, reporter) denies with the ARMED
-# WHY, exactly 4 lines, and questions.md gains the appended question.
+# WHY, exactly 4 lines, and files NOTHING.
+#
+# AMENDED by bug 20261116-132008-3692: this used to pin that the deny filed
+# the raw question as an inbox item (AC17/AC29 of spec 01-inbox-rename).
+# That auto-filing was one of three unguarded paths by which technical
+# questions reached the operator, who could not answer them; nothing
+# classified the text. The deny now files nothing and tells the session to
+# decide itself, filing deliberately and in product terms only a product
+# decision. The positive filing assertions are inverted, not dropped, so a
+# regression back to auto-filing fails here.
 # ===========================================================================
 for my $role (qw(manual driver reporter)) {
     my $root = mk_root();
@@ -206,15 +215,13 @@ for my $role (qw(manual driver reporter)) {
     like($lines[0], qr/\bARMED\b/, "AO-1 (role $role): line 1 contains ARMED");
     like($lines[0], qr/^BLOCKED: continuity is ARMED for this session, so asking the operator would stop unattended work for an answer nobody is there to give\.$/,
          "AO-1 (role $role): exact line 1 text");
-    like($lines[1], qr/^The question is filed as inbox item \S+\.$/,
-         "AC17/AC29 (role $role): line 2 names the filed inbox item");
+    like($lines[1], qr/^Nothing was filed\. Decide it yourself/,
+         "AO-1 (role $role): line 2 says nothing was filed and to decide it yourself");
+    like($lines[2], qr/no technical explanation .*in product terms, with almanac inbox file\.$/,
+         "AO-1 (role $role): line 3 names the deliberate, product-terms route");
 
-    my $recs = filed($root);
-    is(scalar(@$recs), 1, "AO-1 (role $role): exactly one inbox item filed");
-    if (@$recs) {
-        is($recs->[0]{fields}{title}, 'Should I rename it?', "AO-1 (role $role): filed with the exact title");
-        is($recs->[0]{fields}{status}, 'unanswered', "AO-1 (role $role): filed unanswered");
-    }
+    is(scalar(@{ filed($root) }), 0, "AO-1 (role $role): no inbox item filed");
+    ok(!-d "$root/.ccpraxis-local-data/almanac", "AO-1 (role $role): no almanac/ dir was created");
     ok(no_legacy($root), "AO-1 (role $role): no legacy questions.md was written");
 }
 
@@ -269,6 +276,11 @@ for my $role (qw(manual driver reporter)) {
     my @lines = split /\n/, $res_coord->{err};
     like($lines[0], qr/^BLOCKED: this is a headless coordinator session, so asking the operator would stop unattended work for an answer nobody is there to give\.$/,
          'AO-4: exact coordinator WHY line');
+    # Bug 20261116-132008-3692: a coordinator's channel is the ledger
+    # escalation, which the resolver judges; nothing is filed for it.
+    like($res_coord->{err}, qr/bp-ledger\.pl set-escalation, then set status: blocked/,
+         'AO-4: the coordinator is sent to the ledger escalation');
+    ok(!-d "$root/.ccpraxis-local-data/almanac", 'AO-4: nothing filed for the coordinator');
 
     my $res_judge = ao(payload(session_id => 'ao4-judge', cwd => $root, questions => ['Proceed?']),
         env => { CLAUDE_PROJECT_DIR => $root, BP_LEDGER => '/x/ledger.md', BP_ROLE => 'harvest-judge' });
@@ -276,7 +288,19 @@ for my $role (qw(manual driver reporter)) {
 }
 
 # ===========================================================================
-# AO-5 -- question text assembly across calls and shapes.
+# AO-5/AO-6/AO-7 -- AMENDED by bug 20261116-132008-3692.
+#
+# These used to pin how the auto-filed inbox item was built: the question
+# text joined across calls and shapes (AO-5), which project root it was
+# filed under (AO-6, Decision 108), and the filed record's fields (AO-7).
+# The guard no longer files anything -- the raw question text, filed
+# unclassified, is how technical questions reached an operator who could not
+# answer them -- so there is no text to assemble, no root to resolve and no
+# record to shape. What survives of each is the part that is still a
+# contract: every payload shape is still denied while armed (AO-5), no root
+# is ever written under, whichever of cwd / CLAUDE_PROJECT_DIR /
+# BP_PROJECT_ROOT is set, and a missing root no longer changes the deny
+# (AO-6), and repeated calls never accumulate records (AO-7).
 # ===========================================================================
 {
     my $root = mk_root();
@@ -284,130 +308,49 @@ for my $role (qw(manual driver reporter)) {
     my $sid = 'ao5-sid';
     ok(GuardHarness::arm($sid, 'manual'), 'AO-5 setup: session armed');
     my %env = (CLAUDE_PROJECT_DIR => $root);
-
-    ao(payload(session_id => $sid, cwd => $root, questions => ['First question?']), env => \%env);
-    ao(payload(session_id => $sid, cwd => $root, questions => ['Second question?']), env => \%env);
-    ao(payload(session_id => $sid, cwd => $root,
-        questions => ['Third-a?', 'Third-b?']), env => \%env);
-
-    my $recs = filed($root);
-    my %titles = map { $_->{fields}{title} => 1 } @$recs;
-    is(scalar(@$recs), 3, 'AO-5: three calls file three pending decisions');
-    is_deeply([ sort keys %titles ], [ sort ('First question?', 'Second question?', 'Third-a? | Third-b?') ],
-       'AO-5: the set of titles is exactly the three calls (one with two questions joined by " | ")');
-
-    # 17 questions -> 16 plus the truncation marker.
-    my $root17 = mk_root();
-    my $sid17 = 'ao5-17';
-    ok(GuardHarness::arm($sid17, 'manual'), 'AO-5 setup: a second armed session for the 17-question case');
-    my @seventeen = map { "Q$_?" } (1 .. 17);
-    ao(payload(session_id => $sid17, cwd => $root17, questions => \@seventeen),
-        env => { CLAUDE_PROJECT_DIR => $root17 });
-    my $expect17 = join(' | ', map { "Q$_?" } (1 .. 16)) . ' | (+more, truncated at 16)';
-    my $recs17 = filed($root17);
-    is(scalar(@$recs17), 1, 'AO-5: the 17-question call files one decision');
-    is($recs17->[0]{fields}{title}, $expect17, 'AO-5: 17 questions -> 16 plus the truncation marker') if @$recs17;
-
-    # embedded newline in a question is flattened to one line.
-    my $root_nl = mk_root();
-    my $sid_nl = 'ao5-embedded-newline';
-    ok(GuardHarness::arm($sid_nl, 'manual'), 'AO-5 setup: a session for the embedded-newline case');
-    ao(payload(session_id => $sid_nl, cwd => $root_nl, questions => ["line one\r\nline two"]),
-        env => { CLAUDE_PROJECT_DIR => $root_nl });
-    my $recs_nl = filed($root_nl);
-    is(scalar(@$recs_nl), 1, 'AO-5: an embedded CR/LF question files one decision');
-    is($recs_nl->[0]{fields}{title}, 'line one line two',
-       'AO-5: the CR/LF run collapsed to one space in the filed title') if @$recs_nl;
-
-    # no question text at all -> the placeholder.
-    my $root_none = mk_root();
-    my $sid_none = 'ao5-no-text';
-    ok(GuardHarness::arm($sid_none, 'manual'), 'AO-5 setup: a session for the no-recoverable-text case');
-    ao(payload(session_id => $sid_none, cwd => $root_none, tool => 'AskUserQuestion'),
-        env => { CLAUDE_PROJECT_DIR => $root_none });
-    my $recs_none = filed($root_none);
-    is(scalar(@$recs_none), 1, 'AO-5: no question text at all files one decision');
-    is($recs_none->[0]{fields}{title}, '(question text not recoverable from the payload)',
-       'AO-5: no question text at all -> the placeholder') if @$recs_none;
+    my @shapes = (
+        [ 'one question',          payload(session_id => $sid, cwd => $root, questions => ['First question?']) ],
+        [ 'two questions',         payload(session_id => $sid, cwd => $root, questions => ['Third-a?', 'Third-b?']) ],
+        [ 'seventeen questions',   payload(session_id => $sid, cwd => $root, questions => [ map { "Q$_?" } (1 .. 17) ]) ],
+        [ 'an embedded CR/LF',     payload(session_id => $sid, cwd => $root, questions => ["line one\r\nline two"]) ],
+        [ 'no question text',      payload(session_id => $sid, cwd => $root, tool => 'AskUserQuestion') ],
+    );
+    for my $s (@shapes) {
+        my ($label, $p) = @$s;
+        my $res = ao($p, env => \%env);
+        is($res->{rc}, 2, "AO-5: $label -> still denied while armed");
+        like($res->{err}, qr/^Nothing was filed\./m, "AO-5: $label -> the deny says nothing was filed");
+    }
+    is(scalar(@{ filed($root) }), 0, 'AO-5/AO-7: five denied calls filed zero inbox items');
+    ok(!-d "$root/.ccpraxis-local-data/almanac", 'AO-5/AO-7: no almanac/ dir was ever created');
+    ok(no_legacy($root), 'AO-5/AO-7: no legacy questions.md was written');
 }
 
-# ===========================================================================
-# AO-6, rewritten (Decision 108, OTHER: "one accessor, spec 09 sec 2.5").
-# BP_PROJECT_ROOT is no longer a resolution input.
-# ===========================================================================
 {
-    # (i) cwd /nonexistent/wherever, both CLAUDE_PROJECT_DIR and
-    # BP_PROJECT_ROOT set: filed in CLAUDE_PROJECT_DIR, nothing under
-    # BP_PROJECT_ROOT.
-    my $root_cpd = mk_root();
+    my $root_cpd  = mk_root();
     my $root_bppr = mk_root();
-    my $sid = 'ao6-precedence';
-    ok(GuardHarness::arm($sid, 'manual'), 'AO-6 setup: session armed');
-    ao(payload(session_id => $sid, cwd => '/nonexistent/wherever', questions => ['Which root?']),
-        env => { CLAUDE_PROJECT_DIR => $root_cpd, BP_PROJECT_ROOT => $root_bppr });
-    is(scalar(@{ filed($root_cpd) }), 1, 'AO-6 (i): filed in CLAUDE_PROJECT_DIR');
-    ok(!-d "$root_bppr/.ccpraxis-local-data/almanac", 'AO-6 (i): nothing under BP_PROJECT_ROOT');
-
-    # (ii) the same cwd, only BP_PROJECT_ROOT set: rc 2, could-not-be-filed,
-    # nothing under BP_PROJECT_ROOT.
-    my $sid2 = 'ao6-bppr-only';
-    ok(GuardHarness::arm($sid2, 'manual'), 'AO-6 setup: a second armed session');
-    my $res2 = ao(payload(session_id => $sid2, cwd => '/nonexistent/wherever', questions => ['Which root now?']),
-        env => { BP_PROJECT_ROOT => $root_bppr });
-    is($res2->{rc}, 2, 'AO-6 (ii): BP_PROJECT_ROOT alone still denies');
-    like($res2->{err}, qr/The question could not be filed; note it in your report instead\.$/m,
-         'AO-6 (ii): the exact "could not be filed" line appears');
-    ok(!-d "$root_bppr/.ccpraxis-local-data/almanac", 'AO-6 (ii): still nothing under BP_PROJECT_ROOT');
-
-    # (iii) cwd $root_cwd, env {}: filed in $root_cwd.
-    my $root_cwd = mk_root();
-    my $sid3 = 'ao6-cwd-only';
-    ok(GuardHarness::arm($sid3, 'manual'), 'AO-6 setup: a third armed session');
-    ao(payload(session_id => $sid3, cwd => $root_cwd, questions => ['And now?']), env => {});
-    is(scalar(@{ filed($root_cwd) }), 1,
-       'AO-6 (iii): with both CLAUDE_PROJECT_DIR and BP_PROJECT_ROOT unset, the payload cwd\'s own project is used');
-
-    # (iv) no cwd, env {}: rc 2, could-not-be-filed.
-    my $sid4 = 'ao6-none-resolvable';
-    ok(GuardHarness::arm($sid4, 'manual'), 'AO-6 setup: a fourth armed session, no cwd at all');
-    my $res_none = ao(payload(session_id => $sid4, questions => ['Anyone?']), env => {});
-    is($res_none->{rc}, 2, 'AO-6 (iv): with no root resolvable, the call still denies');
-    like($res_none->{err}, qr/The question could not be filed; note it in your report instead\.$/m,
-         'AO-6 (iv): the exact "could not be filed" line appears');
-
-    # (v) cwd $root_cwd/sub/dir (created), CLAUDE_PROJECT_DIR => a second
-    # root: filed in $root_cwd because the walk wins (Almanac::Store DC8).
+    my $root_cwd  = mk_root();
     my $sub = "$root_cwd/sub/dir";
     make_path($sub);
-    my $root_cpd2 = mk_root();
-    my $sid5 = 'ao6-walk-wins';
-    ok(GuardHarness::arm($sid5, 'manual'), 'AO-6 setup: a fifth armed session');
-    ao(payload(session_id => $sid5, cwd => $sub, questions => ['Walk or env?']),
-        env => { CLAUDE_PROJECT_DIR => $root_cpd2 });
-    my $recs5 = filed($root_cwd);
-    ok((grep { defined $_->{fields}{title} && $_->{fields}{title} eq 'Walk or env?' } @$recs5),
-       'AO-6 (v): the cwd walk wins over CLAUDE_PROJECT_DIR (Almanac::Store DC8)');
-}
-
-# ===========================================================================
-# AO-7 -- the filed record's shape: Almanac::Inbox::file's usual fields
-# (title/status/created). "butler-continuity ask" no longer exists to compare
-# against (spec 01-inbox-rename 2.6: retired) -- this pins the shape directly.
-# ===========================================================================
-{
-    my $root = mk_root();
-    my $sid = 'ao7-format';
-    ok(GuardHarness::arm($sid, 'manual'), 'AO-7 setup: session armed');
-    ao(payload(session_id => $sid, cwd => $root, questions => ['Format check?']),
-        env => { CLAUDE_PROJECT_DIR => $root });
-    my $recs = filed($root);
-    is(scalar(@$recs), 1, 'AO-7: exactly one record was filed');
-    if (@$recs) {
-        is($recs->[0]{fields}{title}, 'Format check?', 'AO-7: the filed title is "Format check?"');
-        is($recs->[0]{fields}{status}, 'unanswered', 'AO-7: the filed record is unanswered');
-        like($recs->[0]{fields}{created} // '', qr/\A$ISO_RE\z/, 'AO-7: created matches the ISO shape');
+    my @cases = (
+        [ 'cwd nonexistent, CLAUDE_PROJECT_DIR and BP_PROJECT_ROOT set', 'ao6-a', '/nonexistent/wherever',
+          { CLAUDE_PROJECT_DIR => $root_cpd, BP_PROJECT_ROOT => $root_bppr } ],
+        [ 'cwd nonexistent, only BP_PROJECT_ROOT set', 'ao6-b', '/nonexistent/wherever', { BP_PROJECT_ROOT => $root_bppr } ],
+        [ 'cwd a project, no env', 'ao6-c', $root_cwd, {} ],
+        [ 'no cwd, no env', 'ao6-d', undef, {} ],
+        [ 'cwd under a project, CLAUDE_PROJECT_DIR elsewhere', 'ao6-e', $sub, { CLAUDE_PROJECT_DIR => $root_cpd } ],
+    );
+    for my $c (@cases) {
+        my ($label, $sid, $cwd, $env) = @$c;
+        ok(GuardHarness::arm($sid, 'manual'), "AO-6 setup: $label");
+        my $res = ao(payload(session_id => $sid, (defined $cwd ? (cwd => $cwd) : ()), questions => ['Which root?']),
+            env => $env);
+        is($res->{rc}, 2, "AO-6: $label -> denied");
+        unlike($res->{err}, qr/could not be filed/, "AO-6: $label -> no could-not-be-filed variant any more");
     }
-    ok(no_legacy($root), 'AO-7: no legacy questions.md was written');
+    for my $r ($root_cpd, $root_bppr, $root_cwd) {
+        ok(!-d "$r/.ccpraxis-local-data/almanac", "AO-6: nothing written under $r");
+    }
 }
 
 # ===========================================================================

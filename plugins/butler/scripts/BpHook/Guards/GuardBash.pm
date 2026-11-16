@@ -264,6 +264,150 @@ sub _gb_c {
 }
 
 # ---------------------------------------------------------------------------
+# GB-i -- no direct operator inbox filing from a butler run (bug
+# 20261116-132008-3692). Applies when BP_LEDGER is set (a coordinator, every
+# worker it dispatches, and the judges), and to a subagent of an armed
+# drive-solo driver. Not to the driver's own main thread, nor to any
+# interactive session: the guard-bash.sh prefilter (--pre ledger,driver)
+# never even starts perl for an unarmed manual session.
+#
+# Why: an inbox item is a question the operator sees on every statusline.
+# Filed straight from a coordinator it bypasses the escalation resolver, the
+# only judge of whether a question is the operator's, and that is how a
+# technical question ("may this package chmod a protected path?") reached
+# the operator (item 20261113-150442-8ba20000) and held a fleet for 62 hours.
+# The channel for a coordinator is the ledger escalation; for a drive-solo
+# worker it is its own result, which the driver reads.
+#
+# Matching is by shell words, not substrings, so prose that merely names the
+# command (a grep pattern, a commit message, a data heredoc) is not denied:
+# _inbox_file_words() splits each simple command into dequoted words and
+# looks for an almanac/almanac.pl word followed by "inbox file", or an
+# almanac-inbox/almanac-inbox.pl word followed by "file". A `sh -c`/`bash -c`
+# script argument, an eval, and a $(...)/backtick carrier are scanned too;
+# a perl -e that calls Almanac::Inbox::file is caught by that name. As with
+# guard-continuity-state, this is guidance for a cooperating agent, not a
+# security boundary: deliberate circumvention is out of scope.
+# ---------------------------------------------------------------------------
+sub _shell_word_segments {
+    my ($text) = @_;
+    my @segs = ([]);
+    my ($w, $in_word, $q) = ('', 0, '');
+    my @c = split //, $text, -1;
+    my $n = scalar @c;
+    my $end_word = sub {
+        push @{ $segs[-1] }, $w if $in_word;
+        ($w, $in_word) = ('', 0);
+    };
+    for (my $i = 0; $i < $n; $i++) {
+        my $ch = $c[$i];
+        if ($q eq "'") {
+            if ($ch eq "'") { $q = '' } else { $w .= $ch }
+            next;
+        }
+        if ($q eq '"') {
+            if ($ch eq '"') { $q = ''; next }
+            if ($ch eq '\\' && $i + 1 < $n && $c[$i + 1] =~ /["\\\$\x60]/) { $w .= $c[++$i]; next }
+            $w .= $ch;
+            next;
+        }
+        if ($ch eq "'" || $ch eq '"') { $q = $ch; $in_word = 1; next }
+        if ($ch eq '\\' && $i + 1 < $n) { $w .= $c[++$i]; $in_word = 1; next }
+        if ($ch eq '#' && !$in_word) {
+            $i++ while $i + 1 < $n && $c[$i + 1] ne "\n";
+            next;
+        }
+        if ($ch =~ /[ \t]/) { $end_word->(); next }
+        if ($ch =~ /[\n;&|()\x60]/ || ($ch eq '$' && $i + 1 < $n && $c[$i + 1] eq '(')) {
+            $end_word->();
+            $i++ if $ch eq '$';
+            push @segs, [] if @{ $segs[-1] };
+            next;
+        }
+        $w .= $ch;
+        $in_word = 1;
+    }
+    $end_word->();
+    return grep { @$_ } @segs;
+}
+
+sub _inbox_file_words {
+    my ($text, $depth) = @_;
+    $depth //= 0;
+    return 0 if $depth > 3 || !defined $text || !length $text;
+    for my $seg (_shell_word_segments($text)) {
+        my @w = @$seg;
+        # A command that only prints or searches text names the CLI as data;
+        # only a carrier inside its words ("$(...)", `...`) still runs.
+        my $data_only = ($w[0] =~ m{(?:\A|/)(?:echo|printf|grep|egrep|fgrep|rg)\z}) ? 1 : 0;
+        for my $i (0 .. $#w) {
+            my $word = $w[$i];
+            if ($data_only) {
+                return 1 if $word =~ /(?:\$\(|\x60)(.*)\z/s && _inbox_file_words($1, $depth + 1);
+                next;
+            }
+            (my $base = $word) =~ s{\A.*[/\\]}{};
+            $base = lc $base;
+            return 1 if ($base eq 'almanac' || $base eq 'almanac.pl')
+                && defined $w[$i + 1] && $w[$i + 1] eq 'inbox'
+                && defined $w[$i + 2] && $w[$i + 2] eq 'file';
+            return 1 if ($base eq 'almanac-inbox' || $base eq 'almanac-inbox.pl')
+                && defined $w[$i + 1] && $w[$i + 1] eq 'file';
+            if ($base =~ /\A(?:sh|bash|zsh|dash|ksh)(?:\.exe)?\z/) {
+                for my $j ($i + 1 .. $#w - 1) {
+                    if ($w[$j] =~ /\A-[a-z]*c[a-z]*\z/) {
+                        return 1 if _inbox_file_words($w[$j + 1], $depth + 1);
+                        last;
+                    }
+                }
+            }
+            if ($base eq 'eval') {
+                return 1 if _inbox_file_words(join(' ', @w[$i + 1 .. $#w]), $depth + 1);
+            }
+            if ($base =~ /\Aperl(?:\.exe)?\z/) {
+                for my $j ($i + 1 .. $#w - 1) {
+                    if ($w[$j] =~ /\A-[a-zA-Z]*[eE]\z/) {
+                        return 1 if $w[$j + 1] =~ /Almanac::Inbox::file\b/;
+                    }
+                }
+            }
+            # A double-quoted "$(...)" or `...` stays inside one word here;
+            # scan what follows the carrier opener as a command line too.
+            if ($word =~ /(?:\$\(|\x60)(.*)\z/s) {
+                return 1 if _inbox_file_words($1, $depth + 1);
+            }
+        }
+    }
+    return 0;
+}
+
+sub _gb_i {
+    my ($p, $cmd) = @_;
+    my $ledger = $ENV{BP_LEDGER};
+    my $in_run = (defined $ledger && length $ledger) ? 1 : 0;
+    my $driver_worker = 0;
+    unless ($in_run) {
+        return undef unless defined BpHook::agent_id($p);
+        return undef unless eval { BpHook::role($p) eq 'driver' };
+        $driver_worker = 1;
+    }
+    # Cheap substring screen before any word splitting.
+    return undef unless $cmd =~ /almanac/i && ($cmd =~ /\binbox\b/i || $cmd =~ /Inbox::file/);
+    my $scan = _blank_data_heredocs($cmd);
+    return undef unless _inbox_file_words($scan);
+
+    # Two lines: the guard-bash deny budget (hook-architecture.md).
+    return [
+        'BLOCKED: a drive-solo worker may not file an operator inbox item. Put the question in your result; the driver reads it.',
+        'The driver decides whether it is a product question, one the operator could answer with no technical explanation.',
+    ] if $driver_worker;
+    return [
+        'BLOCKED: a coordinator or its worker may not file an operator inbox item. Your channel is bp-ledger.pl set-escalation plus status: blocked.',
+        "That goes through the escalation resolver, the only judge of whether a question is the operator's.",
+    ];
+}
+
+# ---------------------------------------------------------------------------
 # GB-d -- validation interlock.
 # ---------------------------------------------------------------------------
 my $VALIDATION_RE = qr/
@@ -4343,7 +4487,7 @@ sub run {
         return BpHook::deny(@fitted);
     }
 
-    for my $rule (\&_gb_a, \&_gb_b, \&_gb_c, \&_gb_h, \&_gb_w, \&_gb_d) {
+    for my $rule (\&_gb_a, \&_gb_b, \&_gb_c, \&_gb_i, \&_gb_h, \&_gb_w, \&_gb_d) {
         my $lines = eval { $rule->($p, $cmd, $ti) };
         if (defined $lines) {
             my @fitted = map { BpHook::Guards::Common::fit($_) } @$lines;

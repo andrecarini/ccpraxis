@@ -203,6 +203,83 @@ sub confidence_gate {
 }
 
 # ---------------------------------------------------------------------------
+# product_question_technical_terms($text) -> @hits   -- PURE, no I/O.
+#
+# The plain-language backstop (bug 20261116-132008-3692). The operator's
+# test for "is this mine": "I have absolutely no idea what any of this means
+# so it's obviously not a product question." Two earlier fixes for the same
+# class (20261101-111311-8d3b, 20261112-132220-5b54) only reworded the
+# resolver's prompt, and a mode-only chmod under a "protected" path still
+# reached the operator as `product` and held a fleet for 62 hours. So the
+# words are checked here, where no prompt can talk its way past them.
+#
+# A product_question FAILS when it contains any of:
+#   - a backtick (code formatting is for agents, not for the operator);
+#   - a path-like word: one containing '/' (the prose pairs in %PROSE_SLASH
+#     excepted, so "and/or" is not a path), or ending in a file extension
+#     from $FILE_EXT;
+#   - one of the internal terms in @INTERNAL_TERMS, case-insensitive and
+#     word-bounded.
+# Returns the failing terms as they appear in the text (deduplicated, in
+# order of discovery); an empty list means the question passes.
+#
+# Deliberately strict: a false failure costs one more resolver pass (and is
+# bounded -- see apply_verdict), while a false pass costs the operator a
+# question they cannot answer and the fleet the hours until they look.
+# ---------------------------------------------------------------------------
+my %PROSE_SLASH = map { $_ => 1 } qw(
+    and/or either/or yes/no on/off n/a he/she his/her him/her s/he true/false
+);
+my $FILE_EXT = qr/(?:sh|bash|zsh|ps1|psm1|bat|cmd|pl|pm|t|py|rb|js|mjs|cjs|ts|tsx|jsx|go|rs|erl|hrl|ex|exs
+                   |c|h|cc|cpp|hpp|cs|java|kt|swift|dart|lua|php|sql|md|txt|json|jsonl|yaml|yml|toml
+                   |ini|cfg|conf|lock|xml|html|css|scss|csv|log|env|exe|dll|so)/xi;
+our @INTERNAL_TERMS = (
+    qr/\bwrite[ _-]sets?\b/i,
+    qr/\btest[ _-]paths?\b/i,
+    qr/\bexec(?:utable)?[ -]bits?\b/i,
+    qr/\bchmod\b/i,
+    qr/\bmode-only\b/i,
+    qr/\bledgers?\b/i,
+    qr/\bescalations?\b/i,
+    qr/\bblueprints?\b/i,
+    qr/\bDecisions?\s*#?\s*\d+\b/i,
+    qr/\bADRs?\b/i,
+    qr/\bAC-[A-Za-z0-9][\w.-]*/i,
+    qr/\bcoordinators?\b/i,
+    qr/\bresolvers?\b/i,
+    qr/\borchestrators?\b/i,
+    qr/\bharvest\b/i,
+    qr/\bcheckpoints?\b/i,
+    qr/\bhooks?\b/i,
+    qr/\blefthook\b/i,
+    qr/\bmakefiles?\b/i,
+    qr/\bprotected[ -]paths?\b/i,
+);
+
+sub product_question_technical_terms {
+    my ($text) = @_;
+    return () unless defined $text && !ref $text && length $text;
+    my (@hits, %seen);
+    my $add = sub { my ($t) = @_; push @hits, $t unless $seen{lc $t}++; };
+
+    $add->('`') if index($text, '`') >= 0;
+    for my $tok (split /\s+/, $text) {
+        (my $w = $tok) =~ s/\A[(\[{<"'`]+//;
+        $w =~ s/[)\]}>"'`,;:.!?]+\z//;
+        next unless length $w;
+        if (index($w, '/') >= 0) {
+            $add->($w) unless $PROSE_SLASH{lc $w};
+            next;
+        }
+        $add->($w) if $w =~ /(?:\A|[\w-])\.$FILE_EXT\z/;
+    }
+    for my $re (@INTERNAL_TERMS) {
+        while ($text =~ /($re)/g) { $add->($1); }
+    }
+    return @hits;
+}
+
+# ---------------------------------------------------------------------------
 # chronic_scoping_bump($count_before) -> ($count_after, $fires_escalation)
 # Pure counter step (e01 §2.5's stated threshold, exactly): fires iff
 # $count_after > 2. Persistence (where the count lives on disk) is handled by
@@ -1078,7 +1155,13 @@ sub _one_line {
 #                 archive is then updated with the real applied outcome, and
 #                 the queue file is unlinked ONLY on applied=>true.
 #   'tag-only' -> rewrite the queue file in place (§2.1a); nothing unlinked,
-#                 nothing archived.
+#                 nothing archived. Unless product_question fails the
+#                 plain-language check (product_question_technical_terms):
+#                 then, the first time, the record is re-tagged category
+#                 implementation with product_question_rejected and left
+#                 queued for the resolver (outcome 'not-product', log event
+#                 escalation_resolve_not_product); a second failure on the
+#                 same record is tagged for the operator with a note.
 #   'refuse'   -> log only; queue file untouched; no archive (a refusal is
 #                 not itself a decision, §2.6).
 #   'contradiction' -> an 'act' verdict whose action contradicts the package's
@@ -1105,6 +1188,71 @@ sub apply_verdict {
     }
 
     if ($gate eq 'tag-only') {
+        # The plain-language backstop (product_question_technical_terms
+        # above). A product/operator-action verdict whose question the
+        # operator could not answer without a technical explanation is not
+        # tagged operator-owned: the record is re-tagged `implementation` in
+        # place, carrying `product_question_rejected`, and left queued, so
+        # the orchestrator fires the resolver again (implementation is
+        # resolver-triageable) and the resolver prompt requires it to settle
+        # the record with one of its actions.
+        #
+        # Bounded: a record that ALREADY carries product_question_rejected
+        # and comes back product/operator-action again goes to the operator
+        # -- a loop between the resolver and this check would hold the
+        # package forever, the very cost this check exists to cut -- with a
+        # one-line note appended saying it twice failed the check.
+        #
+        # No exception for the prompt's subject-matter override (data
+        # retention, PII, security, money, product identity): the verdict
+        # contract has no field that says the override fired, and inferring
+        # it from the prose would be the same trust in the resolver's words
+        # that this check replaces. Such a question can be phrased in plain
+        # terms (the check is about words, not subject); when the resolver
+        # does not manage it, the bound still delivers it to the operator.
+        (my $pq0 = $verdict->{product_question}) =~ s/\A\s+|\s+\z//g;
+        my @tech = product_question_technical_terms($pq0);
+        my $already_rejected = (ref $rec eq 'HASH' && exists $rec->{product_question_rejected}) ? 1 : 0;
+        if (@tech && !$already_rejected) {
+            my $stale_np = 0;
+            my ($ok_np) = _with_qpath_lock($qpath, sub {
+                my $fresh = BpOrch::_read_json($qpath);
+                unless (_same_queued_record($fresh, $rec)) { $stale_np = 1; return 0; }
+                my %re = (%$rec);
+                $re{category} = 'implementation';
+                $re{product_question_rejected} = {
+                    terms    => [@tech],
+                    text     => $pq0,
+                    category => BpOrch::canonical_category($verdict->{category}),
+                    at       => _iso_now(),
+                };
+                return _atomic_write_json($qpath, \%re);
+            });
+            if ($stale_np) {
+                _rlog($log, 'escalation_resolve_stale', { decision => $id, package => (ref $rec eq 'HASH' ? $rec->{package} : undef) });
+                return { outcome => 'stale', applied => 0, archived => 0,
+                         reason => 'queued record changed or was removed before the verdict could be applied -- nothing written' };
+            }
+            _rlog($log, ($ok_np ? 'escalation_resolve_not_product' : 'escalation_resolve_not_product_failed'), {
+                decision => $id, package => (ref $rec eq 'HASH' ? $rec->{package} : undef),
+                category => $verdict->{category}, terms => join(', ', @tech),
+            });
+            return { outcome => 'refuse', applied => 0, archived => 0, reason => 'in-place re-tag write failed' }
+                unless $ok_np;
+            return { outcome => 'not-product', applied => 0, archived => 0,
+                     reason => 'product_question failed the plain-language check (' . join(', ', @tech)
+                             . '); re-tagged implementation for the resolver to settle' };
+        }
+        if (@tech) {
+            $pq0 .= ' (Note: this question twice failed the plain-language check; it names '
+                  . join(', ', @tech) . '.)';
+            $pq0 =~ s/[\r\n]+/ /g;
+            _rlog($log, 'escalation_resolve_not_product_bounded', {
+                decision => $id, package => (ref $rec eq 'HASH' ? $rec->{package} : undef),
+                terms => join(', ', @tech),
+            });
+        }
+
         my $stale = 0;
         my ($ok) = _with_qpath_lock($qpath, sub {
             my $fresh = BpOrch::_read_json($qpath);
@@ -1117,9 +1265,9 @@ sub apply_verdict {
             $tagged{resolution}  = $verdict->{resolution} // $verdict->{rationale} // '';
             # e06-fleet-inbox-bridge §2.6: carried onto the tagged record
             # (trimmed) -- verdict_shape_ok already guaranteed it is defined
-            # and non-blank for this category.
-            (my $pq = $verdict->{product_question}) =~ s/\A\s+|\s+\z//g;
-            $tagged{product_question} = $pq;
+            # and non-blank for this category. $pq0 carries the bounded
+            # plain-language note when one applies.
+            $tagged{product_question} = $pq0;
             return _atomic_write_json($qpath, \%tagged);
         });
         if ($stale) {

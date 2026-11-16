@@ -111,11 +111,11 @@ reason: Package 16 flattened this file from the pre-cutover staging tree's guard
 
 ### file: guard-ask-operator.sh
 verdict: keep
-reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still refuses AskUserQuestion while unattended work runs and files the question as an inbox item.
+reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still refuses AskUserQuestion while unattended work runs. Since bug 20261116-132008-3692 it no longer files the raw question as an inbox item: a coordinator is sent to the ledger escalation, which the resolver judges, and an armed interactive session decides itself, filing an inbox item deliberately, in product terms, only for a product decision.
 
 ### file: guard-bash.sh
 verdict: keep
-reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still carries the merged coordinator, headless-background, judge-checks and validation-interlock Bash denials in one process.
+reason: Package 16 flattened this file from the pre-cutover staging tree's guards sub-batch; it still carries the merged coordinator, headless-background, judge-checks and validation-interlock Bash denials in one process, plus (bug 20261116-132008-3692) the deny on filing an operator inbox item from a butler run.
 
 ### file: guard-blueprint-write.sh
 verdict: keep
@@ -1384,7 +1384,9 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
   set, never to an armed driver, so a driver can still commit. Judge checks apply only when `BP_ROLE`
   is `harvest-judge`. The validation interlock applies to coordinators and to every caller in an armed
   driver session, except a payload whose `agent_id` owns a worker marker, so the worker can run its
-  own tests.
+  own tests. The inbox-filing deny (GB-i) applies whenever `BP_LEDGER` is set (coordinator, its
+  workers, judges) and to a subagent of an armed driver; the driver's own main thread and every
+  interactive session may still file.
 - guard-git-mutations with `--only-during-butler-run`: coordinator, or any caller in an armed session.
   The settings.json registration: everyone.
 - wait-shape-guard, context-ceiling and gate-shutdown: coordinators only.
@@ -1409,7 +1411,10 @@ each old rule behind its old applicability test, inside one process:
   commit, push and stash except list/show; rm -rf outside /tmp, BP_DIR and screenshots; deploys;
   BP_BASH_EXTRA_DENY). Headless background deny when `BP_LEDGER` is set, exempting a command that is
   exactly one `butler-hold` invocation (so `butler-hold x; sleep 3000` is still denied). Harvest-judge
-  pnpm/npm/yarn lint, build and test. Validation interlock while a fresh writer marker exists. Sources:
+  pnpm/npm/yarn lint, build and test. Validation interlock while a fresh writer marker exists. Added
+  later (bug 20261116-132008-3692): no operator inbox filing (`almanac inbox file`, `almanac.pl inbox
+  file`, `almanac-inbox.pl file`) from a butler run, matched by shell words so prose naming the
+  command passes; source `plugins/butler/tests/t/guard-bash-inbox-filing.t`. Sources:
   `plugins/butler/tests/t/guard-bash-quote-strip.t` (those four deletion-list sources landed in it
   and were removed from the tree in package 16's batch B).
 - guard-git-mutations.sh: stash (except list/show), checkout, switch, restore, reset and clean, with
@@ -1433,8 +1438,9 @@ each old rule behind its old applicability test, inside one process:
   the evidence-gated `ledger-write-override`. Sources: `plugins/butler/tests/t/blueprint-write-api.t`,
   `plugins/butler/tests/t/blueprint-guard-exempts-template.t` (the ledger-creation deletion-list source
   landed here and was removed from the tree in package 16's batch B).
-- guard-ask-operator.sh: deny and queue only when THIS session is armed or a coordinator. Source:
-  `plugins/butler/tests/t/no-halt-for-questions.t`.
+- guard-ask-operator.sh: deny only when THIS session is armed or a coordinator. Source:
+  `plugins/butler/tests/t/no-halt-for-questions.t`. The deny no longer queues the question (bug
+  20261116-132008-3692): `plugins/butler/tests/t/guard-ask-operator-no-autofile.t`.
 - track-dispatch.sh: one write-capable worker at a time for coordinators, as today. For armed drivers,
   one marker per write-capable dispatch at `.drive-solo/workers/<tool_use_id>` (carrying the session
   and the subagent type), removed at its PostToolUse, so two concurrent writers never clear each

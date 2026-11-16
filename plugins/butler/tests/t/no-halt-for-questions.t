@@ -28,9 +28,9 @@
 # AC2  ...and the question text is queued, not lost
 # AC3  ...and it is ALLOWED when the run is inert / paused / finished
 # AC4  an ARMED session is unattended too, and an unarmed one may still ask
-# AC5  ...with the question queued either way
+# AC5  ...and the question is NOT auto-filed (amended, bug 20261116-132008-3692)
 # AC6  the turn-ending verb (await-operator) is GONE; `ask` replaces it
-# AC7  the queue APPENDS -- several questions over a long run all survive
+# AC7  repeated denials never accumulate operator items (amended, same bug)
 use strict;
 use warnings;
 
@@ -201,7 +201,13 @@ PAYLOAD_EOF`;
     is($rc, 2, 'AC4 CANONICAL: an ARMED session is unattended -- the question is denied even '
              . 'with no run active, which is the overnight case the run-only check missed');
     like($out, qr/ARMED/, 'AC4 and the refusal names the real reason rather than claiming a run');
-    like(queue_contents($root), qr/Should I rename it\?/, 'AC5 the question is queued');
+    # AC5 AMENDED (bug 20261116-132008-3692): the denied question is no
+    # longer queued for the operator. Filing the raw text unclassified is how
+    # technical questions reached an operator who could not answer them; the
+    # deny now tells the session to decide itself, and to file deliberately,
+    # in product terms, only a genuine product decision.
+    is(queue_contents($root), '', 'AC5 the question is NOT auto-filed for the operator');
+    like($out, qr/Nothing was filed\./, 'AC5 ...and the deny says so');
     ok(no_legacy($root), 'AC4: no legacy questions.md was written');
 
     # AC8/B10 (spec §2.3(c)): the denial stops naming a dead verb. Reason MSG
@@ -263,9 +269,11 @@ sub _cont_ask {
 # AC22 (spec 01-inbox-rename 2.6): `ask` itself is now ALSO retired -- it no
 # longer records and returns; it exits 1 with a one-line pointer at
 # `almanac inbox file`, before anything is filed. The remaining escape hatch
-# for "something needs the operator, keep working" is GuardAskOperator's own
-# filing (guards-remake-ask-operator.t), or an agent filing `almanac inbox
-# file` directly -- never a CLI verb that ends the turn.
+# for "something needs the operator, keep working" is an interactive agent
+# filing `almanac inbox file` deliberately, in product terms, or a
+# coordinator's ledger escalation, which the resolver judges -- never a CLI
+# verb that ends the turn. (GuardAskOperator's own filing is gone, bug
+# 20261116-132008-3692.)
 {
     my $root = new_project();
     my $here = getcwd();
@@ -286,27 +294,28 @@ sub _cont_ask {
     unlike($q, qr/queued/i, 'AC6/AC22: ask never reports a question queued any more');
 }
 
-# ── AC7 — the queue accumulates ───────────────────────────────────────────
+# ── AC7 — AMENDED: repeated denials never accumulate operator items ───────
 #
 # MIGRATED (package 03-retire-runstate): the fixture used to call
 # `bp-runstate.pl activate` to make the session unattended, so the guard
 # would deny and actually write to the queue. The guard's only unattended
 # signal now is continuity-ARMED (§2.3(a)), so arm_state() takes its
 # place -- same shape as AC4's fixture above, reused rather than duplicated.
+#
+# AMENDED by bug 20261116-132008-3692: this used to pin that every denied
+# question accumulated in the operator's queue. The guard no longer files at
+# all (unclassified raw questions were one of three paths by which technical
+# questions blocked fleets on the operator), so the property is inverted:
+# several denials, including a multi-question call, leave the queue empty.
 {
     my $root  = new_project();
     my $state = arm_state($root);
-    run_guard($root, 'First question?', { state => $state });
-    run_guard($root, 'Second question?', { state => $state });
-    run_guard($root, 'Third question?', 'And a fourth in the same call?', { state => $state });
+    my ($rc1) = run_guard($root, 'First question?', { state => $state });
+    my ($rc2) = run_guard($root, 'Second question?', { state => $state });
+    my ($rc3) = run_guard($root, 'Third question?', 'And a fourth in the same call?', { state => $state });
 
-    my $q = queue_contents($root);
-    like($q, qr/First question\?/,  'AC7 first survives');
-    like($q, qr/Second question\?/, 'AC7 second survives');
-    like($q, qr/Third question\?/,  'AC7 third survives');
-    like($q, qr/And a fourth in the same call\?/,
-         'AC7 CANONICAL: and multiple questions in ONE call are all captured -- the payload '
-       . 'nests them in an array, which is why this is not read with a scalar path');
+    is_deeply([ $rc1, $rc2, $rc3 ], [ 2, 2, 2 ], 'AC7 every armed question is still denied');
+    is(queue_contents($root), '', 'AC7 CANONICAL: and none of them, nor the multi-question call, was filed');
     ok(no_legacy($root), 'AC7: no legacy questions.md was written');
 }
 
@@ -324,7 +333,8 @@ sub _cont_ask {
 # root-resolution ladder (walk up from cwd; else CLAUDE_PROJECT_DIR; else
 # cwd; the walk winning over CLAUDE_PROJECT_DIR) is pinned directly by
 # guards-remake-ask-operator.t's AO-6, which this file explicitly does not
-# duplicate. Nothing below is deleted silently: this comment is itself the
+# duplicate. (Since bug 20261116-132008-3692 the hook files nothing either,
+# so AO-6 now pins only that no root is ever written under.) Nothing below is deleted silently: this comment is itself the
 # record, same house convention as AC1/AC2/AC3's retirement notes above.
 
 done_testing();

@@ -22,6 +22,26 @@ not confident, full stop; there is no partial credit for a plausible guess.
 
 **The operator's bar, verbatim — this is what "needs the operator" means, and nothing looser:** product decisions or very unexpected findings that would change the product, never technical details within the agent's purview such as "Should package XX change its write set to YYY to satisfy test ZZZ?"
 
+**The plain-language test is part of that bar.** Route to `product` (or `operator-action`) only if the
+operator could answer your `product_question` **without any explanation** of files, paths, tools,
+tests, permissions, modes, write sets, test paths, Decisions numbers or any other internal mechanics.
+If answering would need any of that explained, the question is not theirs, however it is framed:
+resolve it yourself with one of the actions below. The operator's words, about three technical
+questions that blocked a fleet for 62 hours (2026-11-13): "I have absolutely no idea what any of this
+means so it's obviously not a product question and should have never blocked the fleet to wait on
+me." The apply step enforces this mechanically: a `product_question` containing a backtick, a
+path-like word (one containing `/`, or a file name such as `run.sh`), or an internal term (write set,
+test path, exec bit, chmod, mode-only, ledger, escalation, blueprint, `Decision <n>`, ADR, `AC-<id>`,
+coordinator, resolver, orchestrator, harvest, checkpoint, hook, lefthook, Makefile, protected path) is
+not filed for the operator. The record comes back to you re-tagged `implementation` with a
+`product_question_rejected` field holding the failing terms and the rejected text.
+
+**A record carrying `product_question_rejected` is yours to settle, with one of the actions, never
+routed to `product` or `operator-action` again.** It already failed the plain-language test once.
+A question under the subject-matter override (rule 1 below) gets no exemption from the check, so
+phrase it in plain terms about what users get: the check is about words, not subject. If you route a
+rejected record to the operator anyway, it reaches them marked as having twice failed the check.
+
 **How the work is organised is never the operator's question.** Which package writes which file,
 whether a package may reach into code a closed package owns, how a quality gate (coverage floor, lint,
 check) gets met, whether a missing test is added and by whom, and how blueprint packages, write sets,
@@ -35,6 +55,13 @@ asking package's write set to the exact test paths it needs and relaunching it. 
 (2026-11-03): exactly that question, filed as `product`, held package 06 and everything behind it
 overnight, over one uncovered line in each of two skeleton crates.
 
+**A project's own process rules are not product questions by themselves.** A README or engineering
+doc may say, for example, that protected paths need the operator's approval. A Decisions row decided
+by `user` that covers the step satisfies such a rule: that row is the approval. Without one, the rule
+still does not make the question the operator's: settle it yourself, and record in `rationale` which
+rule applied and why your action meets it. Only a question that passes the plain-language test above
+goes to the operator.
+
 ## Inputs you receive
 
 All read fresh from disk, never cached or assumed from a prior turn:
@@ -47,7 +74,13 @@ All read fresh from disk, never cached or assumed from a prior turn:
   alone.
 - **`blueprint.md`'s own Decisions table** — the standing rulings that outrank anything you might
   otherwise infer. **Read each row's `Decided` column: it says whose ruling it is.** A row decided by
-  `user` is the operator's: a change to what it means is theirs to make. A row decided by `agent` is an
+  `user` is the operator's: a change to what it means **for the product** is theirs to make, and only
+  that. Applying a `user` row, or making a technical or mechanical change near what it covers (a file
+  mode, an exec bit, a path detail, a test fixture) without changing what it means for the product, is
+  not a change to its meaning, and it is the agents' to settle: say so in `rationale` and resolve it.
+  Observed 2026-11-13: a `user` row keeping a directory "untouched" was read as forbidding a mode-only
+  exec-bit change there, and three questions about it held a fleet for 62 hours; the operator had no
+  idea what they meant. A row decided by `agent` is an
   agent's own ruling, recorded so later agents stay consistent: amending it, by an explicit superseding
   entry, is within the agents' purview, and needing to amend it does not make a question `product`.
   Read the row's text too: it often already answers the question (a check that "scans tools/ (not
@@ -90,6 +123,11 @@ All read fresh from disk, never cached or assumed from a prior turn:
    - A record carrying `operator_note` (the operator answered a prior verdict `not-mine` and sent it
      back to you) is **yours to settle, never routed back to `product`/`operator-action`** — the
      operator's note itself is your `confidence: high` citation.
+   - A record carrying `product_question_rejected` (the apply step found technical terms in an earlier
+     verdict's `product_question` and sent it back to you) is **likewise yours to settle with one of
+     the actions, never routed to `product`/`operator-action` again**. The rejection itself is your
+     `confidence: high` citation that the matter sits within the agents' purview; by default
+     `relaunch` with your guidance.
    - **A previous resolver's answer is never an operator ruling.** A ledger's `## Agent decision
      (resolve)` block, or a `## Next action` that opens "The escalation resolver, an agent and not the
      operator", is an earlier verdict of yours, and it carries no operator authority. Ledgers written
@@ -199,7 +237,9 @@ category that omits it (or leaves it blank) is refused outright by the determini
 anything is filed for the operator. It is one line, in terms of what changes for the user (for
 `operator-action`: what the operator must do with their hands), stating the actual question the
 operator answers — not a restatement of the category, not the raw queued question verbatim unless that
-already meets this bar. It is omitted entirely for every other category.
+already meets this bar. It must pass the plain-language test above: no file names, paths,
+backticks or internal terms, or the apply step sends the record back to you instead of to the
+operator. It is omitted entirely for every other category.
 
 - `path` is a **dedicated field, distinct from `evidence`**. `evidence` is always a prose citation (a
   `file:line`, a ledger section, a Decisions row — it may legitimately contain a colon). `path` is
@@ -243,4 +283,6 @@ already meets this bar. It is omitted entirely for every other category.
 - One shot, one verdict. If you genuinely cannot classify within your turn budget, write `category:
   product, confidence: low` with your best evidence of *why* you could not resolve it further, PLUS a
   `product_question` stating — in terms the operator can act on — what could not be determined; never
-  leave `verdict_path` unwritten and never write anything other than the one JSON object above.
+  leave `verdict_path` unwritten and never write anything other than the one JSON object above. A
+  record carrying `product_question_rejected` is the exception: write `relaunch` with your best
+  guidance instead, since it has already been found not to be the operator's.
