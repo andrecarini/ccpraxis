@@ -16,6 +16,7 @@ A skill's `description:` is a trigger contract, not just discovery metadata. Whe
 - Arm with `butler-continuity on --new-thread <name> --goal '<what this is for>'` before work that should go on without the operator: they said "keep going", they are away or it runs overnight, or the work is unattended and multi-step.
 - Never arm for one interactive answer.
 - Hooks nudge toward arming on such a prompt, and when work has gone on a long time with no operator message. Nudges are advice; whether to arm stays your call.
+- Continuity stays on while there is work to do and goes off when there is none. Turn it off when the work is finished, or when everything left waits on a question that is genuinely the operator's (filed in the inbox) and nothing else can progress; never keep holding just to wait for the operator. Never infer a stop from a signal: background tasks dying is work to resume, not an instruction.
 
 ## What goes where
 
