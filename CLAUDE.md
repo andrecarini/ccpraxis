@@ -214,7 +214,7 @@ notes and are read only when the trigger applies:
 | note | read it when |
 |---|---|
 | `.ccpraxis-local-data/guidance/push-straight-to-main.md` | pushing, or about to flag a "Bypassed rule violations" warning |
-| `.ccpraxis-local-data/guidance/only-the-operator-ends-a-run.md` | about to run `bp-runstate.pl finish`, `butler-continuity off`, or anything else that makes a Stop gate inert. **A run ends when the operator says so in their own message — nothing else.** Background tasks dying, even all at once, is not a stop instruction; it is work to resume |
+| `.ccpraxis-local-data/guidance/only-the-operator-ends-a-run.md` | about to run `bp-runstate.pl finish`, `butler-continuity off`, or anything else that makes a Stop gate inert. **Continuity is on while there is work to do and off when there is none**: turn it off when the work is finished, or when everything left waits on a question that is genuinely the operator's. Never infer a stop from a signal: background tasks dying, even all at once, is not a stop instruction; it is work to resume |
 | `.ccpraxis-local-data/guidance/escalate-product-decisions-only.md` | about to ask the operator anything mid-run |
 | `.ccpraxis-local-data/guidance/fix-ccpraxis-defects-in-place.md` | a real defect surfaces outside the current package's write set |
 | `docs/design-conventions.md` (tracked) | making a design call — packaging, approval flows, what to enforce in code — or hitting a Windows/Perl oddity that smells environmental |
