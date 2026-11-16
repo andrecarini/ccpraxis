@@ -1427,6 +1427,139 @@ sub apply_verdict {
 }
 
 # ---------------------------------------------------------------------------
+# apply_gate_verdict(\%verdict, \%rec, $id, \%ctx) -> \%outcome
+#
+# The operator gate's apply step (the fifth judge kind, `operator-gate`; the
+# design note is THE OPERATOR GATE in bp-orchestrator.pl). The orchestrator's
+# inbox bridge has already checked the verdict's SHAPE
+# (BpOrch::operator_gate_verdict_ok); this adds the word-level checks and
+# then rewrites the still-queued record in place, under the same lock /
+# re-read / compare discipline as apply_verdict. It never files anything and
+# never unlinks the record: the bridge's S3 files, from what this wrote.
+#
+#   operator -> `operator_gate` {verdict, question, reasoning, basis, at} on
+#               the record; S3 then files it with `question` leading. A
+#               question with no visible text, or one that fails the
+#               plain-language check (product_question_technical_terms),
+#               is refused: outcome 'retry', the CLI exits 3, the bridge
+#               counts a failed attempt and fires the gate again.
+#   agents   -> the record is re-tagged `implementation` with
+#               `operator_gate_rejected` {reasoning, guidance,
+#               covering_decision, category, at} and left queued, so the
+#               escalation resolver fires for it and must settle it with an
+#               action (agents/bp-escalation-resolver.md). Logged
+#               operator_gate_agents. Unless:
+#                 - the record already carries operator_gate_rejected (it was
+#                   handed to the agents once and came back), or
+#                 - $ctx->{resolver_unavailable} (no resolver can reach it:
+#                   the bridge's F2 test),
+#               in which case the `agents` verdict is not applied: the record
+#               gets an `operator` operator_gate with `bounded` and a one-line
+#               `note` carrying the gate's reasoning, so it reaches the
+#               operator instead of looping. Logged operator_gate_bounded.
+#
+# Outcomes: operator | agents | bounded | retry | stale | error.
+# ---------------------------------------------------------------------------
+sub _gate_one_line {
+    my ($s, $max) = @_;
+    return '' unless defined $s && !ref $s;
+    (my $t = $s) =~ s/\s+/ /g;
+    $t =~ s/\A //; $t =~ s/ \z//;
+    $t = substr($t, 0, $max - 3) . '...' if defined $max && length($t) > $max;
+    return $t;
+}
+
+sub apply_gate_verdict {
+    my ($verdict, $rec, $id, $ctx) = @_;
+    my $runs  = $ctx->{runs};
+    my $log   = $ctx->{log};
+    my $qpath = BpOrch::escalations_dir($runs) . "/$id.json";
+    my $pkg   = ref $rec eq 'HASH' ? $rec->{package} : undef;
+
+    my ($shape_ok, $why) = BpOrch::operator_gate_verdict_ok($verdict);
+    unless ($shape_ok) {
+        _rlog($log, 'operator_gate_refused', { decision => $id, package => $pkg, why => $why });
+        return { outcome => 'retry', applied => 0, reason => $why };
+    }
+    my $v = $verdict->{verdict};
+    my $reasoning = _gate_one_line($verdict->{reasoning}, 400);
+    my %write;            # the fields this outcome sets
+    my @drop;             # the fields it removes
+    my ($outcome, $event);
+
+    if ($v eq 'operator') {
+        my $q = _gate_one_line($verdict->{question});
+        unless (_has_visible_text($q)) {
+            _rlog($log, 'operator_gate_refused', { decision => $id, package => $pkg, why => 'question has no visible text' });
+            return { outcome => 'retry', applied => 0, reason => 'question has no visible text' };
+        }
+        my @tech = product_question_technical_terms($q);
+        if (@tech) {
+            _rlog($log, 'operator_gate_refused', { decision => $id, package => $pkg,
+                why => 'question failed the plain-language check', terms => join(', ', @tech) });
+            return { outcome => 'retry', applied => 0,
+                     reason => 'question failed the plain-language check (' . join(', ', @tech) . ')' };
+        }
+        %write = (operator_gate => { verdict => 'operator', question => $q, reasoning => $reasoning, at => _iso_now() });
+        ($outcome, $event) = ('operator', 'operator_gate_operator');
+    } else {
+        my $guidance = _gate_one_line($verdict->{guidance}, 2000);
+        my $cd = $verdict->{covering_decision};
+        $cd = (defined $cd && !ref $cd && $cd =~ /\S/) ? _gate_one_line("$cd", 64) : undef;
+        my $came_back = (ref $rec eq 'HASH' && exists $rec->{operator_gate_rejected}) ? 1 : 0;
+        if ($came_back || $ctx->{resolver_unavailable}) {
+            my $note = $came_back
+                ? "Note: the check that keeps technical questions away from you ruled this was not yours ($reasoning), "
+                . "but it came back after the agents were told to settle it, so it is filed rather than sent round again."
+                : "Note: the check that keeps technical questions away from you ruled this was not yours ($reasoning), "
+                . "but no agent can take it up right now, so it is filed for you.";
+            %write = (operator_gate => { verdict => 'operator', bounded => JSON::PP::true, note => $note,
+                                         reasoning => $reasoning, at => _iso_now() });
+            ($outcome, $event) = ('bounded', 'operator_gate_bounded');
+        } else {
+            %write = (
+                category => 'implementation',
+                operator_gate_rejected => {
+                    reasoning         => $reasoning,
+                    guidance          => $guidance,
+                    covering_decision => $cd,
+                    category          => BpOrch::canonical_category($rec->{category}),
+                    at                => _iso_now(),
+                },
+            );
+            @drop = ('operator_gate');
+            ($outcome, $event) = ('agents', 'operator_gate_agents');
+        }
+    }
+
+    my $stale = 0;
+    my ($ok, $lockerr) = _with_qpath_lock($qpath, sub {
+        my $fresh = BpOrch::_read_json($qpath);
+        unless (_same_queued_record($fresh, $rec)) { $stale = 1; return 0; }
+        my %re = (%$rec);
+        delete @re{@drop};
+        @re{keys %write} = values %write;
+        # The basis is taken from the record AS WRITTEN, so the bridge's
+        # check (operator_gate_cleared) sees exactly what was judged.
+        $re{operator_gate}{basis} = BpOrch::operator_gate_basis(\%re) if ref $re{operator_gate} eq 'HASH';
+        return _atomic_write_json($qpath, \%re);
+    });
+    if ($stale) {
+        _rlog($log, 'operator_gate_stale', { decision => $id, package => $pkg });
+        return { outcome => 'stale', applied => 0,
+                 reason => 'queued record changed or was removed before the gate verdict could be applied -- nothing written' };
+    }
+    unless ($ok) {
+        _rlog($log, 'operator_gate_apply_failed', { decision => $id, package => $pkg, error => ($lockerr // 'write failed') });
+        return { outcome => 'error', applied => 0, reason => ($lockerr // 'in-place write failed') };
+    }
+    _rlog($log, $event, { decision => $id, package => $pkg, verdict => $v,
+        ($outcome eq 'agents' && defined $write{operator_gate_rejected}{covering_decision}
+            ? (covering_decision => $write{operator_gate_rejected}{covering_decision}) : ()) });
+    return { outcome => $outcome, applied => 1 };
+}
+
+# ---------------------------------------------------------------------------
 # digest_list($runs) -> \@records
 # DC6's read-only surface: scans runs/resolved-escalations/*.json, returns
 # one hashref per resolution, sorted oldest resolved_at first. Mutates
@@ -1454,7 +1587,7 @@ use warnings;
 
 unless (caller) {
     require JSON::PP;
-    my ($bp, $bpdir, $apply_verdict_path, $decision, $digest_mode);
+    my ($bp, $bpdir, $apply_verdict_path, $decision, $digest_mode, $gate_verdict_path, $resolver_unavailable);
     my @pos;
     my $need = sub {
         my ($flag) = @_;
@@ -1470,6 +1603,8 @@ unless (caller) {
         elsif ($arg eq '--apply-verdict')   { $apply_verdict_path = $need->('--apply-verdict'); }
         elsif ($arg eq '--decision')        { $decision           = $need->('--decision'); }
         elsif ($arg eq '--digest')          { $digest_mode        = 1; }
+        elsif ($arg eq '--apply-gate-verdict') { $gate_verdict_path = $need->('--apply-gate-verdict'); }
+        elsif ($arg eq '--resolver-unavailable') { $resolver_unavailable = 1; }
         elsif ($arg =~ /^--/)               { print STDERR "bp-resolve: unknown option $arg\n"; exit 2; }
         else  { push @pos, $arg; }
     }
@@ -1477,6 +1612,7 @@ unless (caller) {
 
     unless (defined $bp && length $bp) {
         print STDERR "usage: bp-resolve.pl <blueprint> --apply-verdict <path> --decision <id> [--bp-dir DIR]\n"
+                   . "       bp-resolve.pl <blueprint> --apply-gate-verdict <path> --decision <id> [--resolver-unavailable] [--bp-dir DIR]\n"
                    . "       bp-resolve.pl <blueprint> --digest [--bp-dir DIR]\n";
         exit 2;
     }
@@ -1491,6 +1627,36 @@ unless (caller) {
         my $recs = BpResolve::digest_list($runs);
         my $j = JSON::PP->new->canonical;
         for my $r (@$recs) { print $j->encode($r) . "\n"; }
+        exit 0;
+    }
+
+    # The operator gate's apply step (apply_gate_verdict). Exit 0 once the
+    # verdict is applied, or is moot (stale record, record gone); 3 when the
+    # verdict is refused and the gate should try again; 1 on a write
+    # failure; 2 on a usage or input error. Quiet on success: the outcome is
+    # logged to runs/orchestrator.log, and this runs inside the orchestrator's
+    # tick, whose stdout is not a place for it.
+    if (defined $gate_verdict_path) {
+        unless (defined $decision) {
+            print STDERR "bp-resolve: --apply-gate-verdict needs --decision <id>\n"; exit 2;
+        }
+        my $vtxt = BpOrch::_read_file($gate_verdict_path);
+        unless (defined $vtxt) { print STDERR "bp-resolve: cannot read gate verdict file: $gate_verdict_path\n"; exit 2; }
+        my $verdict = eval { JSON::PP->new->decode($vtxt) };
+        unless (ref $verdict eq 'HASH') { print STDERR "bp-resolve: gate verdict file is not a JSON object\n"; exit 3; }
+        (my $id = $decision) =~ s{.*[\\/]}{};
+        $id =~ s/\.json$//i;
+        my $rec = BpOrch::_read_json(BpOrch::escalations_dir($runs) . "/$id.json");
+        unless (ref $rec eq 'HASH') {
+            BpOrch::_log("$runs/orchestrator.log", 'operator_gate_moot', { decision => $id, why => 'record not queued' });
+            exit 0;
+        }
+        my $out = BpResolve::apply_gate_verdict($verdict, $rec, $id,
+            { bpdir => $bpdir, runs => $runs, bp => $bp, log => "$runs/orchestrator.log",
+              resolver_unavailable => ($resolver_unavailable ? 1 : 0) });
+        my $o = $out->{outcome} // 'error';
+        exit 3 if $o eq 'retry';
+        exit 1 if $o eq 'error';
         exit 0;
     }
 

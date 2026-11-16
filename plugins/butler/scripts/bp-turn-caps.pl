@@ -181,6 +181,11 @@ sub _surfaces {
         field => 'BP_ESCALATION_MAX_TURNS', re => qr/BP_ESCALATION_MAX_TURNS:-(\d+)/,
         want => cap_for_role($cfg, 'bp-escalation-resolver'), writable => 0,
     };
+    push @s, {
+        surface => 'script', file => "$root/plugins/butler/scripts/bp-judge.sh",
+        field => 'BP_OPERATOR_GATE_MAX_TURNS', re => qr/BP_OPERATOR_GATE_MAX_TURNS:-(\d+)/,
+        want => cap_for_role($cfg, 'bp-operator-gate'), writable => 0,
+    };
 
     return @s;
 }

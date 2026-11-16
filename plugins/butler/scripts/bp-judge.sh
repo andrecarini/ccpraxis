@@ -2,7 +2,7 @@
 # bp-judge.sh — fire ONE scoped, throwaway judge for a package and detach it.
 #
 # Usage:
-#   bp-judge.sh <harvest|resolve> <blueprint> <package> <verdict_path>
+#   bp-judge.sh <harvest|resolve|conformance|escalation-resolve|operator-gate> <blueprint> <package> <verdict_path>
 #
 # Called by the deterministic orchestrator (bp-orchestrator.pl's spawn_judge seam),
 # never by hand. The judge is a fresh headless `claude -p` that reads its scoped
@@ -36,14 +36,17 @@ KIND="${1:?usage: bp-judge.sh <harvest|resolve> <blueprint> <package> <verdict_p
 BP_NAME="${2:?usage: bp-judge.sh <harvest|resolve> <blueprint> <package> <verdict_path>}"
 PKG="${3:?usage: bp-judge.sh <harvest|resolve> <blueprint> <package> <verdict_path>}"
 VERDICT_PATH="${4:?usage: bp-judge.sh <harvest|resolve> <blueprint> <package> <verdict_path>}"
-case "$KIND" in harvest|resolve|conformance|escalation-resolve) ;; *) echo "bp-judge: unknown kind '$KIND' (want harvest|resolve|conformance|escalation-resolve)" >&2; exit 2 ;; esac
+case "$KIND" in harvest|resolve|conformance|escalation-resolve|operator-gate) ;; *) echo "bp-judge: unknown kind '$KIND' (want harvest|resolve|conformance|escalation-resolve|operator-gate)" >&2; exit 2 ;; esac
 
 PROJECT_ROOT=$(bp_project_root)
 BPDIR=$(bp_dir "$BP_NAME")
 LEDGER=$(bp_ledger "$BP_NAME" "$PKG")
 # conformance is INITIATIVE-scoped: its pseudo-package `_run` has no ledger, so the
-# per-package ledger requirement is skipped for that kind only (harvest/resolve keep it).
-if [ "$KIND" != conformance ]; then
+# per-package ledger requirement is skipped for that kind (harvest/resolve keep it).
+# operator-gate skips it too: it gates fleet-level records (package `_fleet`, e.g. a
+# reauth or broken-env pause) as well as package ones, and it reads only the
+# ledger's Escalation section, "if present" (agents/bp-operator-gate.md).
+if [ "$KIND" != conformance ] && [ "$KIND" != operator-gate ]; then
   [ -f "$LEDGER" ] || { echo "bp-judge: no ledger at $LEDGER" >&2; exit 1; }
 fi
 BLUEPRINT_FILE="$BPDIR/blueprint.md"
@@ -55,6 +58,7 @@ BLUEPRINT_FILE="$BPDIR/blueprint.md"
 # Almanac 20260824-170753-01b8.
 case "$KIND" in
   escalation-resolve) AGENT_FILE="$PLUGIN_ROOT/agents/bp-escalation-resolver.md" ;;
+  operator-gate)      AGENT_FILE="$PLUGIN_ROOT/agents/bp-operator-gate.md" ;;
   *)                  AGENT_FILE="$PLUGIN_ROOT/agents/bp-$KIND-judge.md" ;;
 esac
 [ -f "$AGENT_FILE" ] || { echo "bp-judge: no agent file at $AGENT_FILE" >&2; exit 1; }
@@ -72,9 +76,11 @@ fi
 # indistinguishable from a crash in the log.
 DECISION_ID=""
 DECISION_FILE=""
-if [ "$KIND" = escalation-resolve ]; then
-  DECISION_ID=$(tr -d '\r\n' < "$BPDIR/runs/escalation-resolve/$PKG.decision" 2>/dev/null || true)
-  [ -n "$DECISION_ID" ] || { echo "bp-judge: no decision id at $BPDIR/runs/escalation-resolve/$PKG.decision" >&2; exit 1; }
+# operator-gate names its record the same way, in runs/operator-gate/<pkg>.decision
+# (bp-orchestrator.pl's _operator_gate_fire writes it before spawning us).
+if [ "$KIND" = escalation-resolve ] || [ "$KIND" = operator-gate ]; then
+  DECISION_ID=$(tr -d '\r\n' < "$BPDIR/runs/$KIND/$PKG.decision" 2>/dev/null || true)
+  [ -n "$DECISION_ID" ] || { echo "bp-judge: no decision id at $BPDIR/runs/$KIND/$PKG.decision" >&2; exit 1; }
   # The queue was renamed needs-you -> escalations (the old name asserted the
   # operator owns every record; most are resolver-owned). bp-orchestrator.pl
   # migrates the directory on first use, but this script can run against a tree
@@ -122,6 +128,15 @@ elif [ "$KIND" = escalation-resolve ]; then
   MODEL="${BP_ESCALATION_MODEL:-sonnet}"; MAXT="${BP_ESCALATION_MAX_TURNS:-800}"
   case "$MAXT" in ''|*[!0-9]*|0) MAXT=800 ;; esac
   ROLE="escalation-resolver"; J_WRITE_SET=""; J_TEST_PATHS=""
+elif [ "$KIND" = operator-gate ]; then
+  # READ-ONLY, like the escalation resolver: the gate decides whether one queued
+  # escalation needs the operator before the inbox bridge files it, and
+  # bp-resolve.pl --apply-gate-verdict applies its verdict afterwards. It reads
+  # three short inputs, so sonnet, and the 400 band (the floor for every agent,
+  # coordinator-protocol's maxTurns floor; canonical in turn-caps.json).
+  MODEL="${BP_OPERATOR_GATE_MODEL:-sonnet}"; MAXT="${BP_OPERATOR_GATE_MAX_TURNS:-400}"
+  case "$MAXT" in ''|*[!0-9]*|0) MAXT=400 ;; esac
+  ROLE="operator-gate"; J_WRITE_SET=""; J_TEST_PATHS=""
 else
   MODEL="${BP_HARVEST_MODEL:-sonnet}"
   MAXT="${BP_HARVEST_MAX_TURNS:-}"                       # explicit override WINS

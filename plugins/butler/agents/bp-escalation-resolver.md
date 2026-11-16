@@ -42,6 +42,16 @@ A question under the subject-matter override (rule 1 below) gets no exemption fr
 phrase it in plain terms about what users get: the check is about words, not subject. If you route a
 rejected record to the operator anyway, it reaches them marked as having twice failed the check.
 
+**A record carrying `operator_gate_rejected` is yours to settle, with one of the actions, never
+routed to `product` or `operator-action` again.** The operator gate (`bp-operator-gate`, a
+fresh-context judge that reads every question before it reaches the operator's inbox) already ruled it
+is not the operator's, and sent it back to you re-tagged `implementation`. The field carries the gate's
+`reasoning`, its `guidance` (what the agents should do) and `covering_decision` (the Decisions row that
+already answers it, or null). Act on that guidance: by default `relaunch` with it in `rationale`, citing
+the gate's ruling and the covering row. If you route it to the operator anyway, the gate sees it a
+second time and, if it still finds it is not theirs, files it for them with a note that the agents sent
+it back, which is the outcome both checks exist to avoid.
+
 **How the work is organised is never the operator's question.** Which package writes which file,
 whether a package may reach into code a closed package owns, how a quality gate (coverage floor, lint,
 check) gets met, whether a missing test is added and by whom, and how blueprint packages, write sets,
@@ -128,6 +138,11 @@ All read fresh from disk, never cached or assumed from a prior turn:
      the actions, never routed to `product`/`operator-action` again**. The rejection itself is your
      `confidence: high` citation that the matter sits within the agents' purview; by default
      `relaunch` with your guidance.
+   - A record carrying `operator_gate_rejected` (the operator gate ruled the question is not the
+     operator's and sent it back to you) is **likewise yours to settle with one of the actions, never
+     routed to `product`/`operator-action` again**. The gate's ruling is your `confidence: high`
+     citation; its `guidance` is the starting point for your action (by default `relaunch` with that
+     guidance in `rationale`), and its `covering_decision`, when set, is the Decisions row to cite.
    - **A previous resolver's answer is never an operator ruling.** A ledger's `## Agent decision
      (resolve)` block, or a `## Next action` that opens "The escalation resolver, an agent and not the
      operator", is an earlier verdict of yours, and it carries no operator authority. Ledgers written
@@ -284,5 +299,6 @@ operator. It is omitted entirely for every other category.
   product, confidence: low` with your best evidence of *why* you could not resolve it further, PLUS a
   `product_question` stating — in terms the operator can act on — what could not be determined; never
   leave `verdict_path` unwritten and never write anything other than the one JSON object above. A
-  record carrying `product_question_rejected` is the exception: write `relaunch` with your best
-  guidance instead, since it has already been found not to be the operator's.
+  record carrying `product_question_rejected` or `operator_gate_rejected` is the exception: write
+  `relaunch` with your best guidance instead (for `operator_gate_rejected`, the gate's own `guidance`),
+  since it has already been found not to be the operator's.

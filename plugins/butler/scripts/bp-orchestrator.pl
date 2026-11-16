@@ -1143,8 +1143,338 @@ sub _inbox_bridge_escalation_ids {
     return @ids;
 }
 
+# ===========================================================================
+# THE OPERATOR GATE -- the fifth judge kind, `operator-gate`.
+#
+# The operator, 2026-11-16: "Why not have an agent whose purpose is deciding
+# whether a question needs me or not? Some final sanity check before bringing
+# it to my attention." History: three technical questions held a fleet for 62
+# hours on 2026-11-13 (bugs 8d3b, 5b54, 3692 were all this class). Rewording
+# the resolver's prompt (twice) and checking the resolver's words (6fea2a4)
+# each closed one path; the bridge's S3 below is the ONE place a fleet
+# question becomes an operator inbox item, so a check here covers them all --
+# resolver verdicts, the auth/contract sites that queue operator-owned records
+# directly, and F2's resolver-unavailable records alike.
+#
+# The rule: S3 files a record only when it carries an `operator_gate` verdict
+# of `operator` whose `basis` (operator_gate_basis: a digest of the record's
+# category, kind, question and product_question) still matches the record. A
+# record without one gets a gate judge fired for it and is not filed this tick.
+# A record whose content changed since it was gated is gated again.
+#
+# Mechanics, copied from the escalation-resolve judge (block (d) in run()):
+#   - runs/operator-gate/<pkg>.decision names the record, written BEFORE the
+#     spawn; <pkg>.inflight / .pid / .verdict.json / archive/ are the generic
+#     judge-marker files. At most one gate in flight per package (records of
+#     one package are gated one at a time; packages run in parallel).
+#   - the verdict is validated here (operator_gate_verdict_ok) and APPLIED by
+#     bp-resolve.pl --apply-gate-verdict, a subprocess, exactly as the
+#     resolver's verdicts are: that is the only code that rewrites the record.
+#   - the bridge runs on every tick, paused ticks included, so the gate does
+#     too: a reauth or broken-env pause still reaches the operator.
+#
+# Bounds -- nothing may loop and nothing may be lost:
+#   - a failed attempt (spawn failure, malformed verdict, a judge that died or
+#     timed out with no verdict, an apply step that refused) is counted per
+#     record in runs/operator-gate/attempts/<id>; after operator_gate_attempts
+#     (default 3) the record is filed UNREVIEWED, with a note saying so. A
+#     valid verdict resets the count.
+#   - an `agents` verdict re-tags the record `implementation` with
+#     `operator_gate_rejected` and leaves it queued for the escalation
+#     resolver (bp-resolve.pl). If that record comes back to the gate, or if no
+#     resolver can reach it (F2: _fleet, spawn-capped, turn-starved under a
+#     manual pause), an `agents` verdict is NOT applied again: the record is
+#     filed for the operator with a one-line note giving the gate's reasoning.
+# ===========================================================================
+use constant OPERATOR_GATE_KIND => 'operator-gate';
+
+# operator_gate_basis($rec) -> hex digest of what the gate judged. PURE.
+sub operator_gate_basis {
+    my ($rec) = @_;
+    return '' unless ref $rec eq 'HASH';
+    my $j = JSON::PP->new->canonical;
+    my @parts = (canonical_category($rec->{category}) // '');
+    for my $k (qw(kind question product_question)) {
+        my $v = $rec->{$k};
+        push @parts, !defined $v ? '' : ref $v ? $j->encode($v) : "$v";
+    }
+    my $s = join "\x1f", @parts;
+    # Record text arrives as bytes-as-characters (see _json_bytes); anything
+    # wider is encoded, so the digest is defined for every input.
+    unless (utf8::downgrade($s, 1)) { require Encode; $s = Encode::encode('UTF-8', $s); }
+    require Digest::SHA;
+    return Digest::SHA::sha1_hex($s);
+}
+
+# operator_gate_cleared($rec) -> the record's operator_gate hash when it is a
+# current `operator` verdict, else undef. PURE.
+sub operator_gate_cleared {
+    my ($rec) = @_;
+    return undef unless ref $rec eq 'HASH' && ref $rec->{operator_gate} eq 'HASH';
+    my $g = $rec->{operator_gate};
+    return undef unless defined $g->{verdict} && !ref $g->{verdict} && $g->{verdict} eq 'operator';
+    return undef unless defined $g->{basis} && !ref $g->{basis} && $g->{basis} eq operator_gate_basis($rec);
+    return $g;
+}
+
+# operator_gate_verdict_ok($v) -> (1, undef) | (0, $why). PURE. The verdict
+# contract of agents/bp-operator-gate.md:
+#   {"verdict":"operator","question":"...","reasoning":"..."}
+#   {"verdict":"agents","reasoning":"...","covering_decision":<id|null>,"guidance":"..."}
+# bp-resolve.pl's apply step adds the word-level checks (visible text, the
+# plain-language test on `question`) and refuses with exit 3 when they fail.
+sub operator_gate_verdict_ok {
+    my ($v) = @_;
+    return (0, 'verdict is not a JSON object') unless ref $v eq 'HASH';
+    return (0, 'verdict file is not valid JSON') if $v->{_malformed};
+    my $has = sub { my ($x) = @_; return (defined $x && !ref $x && $x =~ /\S/) ? 1 : 0 };
+    my $verdict = $v->{verdict};
+    return (0, 'missing verdict') unless $has->($verdict);
+    return (0, 'missing reasoning') unless $has->($v->{reasoning});
+    if ($verdict eq 'operator') {
+        return (0, 'an operator verdict needs a question') unless $has->($v->{question});
+        return (0, 'question is longer than 600 bytes') if length(_json_bytes($v->{question})) > 600;
+        return (1, undef);
+    }
+    if ($verdict eq 'agents') {
+        return (0, 'an agents verdict needs guidance') unless $has->($v->{guidance});
+        my $cd = $v->{covering_decision};
+        return (0, 'covering_decision must be a Decisions row id or null')
+            if defined $cd && (ref $cd || $cd !~ /\S/);
+        return (1, undef);
+    }
+    return (0, "verdict must be operator or agents, not '$verdict'");
+}
+
+sub _operator_gate_id_ok {
+    my ($s) = @_;
+    return (defined $s && !ref $s && $s =~ /\A[A-Za-z0-9._-]+\z/ && $s ne '.' && $s ne '..') ? 1 : 0;
+}
+sub _operator_gate_attempts_path { my ($runs, $id) = @_; return "$runs/" . OPERATOR_GATE_KIND . "/attempts/$id"; }
+
+# operator_gate_attempts($runs, $id) -> failed gate attempts for record $id.
+sub operator_gate_attempts {
+    my ($runs, $id) = @_;
+    return 0 unless _operator_gate_id_ok($id);
+    my $t = _read_file(_operator_gate_attempts_path($runs, $id));
+    return (defined $t && $t =~ /\A\s*(\d+)/) ? $1 + 0 : 0;
+}
+sub _operator_gate_reset {
+    my ($runs, $id) = @_;
+    unlink _operator_gate_attempts_path($runs, $id) if _operator_gate_id_ok($id);
+}
+
+# _operator_gate_failed($ctx, $id, $why) -- count one failed attempt. Never dies.
+sub _operator_gate_failed {
+    my ($ctx, $id, $why) = @_;
+    my $runs = $ctx->{runs};
+    return unless _operator_gate_id_ok($id);
+    my $n = operator_gate_attempts($runs, $id) + 1;
+    my $p = _operator_gate_attempts_path($runs, $id);
+    eval {
+        require File::Path; File::Path::make_path("$runs/" . OPERATOR_GATE_KIND . "/attempts");
+        my $tmp = "$p.tmp.$$";
+        open my $fh, '>', $tmp or die "open: $!";
+        print $fh "$n\n" or die "print: $!";
+        close $fh or die "close: $!";
+        rename $tmp, $p or die "rename: $!";
+        1;
+    } or _log($ctx->{log}, 'operator_gate_attempt_unrecorded', { decision => $id, error => _fleet_thread_err($@) });
+    _log($ctx->{log}, 'operator_gate_failed', { decision => $id, attempt => $n, why => $why });
+    return $n;
+}
+
+# _operator_gate_fire($ctx, $t, $key, $id) -> 1 | 0. Names the record, then
+# spawns the judge, then marks it in flight -- the escalation-resolve order.
+sub _operator_gate_fire {
+    my ($ctx, $t, $key, $id) = @_;
+    my $runs  = $ctx->{runs};
+    my $spawn = $t->{spawn_judge};
+    my $now   = $t->{now} // time;
+    require File::Path;
+    File::Path::make_path("$runs/" . OPERATOR_GATE_KIND);
+    my $decf = "$runs/" . OPERATOR_GATE_KIND . "/$key.decision";
+    my $dtmp = "$decf.tmp.$$";
+    my $named = 0;
+    if (open my $fh, '>', $dtmp) {
+        $named = (print $fh $id) ? 1 : 0;
+        $named = 0 unless close $fh;
+        $named = 0 unless $named && rename $dtmp, $decf;
+        unlink $dtmp unless $named;
+    }
+    my $rc = $named ? eval { $spawn->({ kind => 'operator-gate', pkg => $key }) } : 'decision_write_failed';
+    $rc = 'spawn_died' unless defined $rc;
+    if ($rc eq '0' && mark_judge_inflight($runs, OPERATOR_GATE_KIND, $key, $now)) {
+        _log($ctx->{log}, 'operator_gate_fire', { package => $key, decision => $id });
+        return 1;
+    }
+    _log($ctx->{log}, 'judge_spawn_failed', { kind => OPERATOR_GATE_KIND, package => $key, decision => $id,
+        rc => ($rc eq '0' ? 'inflight_marker_failed' : $rc) });
+    unlink $decf;
+    _operator_gate_failed($ctx, $id, 'the gate judge could not be started');
+    return 0;
+}
+
+# _operator_gate_consume($ctx, $t, $key, $unreachable) -> 'idle'|'busy'|'done'.
+# Polls one in-flight gate. $unreachable->($rec) says whether no escalation
+# resolver can take the record (passed to the apply step). Never dies.
+sub _operator_gate_consume {
+    my ($ctx, $t, $key, $unreachable) = @_;
+    my $runs = $ctx->{runs};
+    my $log  = $ctx->{log};
+    my $kind = OPERATOR_GATE_KIND;
+    my $started = judge_inflight($runs, $kind, $key);
+    return 'idle' unless defined $started;
+    my $pid_alive    = $t->{pid_alive}    || \&pid_alive;
+    my $read_verdict = $t->{read_verdict} || sub { my ($k, $p) = @_; read_judge_verdict($runs, $k, $p) };
+    my $now = $t->{now} // time;
+    my $tun = $t->{tunables} || {};
+
+    my $jp = judge_pid($runs, $kind, $key);
+    return 'busy' if defined $jp && $pid_alive->($jp);
+    my $decf = "$runs/$kind/$key.decision";
+    my $did  = _read_file($decf);
+    if (defined $did) { $did =~ s/\A\s+//; $did =~ s/\s+\z//; }
+    $did = undef unless _operator_gate_id_ok($did);
+
+    my $v = $read_verdict->($kind, $key);
+    unless (defined $v) {
+        # A judge whose pid file says it ran and is now dead wrote nothing:
+        # that attempt is over now, not after the timeout (a reauth or
+        # broken-env pause would otherwise sit unfiled for the whole bound).
+        my $timed_out = ($now - ($started || 0)) > ($tun->{operator_gate_to} // 600);
+        return 'busy' unless defined $jp || $timed_out;
+        _log($log, ($timed_out ? 'judge_timeout' : 'judge_no_verdict'), { kind => $kind, package => $key,
+            (defined $did ? (decision => $did) : ()) });
+        clear_judge_inflight($runs, $kind, $key);
+        unlink $decf;
+        _operator_gate_failed($ctx, $did, $timed_out ? 'the gate judge timed out without a verdict'
+                                                     : 'the gate judge exited without a verdict') if defined $did;
+        return 'done';
+    }
+    clear_judge_inflight($runs, $kind, $key);
+    archive_judge_verdict($runs, $kind, $key, $now, $log);
+    clear_judge_verdict($runs, $kind, $key);
+    unlink $decf;
+    unless (defined $did) {
+        _log($log, 'operator_gate_orphan_verdict', { package => $key, detail => 'verdict landed with no recorded decision id' });
+        return 'done';
+    }
+    my ($ok, $why) = operator_gate_verdict_ok($v);
+    unless ($ok) {
+        _operator_gate_failed($ctx, $did, "malformed verdict: $why");
+        return 'done';
+    }
+    my $rec = _read_json(escalations_dir($runs) . "/$did.json");
+    unless (ref $rec eq 'HASH') {
+        _log($log, 'operator_gate_moot', { decision => $did, why => 'the record left the queue while it was being gated' });
+        _operator_gate_reset($runs, $did);
+        return 'done';
+    }
+    my $vtmp = "$runs/$kind/$key.verdict.landed.json";
+    my $wrote = eval {
+        open my $fh, '>', $vtmp or die "open: $!";
+        print $fh JSON::PP->new->canonical->encode($v) or die "print: $!";
+        close $fh or die "close: $!";
+        1;
+    };
+    unless ($wrote) {
+        _operator_gate_failed($ctx, $did, 'could not hand the verdict to the apply step: ' . _fleet_thread_err($@));
+        unlink $vtmp;
+        return 'done';
+    }
+    my @cmd = ($^X, "$DIR/bp-resolve.pl", $ctx->{bp}, '--apply-gate-verdict', $vtmp,
+               '--decision', $did, '--bp-dir', $ctx->{bpdir});
+    push @cmd, '--resolver-unavailable' if $unreachable && $unreachable->($rec);
+    my $rc = system(@cmd);
+    unlink $vtmp;
+    if ($rc == 0) {
+        _operator_gate_reset($runs, $did);
+    } else {
+        my $ec = $rc == -1 ? -1 : ($rc >> 8);
+        _operator_gate_failed($ctx, $did, $ec == 3 ? 'the apply step refused the verdict (its question failed the plain-language check)'
+                                                   : "the apply step failed (exit $ec)");
+    }
+    return 'done';
+}
+
+# _operator_gate_clearance($ctx, $t, $id, $rec, \%busy, $unreachable)
+#   -> ($gate_or_undef, $rec_now). $gate is what S3 files with: the record's
+#   operator_gate hash, or an unreviewed fallback { note } when the gate could
+#   not run. undef means "not this tick". $rec_now is the record as it stands
+#   after any verdict consumed here (undef if it left the queue).
+sub _operator_gate_clearance {
+    my ($ctx, $t, $id, $rec, $busy, $unreachable) = @_;
+    my $runs = $ctx->{runs};
+    my $tun  = $t->{tunables} || {};
+    if (my $g = operator_gate_cleared($rec)) { return ({ %$g }, $rec); }
+
+    my $cap = $tun->{operator_gate_attempts} // 3;
+    my $n = operator_gate_attempts($runs, $id);
+    if ($n >= $cap) {
+        _inbox_bridge_once($ctx, "gate_exhausted:$id:$n", sub {
+            _log($ctx->{log}, 'operator_gate_exhausted', { decision => $id, attempts => $n });
+        });
+        return ({ unreviewed => 1, note => "Note: the check that keeps technical questions away from you could not "
+                . "reach a verdict on this one after $n attempts, so it reaches you unreviewed rather than being lost." }, $rec);
+    }
+    my $key = $rec->{package};
+    unless (_operator_gate_id_ok($key)) {
+        _inbox_bridge_once($ctx, "gate_unkeyable:$id", sub {
+            _log($ctx->{log}, 'operator_gate_unavailable', { decision => $id, why => 'record has no usable package name' });
+        });
+        return ({ unreviewed => 1, note => "Note: the check that keeps technical questions away from you could not "
+                . "run for this one, so it reaches you unreviewed rather than being lost." }, $rec);
+    }
+    return (undef, $rec) if $busy->{$key};
+    if ($t->{shutdown}) { return (undef, $rec); }
+    unless (ref $t->{spawn_judge} eq 'CODE') {
+        _inbox_bridge_once($ctx, 'gate_no_spawn', sub {
+            _log($ctx->{log}, 'operator_gate_unavailable', { why => 'no judge spawner; nothing is filed until a gate can run' });
+        });
+        return (undef, $rec);
+    }
+    $busy->{$key} = 1;   # one gate per package per tick, whatever happens next
+    return (undef, $rec) unless _operator_gate_fire($ctx, $t, $key, $id);
+    # A verdict can already be on disk (an injected spawner, or a very fast
+    # judge): consume it now rather than a tick later.
+    my $st = _operator_gate_consume($ctx, $t, $key, $unreachable);
+    return (undef, $rec) unless $st eq 'done';
+    my $fresh = _read_json(escalations_dir($runs) . "/$id.json");
+    return (undef, undef) unless ref $fresh eq 'HASH';
+    my $g = operator_gate_cleared($fresh);
+    return ($g ? { %$g } : undef, $fresh);
+}
+
+# _operator_gate_inbox_text($gate, $q, $id, $kind, $f2) -> ($title, $body).
+# $q is the record's own (scrubbed) question text, or undef. An `operator`
+# verdict leads with the gate's plain question and keeps the agents' text
+# below it, marked as background.
+sub _operator_gate_inbox_text {
+    my ($gate, $q, $id, $kind, $f2) = @_;
+    my $kdisp = defined $kind ? $kind : '';
+    my $plain = (ref $gate eq 'HASH' && defined $gate->{question} && !ref $gate->{question} && $gate->{question} =~ /\S/)
+              ? _inbox_bridge_scrub_utf8(_json_bytes($gate->{question})) : undef;
+    my $note  = (ref $gate eq 'HASH' && defined $gate->{note} && !ref $gate->{note} && $gate->{note} =~ /\S/)
+              ? _inbox_bridge_scrub_utf8(_json_bytes($gate->{note})) : undef;
+    $note =~ s/[\r\n]+/ /g if defined $note;
+    my $title = defined $plain ? fleet_thread_reason($plain)
+              : defined $q     ? fleet_thread_reason($q)
+              : "Escalation $id (kind $kdisp) needs your answer";
+    my $orig = defined $q ? $q : $title;
+    my $body = defined $plain
+        ? "$plain\n\nBackground, in the agents' own words (you should not need it to answer):\n$orig"
+        : $orig;
+    $body .= "\n\n$note" if defined $note;
+    $body .= "\n\nEscalation: $id (kind $kdisp)"
+           . ($f2 ? "\nThe escalation resolver could not triage this escalation." : '') . "\n";
+    return ($title, $body);
+}
+
 # _inbox_bridge_tick($ctx, \%t) -> $applied_count. Spec §3.1. t: status, reg,
-# tunables, answer (coderef). NEVER dies. $applied_count is how many answered
+# tunables, answer (coderef), paused; and the operator gate's judge seams
+# (spawn_judge, read_verdict, pid_alive, now, shutdown -- run()'s own). Without
+# spawn_judge no gate can run, so S3 files nothing. NEVER dies. $applied_count is how many answered
 # items had their action successfully applied (rc 0) this tick -- review-1.md
 # M1: the caller uses a non-zero count as the signal to refresh its own
 # $meta/$status/$att/$pid/$sid/$paused snapshot before any later same-tick
@@ -1326,7 +1656,46 @@ sub _inbox_bridge_tick {
     _inbox_bridge_log_error($ctx, 's2_items', $@) unless $inbox_ok;
     return $applied_count unless $inbox_ok;   # S3 depends on S2 (open-inbox) having succeeded
 
-    # S3 -- file: one new item per unfiled operator-owned escalation.
+    # The operator gate (see THE OPERATOR GATE above). $unreachable says
+    # whether no escalation resolver could take a record if the gate handed
+    # it to the agents: the F2 test, asked of the record as if it were
+    # resolver-owned.
+    my $unreachable = sub {
+        my ($r) = @_;
+        return 0 unless ref $r eq 'HASH';
+        my %probe = %$r;
+        $probe{category} = 'implementation';
+        my (undef, $f2p) = _inbox_bridge_eligible_now(\%probe, $reg, $tun, $paused);
+        return $f2p ? 1 : 0;
+    };
+    my $gate_t = { spawn_judge => $t->{spawn_judge}, read_verdict => $t->{read_verdict},
+                   pid_alive => $t->{pid_alive}, now => $t->{now}, shutdown => $t->{shutdown},
+                   tunables => $tun };
+    # S2.5 -- poll every gate in flight; a landed verdict is applied now.
+    my %gate_busy;
+    eval {
+        my $gdir = "$runs/" . OPERATOR_GATE_KIND;
+        if (opendir(my $gdh, $gdir)) {
+            my @keys = sort map { /\A(.+)\.inflight\z/ ? $1 : () } readdir $gdh;
+            closedir $gdh;
+            for my $key (@keys) {
+                my $st = _operator_gate_consume($ctx, $gate_t, $key, $unreachable);
+                $gate_busy{$key} = 1 if $st eq 'busy';
+            }
+        }
+        # An attempt count outlives nothing: drop counts for records gone from the queue.
+        if (opendir(my $adh, "$gdir/attempts")) {
+            my $edir = escalations_dir($runs);
+            for my $aid (grep { _operator_gate_id_ok($_) } readdir $adh) {
+                unlink "$gdir/attempts/$aid" unless -e "$edir/$aid.json";
+            }
+            closedir $adh;
+        }
+        1;
+    } or _inbox_bridge_log_error($ctx, 's25_operator_gate', $@);
+
+    # S3 -- file: one new item per unfiled operator-owned escalation that the
+    # operator gate has cleared.
     eval {
         for my $id (_inbox_bridge_escalation_ids($runs)) {
             next if $has_open_item{$id};
@@ -1350,6 +1719,15 @@ sub _inbox_bridge_tick {
                 next;
             }
 
+            # The operator gate: nothing is filed without its `operator`
+            # verdict (or its unreviewed fallback once it cannot run).
+            my $gate;
+            ($gate, $rec) = _operator_gate_clearance($ctx, $gate_t, $id, $rec, \%gate_busy, $unreachable);
+            next unless $gate && ref $rec eq 'HASH';
+            # A verdict consumed just now may have changed the record.
+            ($f1, $f2, $cat) = _inbox_bridge_eligible_now($rec, $reg, $tun, $paused);
+            next unless $f1 || $f2;
+
             my $q = (defined $rec->{product_question} && length $rec->{product_question}) ? $rec->{product_question}
                   : (defined $rec->{question} && length $rec->{question}) ? $rec->{question} : undef;
             # review-1.md S1/N1 + redteam-1.md M2: undo the JSON::PP flag
@@ -1360,15 +1738,16 @@ sub _inbox_bridge_tick {
             # through fleet_thread_reason) silently fails file() below with
             # no operator-visible signal (redteam-1.md M2, reproduced).
             $q = _inbox_bridge_scrub_utf8(_json_bytes($q)) if defined $q;
-            my $kdisp = defined $kind ? $kind : '';
-            my $title = defined $q ? fleet_thread_reason($q) : "Escalation $id (kind $kdisp) needs your answer";
-            my $body  = (defined $q ? $q : $title) . "\n\n" . "Escalation: $id (kind $kdisp)"
-                      . ($f2 ? "\nThe escalation resolver could not triage this escalation." : '') . "\n";
+            # The gate's plain question leads; the agents' own text follows
+            # as background; a bounded or unreviewed filing carries its note.
+            my ($title, $body) = _operator_gate_inbox_text($gate, $q, $id, $kind, $f2);
 
             my $new_item = eval { Almanac::Inbox::file(root => $ctx->{root}, title => $title, body => $body,
                 link => $link, choices => $choices); };
             if ($new_item) {
-                _log($log, 'inbox_item_filed', { escalation => $id, item => $new_item->{id}, rule => ($f1 ? 'F1' : 'F2') });
+                _operator_gate_reset($runs, $id);
+                _log($log, 'inbox_item_filed', { escalation => $id, item => $new_item->{id}, rule => ($f1 ? 'F1' : 'F2'),
+                    gate => ($gate->{unreviewed} ? 'unreviewed' : $gate->{bounded} ? 'bounded' : 'operator') });
             } else {
                 # redteam-1.md M2: a filing failure (store refused, bad_title,
                 # lock timeout, or -- pre-scrub -- invalid UTF-8) must not be
@@ -3924,10 +4303,12 @@ sub clear_judge_inflight {
 
 # judge_worker_type($kind) -- mirrors bp-judge.sh's own AGENT_FILE case
 # exactly, not invented: escalation-resolve is bp-escalation-resolver
-# (different stem, no "-judge" suffix); every other kind is bp-<kind>-judge.
+# (different stem, no "-judge" suffix), and so is operator-gate (bp-operator-gate);
+# every other kind is bp-<kind>-judge.
 sub judge_worker_type {
     my ($kind) = @_;
     return 'bp-escalation-resolver' if defined($kind) && $kind eq 'escalation-resolve';
+    return 'bp-operator-gate'       if defined($kind) && $kind eq 'operator-gate';
     my $k = defined($kind) ? $kind : '';
     return "bp-$k-judge";
 }
@@ -4388,6 +4769,8 @@ sub _tunables_base {
         corr_cap   => $ENV{BP_CORRECTIVE_CAP}     // 1,        # A5 Q2: corrective relaunches/pkg
         judge_to   => $ENV{BP_JUDGE_TIMEOUT_SECS} // 1800,     # A5: crashed/hung-judge fail-safe
         judge_spawn_cap => $ENV{BP_JUDGE_SPAWN_CAP} // 3,      # A5 H2: park after N harvest-spawn failures
+        operator_gate_to       => $ENV{BP_OPERATOR_GATE_TIMEOUT_SECS} // 600, # the operator gate: wall-clock bound per attempt
+        operator_gate_attempts => $ENV{BP_OPERATOR_GATE_ATTEMPTS}     // 3,   # the operator gate: failed attempts per record before it is filed unreviewed
         harvest_reaudit_cap => $ENV{BP_HARVEST_REAUDIT_CAP} // 2,  # #30: re-audit (not reopen) a done pkg whose harvest didn't complete, up to N times
         harvest_defer_cap => $ENV{BP_HARVEST_DEFER_CAP} // 2,  # b09 spec §2.4: sibling-red defer attempts before reopen/park
         conformance_spawn_cap => $ENV{BP_CONFORMANCE_SPAWN_CAP} // 2, # b05: whole-blueprint conformance gate firings per run
@@ -5237,7 +5620,11 @@ sub run {
             # closed/applied escalation this pass is visible to 05's own tick
             # in the SAME tick.
             my $inbox_applied = $bctx ? _inbox_bridge_tick($bctx, { status => $status, reg => read_registry($runs),
-                tunables => $t, answer => $answer_escalation, paused => $paused }) : 0;
+                tunables => $t, answer => $answer_escalation, paused => $paused,
+                # the operator gate (fifth judge kind) fires and polls from here,
+                # so it runs on paused ticks too -- see THE OPERATOR GATE.
+                spawn_judge => $spawn_judge, read_verdict => $read_verdict, pid_alive => $pid_alive,
+                now => $now, shutdown => $shutdown }) : 0;
             # review-1.md M1: an applied answer (relaunch/reset/accept/drop)
             # flips the ledger and/or unlinks the escalation file THROUGH A
             # SUBPROCESS -- $meta/$status/$att/$pid/$sid and $paused were

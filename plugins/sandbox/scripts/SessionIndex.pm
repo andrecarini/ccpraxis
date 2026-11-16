@@ -33,7 +33,7 @@ our $MAX_TEXT_CHARS = 4096;         # first_typed / last_typed truncation
 
 my $DECODER = JSON::PP->new->utf8;
 
-our $PREAMBLE_RE = qr/\A\s*You are (?:a|the) ccpraxis \*{0,2}(?:butler coordinator|resolve-judge|harvest-judge|escalation-resolver)\b/;
+our $PREAMBLE_RE = qr/\A\s*You are (?:a|the) ccpraxis \*{0,2}(?:butler coordinator|resolve-judge|harvest-judge|escalation-resolver|operator-gate)\b/;
 
 my @NOISE_PREFIXES = (
     '[Request interrupted',

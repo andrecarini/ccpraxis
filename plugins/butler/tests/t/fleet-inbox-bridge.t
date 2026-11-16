@@ -170,13 +170,39 @@ sub setup_ctx {
     return ($ctx, $reason);
 }
 
+# The operator gate (fifth judge kind) files nothing it has not cleared, so
+# every tick here carries a gate seam. approving_gate_spawn is a stand-in
+# gate that passes every question through to the operator unchanged (its plain
+# question IS the record's own product_question/question), which keeps this
+# oracle about the bridge itself. The gate's own behaviour is pinned in
+# operator-gate-bridge.t.
+sub approving_gate_spawn {
+    my ($runs) = @_;
+    return sub {
+        my ($a) = @_;
+        return 0 unless ($a->{kind} // '') eq 'operator-gate';
+        my $id = slurp("$runs/operator-gate/$a->{pkg}.decision");
+        return 1 unless defined $id;
+        my $rec = read_json(decision_path($runs, $id)) // {};
+        my $q = $rec->{product_question} // $rec->{question} // 'Decide this.';
+        # A real gate restates a technical question in plain terms (the apply
+        # step refuses one that is not); so does this stand-in.
+        $q = 'The run needs your attention: decide what should happen next.'
+            if $RESOLVE_LOADED && BpResolve::product_question_technical_terms($q);
+        write_file(BpOrch::judge_verdict_path($runs, 'operator-gate', $a->{pkg}),
+            $J->encode({ verdict => 'operator', question => $q, reasoning => 'fixture gate: passes every question through' }));
+        return 0;
+    };
+}
+
 sub tick_bridge {
     my ($ctx, %o) = @_;
     my $status = $o{status} // {};
     my $reg    = $o{reg}    // {};
     my $tun    = { judge_spawn_cap => 3, %{ $o{tunables} // {} } };
     my $answer = $o{answer} // sub { 1 };
-    BpOrch::_inbox_bridge_tick($ctx, { status => $status, reg => $reg, tunables => $tun, answer => $answer });
+    BpOrch::_inbox_bridge_tick($ctx, { status => $status, reg => $reg, tunables => $tun, answer => $answer,
+        spawn_judge => approving_gate_spawn($ctx->{runs}), pid_alive => sub { 0 }, now => time });
 }
 
 # The default answer seam from spec §2.4, built directly in this test (the
@@ -971,13 +997,14 @@ sub base_run_opts {
                       corr_cap=>1, judge_to=>100000, judge_spawn_cap=>3 },
         http_get => sub { { status => 200, content => $J->encode({ five_hour=>{utilization=>10,resets_at=>'2099-01-01T00:00:00+00:00'}, seven_day=>{utilization=>5,resets_at=>'2099-01-01T12:00:00+00:00'} }) } },
         http_post => sub { { status => 200, content => '{}' } },
-        launch => sub { 0 }, pid_alive => sub { 0 }, spawn_judge => sub { 0 },
+        launch => sub { 0 }, pid_alive => sub { 0 }, spawn_judge => approving_gate_spawn("$o{bpdir}/runs"),
     );
 }
 sub escalation_ids_for_pkg {
     my ($runs, $pkg) = @_;
     opendir(my $dh, "$runs/escalations") or return ();
-    my @ids = grep { /^\Q$pkg\E--/ } readdir $dh;
+    # records only: an apply step's <id>.json.lock beside a record is not an escalation
+    my @ids = grep { /^\Q$pkg\E--.*\.json\z/ } readdir $dh;
     closedir $dh;
     return @ids;
 }
