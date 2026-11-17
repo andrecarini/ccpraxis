@@ -998,7 +998,7 @@ if ($verb eq 'off') {
     print STDERR _bytes(join('',
         "butler-continuity: off not done yet: disarming takes two steps, and continuity is unchanged for session $S8.\n",
         "Disarm is right only when the goal below is met, or this session can no longer advance it (every remaining step needs the operator or is blocked) and no actionable work is left.\n",
-        "It is NOT right for: waiting on an operator answer (file the question and keep working), pausing between steps, or stopping after one slice while more remains.\n",
+        "It is NOT right for: pausing between steps, stopping after one slice while more remains, or waiting on an operator answer while other work can still proceed (file the question and keep working).\n",
         "goal: $goal\n",
         "reason: $reason\n",
         "To disarm, run this within 15 minutes:\n", "  butler-continuity off-confirm --otp $otp --justification '<how the goal is met, or why this session cannot advance it>'\n"));
