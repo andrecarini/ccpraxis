@@ -158,7 +158,9 @@ my $wt = "$T/wt";
 git('-C', $repo, 'worktree', 'add', '-q', $wt);
 my $wt_gitdir = `"$REAL_GIT" -C "$wt" rev-parse --git-path FETCH_HEAD`;
 chomp $wt_gitdir;
-$wt_gitdir = "$wt/$wt_gitdir" unless $wt_gitdir =~ m{^/};
+# git.exe on Windows answers with a drive-letter path (C:/...): absolute too,
+# the same test statusline.pl's $abs_git_path applies.
+$wt_gitdir = "$wt/$wt_gitdir" unless $wt_gitdir =~ m{^(?:/|[A-Za-z]:[\\/])};
 { open my $fh, '>', $wt_gitdir or die "$wt_gitdir: $!"; close $fh; }
 ok(-f "$wt/.git", '(setup) the worktree has a .git FILE');
 reset_log();

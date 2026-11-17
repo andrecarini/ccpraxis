@@ -259,6 +259,7 @@ sub parse_machine_inspect {
     return undef unless defined $raw && !ref $raw && $raw =~ /\S/;
     my $d = eval { JSON::PP->new->decode($raw) };
     return undef unless defined $d;
+    _bytes_deep($d);   # paths are used as filenames: see _bytes_deep
     $d = $d->[0] if ref $d eq 'ARRAY';
     return undef unless ref $d eq 'HASH';
     my $name = $d->{Name};
@@ -313,8 +314,33 @@ sub _decode_doc {
     return undef unless defined $raw && !ref $raw && $raw =~ /\S/;
     my $d = eval { JSON::PP->new->decode($raw) };
     return undef unless defined $d;
+    _bytes_deep($d);
     $d = $d->[0] if ref $d eq 'ARRAY';
     return ref $d eq 'HASH' ? $d : undef;
+}
+
+# _bytes_deep($decoded) -> $decoded, every string in it a BYTE string again.
+# JSON::PP's non-utf8 decode hands back UPGRADED strings: the characters are
+# podman's UTF-8 bytes, but the internal buffer is their UTF-8 re-encoding.
+# Perl's open, -e/-d and exec use that internal buffer, so a path with a
+# non-ASCII letter (an accented user name in the home) named a file that does not
+# exist: "cannot read the share list" on a machine whose config was right
+# there. Downgrading restores the bytes podman printed; a string that cannot
+# downgrade (a \u escape above U+00FF) is encoded as UTF-8 instead.
+sub _bytes_deep {
+    my ($d) = @_;
+    if (ref $d eq 'HASH') {
+        _bytes_deep(\$_) for values %$d;
+    } elsif (ref $d eq 'ARRAY') {
+        _bytes_deep(\$_) for @$d;
+    } elsif (ref $d eq 'SCALAR' || ref $d eq 'REF') {
+        my $v = $$d;
+        if (ref $v) { _bytes_deep($v) }
+        elsif (defined $v && utf8::is_utf8($v)) {
+            utf8::encode($$d) unless utf8::downgrade($$d, 1);
+        }
+    }
+    return $d;
 }
 
 # boolish($v) -> 1 | 0 | undef: a JSON boolean, or a 1/0/true/false/yes/no

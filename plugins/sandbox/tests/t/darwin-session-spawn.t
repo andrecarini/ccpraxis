@@ -113,7 +113,11 @@ SKIP: {
     my ($open, $dash_a, $app, $file) = @{ $CALLS[0] || [] };
     is_deeply([$open, $dash_a, $app], ['open', '-a', 'Terminal'], 'it is `open -a Terminal`');
     like($file // '', qr{\A\Q$tmp\E/claude-session-\w+\.command\z}, '...on a .command file in the launcher temp dir');
-    is(sprintf('%04o', (stat $file)[2] & 07777), '0700', '...created 0700');
+    SKIP: {
+        skip 'POSIX modes are not stored on NTFS: MSYS perl reports 0755 whatever was asked', 1
+            if $^O =~ /^(?:MSWin32|msys|cygwin)$/;
+        is(sprintf('%04o', (stat $file)[2] & 07777), '0700', '...created 0700');
+    }
     my $text = do { open my $f, '<', $file or die; local $/; <$f> };
     like($text, qr{^exec '[^']*perl[^']*' '/opt/ccpraxis/plugins/sandbox/scripts/launcher\.pl' '--session' '/Users/u/My Project'$}m,
         '...which execs this checkout\'s launcher.pl --session <project>');

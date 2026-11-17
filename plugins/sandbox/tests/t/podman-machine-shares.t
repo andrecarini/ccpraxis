@@ -106,6 +106,22 @@ sub fake_home {
     spew("$d/rel.json", '{"schema":1,"projects":["relative/dir"]}');
     (undef, $err) = PodmanMachine::read_state("$d/rel.json");
     like($err, qr/absolute paths/, 'B: a relative project path is refused');
+
+    # Non-ASCII paths (an accented user name) stay the BYTES the filesystem
+    # uses: written once-encoded, read back as a byte string that opens.
+    my $cafe = "$d/Caf\xc3\xa9";
+    make_path("$cafe/podman");
+    my ($wok) = PodmanMachine::write_state("$d/utf.json", { projects => [$cafe], test_scratch => 1, install_root => $cafe });
+    ok($wok, 'B: a list with a non-ASCII project path is written');
+    like(slurp("$d/utf.json"), qr/Caf\xc3\xa9"/, 'B: ...as UTF-8, encoded once');
+    ($st) = PodmanMachine::read_state("$d/utf.json");
+    is_deeply([ map { utf8::is_utf8($_) ? 'chars' : $_ } @{ $st->{projects} }, $st->{install_root} ], [$cafe, $cafe],
+        'B: ...and read back as the same byte paths');
+    ok(-d $st->{projects}[0], 'B: ...which name the directory on disk');
+    spew("$cafe/podman/m.json", '{"Mounts":[{"Source":"/x","Target":"/x"}]}');
+    my $info = HostPlatform::parse_machine_inspect(JSON::PP->new->encode([{ Name => 'm', ConfigDir => { Path => "$cafe/podman" } }]));
+    ok($info && !utf8::is_utf8($info->{config_dir}) && -f "$info->{config_dir}/$info->{name}.json",
+        'B: a non-ASCII ConfigDir from podman machine inspect names the config file on disk');
 }
 
 # ---------------------------------------------------------------------------

@@ -212,8 +212,28 @@ sub read_state {
     my $ir = $d->{install_root};
     return (undef, "$path: install_root must be an absolute path")
         if defined $ir && (ref $ir || $ir !~ m{\A/});
-    my @p = map { my $x = $_; $x =~ s{/+\z}{}; $x } @$projects;
+    my @p = map { my $x = _path_bytes($_); $x =~ s{/+\z}{}; $x } @$projects;
+    $ir = _path_bytes($ir);
     return ({ projects => \@p, test_scratch => $ts, install_root => $ir, exists => 1 }, undef);
+}
+
+# The share list is UTF-8 JSON, but every path the rest of this module (and
+# open, -d, the init argv) handles is a BYTE string, as abs_path and $HOME give
+# it. The ->utf8 decode above yields characters; a non-ASCII path left that way
+# names a file that does not exist and never equals the same folder read from
+# disk. So paths are encoded back to bytes on the way in, and decoded to
+# characters on the way out (write_state), never encoded twice.
+sub _path_bytes {
+    my ($s) = @_;
+    return $s unless defined $s && !ref $s && utf8::is_utf8($s);
+    return Encode::encode('UTF-8', $s);
+}
+sub _path_chars {
+    my ($s) = @_;
+    return $s unless defined $s && !ref $s && !utf8::is_utf8($s);
+    my $copy = $s;
+    my $c = eval { Encode::decode('UTF-8', $copy, Encode::FB_CROAK()) };
+    return defined $c ? $c : $s;
 }
 
 # write_state($path, $state) -> (1, undef) | (0, $error). Atomic: temp file in
@@ -222,10 +242,10 @@ sub write_state {
     my ($path, $st) = @_;
     my %doc = (
         schema       => $STATE_SCHEMA,
-        projects     => [ @{ $st->{projects} || [] } ],
+        projects     => [ map { _path_chars($_) } @{ $st->{projects} || [] } ],
         test_scratch => ($st->{test_scratch} ? JSON::PP::true() : JSON::PP::false()),
     );
-    $doc{install_root} = $st->{install_root} if defined $st->{install_root};
+    $doc{install_root} = _path_chars($st->{install_root}) if defined $st->{install_root};
     my $dir = dirname($path);
     eval { File::Path::make_path($dir) unless -d $dir; 1 };
     return (0, "cannot create $dir") unless -d $dir;

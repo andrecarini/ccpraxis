@@ -101,6 +101,9 @@ sub setup {
     write_text("$clone/scripts/promote.pl", stub(<<'PL'));
 my %a = @ARGV;
 my ($clone, $live) = @a{'--clone', '--live'};
+# Export spawns this with MSYS2_ARG_CONV_EXCL=* on Windows, so hand-translate
+# /c/... -> C:/... for git.exe, as the real promote.pl's git_path() does.
+s{^/([A-Za-z])/}{\u$1:/} for $clone, $live;
 system('git', '-C', $live, 'pull', '-q', '--ff-only', $clone, 'main') == 0 or exit 2;
 print "promote: stand-in fast-forward\n";
 exit 0;

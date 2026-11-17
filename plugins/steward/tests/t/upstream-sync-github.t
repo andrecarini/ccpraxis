@@ -158,7 +158,9 @@ sub push_choice {
     is(($d // {})->{id}, 'upstream.push_confirmation', 'merge: ...with the upstream id');
     like(($d // {})->{detail} // '', qr/local work/, 'merge: the detail lists the local commit');
     like(($d // {})->{detail} // '', qr/Merge/, 'merge: ...and the merge commit');
-    like(($d // {})->{detail} // '', qr/\Q$f->{gh}\E/, 'merge: ...and the remote');
+    # The detail names the remote as git stores it; on Windows the fixture
+    # handed git a native C:/ spelling (git() above), so accept either form.
+    like(($d // {})->{detail} // '', qr/\Q$f->{gh}\E|\Q@{[ _native_path($f->{gh}) ]}\E/, 'merge: ...and the remote');
     is(($d // {})->{data}{count}, 2, 'merge: data.count is every outgoing commit');
     my $main = git_out($f->{clone}, 'rev-parse', 'main');
     is(push_choice($r), 'push_' . substr($main, 0, 12), 'merge: the push choice names the exact commit shown');
