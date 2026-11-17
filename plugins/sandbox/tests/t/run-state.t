@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # s10-panel: orchestrator/run state on the dashboard (RunState.pm +
 # launcher.pl wiring + Dashboard.pm Run-panel append).
 #

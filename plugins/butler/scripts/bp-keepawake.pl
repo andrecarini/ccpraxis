@@ -69,6 +69,36 @@
 # logged warning — never a false claim of holding one. That failure mode is the
 # whole reason 3c661a0 exists (the production spawn/kill defaults were empty
 # subs, so the director REPORTED managing a lock while holding none).
+#
+# MACOS. The same contract, with caffeinate as the assertion and the `hold`
+# command (hold_main, below) in the role keep-awake.ps1 plays on Windows: a
+# small detached process that writes ITS OWN pid into the pid file and lets go
+# when the lease goes stale (nobody touched the pid file for 900s), when the
+# pid file stops naming it (released or replaced), or when its owner exits.
+#
+# The holder is NOT implemented here. It is KeepAwake::hold_main in the
+# sandbox plugin, the one macOS holder this file shares with the launcher's
+# dashboard lock (they had drifted: -i here, -i -s there), and it follows the
+# operator's rule for this machine: the assertion is `caffeinate -i -w <holder
+# pid>` and nothing else, so closing the lid always sleeps the Mac, and it is
+# held only while the Mac is on AC power -- never started on battery, stopped
+# within seconds of a switch to battery, taken again when AC returns while the
+# lease is live. `-w` ties caffeinate to the holder, so a holder killed by any
+# means -- SIGKILL included -- takes the assertion with it. KeepAwake.pm's
+# header has the per-flag reasoning and the battery bound.
+#
+# WHO MAY HOLD IT. Only this machinery: the continuity lease's refresher
+# (BpContinuityLease), which holds it while an armed session has work in
+# flight and releases it while every armed session is only waiting for the
+# operator, and the drive-solo director and fleet orchestrator for their own
+# runs. A session never takes or drops one by hand: the butler guard
+# guard-sleep-control.sh denies caffeinate, pmset and powercfg changes,
+# systemd-inhibit and a hand-started holder in the Bash tool, and names
+# arming continuity instead. This machinery starts its holder by fork+exec
+# from perl, never through the Bash tool, so that guard never sees it; nor
+# does it see Claude Code's own `caffeinate -i -t 300`, a child of the claude
+# process. bp-preflight.pl's power.sleep_intact row (sleep_override_findings,
+# below) warns when something else overrides the Mac's sleep rule anyway.
 
 package BpKeepAwake;
 use strict;
@@ -145,6 +175,50 @@ sub helper_path {
     my $raw = "$DIR/../../sandbox/scripts/keep-awake.ps1";
     my $abs = Cwd::abs_path($raw);
     return defined $abs ? $abs : $raw;
+}
+
+sub _is_windows { return $^O =~ /^(MSWin32|msys|cygwin)$/ ? 1 : 0 }
+
+# The macOS assertion is defined ONCE, in the sandbox plugin's KeepAwake.pm
+# (caffeinate_bin, caffeinate_argv), and shared with the launcher's dashboard
+# lock -- the same relationship this file already has with keep-awake.ps1 on
+# Windows. Loaded lazily and only on the macOS paths: everything else that
+# requires this file (the drivers, the lease, the Windows host) never needs it,
+# and a missing sibling must not break them.
+sub keepawake_lib_path { return "$DIR/../../sandbox/scripts/KeepAwake.pm" }
+
+my $_KA_LIB;
+sub _ka_lib {
+    return $_KA_LIB if defined $_KA_LIB;
+    return $_KA_LIB = 1 if defined &KeepAwake::caffeinate_argv;
+    my $p = keepawake_lib_path();
+    $_KA_LIB = (-f $p && eval { require $p; 1 } && defined &KeepAwake::caffeinate_argv) ? 1 : 0;
+    return $_KA_LIB;
+}
+
+# caffeinate_bin() -> path | undef -- KeepAwake::caffeinate_bin (which honours
+# the CCPRAXIS_CAFFEINATE_BIN test seam), or undef when that library is absent.
+sub caffeinate_bin {
+    return undef unless _ka_lib();
+    return KeepAwake::caffeinate_bin();
+}
+
+# holder_state($pid_file) -> 'asserted' | 'standby' | undef -- what the macOS
+# holder named by $pid_file is doing (KeepAwake::holder_state): caffeinate
+# running on AC power, or standing by off AC. undef when it has written no
+# state, or the library is absent.
+sub holder_state {
+    my ($pid_f) = @_;
+    return undef unless _ka_lib();
+    return KeepAwake::holder_state($pid_f);
+}
+
+# helper_available() -> 0|1 -- can THIS host take a wake-lock at all? The
+# default `powershell_available` seam of apply(). Same PATH-only rule as
+# ps_available: nothing is executed to answer it.
+sub helper_available {
+    return defined(caffeinate_bin()) ? 1 : 0 if $^O eq 'darwin';
+    return ps_available();
 }
 
 # POSIX -> Windows form, for every path handed to powershell.exe.
@@ -416,7 +490,7 @@ sub pin_ps_analysis_cache {
 sub spawn {
     my ($pid_f, $owner, $opts) = @_;
     $owner //= {};
-    return undef unless $^O =~ /^(MSWin32|msys|cygwin)$/;
+    return undef unless _is_windows() || $^O eq 'darwin';
 
     # A TEST MUST NEVER SPAWN A REAL, IMMORTAL OS WAKE-LOCK.
     #
@@ -438,6 +512,8 @@ sub spawn {
     # test that DID reach the real spawn was, by definition, leaking.
     return undef if $ENV{CCPRAXIS_NO_WAKELOCK};
     return undef if defined $0 && $0 =~ /\.t\z/;
+
+    return _spawn_darwin($pid_f, $owner) if $^O eq 'darwin';
 
     my $ps1 = helper_path();
     unless (-f $ps1) { die "keep-awake helper missing: $ps1\n" }
@@ -588,6 +664,71 @@ sub reap_orphan {
     return ($result, $winpid);
 }
 
+# _spawn_darwin($pid_f, \%owner) -> pid. Starts `perl bp-keepawake.pl hold` as
+# a detached process. EXEC, not just fork: a forked child would inherit every
+# descriptor the caller holds -- the continuity refresher's lease.lock flock
+# among them -- and keep that lock alive after the refresher exits, so its
+# successor could never take it. exec drops them (perl marks every descriptor
+# above $^F close-on-exec). The parent writes nothing into the pid file; the
+# holder writes its own pid, exactly as keep-awake.ps1 does.
+#
+# On macOS there is one pid namespace, so owner_winpid -- the name the callers
+# already pass -- is simply the owner's pid (see self_owner_pid).
+#
+# DOUBLE fork: the holder is a grandchild, reparented to launchd at once. The
+# continuity refresher lives for hours and never waits on what it spawns, so a
+# direct child that exits would sit in its process table as a zombie -- one per
+# holder lifetime -- and a zombie answers kill(0) as if it were alive.
+sub _spawn_darwin {
+    my ($pid_f, $owner) = @_;
+    my $script = "$DIR/bp-keepawake.pl";
+    die "keep-awake helper missing: $script\n" unless -f $script;
+    die "caffeinate not found\n" unless defined caffeinate_bin();
+    my $log_f = $pid_f;
+    $log_f =~ s{keepawake\.pid$}{keepawake.log};
+    my @argv = ($^X, $script, 'hold', '--pid-file', $pid_f, '--log-file', $log_f,
+                '--lease', 900);
+    if (defined $owner->{owner_winpid} && $owner->{owner_winpid} =~ /^[1-9]\d*$/) {
+        push @argv, '--owner-pid', $owner->{owner_winpid};
+    }
+    my $clean_desc = owner_desc_clean($owner->{owner_desc});
+    push @argv, '--owner-desc', $clean_desc if defined $clean_desc;
+    require POSIX;
+    my $pid = fork();
+    die "fork: $!\n" unless defined $pid;
+    if ($pid == 0) {
+        open(STDIN,  '<', '/dev/null');
+        open(STDOUT, '>', '/dev/null');
+        open(STDERR, '>', '/dev/null');
+        # Out of the caller's process group: an interrupted Bash tool call
+        # must not take the wake-lock down with it.
+        eval { POSIX::setsid() };
+        my $g = fork();
+        POSIX::_exit(defined $g ? 0 : 1) if !defined $g || $g > 0;
+        exec(@argv) or POSIX::_exit(127);
+    }
+    waitpid($pid, 0);
+    die "fork (holder): failed\n" if $? != 0;
+    return $pid;
+}
+
+# hold_main(@argv) -> exit code. The macOS holder, run as
+# `perl bp-keepawake.pl hold --pid-file F [--log-file L] [--lease S]
+# [--owner-pid P] [--owner-desc D] [--poll S]`. Blocks.
+#
+# The holder itself is KeepAwake::hold_main in the sandbox plugin, shared with
+# the launcher's dashboard lock: it holds `caffeinate -i -w <its pid>` only
+# while the Mac is on AC power, stops it within seconds of a switch to battery,
+# takes it again when AC returns while the lease is live, and lets go for good
+# on a stale lease, a pid file that stops naming it, or an exited owner. This
+# entry point stays so the process keeps the `bp-keepawake.pl hold` command
+# line stop_holder_darwin recognises. Exit 4 when that library is missing.
+sub hold_main {
+    my (@argv) = @_;
+    return 4 unless _ka_lib();
+    return KeepAwake::hold_main(@argv);
+}
+
 # winpid_of($msys_pid) -> positive int | undef -- reads /proc/<pid>/winpid, the
 # only reliable way to map an MSYS pid to the Windows pid Windows tools accept.
 # Never falls back to the MSYS pid; returns undef off Windows.
@@ -604,6 +745,15 @@ sub winpid_of {
 }
 
 sub self_winpid { return winpid_of($$) }
+
+# self_owner_pid() -> the pid a helper should treat as its owner when THIS
+# process owns it: the Windows pid on Windows (keep-awake.ps1 lives in that
+# namespace), $$ on macOS (one namespace), undef elsewhere (nothing to own).
+sub self_owner_pid {
+    return self_winpid() if _is_windows();
+    return $$ if $^O eq 'darwin';
+    return undef;
+}
 
 # owner_started_before(\%owner, $self_winpid?, $now?) -> FILETIME ticks string | undef
 #
@@ -775,9 +925,55 @@ sub kill_pid {
     if ($^O =~ /^(MSWin32|msys|cygwin)$/) {
         return stop_helper($pid, defined $pid_f ? (pid_f => $pid_f) : ());
     }
+    return stop_holder_darwin($pid, pid_f => $pid_f) if $^O eq 'darwin';
     kill('KILL', $pid);
     waitpid($pid, 0);
     return 'gone';
+}
+
+# _production_command_of($pid) -> command line | undef (undef = no such
+# process, or a zombie: an exited process nobody has reaped yet is not running
+# anything, and treating it as alive would escalate to SIGKILL for nothing).
+sub _production_command_of {
+    my ($pid) = @_;
+    return undef unless defined $pid && $pid =~ /^\d+$/;
+    open(my $fh, '-|', 'ps', '-o', 'stat=', '-o', 'command=', '-p', $pid) or return undef;
+    my $out = do { local $/; <$fh> };
+    close $fh;
+    return undef unless defined $out;
+    $out =~ s/^\s+|\s+$//g;
+    my ($stat, $cmd) = $out =~ /^(\S+)\s+(.*)\z/s;
+    return undef unless defined $stat && length $cmd;
+    return undef if $stat =~ /Z/;
+    return $cmd;
+}
+
+# stop_holder_darwin($pid, %seams) -> 'gone' | 'not-ours' | 'still-alive' | 'invalid'
+#
+# The macOS release path. A pid file can outlive its holder (a crash, a reboot)
+# and pids are reused, so the recorded number is checked BEFORE anything is
+# signalled: it must still be `bp-keepawake.pl hold` for THIS pid file. Then
+# TERM, which lets the holder release caffeinate and remove its own pid file;
+# KILL only if it is still there after the wait (caffeinate -w follows it down).
+# %seams: command_of, wait_seconds, pid_f.
+sub stop_holder_darwin {
+    my ($pid, %seams) = @_;
+    return 'invalid' unless defined $pid && $pid =~ /^[1-9]\d*$/;
+    my $command_of = $seams{command_of} // \&_production_command_of;
+    my $wait = defined $seams{wait_seconds} ? $seams{wait_seconds} : 5;
+    my $cmd = $command_of->($pid);
+    return 'gone' unless defined $cmd;
+    return 'not-ours' unless $cmd =~ /bp-keepawake\.pl\s+hold\b/
+                          && (!defined $seams{pid_f} || index($cmd, $seams{pid_f}) >= 0);
+    kill('TERM', $pid);
+    my $deadline = time() + $wait;
+    while (time() < $deadline) {
+        return 'gone' unless defined $command_of->($pid);
+        select(undef, undef, undef, 0.1);
+    }
+    kill('KILL', $pid);
+    select(undef, undef, undef, 0.2);
+    return defined $command_of->($pid) ? 'still-alive' : 'gone';
 }
 
 # _log_has_asserted($log_file, $pid) -> 0|1
@@ -786,7 +982,10 @@ sub kill_pid {
 # line -- the confirmation that SetThreadExecutionState actually returned
 # success for THAT pid (keep-awake.ps1's Write-KaLog at :249), not merely that
 # the process exists or that its pid file has been overwritten. Best effort:
-# a missing or unreadable log reads as "not yet".
+# a missing or unreadable log reads as "not yet". The macOS holder may log
+# STANDBY instead (it is up and working, but the Mac is off AC power, so it
+# holds nothing until AC returns); keep-awake.ps1 never writes that word, so
+# Windows reads exactly as before.
 sub _log_has_asserted {
     my ($log_f, $pid) = @_;
     return 0 unless defined $log_f && defined $pid && length $pid;
@@ -794,7 +993,7 @@ sub _log_has_asserted {
     my $text = do { local $/; <$fh> };
     close $fh;
     return 0 unless defined $text;
-    return $text =~ /\bpid=\Q$pid\E\s+ASSERTED\b/ ? 1 : 0;
+    return $text =~ /\bpid=\Q$pid\E\s+(?:ASSERTED|STANDBY)\b/ ? 1 : 0;
 }
 
 # replace($dir, \%opts) -> 'replaced' | 'none' | 'refused' | 'timeout'
@@ -935,7 +1134,7 @@ sub apply {
     $opts //= {};
     my $spawn = $opts->{spawn}                // \&spawn;
     my $killp = $opts->{kill_pid}             // \&kill_pid;
-    my $ps_ok = $opts->{powershell_available} // \&ps_available;
+    my $ps_ok = $opts->{powershell_available} // \&helper_available;
     my $log   = $opts->{log}                  // sub { };
     my $pid_f = "$dir/keepawake.pid";
     my %owner = (owner_winpid => $opts->{owner_winpid}, owner_desc => $opts->{owner_desc});
@@ -995,7 +1194,10 @@ sub apply {
             # it so the atomic claim below can be taken.
             unlink $pid_f;
         }
-        return unless $ps_ok->();
+        unless ($ps_ok->()) {
+            _note_unavailable($dir, $log);
+            return;
+        }
 
         # CLAIM THE FILE ATOMICALLY, THEN SPAWN. O_EXCL is what makes "is a
         # helper already coming up?" and "I am the one starting it" a single
@@ -1023,6 +1225,7 @@ sub apply {
 
         my $started = eval { $spawn->($pid_f, \%owner) };
         $log->("WARN keepawake spawn failed: $@") if $@;
+        unlink "$dir/keepawake.unavailable" if defined $started;
 
         # A CLAIM NOBODY WILL FILL MUST NOT SURVIVE THE CALL THAT MADE IT.
         # spawn() returns undef when it declined — inside a .t, or under
@@ -1061,9 +1264,145 @@ sub apply {
                 }
             }
             unlink $pid_f;
+            # The macOS holder's state file goes with its pid file (a holder
+            # killed before it could tidy up would otherwise leave 'asserted'
+            # behind). There is none on Windows.
+            unlink "$dir/keepawake.state";
         }
     }
 }
 
+# ---------------------------------------------------------------------------
+# DOCTOR (macOS): is anything overriding the operator's sleep rule?
+#
+# The rule (2026-10-30): no caffeinate may take effect off AC power, and
+# closing the lid must always sleep the Mac. ccpraxis's own holder obeys it by
+# construction (KeepAwake: `caffeinate -i -w`, AC only), and the Bash-tool
+# guard stops a session reaching around it. Two things can still break it
+# without either noticing, so bp-preflight.pl reports them as a warning:
+#
+#   - `pmset -g` shows SleepDisabled 1 (`pmset disablesleep 1`, from anyone):
+#     the Mac then sleeps neither on lid close nor on battery;
+#   - a caffeinate holding -s (system sleep: a closed lid on AC), -d
+#     (display) or -u (user activity) runs under a ccpraxis process or a
+#     Claude Code session -- an old holder from before the rule, or one an
+#     agent started by hand. Claude Code's own `caffeinate -i -t 300`, a
+#     child of the claude process, holds only -i and is not reported.
+#
+# Pure parsers below, with the two reads behind seams; nothing here changes
+# any setting or signals any process.
+# ---------------------------------------------------------------------------
+
+# pmset_sleep_disabled($pmset_g_text) -> 0|1
+sub pmset_sleep_disabled {
+    my ($t) = @_;
+    return 0 unless defined $t && !ref $t;
+    return $t =~ /^[ \t]*SleepDisabled[ \t]+1\b/m ? 1 : 0;
+}
+
+my $CCPRAXIS_PROC = qr{bp-keepawake\.pl|KeepAwake\.pm|launcher\.pl|BpContinuityLease\.pm|claude-sandbox|/\.claude/ccpraxis/|/plugins/(?:butler|sandbox)/};
+my $CLAUDE_PROC   = qr{(?:\A|/)claude(?:\s|\z)|\@anthropic-ai/claude-code};
+
+# caffeinate_flags($command_line) -> the assertion letters it holds (e.g.
+# 'dims'), from its options up to the first operand; -t and -w take a value.
+sub caffeinate_flags {
+    my ($cmd) = @_;
+    return '' unless defined $cmd;
+    my @w = split ' ', $cmd;
+    shift @w;
+    my $letters = '';
+    while (@w && $w[0] =~ /\A-([A-Za-z]+)\z/) {
+        my $cl = $1;
+        shift @w;
+        $letters .= $cl;
+        shift @w if $cl =~ /[tw]\z/ && @w;   # -t <secs>, -w <pid>
+    }
+    $letters =~ s/[tw]//g;
+    return $letters;
+}
+
+# caffeinate_overrides($ps_text) -> list of { pid, flags, owner } for every
+# caffeinate holding -s, -d or -u whose ancestry includes a ccpraxis process
+# or a Claude Code session. $ps_text is `ps -axo pid=,ppid=,command=`.
+sub caffeinate_overrides {
+    my ($ps) = @_;
+    return () unless defined $ps && !ref $ps;
+    my (%cmd, %ppid);
+    for my $line (split /\r?\n/, $ps) {
+        next unless $line =~ /\A\s*(\d+)\s+(\d+)\s+(.*?)\s*\z/;
+        ($ppid{$1}, $cmd{$1}) = ($2, $3);
+    }
+    my @out;
+    for my $pid (sort { $a <=> $b } keys %cmd) {
+        my ($word) = split ' ', $cmd{$pid};
+        next unless defined $word && $word =~ m{(?:\A|/)caffeinate\z};
+        (my $bad = caffeinate_flags($cmd{$pid})) =~ s/[^sdu]//g;
+        next unless length $bad;
+        my ($owner, $p, %seen) = (undef, $ppid{$pid});
+        while (defined $p && $p > 1 && !$seen{$p}++ && defined $cmd{$p}) {
+            if    ($cmd{$p} =~ $CCPRAXIS_PROC) { $owner = "ccpraxis (pid $p)";             last }
+            elsif ($cmd{$p} =~ $CLAUDE_PROC)   { $owner = "a Claude Code session (pid $p)"; last }
+            $p = $ppid{$p};
+        }
+        next unless defined $owner;
+        my %u; my $flags = join '', grep { !$u{$_}++ } split //, $bad;
+        push @out, { pid => $pid, flags => $flags, owner => $owner };
+    }
+    return @out;
+}
+
+sub _doctor_read {
+    my ($argv) = @_;
+    my $ok = eval { require "$DIR/BpPowerJournal.pm" unless defined &BpPowerJournal::run_bounded; 1 };
+    return '' unless $ok;
+    my $r = eval { BpPowerJournal::run_bounded($argv, 5) };
+    return '' unless ref $r eq 'HASH' && ($r->{status} // '') eq 'ok';
+    return $r->{out} // '';
+}
+
+# sleep_override_findings(%seams) -> list of one-line findings; empty when the
+# rule holds. %seams: pmset_g => sub { text }, ps => sub { text }.
+sub sleep_override_findings {
+    my (%o) = @_;
+    my $pm = $o{pmset_g} ? $o{pmset_g}->() : _doctor_read([-x '/usr/bin/pmset' ? '/usr/bin/pmset' : 'pmset', '-g']);
+    my $ps = $o{ps}      ? $o{ps}->()      : _doctor_read([-x '/bin/ps' ? '/bin/ps' : 'ps', '-axo', 'pid=,ppid=,command=']);
+    my @f;
+    push @f, 'pmset reports SleepDisabled 1: this Mac sleeps neither with the lid closed nor on battery '
+           . '(sudo pmset -a disablesleep 0 restores it)' if pmset_sleep_disabled($pm);
+    for my $c (caffeinate_overrides($ps)) {
+        push @f, sprintf('caffeinate pid %d holds -%s under %s: -s keeps a lid-closed Mac awake on AC, '
+                       . '-d/-u keep the display awake; ccpraxis takes only -i, on AC', $c->{pid}, $c->{flags}, $c->{owner});
+    }
+    return @f;
+}
+
+# _note_unavailable($dir, $log) -- a host that should hold a wake-lock and
+# cannot says so ONCE, not on every director tick. The marker beside the pid
+# file is the "already said" flag; a later successful spawn clears it, so a
+# recurrence is reported again. The Linux sandbox stays silent: keep-awake is a
+# documented no-op there (its busy-lease is BpContinuityLease's job).
+sub _note_unavailable {
+    my ($dir, $log) = @_;
+    return unless _is_windows() || $^O eq 'darwin';
+    my $marker = "$dir/keepawake.unavailable";
+    return if -e $marker;
+    my $what = $^O ne 'darwin' ? 'powershell.exe not on PATH'
+             : _ka_lib()       ? 'caffeinate not found'
+             :                   'the sandbox plugin\'s KeepAwake.pm, which defines the assertion, is missing';
+    $log->("WARN keepawake unsupported here ($what); nothing is holding this machine awake");
+    if (open my $fh, '>', $marker) { close $fh }
+}
+
 package main;
+
+# `perl bp-keepawake.pl hold ...` -- the macOS holder's entry point. Requiring
+# this file (every other use) never reaches it.
+unless (caller) {
+    if (@ARGV && $ARGV[0] eq 'hold') {
+        shift @ARGV;
+        exit BpKeepAwake::hold_main(@ARGV);
+    }
+    print STDERR "usage: perl bp-keepawake.pl hold --pid-file F [--log-file L] [--lease S] [--owner-pid P]\n";
+    exit 2;
+}
 1;

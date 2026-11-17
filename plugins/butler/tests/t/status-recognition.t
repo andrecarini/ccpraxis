@@ -126,9 +126,30 @@ my $HEADER = sprintf('%-26s %-11s %-10s %-6s %-4s %s',
 # block_lines(OUT, NAME) -> list of lines from "== NAME" (inclusive of the column header) up
 # to (not including) the blank line the script always emits at the end of a blueprint block.
 # First element is always the column header; the rest are data rows.
+#
+# THE "== NAME" LINE CARRIES THE BLUEPRINT'S OWN LIFECYCLE STATUS, and an
+# orchestrator note when a runs/.orchestrator marker exists:
+#   == NAME  (blueprint status: <status|unknown>)[  [orchestrator pid N LIVE]]
+# bp-status.sh grew that suffix deliberately (a rollup that omitted the
+# blueprint's own state is how sandbox-butler-overhaul sat at `running` with
+# every package done). This file still matched the bare "== NAME" form: it
+# never ran on the Windows host, which has no jq and skips the whole file, so
+# the drift surfaced only on a host with jq. header_re() is the exact shape;
+# named_re() is any header line for NAME, old or new form, which is what the
+# NEGATIVE assertions need -- a bare "== NAME$" there could never match the
+# real output and would pass vacuously.
+sub header_re {
+    my ($name) = @_;
+    return qr/^== \Q$name\E  \(blueprint status: [^)\n]*\)(?:  \[[^\]\n]*\])?$/m;
+}
+sub named_re {
+    my ($name) = @_;
+    return qr/^== \Q$name\E(?:\s|$)/m;
+}
+
 sub block_lines {
     my ($out, $name) = @_;
-    if ($out =~ /^== \Q$name\E\n((?:.*\n)*?)\n/m) {
+    if ($out =~ /^== \Q$name\E  \(blueprint status: [^)\n]*\)(?:  \[[^\]\n]*\])?\n((?:.*\n)*?)\n/m) {
         return split /\n/, $1;
     }
     return ();
@@ -186,7 +207,7 @@ SKIP: {
         my ($rc, $out, $err) = run_status($data, undef);
         is($rc, 0, 'T1: real blueprint with 2 packages -> exit 0');
         is($err, '', 'T1: stderr empty');
-        like($out, qr/^== alpha$/m, 'T1: stdout contains "== alpha"');
+        like($out, header_re('alpha'), 'T1: stdout contains "== alpha"');
         my @rows = block_lines($out, 'alpha');
         is($rows[0], $HEADER, 'T1: column header matches the frozen printf format exactly');
         is(scalar(@rows) - 1, 2, 'T1: exactly 2 data rows');
@@ -209,7 +230,7 @@ SKIP: {
         ($rc234, $out234, $err234) = run_status($phantom_data, undef);
 
         # ---- T2 [AC-2]: stray excluded from the listing ----
-        unlike($out234, qr/^== phantom$/m, 'T2: stdout has no "== phantom" line');
+        unlike($out234, named_re('phantom'), 'T2: stdout has no "== phantom" line');
 
         # ---- T3 [AC-3]: stray reported in the exact §2.5 !! shape ----
         my @bl = bang_lines($out234);
@@ -310,7 +331,7 @@ SKIP: {
 
         my ($rc, $out, $err) = run_status($data, undef);
         is($rc, 0, 'T7: blueprint with empty packages/ -> exit 0');
-        like($out, qr/^== beta$/m, 'T7: stdout contains "== beta"');
+        like($out, header_re('beta'), 'T7: stdout contains "== beta"');
         my @rows = block_lines($out, 'beta');
         is($rows[0], $HEADER, 'T7: column header present');
         is(scalar(@rows) - 1, 0, 'T7: zero data rows');
@@ -328,7 +349,7 @@ SKIP: {
 
         my ($rc, $out, $err) = run_status($data, undef);
         is($rc, 0, 'T8: blueprint with no packages/ at all -> exit 0');
-        like($out, qr/^== gamma$/m, 'T8: stdout contains "== gamma"');
+        like($out, header_re('gamma'), 'T8: stdout contains "== gamma"');
         my @rows = block_lines($out, 'gamma');
         is($rows[0], $HEADER, 'T8: column header present');
         is(scalar(@rows) - 1, 0, 'T8: zero data rows');
@@ -347,7 +368,7 @@ SKIP: {
         write_blueprint_md("$data/blueprints/_archive/steward-plugin");
 
         my ($rc, $out, $err) = run_status($data, undef);
-        unlike($out, qr/^== _archive$/m, 'T9: no "== _archive" line');
+        unlike($out, named_re('_archive'), 'T9: no "== _archive" line');
         unlike($out, qr/_archive/, 'T9: "_archive" never appears anywhere in stdout (neither == nor !!)');
     }
 
@@ -361,7 +382,7 @@ SKIP: {
         write_pkg("$data/blueprints/_archive", 'p1', 'running', 'p1');
 
         my ($rc, $out, $err) = run_status($data, undef);
-        like($out, qr/^== _archive$/m, 'T10: "== _archive" IS listed when _archive/blueprint.md exists');
+        like($out, header_re('_archive'), 'T10: "== _archive" IS listed when _archive/blueprint.md exists');
     }
 
     # =====================================================================================
@@ -393,7 +414,7 @@ SKIP: {
 
         my ($rc, $out, $err) = run_status($t12_data, undef);
         for my $name (qw(zzz-phantom beta-copy x)) {
-            unlike($out, qr/^== \Q$name\E$/m, "T12: no '== $name' line");
+            unlike($out, named_re($name), "T12: no '== $name' line");
         }
         is_deeply([ bang_stray_names($out) ], ['beta-copy', 'x', 'zzz-phantom'],
                    'T12: all three strays appear in the !! section in shell-glob (collation) order');
@@ -409,7 +430,7 @@ SKIP: {
         write_pkg("$t13_data/blueprints/orphan", 'orphan-pkg', 'running', 'orphan-marker-xyz');
 
         my ($rc, $out, $err) = run_status($t13_data, undef);
-        unlike($out, qr/^== orphan$/m, 'T13: no "== orphan" line despite having packages/orphan-pkg.md');
+        unlike($out, named_re('orphan'), 'T13: no "== orphan" line despite having packages/orphan-pkg.md');
         unlike($out, qr/orphan-pkg/, 'T13: the package name "orphan-pkg" is never rendered as a row anywhere');
         unlike($out, qr/orphan-marker-xyz/, 'T13: the orphaned package\'s Next-action text never appears anywhere');
         my @names = bang_stray_names($out);
@@ -425,7 +446,7 @@ SKIP: {
         write_blueprint_md_as_dir("$t14_data/blueprints/gamma");
 
         my ($rc, $out, $err) = run_status($t14_data, undef);
-        unlike($out, qr/^== gamma$/m, 'T14: no "== gamma" line when blueprint.md is a directory, not a file');
+        unlike($out, named_re('gamma'), 'T14: no "== gamma" line when blueprint.md is a directory, not a file');
         my @names = bang_stray_names($out);
         ok((grep { $_ eq 'gamma' } @names), 'T14: "gamma" IS reported as a stray (blueprint.md-as-directory does not count)');
     }
@@ -480,7 +501,7 @@ SKIP: {
 
         my ($rc, $out, $err) = run_status($data, 'alpha');
         is($rc, 0, 'T17: bp-status.sh alpha (phantom also present) -> exit 0');
-        like($out, qr/^== alpha$/m, 'T17: stdout contains "== alpha"');
+        like($out, header_re('alpha'), 'T17: stdout contains "== alpha"');
         unlike($out, qr/phantom/, 'T17: "phantom" never appears anywhere (the loop never visits it)');
         is(scalar(bang_lines($out)), 0, 'T17: no !! section (named-arg scoping suppresses it entirely)');
     }
@@ -515,7 +536,7 @@ SKIP: {
         my ($rc19, $out19, $err19) = run_status(undef, 'sandbox-butler-overhaul', BP_PROJECT_ROOT => $REPO_ROOT);
         is($rc19, 0, 'T19: live - bp-status.sh sandbox-butler-overhaul -> exit 0');
         is($err19, '', 'T19: live - stderr empty');
-        like($out19, qr/^== sandbox-butler-overhaul$/m, 'T19: live - stdout contains "== sandbox-butler-overhaul"');
+        like($out19, header_re('sandbox-butler-overhaul'), 'T19: live - stdout contains "== sandbox-butler-overhaul"');
         my @rows19 = block_lines($out19, 'sandbox-butler-overhaul');
         is(scalar(@rows19) - 1, $expected_rows,
            "T19: live - data-row count equals scalar(glob packages/*.md) == $expected_rows (computed, not hardcoded)");
@@ -523,8 +544,8 @@ SKIP: {
 
         # ---- T20: bp-status.sh (no arg) ----
         my ($rc20, $out20, $err20) = run_status(undef, undef, BP_PROJECT_ROOT => $REPO_ROOT);
-        like($out20, qr/^== sandbox-butler-overhaul$/m, 'T20: live no-arg - "== sandbox-butler-overhaul" present');
-        unlike($out20, qr/^== _archive$/m, 'T20: live no-arg - "_archive" appears on no "==" line');
+        like($out20, header_re('sandbox-butler-overhaul'), 'T20: live no-arg - "== sandbox-butler-overhaul" present');
+        unlike($out20, named_re('_archive'), 'T20: live no-arg - "_archive" appears on no "==" line');
         my @names20 = bang_stray_names($out20);
         ok((!grep { $_ eq '_archive' } @names20), 'T20: live no-arg - "_archive" appears on no "!!" line');
         is(scalar(bang_lines($out20)), 0, 'T20: live no-arg - no !! section at all (this repo has no strays)');

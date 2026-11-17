@@ -1,1 +1,1 @@
-PostToolUse hook on Bash — detects install commands and proposes /backpack:add
+Bash hook in the sandbox: proposes /backpack:add after installs; keeps Node and pnpm on the node-pnpm recipe

@@ -27,24 +27,14 @@ heartbeat-only container keep-alive. Expect 1–2 minutes total.
 ### 1. Pre-flight: confirm a container runtime is reachable
 
 ```bash
-# Detect the runtime using the same fallback chain as the launcher:
-# docker.exe → docker → podman.exe → podman (Windows probes .exe first).
-RUNTIME=$(
-  for _rt in docker.exe docker podman.exe podman; do
-    if command -v "$_rt" > /dev/null 2>&1; then
-      echo "$_rt"
-      break
-    fi
-  done
-)
-if [ -z "$RUNTIME" ]; then
-  echo "Neither docker nor podman is reachable."
-  echo "Start Docker Desktop OR run 'podman machine start', then try again."
-  exit 1
-fi
-$RUNTIME ps > /dev/null 2>&1 || {
-  echo "Runtime '$RUNTIME' found but daemon is not running."
-  echo "Start Docker Desktop OR run 'podman machine start', then try again."
+# The launcher's own detection (HostPlatform.pm): this host's candidate order,
+# or CCPRAXIS_CONTAINER_CLI when set; prints what to install when none is found.
+RUNTIME=$(perl -I"${CLAUDE_PLUGIN_ROOT}/scripts" -MHostPlatform -e '
+  my ($cli, $err) = HostPlatform::detect_container_cli();
+  if (!defined $cli) { print STDERR "$_\n" for ($err ? ($err) : HostPlatform::no_cli_message()); exit 1 }
+  print "$cli\n";') || exit 1
+"$RUNTIME" ps > /dev/null 2>&1 || {
+  echo "'$RUNTIME' is installed but not answering: start its VM or daemon, then try again."
   exit 1
 }
 ```

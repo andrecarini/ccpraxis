@@ -27,18 +27,20 @@ Specifically for the backpack system (if the `backpack` plugin is mounted into t
 
 ## ✅ YOU ARE INSIDE A SANDBOXED CONTAINER — FULL AUTONOMY
 
-You are running inside an isolated dev container (Docker or Podman — auto-detected), as root. The project folder is at `/project`.
+You are running inside an isolated dev container, as root. The project folder is at `/project`. Which container runtime this is, and what that means for networking, is in the last section of this file.
 You have full autonomy. No permission prompts. Go fast.
 
 **You CAN and SHOULD install and run dev tooling directly:**
-- ✅ `apt-get install -y …` for system packages and runtimes (Node.js, Python, etc.) — runs as root, no `sudo` needed (and `sudo` isn't installed; the container IS root)
-- ✅ `npm install`, `npm ci`, `npx`
+- ✅ `apt-get install -y …` for system packages and runtimes (Python, etc.) — runs as root, no `sudo` needed (and `sudo` isn't installed; the container IS root)
+- ✅ `npm install`, `npm ci`, `npx`, `pnpm` — once the project's backpack provides Node (below)
 - ✅ `dart`, `flutter`, `pub get`
 - ✅ `pip install`, `python`, `cargo`, `go build`
 - ✅ `firebase`, `gcloud`, `terraform`
 - ✅ ANY build tool, linter, formatter, or compiler
 
-There is no host machine to protect — this container IS the sandbox. Under rootless Podman, container root is mapped via Podman's user namespace to the unprivileged host user; under Docker Desktop, a similar isolation boundary applies. Either way, a compromise stays contained even with full in-container root.
+**Node.js and pnpm are NOT preinstalled.** The image carries no language runtime beyond the Perl that ccpraxis itself runs on. If the project builds with Node (a `package.json`, an `.nvmrc`, a JS build), declare it with `/backpack:add --recipe node-pnpm` and then `/backpack:install`: an exact Node LTS plus pnpm under `/opt/tools/node`, whose `bin` is already on `PATH`, so `npm install -g` tools are found too. It is the only way: a hook refuses every other Node or pnpm install (apt's Node 18 is end of life) and names the recipe.
+
+There is no host machine to protect — this container IS the sandbox, and a compromise stays contained in it even with full in-container root.
 Worst case, the container gets recreated. Project files are bind-mounted and git-recoverable.
 
 ## ⚠️ SUPPLY CHAIN SECURITY (still applies inside the container)
@@ -46,6 +48,7 @@ Worst case, the container gets recreated. Project files are bind-mounted and git
 Even inside a container, supply chain attacks can exfiltrate project source code and credentials. Minimize the attack surface:
 
 - **`npm_config_ignore_scripts=true` is set as an environment variable.** This blocks npm postinstall hooks globally. Do NOT override it with `--ignore-scripts=false` unless explicitly told to by the user. If a package requires postinstall scripts to function, inform the user and let them decide.
+- **pnpm is hardened the same way, also by environment variables:** `PNPM_CONFIG_IGNORE_SCRIPTS=true` and a 7-day minimum package age (`PNPM_CONFIG_MINIMUM_RELEASE_AGE=10080`, in minutes, with the missing-publish-time escape closed). Environment variables win over a project's `pnpm-workspace.yaml` and `.npmrc`, so do not try to lower them there, and do not add `minimumReleaseAgeExclude` entries to get a fresh package in: flag it to the user instead.
 - **When installing any package manager**, set its equivalent security protections (e.g. pip `--no-build-isolation` where appropriate).
 - **Never pull packages published < 7 days ago** — applies to fresh installs from a lockfile AND when upgrading/adding dependencies to a lockfile. If you notice a dependency was published very recently, flag it.
 - **Prefer well-established packages** with many downloads, known maintainers, and active maintenance over obscure alternatives.
@@ -80,17 +83,12 @@ Nothing listens on these ports at container startup, so a server can bind `0.0.0
 
 ### Sharing the URL with the user
 
-When you print the URL for the user to open, prefer `$SANDBOX_HOST_IP` if it's set. Pick any port from the published range:
+When you print a URL for the user to open, use `localhost` and any port from the published range:
 
 ```bash
-HOST=${SANDBOX_HOST_IP:-localhost}
 PORT=$(echo "$SANDBOX_OPEN_PORTS" | cut -d- -f1)
-echo "Open http://${HOST}:${PORT}"
+echo "Open http://localhost:${PORT}"
 ```
-
-The launcher auto-injects `SANDBOX_HOST_IP` on Windows+Podman, where the host's `localhost:<port>` mirror via WSL2's `wslrelay.exe` is unreliable — it sometimes registers only an IPv6 listener, so IPv4 connects from Firefox/Chrome silently fail even though the container is healthy. The injected value is the WSL distro's directly-reachable IPv4 address and always reaches the published port. On Linux/macOS hosts, or under Docker on any host, the env var is unset and the fallback to `localhost` works as normal.
-
-The env var is captured at container-create time, so if the user runs `wsl --shutdown` or reboots and then re-attaches to an existing sandbox, the value may be stale — a fresh `claude-sandbox` launch (which re-creates if needed) refreshes it.
 
 Example: serve a Flutter web build on the first port of the range:
 ```bash
@@ -121,18 +119,7 @@ The rest of `<project>/.ccpraxis-local-data/claude-home/.launcher/` (hashes, sna
 
 ### Accessing Host Services
 
-Services running on the user's host machine (databases, Chrome DevTools, APIs, etc.) are reachable from inside this container via a special hostname. The exact name depends on which container runtime is hosting you:
-
-- **Docker** (Docker Desktop on Windows/macOS, Docker Engine on Linux): `host.docker.internal`
-- **Podman** (Podman Desktop / Podman Machine): `host.containers.internal`
-
-For example, a Postgres instance on the host on port 5432:
-- Under docker: `host.docker.internal:5432`
-- Under podman: `host.containers.internal:5432`
-
-Both names should work transparently on most modern setups (Podman often aliases `host.docker.internal` for compatibility, and Docker sometimes provides `host.containers.internal`), but the canonical name for each runtime is the safer choice. If unsure which runtime is hosting you, try `getent hosts host.docker.internal host.containers.internal` to see which resolves.
-
-Use one of these names instead of `localhost` or `127.0.0.1` when connecting to host services. `localhost` inside the container refers to the container itself, not the host.
+Services running on the user's host machine (databases, Chrome DevTools, APIs, etc.) are reachable from inside this container through a host name the container runtime provides. That name is in the last section of this file. Use it instead of `localhost` or `127.0.0.1` when connecting to host services: `localhost` inside the container refers to the container itself, not the host.
 
 ## Persistence
 
@@ -141,7 +128,7 @@ Use one of these names instead of `localhost` or `127.0.0.1` when connecting to 
 - **This container is persistent** — it survives between sessions. Installed packages (apt, npm global, pip global, runtimes) persist across sessions.
 - File changes in `/project` persist (bind-mounted to host)
 - Your memories, conversation history, and plans persist in `/project/.ccpraxis-local-data/claude-home/`
-- Auth tokens: your Claude account token (`claudeAiOauth`) is **seeded as a copy from the host at launch** (manager mode re-seeds it when the container is created/restarted), and thereafter this sandbox refreshes its OWN copy in-session — that refresh now persists to disk with no relaunch (Fix 1). Don't hand-edit it. MCP plugin OAuth tokens (`mcpOAuth.*`) are sandbox-owned, written by the standard `claude` / `claude mcp add` auth flow, and persist across container rebuilds. The host's own `.credentials.json` is never touched. If you ever see a loud "the sandbox's OWN OAuth refresh was REJECTED (4xx) / grants DIVERGED" alert, that's the keeper telling you the copied token was rejected — surface it; it's the signal to revisit the copy-token model, not a routine re-login.
+- Auth tokens: your Claude account token (`claudeAiOauth`) is this sandbox's **own grant**, created by one interactive `/login` inside the container; the host's token is never read or copied in (`skills.pl materialize-credentials`). This sandbox refreshes it in-session, and the refresh persists to disk with no relaunch (Fix 1). Don't hand-edit it. MCP plugin OAuth tokens (`mcpOAuth.*`) are sandbox-owned, written by the standard `claude` / `claude mcp add` auth flow, and persist across container rebuilds. The host's own `.credentials.json` is never touched. If you ever see a loud "the sandbox's OWN OAuth refresh was REJECTED (4xx) / grants DIVERGED" alert, that's the keeper telling you this sandbox's own grant was rejected — surface it to the user; a fresh `/login` inside the sandbox replaces the grant.
 - The container may be rebuilt if it becomes stale (Claude Code version mismatch or > 7 days old, Containerfile changed, etc.). The `backpack` plugin handles re-installing tools/runtimes on rebuild — see above. Project-specific files in `/project` persist across rebuilds via the bind mount.
 
 ### Where the launch logs are
@@ -155,3 +142,7 @@ ls -t ~/.claude/sandbox-logs/ | head        # newest launch first
 ```
 
 This is worth knowing because `~/.claude/.launcher/` **is a read-only overlay in here**, and its emptiness reads as "nothing was recorded". It isn't — the logs are in `sandbox-logs/`, which is a different directory and writable on the host side. A report filed from a live container (`20260813-011838-82bf`) reached a speculative "the install was probably interrupted" conclusion for exactly this reason, when the transcript would have named the three unprocessed items outright.
+
+## This sandbox's runtime and host
+
+The launcher writes this section for the container runtime and the host this sandbox was started from, when it creates or rebuilds the sandbox. What follows holds for this sandbox.

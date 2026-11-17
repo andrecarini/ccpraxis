@@ -28,7 +28,8 @@ use StewardTest qw(
 
 my $ROOT = "$Bin/../../../..";
 
-ok(-d "$ROOT/.git", 'the repo root resolved above this file looks like a git worktree (sanity check)')
+# -e, not -d: in a linked worktree (git worktree add) .git is a FILE.
+ok(-e "$ROOT/.git", 'the repo root resolved above this file looks like a git worktree (sanity check)')
     or diag("resolved ROOT=$ROOT");
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 #
 # ORACLE for blueprint package 04-refresher-hygiene (host-wake-and-suspend),
 # derived ONLY from
@@ -40,6 +40,18 @@ use POSIX qw(WNOHANG);
 use Time::HiRes qw(sleep time);
 
 BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
+
+# Genuinely Windows-only: every integration group below runs real
+# keep-awake.ps1 helpers and judges them by WINPID (/proc/<pid>/winpid,
+# tasklist, taskkill, CIM command lines) under a %TEMP% that falls back to
+# C:/Windows/Temp. None of that exists on macOS or Linux. The macOS holder's
+# own contract (pid file identity, ASSERTED line, lease expiry, release on
+# TERM) is pinned in keepawake-shared.t. Decided in BEGIN so the END cleanup
+# below (which sweeps by WINPID through powershell.exe) is never even compiled.
+BEGIN {
+    plan skip_all => 'Windows-only: drives real keep-awake.ps1 helpers by WINPID (tasklist/taskkill/CIM)'
+        unless $^O =~ /^(MSWin32|msys|cygwin)$/;
+}
 
 # Captured BEFORE anything in this file ever touches HOME/USERPROFILE, for
 # AC-17(c)'s read-only check of the operator's REAL registry lease.log. This
@@ -1440,10 +1452,12 @@ my $ps1_src    = do { local $/; open(my $fh, '<:raw', $REPO_SANDBOX_PS1) or die 
 
     unlike($module_src, qr/owner_winpid\s*(?:=>|=)\s*(?:\$\$|getppid\s*\(\s*\))/,
         'AC-15: BpContinuityLease.pm never assigns owner_winpid from $$ or getppid');
-    like($module_src, qr/owner_winpid.{0,120}(?:self_winpid|winpid_of)/s,
-        'AC-15: the owner_winpid value passed comes from self_winpid or winpid_of')
-        or like($module_src, qr/(?:self_winpid|winpid_of).{0,120}owner_winpid/s,
-            'AC-15: (either ordering) self_winpid/winpid_of feeds owner_winpid');
+    # self_owner_pid (the macOS port) is self_winpid on Windows and $$ only on
+    # darwin, where there is one pid namespace -- still never $$ here.
+    like($module_src, qr/owner_winpid.{0,120}(?:self_owner_pid|self_winpid|winpid_of)/s,
+        'AC-15: the owner_winpid value passed comes from self_owner_pid, self_winpid or winpid_of')
+        or like($module_src, qr/(?:self_owner_pid|self_winpid|winpid_of).{0,120}owner_winpid/s,
+            'AC-15: (either ordering) self_owner_pid/self_winpid/winpid_of feeds owner_winpid');
 }
 
 # AC-18

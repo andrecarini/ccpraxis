@@ -1045,7 +1045,12 @@ sub _remedy_sentence {
     }
     if (($action // '') eq 'declare_backpack') {
         my $runtime = $remedy->{runtime} // 'the runtime';
-        return "Declare runtime $runtime in the backpack (/backpack:add) with a one-line rationale, so a container rebuild restores it.";
+        # Node has a sanctioned recipe since it left the sandbox image
+        # (2026-10-30); a remediation worker should use it, not improvise.
+        my $recipe = $runtime eq 'node'
+            ? ' For Node use the sanctioned recipe, /backpack:add --recipe node-pnpm (exact LTS pins, checksum-verified); the sandbox image ships no Node.'
+            : '';
+        return "Declare runtime $runtime in the backpack (/backpack:add) with a one-line rationale, so a container rebuild restores it.$recipe";
     }
     if (($action // '') eq 'create_lockfile') {
         my $eco = $remedy->{ecosystem} // 'the';

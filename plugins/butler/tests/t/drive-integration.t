@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # t/19 — skill↔director contract test (04-wireup-cleanup, Decision #12).
 #
 # Asserts that drive-solo/SKILL.md and bp-drive-next.pl carry the same five

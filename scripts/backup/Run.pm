@@ -71,17 +71,39 @@ our @EXPORT_OK = qw(
 # by package 06's "every kind has a documented presentation" check, not a
 # copy in prose.
 # ===========================================================================
+# 2026-10-30: the backup stopped talking to GitHub. /steward:backup manages
+# local state only (promote, export, commit, promote, vault); fetching,
+# integrating origin/main and pushing are /steward:upstream-sync's
+# (plugins/steward/scripts/upstream-sync.pl), so dirty_worktree,
+# remote_merge_conflict and push_confirmation left this enum and
+# promote_pending joined it: bringing the live install up to the dev clone
+# changes the tooling that runs, so it is asked once, listing the commits.
+#
+# 2026-10-30: claude_md_drift added. ~/.claude/CLAUDE.md is built per host by
+# promote.pl, so a difference from that build cannot be exported back (a line
+# has no record of which part it belongs to); the export phase offers to
+# rebuild it or leave it, where file_conflict offered to copy it into the repo.
+#
+# 2026-10-30: clone_live_divergence retired. The live install is now produced
+# by promote.pl alone, so the dev clone and the live install differing is the
+# normal state between promotions, not a question; what made it dangerous (an
+# export overwriting unpromoted payload edits) is a precondition the
+# preflight phase checks instead, and a "no" skips the export with a note.
+#
+# 2026-11-02: sandbox_settings_key added, the third preference pair (the
+# sandbox preset vs each sandbox's own settings.json). Its choices are not
+# container_settings_key's: a unit can go into the preset, stay in that one
+# sandbox (once or remembered per project), or be reverted in that sandbox.
 our @DECISION_KINDS = qw(
-    dirty_worktree
-    remote_merge_conflict
-    clone_live_divergence
+    promote_pending
     readme_drift
     settings_key
     marketplace_key
     file_conflict
+    claude_md_drift
     container_settings_key
+    sandbox_settings_key
     sensitive_finding
-    push_confirmation
     vault_conflict
     project_registration
     plugin_install

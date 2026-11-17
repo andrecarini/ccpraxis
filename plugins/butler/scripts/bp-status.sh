@@ -100,7 +100,11 @@ for BPDIR in "$DATA"/blueprints/*/; do
     fi
     AGE="$(file_age_min "$LEDGER")m"
     if pid_alive "$PID"; then PROC="pid $PID"; else PROC="—"; fi
-    NEXT=$(awk '/^## Next action/{getline; while ($0 ~ /^[[:space:]]*$/) getline; print; exit}' "$LEDGER" 2>/dev/null | cut -c1-60)
+    # The first non-blank line under "## Next action". getline's return value
+    # is checked: at EOF it returns 0 and leaves $0 as it was, so a loop on $0
+    # alone spun forever on a ledger whose heading is followed only by blank
+    # lines -- and took the whole status read with it.
+    NEXT=$(awk '/^## Next action/{ while ((getline line) > 0) if (line !~ /^[[:space:]]*$/) { print line; exit }; exit }' "$LEDGER" 2>/dev/null | cut -c1-60)
     printf '%-26s %-11s %-10s %-6s %-4s %s\n' "$PKG" "$STATUS" "$PROC" "$AGE" "$ATT" "${NEXT:-}"
   done
   echo

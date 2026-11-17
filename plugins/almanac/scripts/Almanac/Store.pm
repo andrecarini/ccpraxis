@@ -126,23 +126,27 @@ sub _die {
 #
 # Cwd::abs_path($p) when the path resolves (the common case: the directory
 # already exists); otherwise a textual fallback -- backslashes to forward
-# slashes, /x/ <-> X:/ drive-form normalisation, uppercased drive letter, no
-# trailing slash. This restates almanac-bug.pl::canonical_root (find it by
-# that name, not by line number -- see the package ledger's scout note).
-# Duplicated rather than imported because almanac-bug.pl is a script:
-# require-ing it would run its main body (out of scope, S6).
+# slashes, /x/ -> X:/ drive-form normalisation and uppercased drive letter
+# (Windows-family only; elsewhere /x/ is a directory named x), no trailing
+# slash. It is the sibling of almanac-bug.pl::canonical_root, NOT a copy: that
+# one lower-cases on darwin and Windows because its value is only ever a dedupe
+# key, while this one keeps the on-disk/typed case because its result is a path
+# that is opened, printed and compared against callers' own spelling.
+# Separate because almanac-bug.pl is a script (its main body is guarded, but
+# Store is the lower layer and must not require it).
 sub _canonical_path {
     my ($p) = @_;
     return $p unless defined $p;
     my $abs = Cwd::abs_path($p);
+    my $win = $^O =~ /^(?:MSWin32|msys|cygwin)$/ ? 1 : 0;
     if (!defined $abs) {
         $abs = $p;
         $abs =~ s{\\}{/}g;
-        $abs =~ s{^/([a-zA-Z])(?=/|\z)}{uc($1) . ':'}e;
+        $abs =~ s{^/([a-zA-Z])(?=/|\z)}{uc($1) . ':'}e if $win;
     }
     $abs =~ s{\\}{/}g;
     $abs =~ s{/\z}{} if length($abs) > 1;
-    $abs =~ s{^([a-zA-Z]):}{uc($1) . ':'}e;
+    $abs =~ s{^([a-zA-Z]):}{uc($1) . ':'}e if $win;
     return $abs;
 }
 
@@ -163,11 +167,15 @@ sub _canonical_path {
 # callers that pass an explicit root/home (B1, AC-35) are compared against
 # the test oracle's own un-folded normalisation, and folding there would
 # create the opposite mismatch.
+#
+# The /x/ -> X:/ fold is Windows-family only. Elsewhere "/x/..." is just a
+# directory named x at the root, and rewriting it to "X:/..." (a relative
+# path there) sent the walk somewhere that does not exist.
 sub _fold_drive_form {
     my ($p) = @_;
     return $p unless defined $p;
     $p =~ s{\\}{/}g;
-    $p =~ s{^/([a-zA-Z])(?=/|\z)}{uc($1) . ':'}e;
+    $p =~ s{^/([a-zA-Z])(?=/|\z)}{uc($1) . ':'}e if $^O =~ /^(MSWin32|msys|cygwin)$/;
     $p =~ s{/\z}{} if length($p) > 1;
     return $p;
 }
@@ -214,6 +222,9 @@ sub _parent_of {
 # ---------------------------------------------------------------------------
 
 my $SW_IS_WIN = ($^O =~ /^(MSWin32|msys|cygwin)$/) ? 1 : 0;
+# macOS: APFS folds case and /tmp is a second temp root -- the same rules
+# BpDataRoot.pm applies (mirrored in lockstep, see unify-walkups.t).
+my $SW_IS_DARWIN = ($^O eq 'darwin') ? 1 : 0;
 
 sub _sw_fold_ascii {
     my ($s) = @_;
@@ -278,9 +289,9 @@ sub _sw_lex_canon {
 sub _sw_seg_eq {
     my ($x, $y, $allow_83) = @_;
     $allow_83 = 1 unless defined $allow_83;
-    return $x eq $y unless $SW_IS_WIN;
+    return $x eq $y unless $SW_IS_WIN || $SW_IS_DARWIN;
     return 1 if _sw_fold_ascii($x) eq _sw_fold_ascii($y);
-    return 0 unless $allow_83;
+    return 0 unless $SW_IS_WIN && $allow_83;
 
     for my $pair ([$x, $y], [$y, $x]) {
         my ($short, $long) = @$pair;
@@ -341,6 +352,7 @@ sub _sw_compute_stops {
     push @candidates, eval { File::Spec->tmpdir };
     push @candidates, $ENV{TMP}, $ENV{TEMP}, $ENV{TMPDIR};
     push @candidates, $ENV{HOME}, $ENV{USERPROFILE};
+    push @candidates, '/tmp', '/private/tmp' if $SW_IS_DARWIN;
 
     my @stops;
     for my $v (@candidates) {

@@ -45,11 +45,15 @@ claude-sandbox
 
 First run prompts for sandbox setup (bootstrap). On subsequent runs the
 launcher dispatches by container state: if the container is not yet
-running, this terminal becomes the **manager** — it runs the skill/plugin
-selector and then sits in the heartbeat loop keeping the sandbox alive.
-To start a claude session, open a **second terminal** in the same
-project and run `claude-sandbox` there — that one enters **connector**
-mode and drops into `claude` inside the container.
+running, this terminal becomes the **manager**: it runs the skill/plugin
+selector and then shows the dashboard, whose heartbeat keeps the sandbox
+alive. To start a claude session, press **`[c]`** in the dashboard: it
+opens a new window (Windows Terminal on Windows, Terminal.app on macOS)
+running `claude-sandbox --session`, the **connector** entry, which drops
+into `claude` inside the container. By hand, the same is
+`claude-sandbox --session` in a second terminal in the project. A second
+bare `claude-sandbox` while the sandbox runs opens another dashboard, not
+a session.
 
 To run the test suite:
 
@@ -61,23 +65,88 @@ Or via the slash command: `/sandbox:test`.
 
 ## Runtime support
 
-The launcher auto-detects which container runtime is installed and uses
-whichever is present, in this preference order:
+The launcher auto-detects which container CLI to drive
+(`HostPlatform::detect_container_cli`, shared by `launcher.pl`,
+`bootstrap.pl` and `tests/lib/TestSandbox.pm`; `runtime-detection.t` and
+`host-platform-decisions.t` pin it). It probes `<cli> --version` in this
+order:
 
-1. **Docker** (`docker.exe` on Windows, `docker` elsewhere) — Docker
-   Desktop on Windows/macOS, Docker Engine on Linux.
-2. **Podman** (`podman.exe` / `podman`) — Podman Desktop / Podman Machine
-   on Windows/macOS, native podman on Linux.
+| host | order | notes |
+|---|---|---|
+| Windows (Git-for-Windows perl) | `docker.exe`, `podman.exe` | Docker Desktop or Podman Machine, both on WSL2 |
+| macOS | `podman`, `docker` | a rootful `podman machine`, set up by `scripts/podman-machine.pl`, is the supported runtime |
+| Linux | `docker`, `podman` | Docker Engine or native podman |
 
-Detection runs each time the launcher starts (`<cli> --version`). The
-same helper lives in `launcher.pl`, `bootstrap.pl`, and
-`tests/lib/TestSandbox.pm` (test `04-runtime-detection.t` pins this).
+`CCPRAXIS_CONTAINER_CLI=<name or path>` overrides the order. When set it
+is the only candidate: if it does not answer `--version` the launcher
+stops and names it, instead of falling back to something else.
 
 **On Windows, both runtimes require WSL2** (see the warning at the top of
 this file). The bootstrap blocks `podman + hyperv` automatically; Docker
 Desktop on Hyper-V isn't auto-detected (it requires manual user effort
 to even configure) but the same fatal 9p bugs apply if you set it up
 that way. Don't.
+
+### macOS: rootful podman machine
+
+One-time setup, from any terminal. The machine is created by a script, not
+by `podman machine init` (whose defaults share `/Users`, `/private` and
+`/var/folders` read-write):
+
+```bash
+brew install podman
+S=~/.claude/ccpraxis/plugins/sandbox/scripts/podman-machine.pl
+perl $S apply --confirm                       # rootful, 6 CPUs, 12 GiB, no project yet
+perl $S add-project ~/Projects/app --confirm  # share each project you sandbox
+```
+
+Then, from that project directory:
+
+```bash
+claude-sandbox            # first run: bootstrap, image build, skills picker, dashboard
+```
+
+Press `[c]` in the dashboard for a claude session: it opens a new
+Terminal.app window (via a single-use `.command` file and `open -a
+Terminal`, so no Automation permission is asked for). By hand, run
+`claude-sandbox --session` in a second terminal.
+
+What differs from Windows, and why:
+
+- **The image is built natively for the machine's architecture**, so an
+  Apple Silicon Mac builds a linux/arm64 image with no emulation. No step
+  downloads an artifact for one architecture only
+  (`containerfile-portability.t`); the backpack's Node recipe picks its
+  tarball from `dpkg --print-architecture` the same way.
+- **Only the machine's shared folders can be mounted.** The machine
+  shares a copy of the live install's plugins, skills and statusline
+  (refreshed by promotion and by each launch; never the live install
+  itself, whose code runs on the Mac) and ccpraxis's container-files
+  folder read-only, its container-test folder and each project in its
+  list read-write, and nothing else of the Mac
+  (`plugins/sandbox/docs/podman-machine.md` has the table and the reasons).
+  The launcher reads the machine's share list, with each share's mode, and
+  refuses a project outside it before asking anything; the message gives
+  the `add-project <dir>` command. podman passes paths literally, so the
+  launcher resolves the project path first (`/tmp/x` is `/private/tmp/x`).
+- **Bind mounts need no `:Z`.** The machine runs SELinux, but the
+  virtiofs shares are usable as they are; files the container's root
+  writes appear on the Mac owned by you, and O_APPEND, rename and
+  utimensat behave (`bind-honors-append-and-utimensat.t`).
+- **Keep-awake** is `caffeinate -i`, run by a small holder only while the
+  Mac is on AC power: idle sleep is held off, closing the lid always sleeps
+  the Mac, and on battery nothing is asserted (the holder drops caffeinate
+  within seconds of unplugging and takes it again on AC). It exits by
+  itself with the launcher.
+- **The Resources panel** reads the Mac's RAM, swap, CPU and disk from
+  `sysctl`, `vm_stat`, `ps` and `df`.
+- **Published ports** (`$SANDBOX_OPEN_PORTS`, 9000-9019 for the first
+  sandbox) are reachable at `localhost:<port>` on the Mac through
+  podman's gvproxy, and services on the Mac are reachable from inside the
+  container as `host.containers.internal`.
+- **Sign in inside the sandbox.** The sandbox never copies the host's
+  Claude token (and on macOS Claude Code keeps it in the login Keychain
+  anyway): run `/login` once in the first session.
 
 The historical Hyper-V investigation produced an xfs-volume + sync-sidecar
 workaround that shipped in earlier versions of this sandbox — retired in
@@ -114,15 +183,35 @@ container's `/root/.claude/` — claude's session jsonl, tasks/, lockfiles,
 settings.json, and CLAUDE.md are all writable host files. No volume,
 no sync sidecar, no `podman cp` round-trips.
 
+### What the image contains, and what it leaves to the backpack
+
+The image (`container/Containerfile`) is Debian bookworm-slim with the tools
+every sandbox uses (git, curl, build-essential, jq, perl, openssh-client and a
+few more), Claude Code from its native installer, and GitHub's SSH host keys.
+Beyond the Perl that ccpraxis itself runs on, it carries **no language runtime**:
+anything a project builds with is declared in that project's backpack and
+installed on top, so a rebuild returns each sandbox to its own toolchain and
+nothing else.
+
+**Node.js and pnpm are not in the image** since 2026-10-30 (they were from
+2026-08-03, pinned in the Containerfile). A project that needs them adds the
+sanctioned recipe, `/backpack:add --recipe node-pnpm`
+(`plugins/backpack/recipes/node-pnpm.json`): an exact Node LTS tarball checked
+against its sha256, plus pnpm, under `/opt/tools/node`. The image keeps what
+protects that Node once it exists: `npm_config_ignore_scripts=true`, the
+`PNPM_CONFIG_*` settings (no install scripts; a 7-day minimum package age), and
+`/opt/tools/node/bin` on `PATH`, so `npm install -g` tools are reachable by
+name from every process. With no Node installed those cost nothing.
+
 ### Mount layering
 
 The launcher applies these in order during `podman create`:
 
 1. **`.ccpraxis-local-data/claude-home` → `/root/.claude` (RW)** — the bulk bind. Sessions,
-   tasks, lockfiles, blueprint copies (`CLAUDE.md`, `settings.json`) all
-   land here. `apply_blueprints_to_host_data` writes the canonicals
-   from `.launcher/` to `.ccpraxis-local-data/claude-home/` on container create so they
-   appear at the standard paths inside.
+   tasks, lockfiles, `CLAUDE.md` and `settings.json` all land here. On container create
+   `apply_blueprints_to_host_data` writes the current `CLAUDE.md` render and merges the
+   current preset into the sandbox's own `settings.json` (see "The sandbox's own
+   settings" below), so they appear at the standard paths inside.
 
 2. **`.launcher` → `/root/.claude/.launcher:ro` (RO overlay)** — defends
    the launcher's metadata. The container can READ launcher state
@@ -153,6 +242,45 @@ The launcher applies these in order during `podman create`:
    `ensure_claude_json_host_file` touches it if missing).
 
 ---
+
+### The sandbox's own settings
+
+A sandbox's user settings are `claude-home/settings.json` (`/root/.claude/settings.json`
+inside). They start as the preset, `container/settings.json`, and from then on they are the
+sandbox's: Claude Code writes permissions, plugin choices and the like into them.
+
+**Every container create merges, never overwrites** (`plugins/sandbox/scripts/SandboxSettings.pm`). Rebuild
+or not, the current preset is merged into the sandbox's file key by key, against the preset
+the sandbox was last given (`.launcher/container-settings.json`). A key only the sandbox
+changed is kept; a key only the preset changed is taken; a key both changed is asked about at
+the launch (keep the sandbox's value, or take the preset's), and with nobody to ask, or on
+q/ESC, the sandbox's value is kept. Keys are the one-level dotted units every settings sync in
+ccpraxis uses (`plugins/steward/scripts/SettingsUnits.pm`): `env.FOO` is its own key. The old
+file is backed up first, to `.launcher/backups/<UTC time>/settings.json`, and the preset is
+then recorded as the one the sandbox was given.
+
+`CLAUDE.md` stays generated: each create writes the current render. A copy the sandbox edited
+(it differs from the last render it was given) is backed up to the same directory first, and
+the launch says where.
+
+The backups are read-only inside the container (`.launcher` is overlaid read-only at
+`/root/.claude/.launcher`), the same protection every launcher record has. A process in the
+container can still reach them through `/project/.ccpraxis-local-data`, as it can reach
+anything else in the project.
+
+**The stale prompt.** A changed preset or `CLAUDE.md` makes the launch ask whether to rebuild,
+and the prompt says what a new container does to these files. Choosing "Continue" records
+that preset (or `CLAUDE.md`) version for this project (`.launcher/*-declined-hash`), and the
+prompt does not ask about it again until the file changes once more.
+
+**Carrying a sandbox's changes back.** Each launch records the project in this machine's
+sandbox list, `~/.claude/ccpraxis-sandbox-projects.json` (`plugins/sandbox/scripts/SandboxRegistry.pm`), under
+an id kept in `.launcher/sandbox-id` that survives moving or renaming the project.
+`/steward:backup` reads that list and, for every key a sandbox changed on its own, asks
+whether to put it into the dev clone's preset (every sandbox takes it on its next merge), keep
+it in that sandbox (once, or remembered for that project), or revert that sandbox to the
+preset's value (after a backup). A key the preset changed and the sandbox did not is not
+asked: the next merge takes it.
 
 ## Plugin store (Fix 2 — copy model, two tiers)
 
@@ -239,7 +367,7 @@ Read and validated by `scripts/ProjectSandbox.pm`; the rules are held by `tests/
 
 | Event | Host's `.ccpraxis-local-data/claude-home/` state |
 |-------|--------------------------------------------------|
-| Container freshly created | Blueprint files written to host before mount; .claude.json placeholder ensured |
+| Container freshly created | `CLAUDE.md` rendered and the preset merged into `settings.json` before mount (old copies backed up to `.launcher/backups/`); .claude.json placeholder ensured |
 | claude session writes a turn | Host sees it immediately (bind mount) |
 | claude exits cleanly | Host already has everything — no final sync needed |
 | Container crashes | Host already has everything — no rescue needed |
@@ -362,11 +490,14 @@ it stays alive + processing throughout.
 │   └── claude-sandbox.sh              # Bash shim → launcher.pl
 ├── container/
 │   ├── Containerfile                  # debian:trixie-slim + claude install
-│   ├── CLAUDE.md                      # blueprint copied into each container
-│   └── settings.json                  # blueprint copied into each container
+│   ├── CLAUDE.md                      # container instructions shared by every launch
+│   ├── CLAUDE.<part>.md               # per runtime/host parts the launcher appends (ContainerClaudeMd.pm)
+│   └── settings.json                  # the sandbox preset, merged into each sandbox's settings.json
 ├── scripts/
 │   ├── launcher.pl                    # main entrypoint (manager + connector modes)
 │   ├── MountSpec.pm                   # mount-spec parsing (bind vs volume)
+│   ├── SandboxSettings.pm             # settings.json merge + CLAUDE.md refresh at create, backups
+│   ├── SandboxRegistry.pm             # this machine's list of sandboxed projects
 │   ├── select-session.pl              # picker TUI (used in connector mode)
 │   ├── bootstrap.pl                   # first-time .ccpraxis-local-data/claude-home setup
 │   └── skills.pl                      # discovery + selection state

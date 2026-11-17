@@ -209,6 +209,9 @@ sub age_marker {
 {
     require "$S/BpPowerJournal.pm";
     my $payload;
+    # The probe under test is the PowerShell one; production sends darwin to
+    # pmset instead, so pin the platform to the one that reads it.
+    local $^O = 'MSWin32';
     no warnings qw(redefine once);
     local *BpPowerJournal::probe_argv = sub { ['probe'] };
     local *BpPowerJournal::run_bounded = sub { return { status => 'ok', out => $payload } };

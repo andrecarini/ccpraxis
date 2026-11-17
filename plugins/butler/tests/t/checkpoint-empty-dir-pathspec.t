@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # A write-set entry naming a directory that exists but holds nothing git can
 # track must not cost the other entries their checkpoint.
 #

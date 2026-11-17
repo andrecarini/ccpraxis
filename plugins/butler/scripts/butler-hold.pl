@@ -171,9 +171,20 @@ sub write_record_atomic {
 
 # --------------------------------------------------------------- pid/fp -----
 
+# darwin has no /proc: the fp there is this process's start time
+# (BpHook::start_fp, "ps:<lstart>"), and the liveness check is BpHook's own,
+# so a recycled pid is told apart from the holder on that host too. Without
+# it the fp was always empty there and a pid reused by any other process
+# read as a live holder -- an extend merged into nobody and the session
+# stopped unheld.
 sub compute_fp {
     my $c = read_bytes_file("/proc/$$/cmdline");
-    return (defined $c && length $c) ? sha1_hex($c) : '';
+    return sha1_hex($c) if defined $c && length $c;
+    if ($^O eq 'darwin') {
+        my $fp = BpHook::start_fp($$);
+        return $fp if defined $fp;
+    }
+    return '';
 }
 
 sub proc_alive {
@@ -184,6 +195,7 @@ sub proc_alive {
         return 0 unless defined $cmdline && length $cmdline;
         return sha1_hex($cmdline) eq $fp ? 1 : 0;
     }
+    return BpHook::_holder_proc_alive({ pid => $pid, fp => $fp }) if $^O eq 'darwin';
     return kill(0, $pid) ? 1 : 0;
 }
 
@@ -194,6 +206,17 @@ sub resolve_self_task_id {
     # basename of its own stdout redirect target -- resolved the same way
     # the spec resolves any other item's output file (2.7).
     my $link = readlink("/proc/$$/fd/1");
+    if ((!defined $link || !length $link) && $^O eq 'darwin') {
+        # No /proc on macOS. fcntl(F_GETPATH) asks the kernel for the path
+        # behind an open fd -- the answer readlink gives above -- with no
+        # process started. 50 is F_GETPATH in <sys/fcntl.h>; Fcntl.pm does
+        # not export it. The buffer is MAXPATHLEN (1024) with room to spare;
+        # the kernel NUL-terminates what it writes.
+        my $buf = "\0" x 4096;
+        if (fcntl(STDOUT, 50, $buf)) {
+            ($link = $buf) =~ s/\0.*\z//s;
+        }
+    }
     return undef unless defined $link && length $link;
     $link =~ s{\\}{/}g;
     return undef unless $link =~ m{([^/]+)\.output$};

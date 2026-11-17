@@ -66,7 +66,7 @@ was disabled machine-wide (2026-08-13).
 
 **Repo facts:**
 - Root `.gitattributes` forces LF for `*.sh/.pl/.pm/.t/.ps1`/`Containerfile` — load-bearing, do not
-  remove. A `git checkout`/`merge` round-trip on this host once re-smudged the working tree to
+  remove. A `git checkout`/`merge` round-trip on the Windows host once re-smudged the working tree to
   CRLF and broke every sandbox bash hook (`$'\r': command not found`). Recovery: find offenders
   with `git ls-files --eol | grep 'w/crlf'` (git-authoritative), delete + recreate those
   working-tree files, then `git checkout-index -f -a`.
@@ -78,13 +78,13 @@ was disabled machine-wide (2026-08-13).
   auth relies on a git **credential helper** file, not the env var — see `launcher.pl`'s
   `ensure_git_credential_helper()`. Container runs as root (`HOME=/root`); `gh` is not baked into
   the image, install it via the backpack if a project needs it.
-- This host is Modern-Standby-only (S0, no S3): a keep-awake needs `ES_DISPLAY_REQUIRED` (not just
+- The Windows host is Modern-Standby-only (S0, no S3): a keep-awake needs `ES_DISPLAY_REQUIRED` (not just
   `ES_SYSTEM_REQUIRED`) to actually block connected standby; keep on AC with the lid open for long
   unattended runs. The host and the WSL2/podman VM are separate power domains that don't suspend
   simultaneously (the VM can keep running several minutes after the host goes quiet) — never
   compute a lease/mtime age across the host/container clock boundary, compute both sides inside
   the same clock domain.
-- `podman machine set --memory` is unsupported on this host's WSL2-backend machine; the configured
+- `podman machine set --memory` is unsupported on the Windows host's WSL2-backend machine; the configured
   `Resources.Memory` value is cosmetic. Actual container RAM is capped by `~/.wslconfig`'s
   `[wsl2] memory=`. To change the podman-reported config value, hand-edit
   `%USERPROFILE%\.config\containers\podman\machine\wsl\podman-machine-default.json` while the

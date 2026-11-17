@@ -17,7 +17,23 @@ H="${ALMANAC_HOME:-${HOME:-$USERPROFILE}}"
 [ -n "$H" ] || exit 0
 case "$H" in /*|[A-Za-z]:/*) ;; *) exit 0 ;; esac
 
-IFS= read -r -N 8388608 -t 10 P
+# The payload is read by scripts/read-payload.sh, the one reader the bash hooks
+# of almanac and butler share (sourced, so no process): "read -N" on bash
+# >= 4.1, a NUL-delimited read on macOS /bin/bash 3.2, where -N is an
+# invalid option (it once read nothing and, with `set -u`, made the next
+# line an exit-1 error on EVERY PostToolUse call). The reminder is advisory,
+# so every failure is silence: a timeout leaves P empty on every bash and
+# the gate exits; a payload over 8 MiB is still sampled from its first part,
+# as before; a missing library exits.
+case "${BASH_SOURCE[0]//\\//}" in
+    */*) _rp_dir="${BASH_SOURCE[0]//\\//}"; _rp_dir="${_rp_dir%/*}" ;;
+    *)   _rp_dir=. ;;
+esac
+[ -f "$_rp_dir/../scripts/read-payload.sh" ] || exit 0
+. "$_rp_dir/../scripts/read-payload.sh"
+declare -F ccp_read_payload >/dev/null || exit 0
+P=''
+ccp_read_payload P
 [ -n "$P" ] || exit 0
 
 [[ $P =~ \"hook_event_name\"[[:space:]]*:[[:space:]]*\"PostToolUse\" ]] || exit 0

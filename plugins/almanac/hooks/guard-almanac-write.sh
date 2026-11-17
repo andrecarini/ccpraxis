@@ -28,12 +28,22 @@
 # host settings file, so any project with almanac enabled gets it.
 #
 # Reading is untouched. Fails OPEN on anything unexpected — empty/broken
-# input, a payload with no path, a perl that dies at startup — because a
-# guard that wedges an unrelated project's session is worse than an
-# unguarded edit; the sealed digest (almanac-bug.pl verify) still detects the
-# out-of-band write regardless. That layer does not depend on prevention.
-# The Bash branch fails open the same way, including when butler is absent
-# or GuardBash's public interface changes shape (sec 2.6 of the spec).
+# input, a payload with no path, a perl that dies at startup, a missing
+# payload-reader library — because a guard that wedges an unrelated
+# project's session is worse than an unguarded edit; the sealed digest
+# (almanac-bug.pl verify) still detects the out-of-band write regardless.
+# That layer does not depend on prevention. The Bash branch fails open the
+# same way, including when butler is absent or GuardBash's public interface
+# changes shape (sec 2.6 of the spec).
+#
+# The one exception fails CLOSED: a payload that could not be READ in full
+# (no end of input within 10 s, or over 8 MiB). That is not broken input the
+# guard looked at and could not use; it is input the guard never saw, and
+# the hosts used to disagree about it -- bash >= 4 kept the partial text of
+# a timed-out read and still judged it, while macOS /bin/bash 3.2 dropped it
+# and let every such call through. A deny costs one retry; Claude Code
+# closes a hook's stdin as soon as it has written the payload, so a timeout
+# means something is genuinely stuck.
 #
 # COST DISCIPLINE (DC6, budget 50ms median). Every Edit/Write in every
 # session pays for this hook, so it is built in two stages: a bash-only
@@ -62,12 +72,70 @@
 # that is never opened.
 set -u
 
-# Stage 0: read the payload with a bash BUILTIN — no cat, no $(...), no pipe,
-# no external command. -N is the buffered form, required on a non-tty. Any
-# read status (timeout, short read, EOF) is tolerated; an empty payload just
-# fails open below.
-IFS= read -r -N 8388608 -t 10 P
+# Stage 0: read the payload with bash BUILTINS only — no cat, no $(...), no
+# pipe, no external command — through scripts/read-payload.sh, the one bounded
+# reader the bash hooks of almanac and butler share (sourced, so no process
+# is spawned). It keeps "read -N" on bash >= 4.1 and reads NUL-delimited on
+# macOS /bin/bash 3.2, where -N is an invalid option (rc 2, nothing read:
+# this guard once silently allowed every write there). Its states:
+#   complete           judged below; an empty payload fails open.
+#   truncated, timeout the guard never saw the whole call: deny (fail
+#                      CLOSED, see the header).
+#   (library missing)  a broken install: fail open, like a perl that dies.
+# P starts empty so `set -u` can never trip on it, whatever read does.
+_ALM_BASH4=0
+[ "${BASH_VERSINFO[0]:-0}" -ge 4 ] && _ALM_BASH4=1
+case "${BASH_SOURCE[0]//\\//}" in
+  */*) _alm_rp_dir="${BASH_SOURCE[0]//\\//}"; _alm_rp_dir="${_alm_rp_dir%/*}" ;;
+  *)   _alm_rp_dir=. ;;
+esac
+[ -f "$_alm_rp_dir/../scripts/read-payload.sh" ] || exit 0
+. "$_alm_rp_dir/../scripts/read-payload.sh"
+declare -F ccp_read_payload >/dev/null || exit 0
+P=''
+ccp_read_payload P
+case "${CCP_PAYLOAD_STATE:-}" in
+  complete) ;;
+  truncated|timeout)
+    if [ "$CCP_PAYLOAD_STATE" = timeout ]; then
+      _alm_why="its hook input did not end within the 10-second read budget"
+    else
+      _alm_why="its hook input is larger than the 8 MiB the guard reads"
+    fi
+    {
+      echo "BLOCKED: the almanac write guard could not read this call in full ($_alm_why), so it cannot tell whether the call writes a bug report or an almanac record."
+      echo
+      echo "Retry the call. A write guard that cannot read its input refuses rather than guessing; Claude Code normally hands a hook its whole input at once, so a repeat of this means the hook's input pipe is stuck."
+    } >&2
+    exit 2
+    ;;
+  *) exit 0 ;;
+esac
 [ -n "${P:-}" ] || exit 0
+
+# _alm_has_marker TEXT -> 0 when TEXT holds either root's literal, a store
+# segment's 8.3 short-name prefix, or a store leaf name (see Stage 1 for
+# why each is there). Case-insensitive via the nocasematch set below.
+_alm_has_marker() {
+  case "$1" in
+    *ccpraxis-local-data*|*claude-code-vault*|*'ccprax~'*|*'claude~'*|*bug-reports*|*almanac*|*code-vault*) return 0 ;;
+  esac
+  return 1
+}
+
+# _alm_unquoted TEXT -> sets ALM_UNQUOTED to TEXT with every ', " and \
+# removed. bash >= 4 does it with the ${x//pattern/} builtin (no spawn, which
+# the Windows latency budget needs). bash 3.2's pattern substitution is
+# super-linear: measured 1.6s on a 3 KB payload and 66s on a 10 KB one, past
+# every hook timeout, so 3.2 pipes through tr instead -- one cheap spawn on
+# a host (macOS) where process creation costs a few milliseconds.
+_alm_unquoted() {
+  if [ "$_ALM_BASH4" -eq 1 ]; then
+    ALM_UNQUOTED=${1//[\'\"\\]/}
+  else
+    ALM_UNQUOTED=$(printf '%s' "$1" | LC_ALL=C tr -d "\\\\'\"")
+  fi
+}
 
 # Stage 1: the prefilter. A case-insensitive bash builtin match for either
 # root's literal substring, OR the 8.3 short-name PREFIX either store
@@ -100,10 +168,12 @@ shopt -s nocasematch
 # stripped copy tested as well. Matching only `$P` left the strip at :122
 # dead code for Stage 1's own purposes, since Stage 1 already exited above
 # it on a miss. Builtins only; can only add perl spawns, never remove a deny.
-case "$P${P//[\'\"\\]/}" in
-  *ccpraxis-local-data*|*claude-code-vault*|*'ccprax~'*|*'claude~'*|*bug-reports*|*almanac*|*code-vault*) ;;
-  *) exit 0 ;;
-esac
+# The stripped copy is only built when the raw text misses: it can only add a
+# hit, so a raw hit already settles Stage 1.
+if ! _alm_has_marker "$P"; then
+  _alm_unquoted "$P"
+  _alm_has_marker "$ALM_UNQUOTED" || exit 0
+fi
 
 # Stage 1b (Bash only, builtins only, spawns nothing). Narrows the trigger
 # to the two fields that can actually name a write target -- tool_input.
@@ -126,12 +196,12 @@ if [[ $P =~ $RE_TOOL_IS_BASH ]]; then
     # S5/B1: a quote injected mid-literal (`.ccpraxis-local-"data"`) or a
     # backslash before a path separator defeats a literal substring match
     # even though the two would be the SAME path once the shell strips
-    # them. Also test a quote/backslash-stripped copy, builtins only.
-    STRIPPED1B=${COMBINED1B//[\'\"\\]/}
-    case "$COMBINED1B$STRIPPED1B" in
-      *ccpraxis-local-data*|*claude-code-vault*|*'ccprax~'*|*'claude~'*|*bug-reports*|*almanac*|*code-vault*) ;;
-      *) exit 0 ;;
-    esac
+    # them. Also test a quote/backslash-stripped copy (builtins only on
+    # bash >= 4; see _alm_unquoted for 3.2).
+    if ! _alm_has_marker "$COMBINED1B"; then
+      _alm_unquoted "$COMBINED1B"
+      _alm_has_marker "$ALM_UNQUOTED" || exit 0
+    fi
   fi
 fi
 
@@ -460,7 +530,8 @@ OUT=$(printf "%s" "$P" | perl -MJSON::PP -MTime::HiRes -e '
             }
             my $vi = $seg->{s};
             while ($vi <= $seg->{e} && $toks->[$vi] =~ /^[A-Za-z_][A-Za-z0-9_]*=/) { $vi++; }
-            while ($vi <= $seg->{e} && $toks->[$vi] =~ /^(?:\{|then|else|do|builtin|command|time|!|if|elif|while|until)\z/i) { $vi++; }
+            # noglob / nocorrect / a lone "-": zsh precommand modifiers.
+            while ($vi <= $seg->{e} && $toks->[$vi] =~ /^(?:\{|then|else|do|builtin|command|time|!|if|elif|while|until|noglob|nocorrect|-)\z/i) { $vi++; }
             next if $vi > $seg->{e};
             (my $cbase = $toks->[$vi]) =~ s{.*[/\\]}{};
             $cbase =~ s/\.exe\z//i;
@@ -814,7 +885,10 @@ OUT=$(printf "%s" "$P" | perl -MJSON::PP -MTime::HiRes -e '
         my $n = scalar @$toks;
         for (my $k = 0; $k < $n; $k++) {
             my $word = $toks->[$k];
-            (my $base = $word) =~ s{.*[/\\]}{};
+            # zsh (the macOS Bash tool shell) expands a command word
+            # "=perl" to the path of perl, so "=perl -e CODE" runs perl.
+            (my $base = $word) =~ s{\A=(?=[^=])}{};
+            $base =~ s{.*[/\\]}{};
             $base =~ s/\.exe\z//i;
             my $interp;
             if    ($base =~ /^perl\z/i)                 { $interp = "perl"; }
@@ -960,7 +1034,7 @@ OUT=$(printf "%s" "$P" | perl -MJSON::PP -MTime::HiRes -e '
     # and never emits a kind=>"cd" entry for it. Treat it like an explicit
     # cd: this disables the (wrong) cwd join below for a relative literal
     # and lets the Rule E relative-write check below see it.
-    $any_cd = 1 if $cmd =~ /(?:^|[\s;&|(])(?:env|sudo)\b[^;&|]*\s(?:-C|--chdir(?:=\S+)?|-D)\b/;
+    $any_cd = 1 if $cmd =~ /(?:^|[\s;&|(])(?:=|[^\s;&|()]*\/)?(?:env|sudo)\b[^;&|]*\s(?:-C|--chdir(?:=\S+)?|-D)\b/;
 
     # FIX-BATCH (item 3, architectural): resolve $cwd through every cd this
     # command performs, textually, BEFORE deciding whether a relative write
@@ -1009,7 +1083,7 @@ OUT=$(printf "%s" "$P" | perl -MJSON::PP -MTime::HiRes -e '
         unless ($has_marker) {
             # M2: the directory argument of env -C/sudo -D is a cd target
             # too.
-            while ($hcmd =~ /(?:^|[\s;&|(])(?:env|sudo)\b[^;&|]*?\s(?:-C|--chdir(?:=)?|-D)[= ]?(\S+)/g) {
+            while ($hcmd =~ /(?:^|[\s;&|(])(?:=|[^\s;&|()]*\/)?(?:env|sudo)\b[^;&|]*?\s(?:-C|--chdir(?:=)?|-D)[= ]?(\S+)/g) {
                 my $cd_tgt = $1;
                 if ($cd_tgt =~ /ccpraxis-local-data|claude-code-vault|ccprax~\d+|claude~\d+/i) {
                     $has_marker = 1;
@@ -1210,10 +1284,17 @@ fi
 
 # kind == store — the verb map, keyed by lc(type). ${TYPE,,} is a bash
 # builtin (no extra process on the deny path, unlike a printf|tr pipeline).
+# It is bash 4 syntax, though: macOS /bin/bash 3.2 aborts on it ("bad
+# substitution", exit 1, a non-blocking hook error), so a store deny there
+# let the write through. 3.2 pays the tr instead.
 # LEGACY_INBOX_TYPE is the unmigrated store dir's own name (blueprint
 # where-things-go, package 01-inbox-rename): a write into an unmigrated
 # legacy dir is still denied and points at the live script.
-TYPE_LC=${TYPE,,}
+if [ "$_ALM_BASH4" -eq 1 ]; then
+  TYPE_LC=${TYPE,,}
+else
+  TYPE_LC=$(printf '%s' "$TYPE" | LC_ALL=C tr 'A-Z' 'a-z')
+fi
 LEGACY_INBOX_TYPE=decision
 case "$TYPE_LC" in
   todo)        SCRIPT="almanac-todo.pl";     VERBS="create | edit | complete | reopen | delete" ;;

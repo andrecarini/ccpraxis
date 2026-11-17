@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Oracle test for s18-terminal-minimize-spike, derived from
 #   .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/s18-terminal-minimize-spike-spec.md
 #

@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 #
 # ORACLE for package 08-host-awake-actuator (blueprint wake-and-pause-consolidation),
 # AC1-AC17 of

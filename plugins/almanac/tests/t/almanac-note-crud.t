@@ -1618,6 +1618,45 @@ SKIP: {
 }
 
 # =============================================================================
+# Case-insensitive filesystems (NTFS on Windows, default APFS on macOS): a
+# case variant of a path names the SAME file, so (a) an external target
+# spelled .CCPRAXIS-LOCAL-DATA/... still points into the unversioned area,
+# and (b) deleting a note whose target is a case variant of another live
+# note's target must not unlink that other note's content. Both checks used
+# to fold case on Windows only; on macOS (b) destroyed the other note's file.
+# =============================================================================
+{
+    my $FOLDS = ($^O =~ /^(MSWin32|cygwin|msys|darwin)$/) ? 1 : 0;
+    my $ROOTCF = tempdir(CLEANUP => 1); $ROOTCF =~ s{\\}{/}g;
+
+    my $rext = run_cli('create', '--title', 'CF ext', '--audience', 'external',
+                       '--target', '.CCPRAXIS-LOCAL-DATA/x.md', '--root', $ROOTCF);
+    if ($FOLDS) {
+        is($rext->{rc}, 2, 'CF(a): an external target in a case variant of .ccpraxis-local-data is refused')
+            or diag("stdout: $rext->{out}\nstderr: $rext->{err}");
+        is(field2($rext->{err}, 'detail'), 'external_target_unversioned', 'CF(a): ...as external_target_unversioned');
+    } else {
+        is($rext->{rc}, 0, 'CF(a): on a case-sensitive host .CCPRAXIS-LOCAL-DATA is a different, versioned dir')
+            or diag("stderr: $rext->{err}");
+    }
+
+    my $rx = run_cli('create', '--title', 'CF owner', '--id', 'cf-owner', '--content', 'owner bytes', '--root', $ROOTCF);
+    is($rx->{rc}, 0, 'CF(b) fixture: the owning note is created') or diag("stderr: $rx->{err}");
+    my $owned = internal_dir($ROOTCF, 'project') . '/cf-owner.md';
+    my $ry = run_cli('create', '--title', 'CF alias', '--id', 'cf-alias',
+                     '--target', '.ccpraxis-local-data/notes/CF-OWNER.md', '--root', $ROOTCF);
+    is($ry->{rc}, 0, 'CF(b) fixture: a second note targets a case variant of the first one\'s content file')
+        or diag("stderr: $ry->{err}");
+    my $rdel = run_cli('delete', 'cf-alias', '--root', $ROOTCF);
+    is($rdel->{rc}, 0, 'CF(b): deleting the aliasing note exits 0') or diag("stderr: $rdel->{err}");
+    if ($FOLDS) {
+        like($rdel->{out}, qr/^content: kept$/m, 'CF(b): content: kept -- the target is another live note\'s file');
+    }
+    ok(-f $owned, 'CF(b): the owning note\'s content file survives');
+    is(slurp_raw($owned), 'owner bytes', 'CF(b): ...byte for byte');
+}
+
+# =============================================================================
 # Live-store sanity, again, at the end (AC-50).
 # =============================================================================
 {

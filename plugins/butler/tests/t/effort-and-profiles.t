@@ -109,6 +109,17 @@ my $LAUNCH = "$ROOT_BUTLER/scripts/bp-launch.sh";
 my $HAVE_JQ = do { my $o = `jq --version 2>/dev/null`; (defined $o && $o =~ /jq/) ? 1 : 0 };
 my $NO_JQ   = 'jq is not installed on this host; bp-launch.sh exits at require_cmd, so no launch '
             . 'happens and neither the positive NOR the negative assertions mean anything here';
+# The same vacuity argument covers bp-launch.sh's other hard requirements. It is
+# a SANDBOX launcher (setsid + flock around a detached `claude -p`), and a host
+# without those tools -- macOS ships neither flock(1) nor setsid(1) -- stops it
+# at the same require_cmd. Treated exactly like a missing jq.
+my @MISSING_LAUNCH_TOOLS = grep { !`bash -c 'command -v $_' 2>/dev/null` } qw(flock setsid realpath);
+if (@MISSING_LAUNCH_TOOLS) {
+    $NO_JQ   = 'bp-launch.sh needs ' . join(', ', @MISSING_LAUNCH_TOOLS) . ' (sandbox tools) and this host lacks them;'
+             . ' it exits at require_cmd, so no launch happens and neither the positive NOR the negative'
+             . ' assertions mean anything here';
+    $HAVE_JQ = 0;
+}
 my $ORCH   = "$ROOT_BUTLER/scripts/bp-orchestrator.pl";
 (my $AUTH_SKILL   = "$Bin/../../../blueprint/skills/authoring-protocol/SKILL.md") =~ s{\\}{/}g;
 (my $CREATE_SKILL = "$Bin/../../../blueprint/skills/create/SKILL.md")             =~ s{\\}{/}g;

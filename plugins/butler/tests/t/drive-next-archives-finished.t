@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Oracle for blueprint director-archives-finished, package 01
 # (specs/01-archive-on-blueprint-done-spec.md AC1-AC9). Tests only, blind to
 # the implementation of bp-drive-next.pl.

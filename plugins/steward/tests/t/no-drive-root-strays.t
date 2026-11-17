@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # 09 — regression guard for the C:\c and C:\tmp leak.
 #
 # WHAT HAPPENED

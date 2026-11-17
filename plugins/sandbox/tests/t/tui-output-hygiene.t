@@ -112,6 +112,13 @@ ok(length($LAUNCHER_SRC_TEXT) > 0, 'setup: launcher.pl was read as source text')
 # run_capped($cmd_list_or_str, %opts) -> ($stdout_and_stderr, $exit)
 # Bounded subprocess runner (never launcher.pl). Uses `timeout` per the
 # standing hazard.
+# macOS ships no `timeout`: the runner puts scripts/test-bin/timeout on PATH
+# for a sweep, and a file run on its own puts it there itself (the same rule
+# as GuardHarness.pm).
+unless (grep { -x "$_/timeout" } split /:/, ($ENV{PATH} // '')) {
+    $ENV{PATH} = "$Bin/../../../../scripts/test-bin:" . ($ENV{PATH} // '')
+        if -x "$Bin/../../../../scripts/test-bin/timeout";
+}
 sub run_capped {
     my ($cmd, %opts) = @_;
     my $secs = $opts{secs} // 10;
@@ -174,6 +181,14 @@ sub make_fake_tput {
     print $fh "#!/bin/sh\necho $cols\n";
     close $fh;
     chmod 0755, $path;
+    # statusline.pl asks $COLUMNS and the controlling terminal (stty size
+    # </dev/tty) before tput off Windows; pin both so this shim decides the
+    # width even when the file is run from an interactive terminal.
+    open(my $sfh, '>', "$FAKE_TPUT_DIR/stty") or die "cannot write fake stty: $!";
+    print $sfh "#!/bin/sh\nexit 1\n";
+    close $sfh;
+    chmod 0755, "$FAKE_TPUT_DIR/stty";
+    delete $ENV{COLUMNS};
     return $path;
 }
 

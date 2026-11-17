@@ -1,23 +1,35 @@
 #!/usr/bin/env perl
 # platform: any
-# Oracle for b38 (blueprint sandbox-butler-overhaul).
+# Oracle for b38 (blueprint sandbox-butler-overhaul), RETARGETED 2026-10-30.
 #
 # IMMUTABLE ORACLE: written from the spec BEFORE the implementation exists.
 # Do not weaken these assertions to make a future implementation's life
 # easier; a criterion this file cannot honestly test is reported, not faked.
 #
-# Spec: .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b38-spec.md
+# RETARGETED 2026-10-30 (operator decision): Node and pnpm left the sandbox
+# base image and are declared per project in the backpack, through the
+# sanctioned recipe plugins/backpack/recipes/node-pnpm.json. D1 used to assert
+# the Containerfile's own Node/pnpm pins; it now asserts that the image installs
+# neither, and that the RECIPE carries the same guarantees the image step did
+# (exact pins, one version for both architectures, an unknown architecture
+# refused) plus a pinned sha256 per tarball, which the image step never had.
+# D2-D7 are unchanged: the hardening is environment and config, it stays in the
+# image, and it is what protects whichever Node a project installs later.
+#
+# Spec: .ccpraxis-local-data/blueprints/_archive/sandbox-butler-overhaul/specs/b38-node-pnpm-toolchain-spec.md
 # Test slot is 57, NOT 55 -- spec section 1.7 records the collision with the
 # pre-existing minimize-evidence.t and the corrected slot.
 #
 # NEVER build an image or start a container here. Containerfile content is
 # asserted as TEXT ONLY, following the precedent in t/refuse-in-place.t
 # (source-grep without spawning). D7 is the sole exception: it runs the
-# REAL `pnpm` binary already installed in this sandbox against a File::Temp
+# REAL `pnpm` binary, when a backpack has installed one, against a File::Temp
 # scratch directory -- never the real project, never a container.
 #
 # Criterion mapping (spec section 3):
-#   D1 : Node/pnpm exactly pinned, no latest/lts/bare-major floating ref
+#   D1 : the image installs no Node/pnpm; the backpack recipe pins both exactly
+#        (one version for both architectures, a sha256 per tarball, no
+#        latest/lts/bare-major), and installs where the image PATH looks
 #   D2 : the four PNPM_CONFIG_* env vars, exact values (unit named for D2b)
 #   D3 : MINIMUM_RELEASE_AGE_IGNORE_MISSING_TIME explicitly false (why, below)
 #   D4 : dangerouslyAllowAllBuilds never enabled + ignore_scripts non-regression
@@ -31,6 +43,7 @@ use FindBin qw($Bin);
 use Test::More;
 use File::Temp qw(tempdir);
 use Cwd qw(abs_path getcwd);
+use JSON::PP;
 
 my $REPO_ROOT = abs_path("$Bin/../../../..");
 BAIL_OUT("cannot resolve repo root from $Bin/../../../..") unless defined $REPO_ROOT;
@@ -56,48 +69,86 @@ close $sfh;
 my $ssrc = join '', @slines;
 
 # =====================================================================
-# D1 -- exact version pins, no floating reference
+# D1 -- no Node/pnpm in the image; the backpack recipe pins both exactly
 # =====================================================================
+my $RECIPE_FILE = "$REPO_ROOT/plugins/backpack/recipes/node-pnpm.json";
+my $recipe = do {
+    open my $rfh, '<:raw', $RECIPE_FILE or BAIL_OUT("cannot open the node-pnpm recipe at $RECIPE_FILE: $!");
+    local $/;
+    my $doc = eval { JSON::PP->new->utf8->decode(<$rfh>) };
+    BAIL_OUT("the node-pnpm recipe is not valid JSON: $@") unless ref $doc eq 'HASH';
+    ref $doc->{items} eq 'ARRAY' && @{ $doc->{items} } == 1
+        or BAIL_OUT('the node-pnpm recipe must hold exactly one item');
+    $doc->{items}[0];
+};
+my $r_install = $recipe->{install} // '';
+my $r_verify  = $recipe->{verify}  // '';
 {
-    # Pre-existing lines that legitimately mention "node"/"pnpm"-adjacent
-    # tokens and must NOT be mistaken for the new toolchain block.
-    my %preexisting = map { $_ => 1 } (
-        "ENV npm_config_ignore_scripts=true\n",
-        'ENV NODE_OPTIONS="--dns-result-order=ipv4first"' . "\n",
-    );
+    # D1a: the IMAGE installs neither. Code lines only: the comment block that
+    # records the 2026-10-30 decision legitimately names what used to be here.
+    unlike($ccode, qr{nodejs\.org/dist/}, 'D1a: the Containerfile downloads no Node tarball');
+    unlike($ccode, qr/\b(?:npm|pnpm)\s+(?:install|i|add)\s+(?:-g|--global)\b/,
+        'D1a: the Containerfile installs no global npm/pnpm package');
+    unlike($ccode, qr/\bcorepack\b|\bnodesource\b|apt-get install[^\n]*\bnodejs\b/i,
+        'D1a: the Containerfile installs Node by no other route either (corepack, NodeSource, apt nodejs)');
+    unlike($ccode, qr{/opt/node24}, 'D1a: nothing in the Containerfile still refers to the old /opt/node24 prefix');
 
-    my @relevant = grep { (/\bnode\b/i || /\bpnpm\b/i) && !$preexisting{$_} } @ccode_lines;
+    # D1b: the recipe pins Node exactly, ONE version for both architectures.
+    my ($x64)   = $r_install =~ /\bnode-v(\d+\.\d+\.\d+)-linux-x64\.tar\.xz\b/;
+    my ($arm64) = $r_install =~ /\bnode-v(\d+\.\d+\.\d+)-linux-arm64\.tar\.xz\b/;
+    my ($url)   = $r_install =~ m{https://nodejs\.org/dist/v(\d+\.\d+\.\d+)/};
+    ok(defined $x64,   'D1b: the recipe names an exact linux-x64 Node tarball');
+    ok(defined $arm64, 'D1b: the recipe names an exact linux-arm64 Node tarball');
+    is($arm64, $x64, 'D1b: both architectures pin the SAME Node version (a bump must move both)');
+    is($url,   $x64, 'D1b: the download URL is the pinned version\'s own dist directory');
+    my ($pnpm) = $r_install =~ /\bpnpm\@(\d+\.\d+\.\d+)\b/;
+    ok(defined $pnpm, 'D1b: the recipe pins pnpm to an exact x.y.z');
 
-    my $has_node_pin = grep { /\bv24\.18\.0\b/ } @relevant;
-    my $has_pnpm_pin = grep { /\b11\.17\.0\b/ } @relevant;
-
-    ok($has_node_pin, 'D1a: Containerfile pins Node to exact v24.18.0 in the added toolchain block')
-        or diag('no line mentioning node/pnpm (outside the pre-existing env lines) contains "v24.18.0"');
-    ok($has_pnpm_pin, 'D1b: Containerfile pins pnpm to exact 11.17.0 in the added toolchain block')
-        or diag('no line mentioning node/pnpm (outside the pre-existing env lines) contains "11.17.0"');
-
-    # Comment lines are EXCLUDED (coordinator fix at the step-4 gate). D1c is about
-    # what the image actually installs — a floating reference in a RUN/ENV directive.
-    # The implementation's comment block legitimately explains *why* `latest` was
-    # rejected ("11.18.0/dist-tag latest (5d) were both too new"), and flagging that
-    # prose as a floating reference is a false positive that would pressure the
-    # implementer to delete the very rationale a future maintainer needs.
-    my @floating_hits;
-    for my $line (grep { !/^\s*#/ } @relevant) {
-        push @floating_hits, $line if $line =~ /\b(?:latest|lts)\b/i;
-        push @floating_hits, $line if $line =~ /(?:\bnode[:@]|NODE_VERSION\s*=\s*)24(?!\.\d)/i;
-        # `\@` MUST be escaped (coordinator fix). Written as `pnpm@11`, Perl
-        # interpolates `@11` as a non-existent (empty) array, silently collapsing the
-        # pattern to /\bpnpm(?!\.\d)/ — which matches ANY line containing "pnpm" not
-        # followed by ".<digit>", and so flagged the correctly-pinned
-        # `npm install -g pnpm@11.17.0` as a floating reference. Same class as the
-        # \Q...$?...\E interpolation trap fixed in t/67: an unescaped sigil silently
-        # changes what the regex means, and the test still "works" — wrongly.
-        push @floating_hits, $line if $line =~ /\bpnpm\@11(?!\.\d)/i;
+    # Floating references anywhere in the recipe's commands. `\@` escaped, see
+    # the coordinator note this file has carried since b38: an unescaped `@11`
+    # interpolates as an empty array and silently changes the pattern.
+    my @floating;
+    for my $cmd ($r_install, $r_verify) {
+        push @floating, $1 while $cmd =~ /(\b(?:latest|lts)\b)/gi;
+        push @floating, $1 while $cmd =~ /(\bpnpm\@\d+(?:\.\d+)?)(?![.\d])/g;
+        push @floating, $1 while $cmd =~ /(node-v\d+(?:\.\d+)?-)/g;
+        push @floating, $1 while $cmd =~ /(\bnvm\s+install\b)/g;
     }
-    is(scalar(@floating_hits), 0,
-       'D1c: no `latest`, `lts`, or bare-major floating reference appears in the added Node/pnpm block')
-        or diag("floating-reference hits:\n  " . join("  ", @floating_hits));
+    is(scalar(@floating), 0, 'D1b: no latest, lts, bare-major or nvm floating reference in the recipe')
+        or diag('floating references: ' . join(', ', @floating));
+
+    # D1c: each tarball is checked against a pinned sha256 BEFORE it is unpacked.
+    my ($x64_arm)   = $r_install =~ /\bamd64\)([^;]*);;/;
+    my ($arm64_arm) = $r_install =~ /\barm64\)([^;]*);;/;
+    like($x64_arm   // '', qr/linux-x64\.tar\.xz\b.*\b[0-9a-f]{64}\b/,   'D1c: the amd64 branch carries a 64-hex sha256 next to its tarball');
+    like($arm64_arm // '', qr/linux-arm64\.tar\.xz\b.*\b[0-9a-f]{64}\b/, 'D1c: the arm64 branch carries a 64-hex sha256 next to its tarball');
+    my $sum_at = index($r_install, 'sha256sum -c');
+    my $tar_at = index($r_install, 'tar -');
+    ok($sum_at >= 0 && $tar_at > $sum_at, 'D1c: sha256sum -c runs before tar unpacks anything')
+        or diag("sha256sum at $sum_at, tar at $tar_at");
+    like($r_install, qr/sha256sum -c[^&]*&&/, 'D1c: a checksum failure stops the && chain');
+
+    # D1d: the architecture comes from the image (dpkg), and an unknown one fails.
+    like($r_install, qr/dpkg --print-architecture/, 'D1d: the recipe picks its tarball from dpkg --print-architecture');
+    like($r_install, qr/\*\)[^;]*;\s*exit 1\s*;;/, 'D1d: an unrecognised architecture exits 1 instead of guessing');
+
+    # D1e: it installs where the image PATH looks, and nowhere else.
+    my $prefix = '/opt/tools/node';
+    is_deeply($recipe->{bin_dirs}, ["$prefix/bin"], "D1e: the recipe's bin_dirs is exactly $prefix/bin");
+    like($r_install, qr{-C \Q$prefix\E\.new\b.*\bmv \Q$prefix\E\.new \Q$prefix\E\b},
+        "D1e: the tarball unpacks to $prefix.new and replaces $prefix only once complete");
+    ok((grep { m{^ENV PATH="\Q$prefix\E/bin:\$\{PATH\}"\s*$} } @ccode_lines),
+        "D1e: the Containerfile puts $prefix/bin on PATH (npm -g tools land there; hooks and the Bash tool need them by name)");
+
+    # D1f: verify checks the EXACT pins, so a bump of install alone cannot pass.
+    my ($want_node, $want_pnpm) = ($x64 // 'NONE', $pnpm // 'NONE');
+    like($r_verify, qr/= v\Q$want_node\E\b/, 'D1f: verify checks node --version against the pinned Node version');
+    like($r_verify, qr/= \Q$want_pnpm\E\b/, 'D1f: verify checks pnpm --version against the pinned pnpm version');
+    like($r_verify, qr{^cd / &&}, 'D1f: verify runs from /, so a project packageManager pin cannot redirect pnpm --version');
+
+    # D1g: the recipe never turns install scripts back on for its own install.
+    unlike($r_install, qr/ignore-scripts\s*=\s*false|--ignore-scripts=false|npm_config_ignore_scripts=false/i,
+        'D1g: the recipe does not re-enable install scripts');
 }
 
 # =====================================================================

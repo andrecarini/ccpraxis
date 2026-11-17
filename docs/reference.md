@@ -11,6 +11,7 @@ each other, and the contracts they hold to. Start at the
 - [Slash commands](#slash-commands)
 - [Statusline](#statusline)
 - [/steward:backup flow](#stewardbackup-flow)
+- [/steward:upstream-sync flow](#stewardupstream-sync-flow)
 - [Vault sync](#vault-sync)
 - [Sandbox](#sandbox)
 - [Backpack plugin](#backpack-plugin)
@@ -22,6 +23,8 @@ Per-surface `ccpraxis-install.pl` hooks let each plugin/skill own its install-ti
 
 The orchestrator is two-phase: a bare run prints the plan and exits without touching anything; re-running with `--confirm` applies it. Each hook is idempotent — re-runs are safe no-ops. On Windows only User-scope `PATH`/`PATHEXT` are touched (no admin required).
 
+`install.pl` wires; it never updates. Plugin code and the global config reach the live install and `~/.claude` only by promotion (`scripts/promote.pl`, run from the dev clone), so run `install.pl` from the live install, after promoting, and only when the wiring changed. [Working on ccpraxis](working-on-ccpraxis.md) has the model and the fresh-machine procedure.
+
 ## Shell-script policy
 
 `.sh` and `.ps1` files exist only for **commands the user runs directly outside Claude** (`claude-sandbox`). Everything else — install logic, plugin internals, statusline rendering — is Perl. One source of truth for host-side code.
@@ -31,7 +34,8 @@ Two deliberate exceptions: the `butler` and `blueprint` plugins each carry a sma
 ## Slash commands
 
 **Config and sync**
-- `/steward:backup` — sync ccpraxis config + every registered vault project (drift detection, AI-assisted conflict merge, secret scan, push). `host-only`.
+- `/steward:backup` — local state: promote the ccpraxis dev clone into the live install (asking first), export `~/.claude` settings into its payload key by key, commit and promote again; then sync every registered vault project. Never talks to GitHub. `host-only`.
+- `/steward:upstream-sync` — the GitHub side, for the dev clone only: fetch your fork, integrate `origin/main`, secret-scan, push `main` after you confirm the outgoing commits. `host-only`.
 - `/steward:setup-project` — bootstrap a project for vault backup (orphan discovery, slug pick, initial sync). `host-only`.
 - `/refresh` — re-read all CLAUDE.md files and summarize key rules.
 
@@ -77,22 +81,70 @@ Opus 4.6 1M  22% |220k 780k| 5h 15%|3h 46m|  7d 12%|4d 22h|
 
 - Background `git fetch` every 30 min (non-blocking)
 - Wraps to 3 lines if terminal is too narrow
-- Requires: git, terminal with 24-bit color (Windows Terminal, iTerm2, WezTerm, Kitty)
+- Requires: git, terminal with 24-bit color (Windows Terminal, iTerm2, WezTerm, Kitty, and Terminal.app on macOS 27, which sets `COLORTERM=truecolor`)
 
 ## /steward:backup flow
 
-Bidirectional sync between your live `~/.claude/` config and your ccpraxis repo:
+Brings local state in line and backs it up; it never fetches, merges or pushes (that is
+[/steward:upstream-sync](#stewardupstream-sync-flow)). The driver is
+`scripts/backup.pl`; the skill presents its decisions and relays its report. Two checkouts
+are involved ([Working on ccpraxis](working-on-ccpraxis.md)): the live install
+(`~/.claude/ccpraxis`, what runs, changed only by `scripts/promote.pl`) and the dev clone
+(the live install's `origin`, where the export lands).
 
-1. Detects drift (identical, live-only, export-only, conflict, settings, marketplace, and container settings changes)
-2. Creates timestamped backups of live settings before any modifications
-3. Three-way settings sync: live host ↔ global-config ↔ plugins/sandbox/container (semantic JSON comparison — ignores key order)
-4. Saves user preferences for intentionally-divergent keys so the same questions aren't re-asked across syncs
-5. Syncs marketplace selections across machines (strips machine-specific paths)
-6. Merges conflicts with AI assistance and user approval
-7. Scans all staged files for secrets (API keys, tokens, credentials, private keys)
-8. Commits and pushes (pulls first to avoid conflicts)
-9. **Iterates every registered vault project** — runs the full sync engine for each (see Vault Sync below), surfacing conflicts interactively
-10. **Offers registration for the current project** if it has Claude files but isn't tracked yet — `Yes` invokes `/steward:setup-project`, `Not now` defers, `Don't ask again` writes a `.claude/backup-skip` opt-out marker
+1. **Locates the dev clone** through the live install's `origin`. A GitHub URL there (a
+   machine set up before promotion owned the live install), a dev clone off `main`, or
+   uncommitted changes to its `global-config/` payload skip the ccpraxis part with a note
+   saying why and how to fix it; the vault part still runs.
+2. **Promotes** when the dev clone's `main` is ahead of the live install: one
+   `promote_pending` question lists the commits, then the dev clone's own
+   `scripts/promote.pl` runs (its output is kept verbatim). A refusal stops the ccpraxis
+   part. Declined, the export is skipped too if the payload then differs from the live one,
+   because the export would overwrite payload edits that were never promoted.
+3. **Checks the live install**: README path lint and the repo-layout tree (questions on
+   drift), the skills mirror into `~/.claude/skills`, and `~/.claude/CLAUDE.md` against the
+   build of the live payload for this host (`GlobalClaudeMd.pm`).
+4. **Asks per key.** `~/.claude/settings.json` is compared with the payload
+   (`json-diff.pl --host-live`, one-level dotted units, the `${CCPRAXIS_LIVE}` path and other
+   platforms' keys and hooks normalised by `MachineLocalSettings.pm`). Every differing unit
+   without a saved preference (`.backup-preferences.json` in the live install) is one
+   question: into the payload, back into `~/.claude`, skip, or keep different for good. The
+   same per marketplace (`known_marketplaces.json`) and per container-settings key, and for
+   each sandbox in this machine's sandbox list, per key that sandbox changed on its own: into
+   the dev clone's sandbox preset, keep it in that sandbox (once, or remembered for that
+   project), or revert that sandbox to the preset's value after a backup. A
+   `~/.claude/CLAUDE.md` hand edit is never exported: rebuild it or fold the lines into the
+   payload by hand.
+5. **Exports and commits** only what was sent to the payload, into the dev clone's working
+   tree, after a secret scan of exactly those files; the commit (`backup: sync ccpraxis config (N
+   file(s))`) holds those files and nothing else of the developer's. Values sent back into
+   `~/.claude` are written with the token expanded, never the raw `${CCPRAXIS_LIVE}`.
+6. **Promotes again**, without a question, when every commit the live install lacks is a
+   backup export commit, so the run ends with the live install at the dev clone's `main`.
+7. **Iterates every registered vault project** — runs the full sync engine for each (see
+   Vault Sync below), surfacing conflicts interactively.
+8. **Offers registration for the current project** if it has Claude files but isn't tracked
+   yet — `Yes` invokes `/steward:setup-project`, `Not now` defers, `Don't ask again` writes a
+   `.claude/backup-skip` opt-out marker.
+
+## /steward:upstream-sync flow
+
+The GitHub side, for the dev clone only (`plugins/steward/scripts/upstream-sync.pl`,
+stateless: every run recomputes from git):
+
+1. Fetches `origin` (your fork; git's own credential helpers answer, no prompt opens).
+2. Integrates `origin/main` into `main`: a fast-forward, or a merge commit when `main` has
+   commits of its own. A conflict aborts the merge it just started and names the files; a
+   merge git refuses because it would overwrite uncommitted files stops with nothing
+   changed. Never a stash or a reset.
+3. Scans what the push would send for secrets: every file version the outgoing commits add or
+   change, from git, so a credential committed and removed again is still caught and untracked
+   work in progress never blocks it.
+4. Pushes `main` only after a `push_confirmation` that lists the remote and every outgoing
+   commit; the answer names the commit it was shown, so a `main` that moved meanwhile is
+   asked about again. `ls-remote` confirms the remote has it.
+5. Reports how far the dev clone is ahead of the live install; `/steward:backup` (or
+   `scripts/promote.pl`) brings it live.
 
 ## Vault sync
 
@@ -132,11 +184,11 @@ To change what's offered by default, edit `@DEFAULT_TRACKABLE` and `%HARD_EXCLUD
 - Two-level locking (vault `.lock` + per-project `.lock`) with PID+ISO-timestamp and 10-min stale reclaim
 - Atomic `.vault-sync.tmp` staging + batch-rename of staged files
 - Journal at `<vault>/projects/<slug>/.sync-journal.json` with phases (`staging` → `awaiting_resolution` → `renaming` → `sensitive_check` → `committing`); reconciliation on every sync start so an interrupted sync recovers cleanly
-- Secret-scanning is intentionally **not** applied to the private vault — it's a personal backup, so it stores project content (CLAUDE.md, blueprints) verbatim. Secret-scanning is the *public* ccpraxis repo's job only (`sensitive-check.pl`, backup Step 4). The vault scan hooks (`scan_files_for_secrets`, the `sensitive_check` journal phase) remain in code but are disabled by policy — re-enable by restoring `scan_files_for_secrets`
+- Secret-scanning is intentionally **not** applied to the private vault — it's a personal backup, so it stores project content (CLAUDE.md, blueprints) verbatim. Secret-scanning is the *public* ccpraxis repo's job only (`sensitive-check.pl`, run by `/steward:backup` on the files its export commit will contain, and by `/steward:upstream-sync` on what a push sends). The vault scan hooks (`scan_files_for_secrets`, the `sensitive_check` journal phase) remain in code but are disabled by policy — re-enable by restoring `scan_files_for_secrets`
 - File-modified-during-sync rollback (re-hash before final rename)
 - Path safety (no `..`, no absolute paths, no backslashes; symlinks skipped via `File::Find` preprocess)
 
-**Restore on a fresh machine:** clone ccpraxis, run vault init, then `/steward:setup-project` inside a project. The skill calls `list-orphans` first; if a slug already exists in the vault from another machine, it offers to link this directory to it — first sync then pulls all vault content locally.
+**Restore on a fresh machine:** set the machine up as in [Setting up a machine](working-on-ccpraxis.md#setting-up-a-machine), whose vault step runs `vault-sync.pl init`, then run `/steward:setup-project` inside each project, the ccpraxis dev clone included. The skill calls `list-orphans` first; if a slug already exists in the vault from another machine, it offers to link this directory to it — first sync then pulls all vault content locally.
 
 ## Sandbox
 
@@ -167,7 +219,7 @@ Container names are deterministic per project path (hash-based), stored in `.ccp
 
 Neither check has an override flag or environment variable. Details: [plugins/sandbox/docs/protected-paths.md](../plugins/sandbox/docs/protected-paths.md), sections 1-2 (protected paths) and 10 (markers).
 
-The container runs `claude --dangerously-skip-permissions` as root — full autonomy inside the sandbox. With rootless Podman, container root is mapped to the unprivileged host user via the kernel's user namespace, so files written to `/project` come out owned by the host user (no chown dance) and a container escape lands as the unprivileged host user, not host root. Docker Desktop uses a similar VM-isolation model on Windows/macOS. The container-specific `CLAUDE.md` tells Claude it can install and run anything, while still enforcing supply chain rules.
+The container runs `claude --dangerously-skip-permissions` as root — full autonomy inside the sandbox. With rootless Podman, container root is mapped to the unprivileged host user via the kernel's user namespace, so files written to `/project` come out owned by the host user (no chown dance) and a container escape lands as the unprivileged host user, not host root. Docker Desktop uses a similar VM-isolation model on Windows/macOS. On macOS the podman machine is rootful instead: container root is root in the VM, the VM is the boundary, and it sees only the folders `plugins/sandbox/scripts/podman-machine.pl` shares with it ([podman-machine.md](../plugins/sandbox/docs/podman-machine.md)). The container-specific `CLAUDE.md` tells Claude it can install and run anything, while still enforcing supply chain rules.
 
 **Mounts:**
 
@@ -250,10 +302,18 @@ The `project-setup` category handles project-level setup commands (e.g. `npm ci 
 - `yarn global add …`
 - `pip install X[==v]` / `pip3 install …` / `python -m pip install …` (skipped when `-r`/`-e`/`-c`/`--requirement` points at a file)
 - `cargo install X[@v]` (also `--version V X`)
-- Leading `sudo` is stripped per-segment (sandbox runs as root, so `sudo` isn't installed; the strip is defensive parsing for the case where an agent prepends it out of habit)
-- Compound commands (`A && B`) are split on `&&`/`;`/`||`; each segment is matched independently
+- Leading `sudo`, `env` and `VAR=value` prefixes are dropped per simple command (sandbox runs as root, so `sudo` isn't installed; the strip is defensive parsing for the case where an agent prepends it out of habit)
+- Commands are read the way the shell reads them: split at unquoted `&&`/`||`/`;`/`|`/newlines, with quoted text, comments and here-document bodies treated as data, and `sh -c '…'`/`eval` looked through; each simple command is matched independently
 
 The hook **does not write to backpack.json**. It detects install-shape commands, filters out items already in the backpack, and emits a `hookSpecificOutput.additionalContext` block with pre-filled `/backpack:add` invocations and `<WHY>` placeholders for the rationale. Claude decides per-item whether to commit (replacing `<WHY>` with a real one-line reason) or skip (one-off install). If skipped, no pollution lands; if the agent installs the same thing again later, they get re-prompted. The retry cost is near-zero, the pollution problem (one-off `apt-get install -y jq` to inspect a JSON, then never needed again) is structurally avoided. A safe-name regex `^[\@a-zA-Z0-9][a-zA-Z0-9._/+\-]*$` rejects parsed tokens that don't look like real package names. The hook always exits 0 — failures must not disrupt Claude.
+
+**Node.js and pnpm: one way in.** The image ships no Node; a project declares it with `/backpack:add --recipe node-pnpm` (`plugins/backpack/recipes/node-pnpm.json`: an exact Node LTS and pnpm, sha256-checked, under `/opt/tools/node`). The same hook file is registered on two more Bash events in the container's `settings.json`, so the recipe does not depend on an agent having read the add skill:
+
+- `PreToolUse` refuses an ad-hoc Node or pnpm install (apt `nodejs`/`npm`, nvm, n, fnm, volta, nodenv, asdf, mise, their installers, NodeSource, a nodejs.org tarball download, corepack for pnpm or without the recipe's Node, a global or `npx` pnpm, `pnpm env use`) and any Node or pnpm backpack item added without `--recipe`; the refusal names the recipe. The full matrix, with the reason for each entry, is in the hook's header.
+- `PostToolUseFailure` names the recipe when a command fails because `node`, `npm`, `npx`, `pnpm` or `corepack` is missing, adjusted to what the backpack already declares (declared but not installed: `/backpack:install`; a grandfathered Node item without pnpm: replace it with the recipe).
+- `PostToolUse` never proposes a Node or pnpm install as a backpack item; it proposes the recipe instead.
+
+Items already in a backpack keep replaying, grandfathered Node items included: the install pass runs each item inside `backpack.pl`, never as a Bash tool call, so no hook sees it.
 
 **Trust-hash defense.** `.ccpraxis-local-data/claude-home/.launcher/backpack-trusted-hash` (host-side, `:ro`-mounted into the container so it's tamper-evident) defends against two attack scenarios: a backpack.json supplied by a third-party project clone, or one overwritten by a compromised in-container agent. Both would otherwise run `install`/`verify` commands as root on the next launcher pass. On every launch:
 
@@ -285,5 +345,9 @@ The install pass runs after `release_lock`. In manager mode the launcher then en
 
 The launcher logic and every install hook are written in Perl 5.14+ (see prerequisites). The `.sh` / `.ps1` files under `plugins/*/bin/` are thin shims that locate Perl and exec the corresponding Perl script — they exist only so the user can type `claude-sandbox` directly from their shell.
 
-- **Linux/macOS:** `claude-sandbox.sh` (Bash) execs `plugins/sandbox/scripts/launcher.pl`. No Bash version requirement beyond what comes with any modern distribution.
+- **Linux/macOS:** `claude-sandbox.sh` (Bash) execs `plugins/sandbox/scripts/launcher.pl`; the extensionless `claude-sandbox` next to it is a tracked shim that execs the `.sh`, so the command works without its extension. `install.pl --confirm` puts each plugin's `bin/` on PATH by appending an `export PATH=...` line to `~/.zshrc` when `$SHELL` is zsh, otherwise to `~/.bashrc` if it exists or `~/.profile`. A shell that is already open does not re-read that file: open a new terminal.
 - **Windows:** `claude-sandbox.ps1` (PowerShell) locates Perl (PATH, Git for Windows, Strawberry, ActiveState) and execs `plugins/sandbox/scripts/launcher.pl`. PATH and `.PS1` PATHEXT wiring is handled by `perl install.pl --confirm` — no manual environment-variable edits required.
+
+**The bash floor is 3.2.** macOS's `/bin/bash` and `/bin/sh` are bash 3.2.57, and Claude Code starts hook commands there through `/bin/sh -c`. Every shell script that runs on a host (launcher shims, hook scripts, the `bp-*` helpers) must therefore work on 3.2: no associative arrays, `${var,,}`, `read -N`, `mapfile`, `$EPOCHSECONDS` or `globstar`, and no `"${arr[@]}"` on an empty array under `set -u`. Where a bash 4 feature is the fast path on Windows (Git for Windows ships bash 5), keep it behind a version check with a 3.2 fallback. Scripts that run only inside the Linux sandbox container may assume the container's bash.
+
+**macOS specifics.** Terminal.app and zsh, the default login shell, are what the port was tested with. Claude Code's Bash tool runs zsh as well, which changes how commands Claude writes behave: the macOS section of `global-config/CLAUDE.md` lists those rules, along with the BSD userland differences, the missing `timeout`, `setsid` and `flock`, `/tmp` resolving to `/private/tmp`, case-insensitive APFS, and Claude Code's credentials living in the login Keychain rather than in `~/.claude/.credentials.json`. Homebrew lives at `/opt/homebrew`; ccpraxis needs it only for Podman.

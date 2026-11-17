@@ -70,7 +70,12 @@ sub fresh_src {
     make_path("$src/subdir/nested");
     write_file("$src/a.txt",                 "alpha content\n");
     write_file("$src/subdir/b.txt",           "beta content\n");
-    write_file("$src/subdir/nested/c-\xe9.txt", "gamma content \xe9\n");
+    # APFS (macOS) refuses a file name that is not valid UTF-8, so there the
+    # name's e-acute is its UTF-8 encoding; elsewhere the original lone Latin-1
+    # byte. The CONTENT keeps the Latin-1 byte everywhere: bytes inside a file
+    # are not the filesystem's business.
+    my $name = $^O eq 'darwin' ? "c-\xc3\xa9.txt" : "c-\xe9.txt";
+    write_file("$src/subdir/nested/$name", "gamma content \xe9\n");
     return $src;
 }
 

@@ -8,7 +8,12 @@
 # shell-script policy in references/extending-ccpraxis.md). Behaviour is preserved:
 # same patterns, same exclusions, same grouped output, same exit codes.
 #
-# Usage: perl sensitive-check.pl [DIR]      (DIR defaults to ".")
+# Usage: perl sensitive-check.pl [DIR] [--file REL ...]   (DIR defaults to ".")
+#   --file REL  scan exactly these files (relative to DIR, any extension, git
+#               status not consulted) instead of walking DIR. /steward:backup
+#               scans the files its export commit will contain, so a
+#               developer's untracked work in progress in the dev clone never
+#               blocks a local export.
 # Exit:  0 = clean, 1 = sensitive data found, 2 = usage/IO error
 use strict;
 use warnings;
@@ -16,7 +21,21 @@ use File::Find;
 
 # Files come off the filesystem as raw UTF-8 bytes; read and print bytes throughout
 # (no :encoding layer) so non-ASCII paths like "André" round-trip correctly.
-my $dir = @ARGV ? $ARGV[0] : '.';
+my ($dir, @only);
+while (@ARGV) {
+    my $a = shift @ARGV;
+    if ($a eq '--file') {
+        my $rel = shift @ARGV;
+        unless (defined $rel && length $rel) { print STDERR "sensitive-check.pl: --file requires a path\n"; exit 2; }
+        push @only, $rel;
+    } elsif (!defined $dir) {
+        $dir = $a;
+    } else {
+        print STDERR "sensitive-check.pl: unexpected argument: $a\n";
+        exit 2;
+    }
+}
+$dir //= '.';
 unless (-d $dir) {
     print STDERR "sensitive-check.pl: not a directory: $dir\n";
     exit 2;
@@ -101,19 +120,28 @@ sub git_ignored_files {
 # Collect candidate files: *.pl *.sh *.md *.json (mirrors grep --include). Prune
 # .git for speed — it holds no files with those extensions, so results are identical.
 my @files;
-find({
-    no_chdir => 1,
-    wanted   => sub {
-        if (-d $_ && /(?:^|\/)\.git$/) { $File::Find::prune = 1; return; }
-        return unless -f $_;
-        return unless /\.(?:pl|sh|md|json)$/;
-        push @files, $_;
-    },
-}, $dir);
+my $ignored_ref;
+if (@only) {
+    # Exactly the named files: what a commit is about to contain. A named
+    # file that is gone (a deletion being committed) has nothing to scan.
+    @files = grep { -f $_ } map { "$dir/$_" } @only;
+    $ignored_ref = {};
+}
+else {
+    find({
+        no_chdir => 1,
+        wanted   => sub {
+            if (-d $_ && /(?:^|\/)\.git$/) { $File::Find::prune = 1; return; }
+            return unless -f $_;
+            return unless /\.(?:pl|sh|md|json)$/;
+            push @files, $_;
+        },
+    }, $dir);
 
-# Determine the skip-set from real git status when $dir is a repo (the normal
-# case). $ignored_ref defined => use it; undef => fall back to path patterns.
-my $ignored_ref = (-e "$dir/.git" && @files) ? git_ignored_files($dir, \@files) : undef;
+    # Determine the skip-set from real git status when $dir is a repo (the normal
+    # case). $ignored_ref defined => use it; undef => fall back to path patterns.
+    $ignored_ref = (-e "$dir/.git" && @files) ? git_ignored_files($dir, \@files) : undef;
+}
 
 # pattern label => arrayref of matching "path:lineno:content" lines (insertion order)
 my %hits;

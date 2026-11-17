@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Oracle for blueprint hook-continuity-remake, package
 # 37-promote-drops-retired-keys (scripts/promote.pl's settings merge).
 # Derived ONLY from the package ledger's Scope and Done criteria

@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # s21-keep-awake-probe-failure-handling: a transient podman-exec failure must
 # not SIGKILL the wake-lock and re-spawn it.
 #

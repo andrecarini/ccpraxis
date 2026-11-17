@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # 152 -- g04-tooling-bugs-get-filed
 #
 # Spec: .ccpraxis-local-data/blueprints/butler-and-dashboard-overhaul/specs/

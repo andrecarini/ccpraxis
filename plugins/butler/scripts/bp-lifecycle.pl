@@ -24,7 +24,8 @@
 #      `withdrawn_reason` on the record (10-unreapable-running, criterion 7);
 #   5. archives the blueprint (moves it into `blueprints/_archive/`) once its
 #      lifecycle derives `done` (see `BpState::blueprint_lifecycle`), unless
-#      `--no-archive` was given.
+#      `--no-archive` was given, or, with `--abandon`, whatever its
+#      packages say (the operator dropped it).
 #
 # It does NOT repair blueprint.md's package-status TABLE, and it does NOT
 # reconcile a `runs/registry.json` entry's `status` field — both were retired
@@ -57,6 +58,9 @@
 #                    <project-root>/.ccpraxis-local-data)
 #   --archive        move a blueprint that reaches `done` into blueprints/_archive/
 #   --no-archive     never archive (default is --archive; see ARCHIVING below)
+#   --abandon        with --blueprint only: archive it although its packages are not
+#                    all delivered (the operator dropped it); same move, same
+#                    copy-then-remove fallback
 #   --dry-run        report what would change, change nothing
 #   --json           machine-readable report on stdout
 #   --quiet          suppress the human report (implied by --json)
@@ -168,6 +172,7 @@ sub die_usage {
     print STDERR <<'USAGE';
 usage: bp-lifecycle.pl reconcile (--blueprint <name|dir> | --all)
                                  [--data-dir DIR] [--archive|--no-archive]
+                                 [--abandon]
                                  [--dry-run] [--json] [--quiet]
 USAGE
     exit 2;
@@ -690,6 +695,7 @@ sub reconcile_one {
             ? "orchestrator marker lock is held (" . (defined $pid ? "pid $pid" : 'pid unknown') . "); state belongs to the run"
             : "orchestrator pid $pid is alive; state belongs to the run";
         push @{ $r{actions} }, { kind => 'skipped', detail => $detail };
+        push @{ $r{errors} }, "refusing to abandon: a live run owns this blueprint" if $opt->{abandon};
         return \%r;
     }
 
@@ -1120,14 +1126,24 @@ sub reconcile_one {
     }
 
     # --- 3. archive -----------------------------------------------------------
-    if ($opt->{archive} && $lifecycle eq 'done' && !@{ $r{errors} }) {
+    #
+    # --abandon archives a blueprint whose packages are NOT all delivered: the
+    # operator has decided to drop it. It goes through the same move as a
+    # finished blueprint, so nobody moves a blueprint directory by hand -- a
+    # plain `mv` has no fallback when the rename fails (a background handle on
+    # one of hundreds of files is enough), and move_dir does.
+    my $abandon = $opt->{abandon} ? 1 : 0;
+    if ($opt->{archive} && ($lifecycle eq 'done' || $abandon) && !@{ $r{errors} }) {
         my $blueprints = $bpdir;
         $blueprints =~ s{[\\/][^\\/]+\z}{};
         my $dst = "$blueprints/_archive/$name";
-        if (-e $dst) {
+        my $how_archived = $abandon && $lifecycle ne 'done' ? ' (abandoned)' : '';
+        if ($blueprints =~ m{(?:\A|[\\/])_archive\z}) {
+            push @{ $r{errors} }, "refusing to archive: $bpdir is already under _archive/";
+        } elsif (-e $dst) {
             push @{ $r{errors} }, "refusing to archive: $dst already exists";
         } elsif ($opt->{dry_run}) {
-            push @{ $r{actions} }, { kind => 'archive', detail => "would archive to _archive/$name", applied => 0 };
+            push @{ $r{actions} }, { kind => 'archive', detail => "would archive to _archive/$name$how_archived", applied => 0 };
         } else {
             make_path("$blueprints/_archive") unless -d "$blueprints/_archive";
             # Flip the recorded status BEFORE moving: a directory that lands in
@@ -1138,10 +1154,20 @@ sub reconcile_one {
             bp_call('set-meta', '--file', $bpmd, '--field', 'last_updated', '--value', iso_now());
             my ($ok, $how) = move_dir($bpdir, $dst);
             if ($ok) {
-                push @{ $r{actions} }, { kind => 'archive', detail => "archived to _archive/$name ($how)", applied => 1 };
+                push @{ $r{actions} }, { kind => 'archive', detail => "archived to _archive/$name ($how)$how_archived", applied => 1 };
                 $r{status_after} = 'archived';
                 $r{lifecycle}    = 'archived';
                 $r{dir} = $dst;
+            } elsif ($how_archived) {
+                # An abandoned blueprint was never all-delivered, so the
+                # rollback below (to 'audited') would claim more than is true.
+                # Put back the authored word it had -- set-meta accepts each
+                # of these -- and drafting when there was none.
+                my $prior = (defined $bp_status && $bp_status =~ /\A(?:drafting|audited|parked|archived)\z/)
+                          ? $bp_status : 'drafting';
+                bp_call('set-meta', '--file', $bpmd, '--field', 'status', '--value', $prior);
+                $r{status_after} = $prior;
+                push @{ $r{errors} }, "archive failed: $how";
             } else {
                 # Roll back the write above -- but NEVER to a literal 'done'
                 # (DC3 forbids it, and op_set_meta now REJECTS it outright).
@@ -1255,7 +1281,7 @@ my $getopt_warning;
     Getopt::Long::Configure(qw(no_auto_abbrev));
     local $SIG{__WARN__} = sub { $getopt_warning = $_[0] unless defined $getopt_warning; };
     $ok = GetOptionsFromArray(\@argv, \%opt,
-        'blueprint=s', 'all', 'data-dir=s', 'archive!', 'dry-run', 'json', 'quiet');
+        'blueprint=s', 'all', 'data-dir=s', 'archive!', 'abandon', 'dry-run', 'json', 'quiet');
 }
 unless ($ok) {
     my $msg = defined $getopt_warning ? $getopt_warning : 'unrecognised option';
@@ -1266,6 +1292,10 @@ die_usage('unexpected extra arguments: ' . join(' ', @argv)) if @argv;
 die_usage('need exactly one of --blueprint or --all')
     if (defined $opt{blueprint} ? 1 : 0) + ($opt{all} ? 1 : 0) != 1;
 $opt{dry_run} = delete $opt{'dry-run'};
+die_usage(q{--abandon needs --blueprint: abandoning is a decision about one blueprint})
+    if $opt{abandon} && $opt{all};
+die_usage(q{--abandon archives; it cannot be combined with --no-archive})
+    if $opt{abandon} && !$opt{archive};
 
 my $DATA  = data_dir($opt{'data-dir'});
 $opt{data_root} = $DATA;

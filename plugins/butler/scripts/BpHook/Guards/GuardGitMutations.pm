@@ -35,6 +35,14 @@ require "$SELF_DIR/Common.pm"
 require "$SELF_DIR/Shell.pm"
     unless grep { m{(?:^|/)Guards/Shell\.pm$} } keys %INC;
 
+# The command word "git" as a shell resolves it -- "git", "/usr/bin/git",
+# zsh's "=git" (the macOS Bash tool runs zsh, which expands "=git" to the
+# path of git), "\git", "git.exe" -- and the same prefix for the shell words
+# below (Common::git_word_re / cmd_prefix_re). Before, "=git stash" and
+# "/usr/bin/git stash" both ran a stash this guard never saw.
+my $GIT_WORD   = BpHook::Guards::Common::git_word_re();
+my $CMD_PREFIX = BpHook::Guards::Common::cmd_prefix_re();
+
 my $MASK_MAX = 8192;
 
 # Package 08 Amendment 1 (Decision 48), spec sec 2.1 P0a. Bounds the only
@@ -54,9 +62,9 @@ my $UNQUOTED_HD_OPENER_RE = qr/<<-?+[ \t]*([^'"]|$)/;
 my $ODD_HD_DELIM_RE = qr/<<-?+[ \t]*([^A-Za-z0-9_'" \t]|'[A-Za-z0-9_]*[^A-Za-z0-9_']|"[A-Za-z0-9_]*[^A-Za-z0-9_"]|[A-Za-z0-9_]*[^A-Za-z0-9_'" \t])/;
 
 my $SHELLWORD_WORD_RE = qr/
-    (^|[;&|\s])(bash|sh|zsh|ksh|dash|eval|xargs)([\s]|$)
-  | (^|[;&|\s])(perl|ruby|node)[\s]+-e([\s]|$)
-  | (^|[;&|\s])(python|python3)[\s]+-c([\s]|$)
+    (^|[;&|\s])${CMD_PREFIX}(bash|sh|zsh|ksh|dash|eval|xargs)([\s]|$)
+  | (^|[;&|\s])${CMD_PREFIX}(perl|ruby|node)[\s]+-e([\s]|$)
+  | (^|[;&|\s])${CMD_PREFIX}(python|python3)[\s]+-c([\s]|$)
 /x;
 
 # Package 08 (guard-git-mutations-heredoc-false-positive). Allow-list of
@@ -502,18 +510,25 @@ sub _git_scan_target {
     my $carrier = 0;
     my $out = '';
     my ($qbuf, $qhaswhite, $qadjacent) = ('', 0, 0);
-    my $adj_re = qr/(^|[;&|\s({])git[\s]+$/;
+    my $adj_re = qr/(^|[;&|\s({])${GIT_WORD}[\s]+$/;
+    # Asked at every opening quote; only the tail of the text so far can end
+    # in "git ", so the match runs on a bounded tail (the leading 'x' keeps
+    # '^' from matching at the cut).
+    my $adj_tail = sub {
+        my ($o) = @_;
+        return length($o) > 1024 ? 'x' . substr($o, -1024) : $o;
+    };
     my $i = 0;
     while ($i < $n) {
         my $c = $chars[$i];
         if ($state eq 'NONE') {
             if ($c eq "'") {
                 $state = 'SINGLE'; $qbuf = ''; $qhaswhite = 0;
-                $qadjacent = ($out =~ $adj_re) ? 1 : 0;
+                $qadjacent = ($adj_tail->($out) =~ $adj_re) ? 1 : 0;
             }
             elsif ($c eq '"') {
                 $state = 'DOUBLE'; $qbuf = ''; $qhaswhite = 0;
-                $qadjacent = ($out =~ $adj_re) ? 1 : 0;
+                $qadjacent = ($adj_tail->($out) =~ $adj_re) ? 1 : 0;
             }
             elsif ($c eq "\x60") {
                 $carrier = 1; $out .= "\x60";
@@ -633,8 +648,8 @@ sub run {
     # redteam H2 ("git -C <dir>"/"git -c k=v" past the flags-only group) and
     # M3 (the list/show exemption checked against the whole scan instead of
     # the matched occurrence) both apply here, mirroring GuardBash's fix.
-    my $stash_re = qr/${anchor}git[\s]+${gitopt}stash\b(?![\s]+(list|show)\b)/;
-    my $mut_re   = qr/${anchor}git[\s]+${gitopt}(checkout|switch|restore|reset|clean)\b/;
+    my $stash_re = qr/${anchor}${GIT_WORD}[\s]+${gitopt}stash\b(?![\s]+(list|show)\b)/;
+    my $mut_re   = qr/${anchor}${GIT_WORD}[\s]+${gitopt}(checkout|switch|restore|reset|clean)\b/;
 
     if (BpHook::Guards::Common::line_match($stash_re, $scan))
     {
@@ -691,7 +706,7 @@ sub _subagent_git_index_mutation {
     # (?![-\w]), not \b, so a hyphenated plumbing verb that never touches
     # the index/refs/history is not swept in: merge-file, merge-tree,
     # merge-base, commit-tree, commit-graph (fix-batch S1).
-    my $bare_re = qr/${anchor}git[\s]+${gitopt}(add|rm|mv|commit|update-index|update-ref|read-tree|merge|rebase|cherry-pick|revert|am|push|pull|fetch|stage|bisect|gc|prune|repack|filter-branch|replace)(?![-\w])/;
+    my $bare_re = qr/${anchor}${GIT_WORD}[\s]+${gitopt}(add|rm|mv|commit|update-index|update-ref|read-tree|merge|rebase|cherry-pick|revert|am|push|pull|fetch|stage|bisect|gc|prune|repack|filter-branch|replace)(?![-\w])/;
     return 1 if BpHook::Guards::Common::line_match($bare_re, $scan);
 
     # Verbs whose own arguments decide the verdict (Decision 118). Every
@@ -699,16 +714,16 @@ sub _subagent_git_index_mutation {
     # the leftmost -- fix-batch M1. $anchor carries its own capture group
     # (group 1), so each verb's "rest of the invocation" capture is group 2.
     my @qualified = (
-        [qr/${anchor}git[\s]+${gitopt}apply(?![-\w])([^;&|)\n]*)/,         \&_apply_rest_is_mutating],
-        [qr/${anchor}git[\s]+${gitopt}branch(?![-\w])([^;&|)\n]*)/,        \&_branch_rest_is_mutating],
-        [qr/${anchor}git[\s]+${gitopt}tag(?![-\w])([^;&|)\n]*)/,           \&_tag_rest_is_mutating],
-        [qr/${anchor}git[\s]+${gitopt}notes(?![-\w])([^;&|)\n]*)/,         \&_notes_rest_is_mutating],
-        [qr/${anchor}git[\s]+${gitopt}worktree(?![-\w])([^;&|)\n]*)/,      \&_worktree_rest_is_mutating],
-        [qr/${anchor}git[\s]+${gitopt}submodule(?![-\w])([^;&|)\n]*)/,     \&_submodule_rest_is_mutating],
-        [qr/${anchor}git[\s]+${gitopt}remote(?![-\w])([^;&|)\n]*)/,        \&_remote_rest_is_mutating],
-        [qr/${anchor}git[\s]+${gitopt}config(?![-\w])([^;&|)\n]*)/,        \&_config_rest_is_mutating],
-        [qr/${anchor}git[\s]+${gitopt}symbolic-ref(?![-\w])([^;&|)\n]*)/,  \&_symbolic_ref_rest_is_mutating],
-        [qr/${anchor}git[\s]+${gitopt}reflog(?![-\w])([^;&|)\n]*)/,        \&_reflog_rest_is_mutating],
+        [qr/${anchor}${GIT_WORD}[\s]+${gitopt}apply(?![-\w])([^;&|)\n]*)/,         \&_apply_rest_is_mutating],
+        [qr/${anchor}${GIT_WORD}[\s]+${gitopt}branch(?![-\w])([^;&|)\n]*)/,        \&_branch_rest_is_mutating],
+        [qr/${anchor}${GIT_WORD}[\s]+${gitopt}tag(?![-\w])([^;&|)\n]*)/,           \&_tag_rest_is_mutating],
+        [qr/${anchor}${GIT_WORD}[\s]+${gitopt}notes(?![-\w])([^;&|)\n]*)/,         \&_notes_rest_is_mutating],
+        [qr/${anchor}${GIT_WORD}[\s]+${gitopt}worktree(?![-\w])([^;&|)\n]*)/,      \&_worktree_rest_is_mutating],
+        [qr/${anchor}${GIT_WORD}[\s]+${gitopt}submodule(?![-\w])([^;&|)\n]*)/,     \&_submodule_rest_is_mutating],
+        [qr/${anchor}${GIT_WORD}[\s]+${gitopt}remote(?![-\w])([^;&|)\n]*)/,        \&_remote_rest_is_mutating],
+        [qr/${anchor}${GIT_WORD}[\s]+${gitopt}config(?![-\w])([^;&|)\n]*)/,        \&_config_rest_is_mutating],
+        [qr/${anchor}${GIT_WORD}[\s]+${gitopt}symbolic-ref(?![-\w])([^;&|)\n]*)/,  \&_symbolic_ref_rest_is_mutating],
+        [qr/${anchor}${GIT_WORD}[\s]+${gitopt}reflog(?![-\w])([^;&|)\n]*)/,        \&_reflog_rest_is_mutating],
     );
     for my $line (split /\n/, $scan) {
         for my $q (@qualified) {
@@ -733,6 +748,9 @@ sub _subagent_git_index_mutation {
 sub _strip_redirects {
     my ($rest) = @_;
     return '' unless defined $rest;
+    # zsh spellings (">! out", ">>| out", "&>! out") as the bash operator they
+    # mean, so their target goes with them instead of reading as an argument.
+    $rest = BpHook::normalize_redirects($rest);
     $rest =~ s/\d*>&\d+//g;       # 2>&1, >&2 -- no filename target
     $rest =~ s/&>\s*\S*//g;       # &>file, &> file
     $rest =~ s/\d*>>?\s*\S*//g;   # >file, >>file, 2>/dev/null, > out.txt

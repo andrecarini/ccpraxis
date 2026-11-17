@@ -326,4 +326,74 @@ die "could not load almanac-bug.pl in-process: $@" if $@;
     }
 }
 
+# --- A payload the guard could not READ in full fails CLOSED ---------------
+# Broken input it did read still fails open (above). Input it never saw in
+# full is different: bash >= 4 used to keep a timed-out read's partial text
+# and judge it, while macOS /bin/bash 3.2 dropped it and let EVERY such call
+# through -- a Write onto a bug report included, even when the whole payload
+# had arrived and only the end of input was missing. Both now deny, the same
+# way (scripts/read-payload.sh empties a timed-out read on every bash).
+# fire_held: stdin is a fifo whose writer sends the whole payload and then
+# holds the pipe open, so the read can only end by its (1 s) timeout.
+sub fire_held {
+    my ($payload) = @_;
+    require POSIX;
+    require Time::HiRes;
+    require File::Spec;
+    my $dir = tempdir(CLEANUP => 1);
+    my $fifo = "$dir/stdin.fifo";
+    POSIX::mkfifo($fifo, 0600) or return undef;
+    my $writer = fork();
+    die "fork: $!" unless defined $writer;
+    if ($writer == 0) {
+        open(STDOUT, '>', File::Spec->devnull);
+        open(STDERR, '>', File::Spec->devnull);
+        open(my $w, '>', $fifo) or POSIX::_exit(1);
+        syswrite($w, $J->encode($payload));
+        sleep 20;
+        POSIX::_exit(0);
+    }
+    my $pid = fork();
+    die "fork: $!" unless defined $pid;
+    if ($pid == 0) {
+        open(STDIN, '<', $fifo) or POSIX::_exit(126);
+        open(STDOUT, '>', File::Spec->devnull);
+        open(STDERR, '>', "$dir/err") or POSIX::_exit(126);
+        $ENV{BP_PAYLOAD_READ_TIMEOUT} = 1;
+        exec('bash', $GUARD) or POSIX::_exit(127);
+    }
+    my $deadline = Time::HiRes::time() + 30;
+    my ($finished, $status) = (0, 0);
+    while (Time::HiRes::time() < $deadline) {
+        if (waitpid($pid, POSIX::WNOHANG()) == $pid) { ($finished, $status) = (1, $?); last }
+        Time::HiRes::sleep(0.05);
+    }
+    unless ($finished) { kill 'KILL', $pid; waitpid($pid, 0) }
+    kill 'KILL', $writer;
+    waitpid($writer, 0);
+    my $se = do { open my $f, '<', "$dir/err" or return { finished => $finished, rc => $status >> 8, err => '' }; local $/; <$f> // '' };
+    return { finished => $finished, rc => $status >> 8, err => $se };
+}
+
+SKIP: {
+    my $r = fire_held(ev('Write', $R));
+    skip 'no mkfifo on this host', 5 unless defined $r;
+    ok($r->{finished}, 'held-open payload: the guard does not hang on it');
+    is($r->{rc}, 2, 'held-open payload: a Write onto a bug report is DENIED, not let through unread');
+    like($r->{err}, qr/could not read this call in full/, 'held-open payload: ...saying the guard could not read it');
+    like($r->{err}, qr/did not end within/, 'held-open payload: ...because the input never ended');
+    my $r2 = fire_held(ev('Write', '/c/Development/Someproject/src/main.rs'));
+    is($r2->{rc}, 2, 'held-open payload: an unrelated Write is denied too -- the guard cannot know what it did not read');
+}
+
+{   # Over the 8 MiB the guard reads: truncated, so the same deny (no perl
+    # spawned, no partial JSON judged). bash 3.2 used to read it whole, bash
+    # >= 4.1 cut it at 8 MiB and let it through on a failed decode.
+    my $big = { hook_event_name => 'PreToolUse', tool_name => 'Write',
+                tool_input => { file_path => $R, content => ('x' x (8 * 1024 * 1024)) } };
+    my ($rc, $se) = fire($big);
+    is($rc, 2, 'a payload over 8 MiB is DENIED: the guard could not read all of it');
+    like($se, qr/larger than the 8 MiB/, '...and says why');
+}
+
 done_testing();

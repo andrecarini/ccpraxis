@@ -112,6 +112,25 @@ sub _write_bytes_atomic {
     return 0;
 }
 
+# _ensure_logdir($dir) -> 1|0 -- BpDispatchLog::_mkdir_p, retried.
+# _mkdir_p tests -d and then mkdirs one component at a time, and gives up on
+# the first mkdir that fails -- EEXIST included. Hooks for parallel
+# dispatches start together, so on a project with no dispatch log yet two of
+# them race to create the same fresh tree: the loser's mkdir hits EEXIST,
+# it returns 0 before creating the deeper component, and its record write
+# then lands in a directory that does not exist yet and is silently lost
+# (dispatch-write-path.t AC32 dropped one to three of five records on macOS,
+# where fork+exec is slow enough to interleave). Every failed pass means
+# another process created a component, so a fresh pass gets further; four
+# passes cover far deeper trees than the two new levels this one has.
+sub _ensure_logdir {
+    my ($dir) = @_;
+    for (1 .. 4) {
+        return 1 if eval { BpDispatchLog::_mkdir_p($dir) };
+    }
+    return -d $dir ? 1 : 0;
+}
+
 sub _ascii64 {
     my ($s) = @_;
     return '' unless defined $s;
@@ -235,7 +254,7 @@ sub _over_cap_alarm_and_prune {
         $sz = 0 unless defined $sz;
         if ($sz < 65536) {
             eval {
-                BpDispatchLog::_mkdir_p($logdir);
+                _ensure_logdir($logdir);
                 open(my $fh, '>>', $alarm) or die "cannot open $alarm: $!\n";
                 print {$fh} "$now track-dispatch.sh stood aside: over 2000 records, "
                           . "this dispatch went unrecorded; running a prune\n";
@@ -327,7 +346,7 @@ sub _record_dispatch {
     $rec->{package}      = $pkgtok if defined $pkgtok;
     $rec->{dispatch_key} = $key    if defined $key;
 
-    eval { BpDispatchLog::_mkdir_p($logdir) };
+    _ensure_logdir($logdir);
     my $path = eval { BpDispatchLog::record_path($root, $id) };
     return unless defined $path;
     eval {

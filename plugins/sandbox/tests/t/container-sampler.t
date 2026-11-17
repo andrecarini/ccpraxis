@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # THE CONTAINER-STATE SAMPLER, and the one mapping in it that can cost real
 # money in wall-power.
 #

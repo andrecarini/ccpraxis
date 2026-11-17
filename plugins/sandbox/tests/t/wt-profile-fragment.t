@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # ORACLE for package 01-wt-profile-fragment (blueprint sandbox-wt-profile),
 # specs/01-wt-profile-fragment-spec.md. Written BLIND to any WtProfile.pm
 # implementation -- directly from the spec's observable behaviors (B1..B15)

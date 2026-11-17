@@ -151,7 +151,13 @@ sub run_hook {
     my $wall = delete $env{__wall} // 20;
     my $cwd  = delete $env{__cwd};
     $caseN++;
-    my $ti = "$ROOT/run$caseN";
+    # $$ as well as $caseN: AC32 forks five children that each call this with
+    # the SAME inherited $caseN, so without the pid they all wrote one
+    # payload.json and raced on it -- a child could run the hook on a
+    # sibling's payload, two hooks then saw one worker type, the second was
+    # deduplicated as already claimed, and AC32 counted fewer than five
+    # records (seen on macOS, where fork+exec is slow enough to interleave).
+    my $ti = "$ROOT/run$caseN-$$";
     make_path($ti);
     my ($pf, $out_f, $err_f) = ("$ti/payload.json", "$ti/out", "$ti/err");
     write_file($pf, defined $payload ? $payload : '{}');
@@ -660,7 +666,12 @@ SKIP: {
         unless $bg_supported;
     my ($env, $bp_dir, $proj) = fresh_env();
     my $logdir = logdir_of($proj);
-    my @types = qw(bp-implementer bp-test-writer bp-ui-prober bp-scout bp-architect);
+    # ONE write-capable type only. TrackDispatch's writer interlock (pinned by
+    # guards-remake-track-dispatch.t, "a write-capable worker ... is already
+    # in flight") denies a second concurrent writer by design, so the old
+    # list -- implementer, test-writer and ui-prober side by side -- made
+    # this a race over which writer won, never a test of the record path.
+    my @types = qw(bp-implementer bp-scout bp-architect bp-reviewer bp-redteam);
     my @pids;
     for my $t (@types) {
         my $pid = fork();
@@ -678,6 +689,55 @@ SKIP: {
     my %uniq = map { ($_ => 1) } @ids;
     is(scalar(keys %uniq), 5, 'AC32: five distinct ids');
     ok((grep { !defined($_) } map { read_json($_) } @files) == 0, 'AC32: every record decodes as valid JSON');
+}
+
+# ===========================================================================
+# AC32b -- the race AC32 can only hit by chance, made deterministic: another
+# hook creates <proj>/.ccpraxis-local-data between this hook's -d check and
+# its own mkdir, so that mkdir fails with EEXIST. The record must still be
+# written. BpDispatchLog::_mkdir_p gives up on that first EEXIST, and before
+# TrackDispatch retried it the record write went to a directory that did
+# not exist yet and was lost without a trace (no stderr, rc 0). Runs the
+# module in a perl child, the way run-hook.sh does, with a CORE::GLOBAL
+# mkdir that plays the other hook exactly once. Any OS: no fork.
+# ===========================================================================
+{
+    my ($env, $bp_dir, $proj) = fresh_env();
+    my $logdir = logdir_of($proj);
+    $caseN++;
+    my $ti = "$ROOT/run$caseN-race";
+    make_path($ti);
+    my ($pf, $out_f, $err_f) = ("$ti/payload.json", "$ti/out", "$ti/err");
+    write_file($pf, task_payload('butler:bp-scout'));
+    my $code = <<'PERL';
+use Errno ();
+BEGIN {
+    my $raced = 0;
+    *CORE::GLOBAL::mkdir = sub {
+        my ($d, @mode) = @_;
+        if (!$raced && defined $d && $d =~ m{/\.ccpraxis-local-data\z}) {
+            $raced = 1;
+            CORE::mkdir($d);            # the concurrent hook wins the race
+            $! = Errno::EEXIST();
+            return 0;
+        }
+        return @mode ? CORE::mkdir($d, $mode[0]) : CORE::mkdir($d);
+    };
+}
+require BpHook;
+my $r = BpHook::main('Guards::TrackDispatch');
+exit((defined $r && $r == 2) ? 2 : 0);
+PERL
+    local %ENV = (%CLEAN_ENV, BUTLER_STATE_DIR => fwd("$ROOT/butler-state"), %$env,
+        RACECODE => $code, SCRIPTSDIR => $SCRIPTS, PFILE => fwd($pf),
+        OUTFILE => fwd($out_f), ERRFILE => fwd($err_f));
+    system('bash', '-c', 'perl -I"$SCRIPTSDIR" -e "$RACECODE" < "$PFILE" > "$OUTFILE" 2> "$ERRFILE"');
+    my $exit = WIFEXITED($?) ? WEXITSTATUS($?) : -1;
+    is($exit, 0, 'AC32b: a log dir another hook created mid-mkdir -> exit 0');
+    ok(-d "$proj/.ccpraxis-local-data", 'AC32b: fixture sanity -- the simulated racer did create the data dir');
+    is(scalar(json_record_files($logdir)), 1,
+       'AC32b: the record is still written when the first mkdir of the log dir hits EEXIST')
+        or diag('stderr: ' . (read_file($err_f) // ''));
 }
 
 # ===========================================================================

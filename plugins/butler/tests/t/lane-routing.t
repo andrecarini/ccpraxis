@@ -23,7 +23,7 @@
 #    is DEFERRED -- do not write assertions for it, and do not write a
 #    placeholder that asserts something weaker in its name."
 # 2. DC-6 IS THE LEDGER'S CORRECTED FORM, not the spec's literal text. The
-#    spec's own section 0.3 already corrects DC-6 to "(windows-marked
+#    spec's own section 0.3 already corrects DC-6 to "(host-marked
 #    files) UNION (serial-classified files, regardless of marker)" and the
 #    ledger's STEP 2 GATE entry independently re-derives and pins the same
 #    correction ("DC-6 AS LITERALLY WRITTEN IS FALSE"). Both agree here;
@@ -45,7 +45,7 @@
 #    invent one. What IS both specified and directly testable, and is
 #    asserted below (the "Decision 18 purity" block, before Part A), is the
 #    interface-agnostic half of Decision 18's own property: "no flag,
-#    environment variable or argument can send a windows file to the
+#    environment variable or argument can send a host file to the
 #    container or pull an any file back to the host" -- proven by showing
 #    classify_file's own source takes exactly one parameter (the file path)
 #    and never consults $ENV or @ARGV, so its per-file verdict cannot vary
@@ -70,10 +70,10 @@
 # MEASURED FROM DISK AT AUTHORING TIME, NEVER FROM scripts/run-tests.pl's
 # OWN LOGIC (a fresh `grep -lE` over plugins/*/tests/t/*.t, independent of
 # any implementation):
-#   350 total .t files; 108 marked windows; 242 marked any; 0 marked linux.
+#   350 total .t files; 108 marked host; 242 marked any; 0 marked linux.
 #   15 files match the serial heuristic (TestSandbox|podman_run_capture|
 #   podman_bin|probe_image); of those 15, exactly 10 are marked `any` and 5
-#   are marked `windows` -- CONFIRMS the spec/ledger's own "10 of 15" claim
+#   are marked `host` -- CONFIRMS the spec/ledger's own "10 of 15" claim
 #   exactly, re-derived independently rather than trusted.
 # Part D re-derives its own expected sets fresh at assertion time and never
 # hardcodes these counts (beyond a floor); they are recorded here only as
@@ -381,7 +381,7 @@ my $CLASSIFY_BODY = <<'BODY';
     if ($serial) {
         return { lane => 'host-serial', marker => $marker, serial => 1 };
     }
-    if ($marker->{value} eq 'windows') {
+    if ($marker->{value} eq 'host') {
         return { lane => 'host-parallel', marker => $marker, serial => 0 };
     }
     # 'any' or 'linux', not serial-classified.
@@ -405,7 +405,7 @@ my $MUTATED_CLASSIFY_BODY = <<'BODY';
 
     my $code = join "\n", grep { !/^\s*#/ } split /\n/, $src, -1;
     my $serial = ($code =~ /\b(?:use|require)\s+TestSandbox\b/ || $code =~ /\bTestSandbox::/) ? 1 : 0;
-    if ($marker->{value} eq 'windows') {
+    if ($marker->{value} eq 'host') {
         return { lane => 'host-parallel', marker => $marker, serial => $serial };
     }
     # 'any' or 'linux': marker decides FIRST under this mutation, so the
@@ -446,8 +446,8 @@ package main;
 # verbatim (name, fixture content, expected lane) so both blocks are
 # provably testing the same cases.
 my @SELF_CHECK_ROWS = (
-    [ 'row1-windows-plain',
-      "#!/usr/bin/env perl\n# platform: windows\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n",
+    [ 'row1-host-plain',
+      "#!/usr/bin/env perl\n# platform: host\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n",
       'host-parallel' ],
     [ 'row2-any-plain',
       "#!/usr/bin/env perl\n# platform: any\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n",
@@ -460,8 +460,8 @@ my @SELF_CHECK_ROWS = (
     . "${TSNS} reference, not a comment mention, trips the serial heuristic\n"
     . "print \"ok 1 - fixture pass\\n\"; exit 0;\n",
       'host-serial' ],
-    [ 'row5-windows-serial',
-      "#!/usr/bin/env perl\n# platform: windows\n${TSNS}podman_bin(); # calls podman_bin() via "
+    [ 'row5-host-serial',
+      "#!/usr/bin/env perl\n# platform: host\n${TSNS}podman_bin(); # calls podman_bin() via "
     . "${TSNS}, a genuine load-shaped reference\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n",
       'host-serial' ],
     [ 'row6-linux-serial',
@@ -479,8 +479,8 @@ my @SELF_CHECK_ROWS = (
       "#!/usr/bin/env perl\n# platform: any\n# mentions MSYS2_ARG_CONV_EXCL, a backfill-scanner signal, "
     . "not a serial-heuristic substring\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n",
       'container' ],
-    [ 'row10-windows-backfill-signal-only',
-      "#!/usr/bin/env perl\n# platform: windows\n# mentions cygpath and podman machine, backfill-scanner "
+    [ 'row10-host-backfill-signal-only',
+      "#!/usr/bin/env perl\n# platform: host\n# mentions cygpath and podman machine, backfill-scanner "
     . "signals with no underscore-joined serial-heuristic substring anywhere in this line\n"
     . "print \"ok 1 - fixture pass\\n\"; exit 0;\n",
       'host-parallel' ],
@@ -511,7 +511,7 @@ for my $row (@SELF_CHECK_ROWS) {
 # the mutation's effect is narrowly scoped to the collision, not "the whole
 # table went red" (which would prove nothing about precedence specifically).
 # --------------------------------------------------------------------------
-my %expect_flip = map { $_ => 1 } qw(row4-any-serial-collision row5-windows-serial row6-linux-serial);
+my %expect_flip = map { $_ => 1 } qw(row4-any-serial-collision row5-host-serial row6-linux-serial);
 my %actually_flipped;
 for my $row (@SELF_CHECK_ROWS) {
     my ($name, undef, $expected) = @$row;
@@ -551,7 +551,7 @@ ok($actually_flipped{'row4-any-serial-collision'},
         my $code = join "\n", grep { !/^\s*#/ } split /\n/, $src, -1;
         my $serial = ($code =~ /\b(?:use|require)\s+TestSandbox\b/ || $code =~ /\bTestSandbox::/) ? 1 : 0;
         if    ($serial)                  { push @expect_hs, $f }
-        elsif ($m->{value} eq 'windows') { push @expect_hp, $f }
+        elsif ($m->{value} eq 'host') { push @expect_hp, $f }
         else                              { push @expect_c,  $f }
     }
 
@@ -650,7 +650,7 @@ my $SRC = do { local (@ARGV, $/) = ($IMPL); <> };
 # =============================================================================
 # Decision 18 purity (lane-availability is not a routing switch): the
 # interface-agnostic half of "no flag, environment variable or argument can
-# send a windows file to the container or pull an any file back to the
+# send a host file to the container or pull an any file back to the
 # host" -- proven structurally, since classify_file's own pinned signature
 # (spec section 2.1) takes exactly one parameter and consults nothing else.
 # The WIRING-level half (what run_sweep does with @container when a lane-
@@ -790,12 +790,12 @@ require $IMPL;
 # =============================================================================
 my $FIXDIR = tempdir(CLEANUP => 1);
 
-# --- row 1: plain windows -> host-parallel -----------------------------------
+# --- row 1: plain host -> host-parallel -----------------------------------
 {
-    my $f = write_fixture($FIXDIR, 'row1-windows-plain.t',
-        "#!/usr/bin/env perl\n# platform: windows\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n");
+    my $f = write_fixture($FIXDIR, 'row1-host-plain.t',
+        "#!/usr/bin/env perl\n# platform: host\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n");
     my $d = classify_file($f);
-    is($d->{lane}, 'host-parallel', 'Part A row 1: plain windows file -> host-parallel');
+    is($d->{lane}, 'host-parallel', 'Part A row 1: plain host file -> host-parallel');
     is($d->{serial}, 0, 'Part A row 1: serial flag is 0');
 }
 
@@ -830,13 +830,13 @@ my $FIXDIR = tempdir(CLEANUP => 1);
     is($d->{serial}, 1, 'Part A row 4: serial flag is 1');
 }
 
-# --- row 5: windows + podman_bin -> host-serial (no-op relative to today) ----
+# --- row 5: host + podman_bin -> host-serial (no-op relative to today) ----
 {
-    my $f = write_fixture($FIXDIR, 'row5-windows-serial.t',
-        "#!/usr/bin/env perl\n# platform: windows\n${TSNS}podman_bin(); # calls podman_bin() via "
+    my $f = write_fixture($FIXDIR, 'row5-host-serial.t',
+        "#!/usr/bin/env perl\n# platform: host\n${TSNS}podman_bin(); # calls podman_bin() via "
       . "${TSNS}, a genuine load-shaped reference\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n");
     my $d = classify_file($f);
-    is($d->{lane}, 'host-serial', 'Part A row 5: a serial-classified windows file -> host-serial');
+    is($d->{lane}, 'host-serial', 'Part A row 5: a serial-classified host file -> host-serial');
 }
 
 # --- row 6: linux + probe_image -> host-serial (generalised rule, zero real
@@ -884,15 +884,15 @@ my $FIXDIR = tempdir(CLEANUP => 1);
       . 'on the lane -- only the declared marker and the (unrelated) serial heuristic do');
 }
 
-# --- row 10: same proof, for the windows value -------------------------------
+# --- row 10: same proof, for the host value -------------------------------
 {
-    my $f = write_fixture($FIXDIR, 'row10-windows-backfill-signal-only.t',
-        "#!/usr/bin/env perl\n# platform: windows\n# mentions cygpath and podman machine, backfill-scanner "
+    my $f = write_fixture($FIXDIR, 'row10-host-backfill-signal-only.t',
+        "#!/usr/bin/env perl\n# platform: host\n# mentions cygpath and podman machine, backfill-scanner "
       . "signals with no underscore-joined serial-heuristic substring anywhere in this line\n"
       . "print \"ok 1 - fixture pass\\n\"; exit 0;\n");
     my $d = classify_file($f);
     is($d->{lane}, 'host-parallel',
-        'Part A row 10 (AC-1): the same proof for the windows value -- cygpath/"podman machine" in the '
+        'Part A row 10 (AC-1): the same proof for the host value -- cygpath/"podman machine" in the '
       . 'body have NO effect on the lane');
 }
 
@@ -1043,12 +1043,12 @@ my $FIXDIR = tempdir(CLEANUP => 1);
         my $code = join "\n", grep { !/^\s*#/ } split /\n/, $src, -1;
         my $serial = ($code =~ /\b(?:use|require)\s+TestSandbox\b/ || $code =~ /\bTestSandbox::/) ? 1 : 0;
         if    ($serial)                  { push @expect_hs, $f }
-        elsif ($m->{value} eq 'windows') { push @expect_hp, $f }
+        elsif ($m->{value} eq 'host') { push @expect_hp, $f }
         else                              { push @expect_c,  $f }
     }
 
     is_deeply([sort @by_classify_hp], [sort @expect_hp],
-        'AC-6/DC-6 (scoped): host-parallel set == windows-marked, non-serial-classified files, enumerated '
+        'AC-6/DC-6 (scoped): host-parallel set == host-marked, non-serial-classified files, enumerated '
       . 'and compared -- never sampled');
     is_deeply([sort @by_classify_c], [sort @expect_c],
         'AC-2/DC-2: container set == any/linux-marked, non-serial-classified files, enumerated and '
@@ -1063,13 +1063,13 @@ my $FIXDIR = tempdir(CLEANUP => 1);
 
     # The corrected DC-6 host set as a single, literal union -- the property
     # the spec's own section 0.3 and the ledger's STEP 2 GATE entry both
-    # independently pin: host set == windows UNION serial-classified, NOT
-    # windows alone.
+    # independently pin: host set == host UNION serial-classified, NOT
+    # host alone.
     my %expect_host = map { $_ => 1 } (@expect_hp, @expect_hs);
     my %by_classify_host = map { $_ => 1 } (@by_classify_hp, @by_classify_hs);
     is_deeply([sort keys %by_classify_host], [sort keys %expect_host],
         'DC-6 (corrected, ledger STEP 2 GATE + spec section 0.3): the host set is EXACTLY '
-      . '(windows-marked files) UNION (serial-classified files), never the windows set alone');
+      . '(host-marked files) UNION (serial-classified files), never the host set alone');
 }
 
 # =============================================================================
@@ -1194,8 +1194,8 @@ CHILD
     # A4-A: "capability gate drops @container instead of folding it into
     # @host_parallel" (mutation A, the package's own named worst case -- a
     # file that runs in no lane at all).
-    my $green_windows = write_fixture($FIXDIR, 'a4a-windows-green.t',
-        "#!/usr/bin/env perl\n# platform: windows\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n");
+    my $green_windows = write_fixture($FIXDIR, 'a4a-host-green.t',
+        "#!/usr/bin/env perl\n# platform: host\nprint \"ok 1 - fixture pass\\n\"; exit 0;\n");
     my $red_any = write_fixture($FIXDIR, 'a4a-any-red.t',
         "#!/usr/bin/env perl\n# platform: any\nprint \"not ok 1 - forced failure\\n\"; exit 1;\n");
     my $state_dir = tempdir(CLEANUP => 1);

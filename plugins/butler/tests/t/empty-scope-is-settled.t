@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Two writer/reader defects that together let the director ask an UNANSWERABLE
 # question and then block the driver's stop on it. Both observed live on
 # 2026-08-25, on this machine, in that order.

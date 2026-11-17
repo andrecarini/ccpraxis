@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # agent-telemetry package 05: RunState reads the
 # dispatch log and attaches live agents to the package (and, per Ruling
 # AT-8, the RUN) they belong to.

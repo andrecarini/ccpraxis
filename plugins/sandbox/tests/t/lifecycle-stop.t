@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # s11: stop-runs + full-shutdown, staged feedback, TUI-persistent.
 #
 # This file is the IMMUTABLE ORACLE for blueprint sandbox-butler-overhaul,

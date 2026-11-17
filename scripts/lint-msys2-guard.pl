@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # lint-msys2-guard.pl — defense-in-depth lint for the MSYS2 path-conversion
-# bug (see global-config/CLAUDE.md "MSYS2 path-conversion mangles `:`-separated
+# bug (see global-config/CLAUDE.windows.md "MSYS2 path-conversion mangles `:`-separated
 # args"). Walks every .pl in the repo, finds files that invoke podman
 # natively (system/exec/backticks), and asserts each one sets
 # $ENV{MSYS2_ARG_CONV_EXCL}='*' near the top.
@@ -121,8 +121,8 @@ for my $issue (@issues) {
 print STDERR "\nFix: add this near the top of each flagged file (after `use strict; use warnings;`):\n\n";
 print STDERR "    # Disable MSYS2 argv path conversion on Windows — otherwise podman -v\n";
 print STDERR "    # HOST:CONTAINER mount specs get split on `:` and re-joined with `;`,\n";
-print STDERR "    # silently corrupting bind mounts. See global-config/CLAUDE.md.\n";
+print STDERR "    # silently corrupting bind mounts. See global-config/CLAUDE.windows.md.\n";
 print STDERR "    \$ENV{MSYS2_ARG_CONV_EXCL} = '*' if \$^O =~ /^(MSWin32|cygwin|msys)\$/;\n\n";
-print STDERR "Background: global-config/CLAUDE.md \"MSYS2 path-conversion mangles `:`-separated args\".\n";
+print STDERR "Background: global-config/CLAUDE.windows.md \"MSYS2 path-conversion mangles `:`-separated args\".\n";
 
 exit 1;

@@ -55,7 +55,7 @@ and `runs/<pkg>.force-stop`.
 
 | source | event | matcher | hook |
 |---|---|---|---|
-| hooks.json | PreToolUse | Bash | guard-bash.sh, guard-git-mutations.sh --only-during-butler-run, arm-on-entry.sh, continuity-off-check.sh, guard-disarm-judge-readonly.sh |
+| hooks.json | PreToolUse | Bash | guard-bash.sh, guard-git-mutations.sh --only-during-butler-run, arm-on-entry.sh, continuity-off-check.sh, guard-disarm-judge-readonly.sh, guard-sleep-control.sh |
 | hooks.json | PreToolUse | Edit\|Write\|MultiEdit\|NotebookEdit | guard-writes.sh, ledger-guard.sh, guard-blueprint-write.sh |
 | hooks.json | PreToolUse | Bash\|Edit\|Write\|MultiEdit\|NotebookEdit | guard-continuity-state.sh |
 | hooks.json | PreToolUse | Edit\|Write\|MultiEdit\|NotebookEdit\|Task\|Agent | gate-shutdown.sh |
@@ -88,6 +88,8 @@ completion still clears its writer marker.
 judged-continuity-disarm package 03 added a 28th hooks.json command, guard-disarm-judge-readonly.sh on PreToolUse Bash; the count above predates it.
 
 The continuity-state guard (2026-10-23) added a 29th, guard-continuity-state.sh, in its own PreToolUse group on Bash and the four edit tools.
+
+The sleep-control guard (2026-10-30) added a 30th, guard-sleep-control.sh, as the last entry of the PreToolUse Bash group.
 
 ### file: arm-on-entry.sh
 verdict: keep
@@ -136,6 +138,14 @@ reason: Package 03 of blueprint judged-continuity-disarm added this guard; it li
 ### registration: hooks.json PreToolUse [Bash] guard-disarm-judge-readonly.sh
 verdict: keep
 reason: Registered in the Bash group so every Bash call of the judge's own claude process gets an explicit allow or deny; a no-op unless CCPRAXIS_DISARM_JUDGE is exactly 1.
+
+### file: guard-sleep-control.sh
+verdict: keep
+reason: Added 2026-10-30 after a hand-run caffeinate kept a lid-closed Mac awake ten hours past its work; it denies a Bash command that changes sleep behaviour by hand and names arming continuity.
+
+### registration: hooks.json PreToolUse [Bash] guard-sleep-control.sh
+verdict: keep
+reason: In the Bash group for every session, main thread and subagents alike; its case-insensitive text prefilter keeps perl from starting on any command that names no target.
 
 ### file: guard-fork.sh
 verdict: keep
@@ -361,16 +371,24 @@ are a closed set owned by 03:
 | `armed` | `armed/<sid>` exists, or the session id could not be extracted |
 | `driver` | the first line of `armed/<sid>` contains `"role":"driver"`, or the session id could not be extracted |
 | `text:<s>` | the raw payload contains `<s>` |
+| `itext:<s>` | the raw payload contains `<s>` in any letter case (bash `nocasematch`, which macOS's bash 3.2 has), for a command name macOS and Windows resolve case-insensitively |
 
 Steps:
 
 1. `r=${BASH_SOURCE[0]}` (this file's own path). Parse the `--pre` clauses up to `--`.
 2. Evaluate every clause made only of env atoms (`ledger`, `coordinator`, `stopfile`). If one fails,
    `exit 0` before reading stdin, as today's hooks already do.
-3. Bulk read: `IFS= read -r -N 8388608 -t 10 BP_PAYLOAD`. Never `$(cat)`, which hung forever on an
-   inherited pipe (bug 20260828-095201-7c1e), and never `read -d ''`, which reads a pipe one byte per
-   syscall (red-team measured 5.7 s for 200 KB). A status above 128 (timeout), or a payload of exactly
-   the cap, sets `BP_PAYLOAD_TRUNCATED=1`.
+3. Bulk read, through `plugins/butler/scripts/read-payload.sh` (sourced, so no process; the one
+   reader every payload-reading bash hook of butler and almanac shares, with a byte-identical copy
+   in each plugin pinned by `read-payload-lib.t`): `ccp_read_payload BP_PAYLOAD`. The scripts
+   directory of step 6 is resolved first for that, since the reader lives there. On bash >= 4.1 the
+   read is `IFS= read -r -N 8388608 -t 10`. Never `$(cat)`, which hung forever on an inherited pipe
+   (bug 20260828-095201-7c1e). `read -d ''` reads a pipe one byte per syscall (red-team measured
+   5.7 s for 200 KB), so it is only the fallback for bash < 4.1 (macOS `/bin/bash` 3.2 has no `-N`),
+   capped at the same 8 MiB with `-n`. A timeout or a payload of exactly the cap sets
+   `BP_PAYLOAD_TRUNCATED=1`. bash 3.2 reports a timeout as an ordinary end of input and drops what
+   it read, so the library tells the two apart by elapsed time, and on a timeout it leaves
+   `BP_PAYLOAD` empty on every bash.
 4. Extract the session id without forking: `sid=${BP_PAYLOAD#*\"session_id\":\"}; sid=${sid%%\"*}`,
    kept only if `[[ $sid =~ ^[A-Za-z0-9_-]{1,128}$ ]]`. If extraction fails, `armed` and `driver`
    count as holding, so the wrapper falls through to perl and never exits on a guess.
@@ -699,15 +717,20 @@ a reporter at its first step, and any other session "only via /butler:continuity
 self-arm". For a manual session after the operator's own `/clear`, the operator re-arms with
 `/butler:continuity on`. After a carry-over, the carry-over skill prose tells the fresh session to run
 `butler-continuity on` when the work was armed. The old id's arm file is not a live session. It stays
-until its transcript is gone, and it stops holding the wake-lock once its transcript has gone an hour
-with no activity (Decision 53). Two SessionStart hooks are registered, and neither carries state across a new id: denial-breaker.sh (never-halt 07) moves its own per-agent counting offset, and session-start-nudge.sh (blueprint where-things-go, package 10), both of which keep the id. SessionStart runs one route on every source: re-attach, then the project digest, then the armed nudges. No SessionEnd hook is registered.
+until its transcript is gone; it stops holding the wake-lock once nothing of it has been in flight for
+20 minutes, and stops counting as live once its transcript has gone an hour with no activity (Decision 53). Two SessionStart hooks are registered, and neither carries state across a new id: denial-breaker.sh (never-halt 07) moves its own per-agent counting offset, and session-start-nudge.sh (blueprint where-things-go, package 10), both of which keep the id. SessionStart runs one route on every source: re-attach, then the project digest, then the armed nudges. No SessionEnd hook is registered.
 
-**Wake-lock (Decision 18, Decision 53).** `BpContinuityLease.pm` (package 04, rewired by package 16) holds the lock
-while an armed session's transcript was written in the last hour. It no longer reads the old
-`.continuity-active` registry, which package 16 retired. The one-hour window is safe because the
-holder's fixed 50-minute timeout wakes a waiting session (which writes its transcript) before the hour
-runs out; it is only the lease's view of activity: it never deletes a file and never changes what
-`is_armed` answers. Its refresher daemon becomes the internal verb
+**Wake-lock (Decision 18, Decision 53, in-flight rule 2026-10-30).** `BpContinuityLease.pm` (package 04, rewired by package 16)
+counts an armed session as live while its transcript was written in the last hour, and holds the lock
+only while a live arm has work in flight: its butler-hold holder is live (a hold that will wake it), or
+its session wrote its transcript, a subagent transcript or its arm file in the last 20 minutes
+(`$IN_FLIGHT_QUIET_SECONDS`, twice the Bash tool's 10-minute ceiling). While every live arm is only
+waiting for the operator (interrupted, stopped by an API or usage-limit error, crashed, or sitting on a
+permission prompt), the lock is released and the refresher keeps ticking, so it takes the lock again on
+its first tick after work resumes. One function decides (`lease_verdict`); `converge` and the
+refresher's tick act on it. It no longer reads the old `.continuity-active` registry, which package 16
+retired. All of this is only the lease's view of activity: it never deletes a file and never changes
+what `is_armed` answers. Its refresher daemon becomes the internal verb
 `butler-continuity lease --daemon`, which also runs `gc_sessions()`. `keep-awake.ps1` is untouched.
 
 **Statusline contract (package 10).** `scripts/statusline.pl` resolves the root through
@@ -1406,7 +1429,7 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 | guard-writes.sh | 3 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
 | ledger-guard.sh | 1 | --pre text:/packages/ --pre ledger,driver : exits when the payload text lacks /packages/, or when BP_LEDGER is unset and the session is not an armed driver |
 | guard-bash.sh | 2 | --pre ledger,driver : exits when BP_LEDGER is unset and the session is not an armed driver |
-| guard-git-mutations.sh | 2 | --pre text:git, plus --pre ledger,armed when its argument is --only-during-butler-run : exits when the payload text lacks git, or for that registration when BP_LEDGER is unset and the session is unarmed |
+| guard-git-mutations.sh | 2 | --pre text:git,text:Git,...,text:GIT (all eight letter cases: macOS and Windows resolve "GIT" to git), plus --pre ledger,armed when its argument is --only-during-butler-run : exits when the payload text lacks git in any case, or for that registration when BP_LEDGER is unset and the session is unarmed |
 | wait-shape-guard.sh | 2 | --pre ledger : exits when BP_LEDGER is unset |
 | context-ceiling.sh | 2 | --pre coordinator : exits when BP_LEDGER is unset or BP_ROLE is set to anything but coordinator |
 | gate-shutdown.sh | 2 | --pre ledger --pre stopfile : exits when BP_LEDGER is unset or none of runs/.shutdown, runs/.paused, runs/<pkg>.force-stop exists under BP_DIR |
@@ -1422,6 +1445,7 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 | ac-standdown-gate.sh | 2 | --pre acstanddown : exits when the AC-loss stand-down marker is absent (env-only, no session file read) |
 | guard-disarm-judge-readonly.sh | 1 | no run-hook.sh and no --pre (pure bash env check, never starts perl unless set) : exits when CCPRAXIS_DISARM_JUDGE is not exactly 1 |
 | guard-continuity-state.sh | 2 | --pre text:continuity,text:Continuity,text:CONTINUITY : exits when the payload text lacks continuity in all three casings |
+| guard-sleep-control.sh | 6 | --pre itext:caffeinate,itext:pmset,itext:powercfg,itext:systemd-inhibit,itext:setthreadexecutionstate,itext:keep-awake.ps1,itext:keepawake.p : exits when the payload names none of them in any letter case |
 
 **Who each rule applies to.** A fork counts as a subagent everywhere.
 
@@ -1449,6 +1473,7 @@ next fork dispatch, and the guard denies again after it. Decision 3 applies thro
 - track-dispatch: coordinator, and an armed driver's main thread.
 - guard-fork: every session and caller (Decision 64).
 - guard-continuity-state: every session and caller, main, coordinator or subagent. The early exit is text-only, so perl starts only for a payload that names continuity. An `armed` clause would have let the transcript half see every call in an armed session, at about 110 ms a call (measured 2026-10-23); editing one's own transcript is deliberate by nature, which the operator ruled out of scope, so the transcript half fires only when the payload also names continuity.
+- guard-sleep-control: every session and caller, main, coordinator or subagent, armed or not: no session may change the machine's sleep behaviour by hand. The early exit is text-only (case-insensitive), so perl starts only for a payload that names a target.
 - arm-nudge-prompt: the main thread's operator prompts only; a task-notification, a subagent payload
   or a BP_LEDGER environment is skipped before anything is written.
 - session-start-nudge: every main-thread session, on every source (startup, resume, clear, compact),
@@ -1515,6 +1540,28 @@ that this is guidance for a cooperating but fallible agent, not a security bound
 slip into a visible refusal, and deliberate circumvention (variables, `eval`, scripts) is out of scope,
 so the matching stays plain substring tests. Paths compare case-insensitively on Windows and macOS,
 with slashes normalised. Source: `plugins/butler/tests/t/guard-continuity-state.t`.
+
+guard-sleep-control.sh (added 2026-10-30, after an unattended session's hand-run
+`caffeinate -i -s -m -t 50400` kept a lid-closed Mac on AC awake from 23:01, when its work ended, to
+08:52) denies a Bash command that changes the machine's sleep behaviour by hand: `caffeinate` in any
+spelling (a path, zsh `=caffeinate`, `\caffeinate`, any letter case, behind `nohup`, `env`, `env -S`,
+`sudo`, `time`, `timeout`, `exec`, `command`, `xargs`, `doas`, `screen`, `tmux`, `launchctl`, `script`,
+`find -exec`, `arch`, `xcrun`, `watch`, `taskpolicy`, `coproc`, `repeat`, `su -c` or `cmd /c`,
+backgrounded with `&`, inside `$(...)`, backticks, `sh -c`, `eval`, a heredoc or pipe into a shell, or
+an interpreter one-liner that execs it), `pkill`/`killall caffeinate`, every `pmset` verb but `-g`
+(writes, `disablesleep`, `noidle`, and `sleepnow`, which would suspend the machine running the work),
+`systemsetup -set...sleep`, `systemd-inhibit` but `--list`, every `powercfg` verb but the queries
+(`/requests`, `/list`, `/query`, `/a`, `/lastwake`, ...; `/requestsoverride` is a query only with no
+arguments), `SetThreadExecutionState` called or declared through PowerShell, and a `keep-awake.ps1`,
+`bp-keepawake.pl hold` or `KeepAwake.pm hold` started by hand. The commands are walked with GuardBash's
+command walker (`_hyg_commands`), so a mention (`grep caffeinate`, a commit message, a heredoc written
+to a file, a PowerShell query naming keep-awake.ps1, a one-liner matching /caffeinate/) passes. The
+prefilter sees only literal names, so a name split by quotes (`caf""feinate`) is out of its reach. The denial names the one sanctioned path, arming
+continuity, whose lease holds the managed wake-lock only while work is in flight (on a Mac: `caffeinate
+-i`, AC power only, never against a closed lid), and adjusts for an armed session and for a subagent.
+ccpraxis's own holders and Claude Code's own `caffeinate -i -t 300` are started by fork+exec, never
+through the Bash tool, so the guard never sees them. Guidance for a cooperating agent, like
+guard-continuity-state. Source: `plugins/butler/tests/t/guard-sleep-control.t`.
 
 Fail direction per hook, applied only after the early exit has let the call through. Fail open
 (exit 0) for everything except coordinator `guard-writes.sh`, `ledger-guard.sh` and `gate-shutdown.sh`
@@ -1637,11 +1684,12 @@ What package 16 changes rather than deletes, so the "exact list" above stays exa
   gate-headless-background forbids background Bash in coordinators. The design answers it without
   depending on the unmeasured case: a coordinator's hold counts only alongside a running background
   subagent it names, and a killed holder keeps its record. Package 08 measures the behaviour once.
-- **The wake-lock's one-hour window (Decision 53).** Decision 18 ties the wake-lock to the armed
-  state. With disarm-on-timeout gone, an arm file can outlive its session (a closed terminal, the old
-  id after `/clear`). The lease therefore counts only an armed session whose transcript was written in
-  the last hour, safe because the holder's fixed 50-minute timeout wakes a waiting session before the
-  hour runs out. That is only the lease's view of activity; it never disarms anything.
+- **The wake-lock's one-hour window (Decision 53), narrowed to work in flight (2026-10-30).** Decision
+  18 ties the wake-lock to the armed state. With disarm-on-timeout gone, an arm file can outlive its
+  session (a closed terminal, the old id after `/clear`). The lease therefore counts only an armed
+  session whose transcript was written in the last hour, and within that holds the lock only while a
+  live holder or the last 20 minutes of activity shows work in flight. That is only the lease's view
+  of activity; it never disarms anything.
 - **Manual sessions after /clear.** Not a conflict: Decision 2 re-arms drive-solo and reporter sessions
   automatically and leaves every other session to `/butler:continuity on` or self-arm. A new id is a
   new session, so nothing is disarmed.

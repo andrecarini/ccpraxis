@@ -26,6 +26,12 @@ my $BASE = tempdir(CLEANUP => 1);
 # same shape as the real registry entry that went missing.
 my $ODD_NAME = "Caf\x{e9} Notes";   # 'é' via a \x{...} escape -> a real Unicode codepoint
 my $ODD_DIR  = "$BASE_WIN/$ODD_NAME";
+# APFS (macOS) refuses a file name that is not valid UTF-8 (EILSEQ). The
+# "\x{e9}" in $ODD_NAME is stored as the single byte 0xE9, which is what
+# perl hands the filesystem, so on darwin the path is utf8::upgrade'd: the same
+# characters, now stored and handed over as UTF-8 bytes, which is what a
+# real macOS path is. Elsewhere the byte form is kept as it was.
+utf8::upgrade($ODD_DIR) if $^O eq 'darwin';
 mkdir $ODD_DIR or die "mkdir $ODD_DIR: $!";
 
 sub run {

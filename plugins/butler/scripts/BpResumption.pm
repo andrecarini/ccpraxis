@@ -81,10 +81,20 @@ sub pid_fingerprint {
         return undef;
     }
 
-    # macOS/BSD fallback: no /proc, not Windows.
-    my $out = `ps -o lstart= -p $pid 2>/dev/null`;
+    # macOS/BSD fallback: no /proc, not Windows. lstart is a DATE STRING
+    # ("Thu Oct 29 22:10:01 2026"): its words follow the locale, so it is read
+    # under LC_ALL=C to stay the same value from one call to the next, and its
+    # spaces are folded to '_' because the marker line is space-separated --
+    # marker_line drops a fingerprint with whitespace in it, which left every
+    # Mac marker with no identity at all and the gate refusing all of them.
+    my $out = do {
+        local $ENV{LC_ALL} = 'C';
+        local $ENV{LANG}   = 'C';
+        `ps -o lstart= -p $pid 2>/dev/null`;
+    };
     return undef unless defined $out && length $out;
     $out =~ s/^\s+|\s+$//g;
+    $out =~ s/\s+/_/g;
     return length($out) ? "ps:$out" : undef;
 }
 

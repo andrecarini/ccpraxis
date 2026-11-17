@@ -485,4 +485,23 @@ if (have_git()) {
         or diag("  tracked:\n$tracked");
 }
 
+# platforms_named -- issue clustering must recognise a Mac report however it
+# names the platform (the operator now runs one). Extracted from source: the
+# script is a CLI, not a module.
+{
+    my $src = do { local (@ARGV, $/) = ($SCRIPT); <> };
+    my ($fn) = $src =~ /(sub platforms_named \{.*?\n\})/s;
+    ok(defined $fn, 'PN0: platforms_named is extractable');
+    my $sub = defined $fn ? eval "package UpdResPN; $fn; \\&UpdResPN::platforms_named" : undef;
+    ok(ref $sub eq 'CODE', 'PN0: platforms_named compiles') or diag($@);
+    if (ref $sub eq 'CODE') {
+        for my $t ('Crash on macOS Sequoia 15.2', 'hangs on Tahoe', 'OS X only', 'on an M3 Max',
+                   'Apple Silicon', 'Ventura regression', 'darwin-arm64 build') {
+            is(join(',', @{ $sub->($t) }), 'macos', "PN1: '$t' is a macOS report");
+        }
+        is(join(',', @{ $sub->('Windows 11 + WSL') }), 'linux,windows', 'PN2: Windows/WSL still classified as before');
+        is(join(',', @{ $sub->('the cache tahoeish thing') }), '', 'PN3: word boundaries hold (no false Mac match)');
+    }
+}
+
 done_testing();

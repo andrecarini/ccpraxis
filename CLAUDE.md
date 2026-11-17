@@ -1,18 +1,27 @@
 # ccpraxis — project instructions
 
 You are working **on ccpraxis itself**: the plugins, skills, launchers and scripts that Claude Code
-runs. Read `plugins/sandbox/docs/working-on-ccpraxis.md` before changing anything about how the
-sandbox launches.
+runs. Read `docs/working-on-ccpraxis.md` before changing anything about how ccpraxis is installed,
+promoted or backed up, and `plugins/sandbox/docs/sandbox-checkouts.md` before changing how the
+sandbox treats checkouts.
 
 ## Where you are, and where you must not be
 
 | path | what it is |
 |---|---|
-| this repo | your **clone**. Develop here. Sandbox here. |
-| `~/.claude/ccpraxis` | the **live install** — the plugin tree Claude Code is executing. Never develop here. |
+| this repo | your **dev clone** (normally under `~/Projects`). Develop here. Sandbox here. The only checkout that talks to GitHub. |
+| `~/.claude/ccpraxis` | the **live install** — the plugin tree Claude Code is executing. Produced by promotion only; never develop, commit, pull or push there. |
 
 `claude-sandbox` refuses to launch against `~/.claude/ccpraxis`, by design. Editing the live install
 means editing tooling while it is in use.
+
+This clone is the only checkout that talks to GitHub: pull and push here. The live install takes
+code from this clone alone: `scripts/promote.pl` creates it on the first run and fast-forwards it
+afterwards (its `origin` is this clone), and refuses a live install that has commits of its own.
+`/steward:backup` is local (promote, settings Claude Code wrote into `~/.claude` exported into this
+clone's `global-config/` one setting at a time, vault); `/steward:upstream-sync` is the only command
+that pulls from or pushes to GitHub, and only for this clone. The model, the fresh-machine procedure and the one-time
+move of a machine set up the old way: `docs/working-on-ccpraxis.md`.
 
 ### ⚠ THE MACHINERY YOU ARE USING IS NOT THE MACHINERY YOU ARE EDITING
 
@@ -22,7 +31,7 @@ differs per surface, and guessing has been wrong in both directions:
 
 | surface | how it reaches a sandbox | effective when |
 |---|---|---|
-| ccpraxis plugin code (`plugins/**`) | **LIVE ro bind mount — of `~/.claude/ccpraxis/plugins`, i.e. THE LIVE INSTALL, _never_ of your clone** — at `/root/.claude/plugins/marketplaces/ccpraxis-local` (`ccpraxis-local` is a `directory`-source marketplace) | **on promotion alone.** No relaunch: a per-call script (`bp-*.pl`) picks it up immediately. Until you promote, the mount keeps serving the OLD code no matter what your clone says |
+| ccpraxis plugin code (`plugins/**`) | **LIVE ro bind mount — of THE LIVE INSTALL's `plugins/`, _never_ of your clone**: `~/.claude/ccpraxis/plugins` itself on Windows and Linux; on macOS its copy in `~/.cache/ccpraxis/live-mirror`, which promotion refreshes — at `/root/.claude/plugins/marketplaces/ccpraxis-local` (`ccpraxis-local` is a `directory`-source marketplace) | **on promotion alone.** No relaunch: a per-call script (`bp-*.pl`) picks it up immediately. Until you promote, the mount keeps serving the OLD code no matter what your clone says |
 | skills (`skills/<name>/`) | bind-mounted **per the picker's selection**, fixed at container create | a **full manager launch** (`--session`/`--resume-session` is the *connector* path and skips the picker entirely) |
 | other marketplaces (e.g. `claude-plugins-official`) | **copied** into `claude-home`, host-authoritative, re-copied every launch | next launch — and an in-container repair is clobbered by that re-copy |
 
@@ -55,18 +64,23 @@ Stale skill text in an old session is this, not a file bug. A **new** `skills/<n
 mounted at all until a full manager launch.
 
 **Promotion is one command: `perl scripts/promote.pl`**, run from this clone (`--dry-run`
-previews and writes nothing). It (1) merges this clone's `main` into the live install
-(`git -C ~/.claude/ccpraxis pull --no-rebase --ff --no-edit <clone> main`; the live install has
-commits of its own, so this is usually a merge commit), refusing on a dirty live tree; then
-(2) syncs the `global-config/` payload into `~/.claude`: `CLAUDE.md` is replaced after a backup
-to `~/.claude/.promotion-backups/<ts>/`, and refused, with the offending lines shown, if it holds
-a line no committed version of the payload ever had; `settings.json` is merged key by key (the
-payload wins only over values it once had, and `.backup-preferences.json` is honoured);
+previews and writes nothing). It (1) fast-forwards the live install to this clone's `main`
+(`git merge --ff-only`; it clones this clone there when the live install is missing, re-points a
+GitHub `origin` at this clone, and refuses a dirty live tree or one with commits this clone lacks);
+then (2) syncs the `global-config/` payload into `~/.claude`: `CLAUDE.md` is built from
+`global-config/CLAUDE.md` plus this host's `CLAUDE.windows.md` or `CLAUDE.macos.md`
+(`plugins/steward/scripts/GlobalClaudeMd.pm`), replaced after a backup to
+`~/.claude/.promotion-backups/<ts>/`, and refused, with the offending lines shown, if it holds a
+line no committed version of any part ever had; `settings.json` is merged key by key (the payload
+wins only over values it once had, and `.backup-preferences.json` is honoured);
 `known_marketplaces.json` is only reported. A bare `git pull` is not a promotion: it leaves
 the installed global config at whatever was last copied, which is how `~/.claude/CLAUDE.md` sat
 at the Aug 26 payload for a month. `install.pl` only re-wires PATH and plugin registration; it
-never copies plugin code, so a clean install run does not mean promotion happened. Full
-mechanics: `plugins/sandbox/docs/working-on-ccpraxis.md`.
+never copies plugin code, so a clean install run does not mean promotion happened. Claude Code
+loads the `ccpraxis-local` plugins in place from `~/.claude/ccpraxis/plugins` (measured on 2.1.301:
+`claude plugin list --json` reports `readFromFolder` there, and hook commands expand
+`${CLAUDE_PLUGIN_ROOT}` to it); the copies under `~/.claude/plugins/cache/ccpraxis-local/` are
+unused leftovers. Full mechanics: `docs/working-on-ccpraxis.md`.
 
 ## Language and runtime
 
@@ -84,7 +98,8 @@ words, no numeric prefix — enforced by `plugins/butler/tests/t/test-naming-hyg
 `Test::More`, no harness config.
 
 **`prove` does not exist on the Git-for-Windows host** — that perl ships no `TAP::Harness`
-(`Can't locate TAP/Harness/Env.pm`). Run one file directly and judge by exit code plus `not ok`
+(`Can't locate TAP/Harness/Env.pm`). macOS's system perl does have it (`/usr/bin/prove`), but keep
+the habit that works on every host: run one file directly and judge by exit code plus `not ok`
 count:
 
 ```bash
@@ -111,7 +126,7 @@ here drift every time a test is added, so prefer deriving them:
 `grep -lE 'TestSandbox|podman_run_capture|podman_bin|probe_image' plugins/*/tests/t/*.t | wc -l`.
 
 The work here is dominated by PROCESS CREATION, not CPU — a bare statusline spawn costs ~292ms on
-this host — so parallelism buys more than the core count suggests.
+the Windows host — so parallelism buys more than the core count suggests.
 
 **The runner keeps the container tests SERIAL, deliberately** (13 at time of writing — derive it,
 do not trust the number). They start real podman containers
@@ -131,7 +146,10 @@ absolute count.
 
 **Never let a test spawn `launcher.pl` unguarded.** It will build an image and start a container
 inside your test run. Interlock any such test on the behaviour already being wired (grep the
-launcher source first) and bound it with `timeout`. This has fired repeatedly.
+launcher source first) and bound it with `timeout`. This has fired repeatedly. macOS has no
+`timeout`: `run-tests.pl` puts the pure-perl `scripts/test-bin/timeout` on PATH when the host lacks
+one, and a test that must also pass when run on its own falls back to that file itself, as
+`plugins/butler/tests/lib/GuardHarness.pm` does.
 
 ## Windows landmines
 
@@ -184,14 +202,48 @@ These have each cost real debugging time. Details in the user-global `CLAUDE.md`
 
 - **Paths contain non-ASCII** (`André`). Nothing may assume ASCII paths. Round-trip registry values
   as UTF-8 bytes; never re-encode something already decoded.
-- **`podman machine set --disk-size` fails on WSL machines** (exit 125). Grow via WSL instead:
-  `wsl --shutdown`, then `wsl --manage podman-machine-default --resize <bytes>` (grow only; it runs
-  `e2fsck`/`resize2fs` itself). Verify with `df -h /` inside the machine — `podman machine list`
-  keeps reporting the creation-time size and is not the truth.
-- **The WSL VM's memory cap is a real failure mode.** `~/.wslconfig`'s `memory=` is what `vmmem`
-  will consume; when the host runs low on commit, Windows terminates the VM and every container in
-  it dies at once, with no reap record. A missing `.launcher/last-reap.txt` is the signature of a
-  hard kill rather than a graceful reap.
+- **Operating the podman machine** (disk and memory limits on the WSL machine, the macOS
+  machine's settings) is in `plugins/sandbox/docs/podman-machine.md`.
+
+## macOS landmines
+
+Measured during the 2026-10 port (macOS 27, Apple Silicon). The rules for commands typed in a
+session (zsh quoting, BSD flags) are in the user-global `CLAUDE.md`; these are the ones that break
+code in this repo.
+
+- **Every host-side shell script runs on bash 3.2.** Claude Code starts hook commands through
+  `/bin/sh -c`, and macOS's `/bin/sh` and `/bin/bash` are bash 3.2.57. Missing there: `read -N`
+  (the almanac guards failed open on it), `${var,,}`, `declare -A`, `mapfile`, `$EPOCHSECONDS`,
+  `printf '%(...)T'`. `"${arr[@]}"` of an empty array is unbound under `set -u`, and
+  `${P//pattern/}` is super-linear on a large string (10 KB took 44 s). Where a bash 4 feature is
+  the Windows fast path, keep it behind a version check with a 3.2 fallback, as the hooks' shared
+  payload reader (`plugins/butler/scripts/read-payload.sh`, mirrored in almanac) does.
+- **BSD userland.** `stat -f %m`, not `stat -c %Y`; `sed -i ''`; `date -v`; no `ps -o etimes`;
+  no `/proc`. A script that shells out to these needs both forms or a perl replacement.
+- **No `timeout`, `setsid` or `flock(1)`.** Tests use `scripts/test-bin/timeout` (see Tests above).
+  Production code must not depend on any of the three: use perl's `alarm`, `POSIX::setsid` and
+  `Fcntl` `flock`.
+- **APFS is case-insensitive, and `Cwd::abs_path` keeps the case you typed.** A comparison that
+  folds case only on `$^O =~ /^(MSWin32|cygwin|msys)$/` misses on a Mac: fold on `darwin` too, or
+  compare device and inode. `getcwd` after a `chdir` does return the on-disk case.
+- **`/tmp` and `/var` are symlinks into `/private`.** `$TMPDIR` is `/var/folders/.../T`, Claude
+  Code's temp root is `/private/tmp/claude-<uid>/<slug>/<session>/`, and `abs_path` and `realpath`
+  return the `/private` form. Canonicalise both sides before a prefix check; the scratchpad and
+  temp-root allowlists were caught by this.
+- **File names must be valid UTF-8.** APFS refuses anything else with `EILSEQ` ("Illegal byte
+  sequence"), so a fixture that builds a Latin-1 `Andr\xe9` name dies before asserting anything.
+  Build non-ASCII fixture names from UTF-8 bytes.
+- **Exec bits matter.** A Mac clone runs with `core.fileMode=true` and honours the mode in the
+  index, which Git for Windows ignores. A script run by path (a hook registration, a `bin/` shim)
+  at 100644 fails with exit 126, and an install-time `chmod` inside the live install makes the
+  next promotion refuse a dirty tree. Commit shebang scripts as 100755
+  (`git update-index --chmod=+x`), as 69efdbb did for 134 of them.
+- **Claude Code's credentials are in the login Keychain** (item `Claude Code-credentials`); there
+  is no `~/.claude/.credentials.json`. Code that reads that file must treat its absence as normal
+  on `darwin`, and tests stub `security` rather than read the real item, which can raise a GUI
+  prompt.
+- **The Bash tool's `grep` and `find` skip gitignored files** (Claude Code wraps them), and
+  `.ccpraxis-local-data/` is gitignored. Search it with `command grep -r`.
 
 ## `.ccpraxis-local-data/` — gitignored, and it does not travel
 
@@ -201,7 +253,7 @@ ignored too — but **not** `.claude/settings.json`; see the next section.
 
 On relocation, **`git status --ignored` is the authoritative copy-list** — `.gitignore` lists
 patterns, not what exists. Full gotchas, including the `claude-home/.launcher/` container-identity
-trap: `plugins/sandbox/docs/working-on-ccpraxis.md`.
+trap: `plugins/sandbox/docs/sandbox-checkouts.md`.
 
 ## Guidance notes — read on demand
 
@@ -290,7 +342,9 @@ blueprint over ad-hoc edits.
 
 ## Do not confuse these two
 
-- `global-config/CLAUDE.md` — a **payload** of this repo, installed to the user's
-  `~/.claude/CLAUDE.md` by `scripts/promote.pl`. Editing it changes what every project sees on
-  this machine once promoted.
+- `global-config/CLAUDE.md` (plus `CLAUDE.windows.md` and `CLAUDE.macos.md`) — the **payload** of
+  this repo that `scripts/promote.pl` builds into the user's `~/.claude/CLAUDE.md`: the shared file
+  for every host, plus the part for the host being promoted on. Editing it changes what every
+  project sees once promoted, so a rule that holds on one OS goes in that OS's part, never in the
+  shared file.
 - **This file** — instructions for working on ccpraxis itself.

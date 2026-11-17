@@ -39,28 +39,31 @@ BEGIN {
 }
 use RefusalMarker ();
 use SandboxIdentity ();
+use HostPlatform ();
 
 binmode STDOUT, ':raw';
 binmode STDERR, ':raw';
 
-# Detect docker OR podman — both are supported. Prefer docker if both
-# present (more widely installed). Use `<cli> --version` exit code as the
-# probe; PATH-lookup heuristics get fooled on Windows by extensionless
-# shell-wrapper shims (Docker Desktop historically dropped one alongside
-# docker.exe that Git-for-Windows perl's POSIX PATH search would find
-# first and fail to spawn). Always name the .exe explicitly.
+# Detect docker OR podman — both are supported. The choice is
+# HostPlatform::detect_container_cli, shared with launcher.pl so the two can
+# never pick different runtimes: CCPRAXIS_CONTAINER_CLI wins when set; the
+# Windows family probes docker.exe then podman.exe (named with .exe because
+# Git-for-Windows perl's POSIX PATH search finds an extensionless shim first
+# and fails to spawn it); macOS probes podman first; Linux docker first.
 my $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/;
+my $CLI_DETECT_ERROR;
 sub _detect_container_cli {
-    for my $candidate ($WINDOWS_FAMILY ? ('docker.exe', 'podman.exe') : ('docker', 'podman')) {
-        my $rc = system("$candidate --version > /dev/null 2>&1");
-        return $candidate if $rc == 0;
-    }
-    return undef;
+    my ($cli, $err) = HostPlatform::detect_container_cli();
+    $CLI_DETECT_ERROR = $err;
+    return $cli;
 }
 my $PODMAN = _detect_container_cli();
 unless (defined $PODMAN) {
-    print STDERR "ERROR: no container CLI on PATH (looked for docker, podman).\n";
-    print STDERR "       Install Docker Desktop (https://docker.com) or Podman Desktop (https://podman-desktop.io/) and re-run.\n";
+    if (defined $CLI_DETECT_ERROR) {
+        print STDERR "ERROR: $CLI_DETECT_ERROR\n";
+    } else {
+        print STDERR "$_\n" for HostPlatform::no_cli_message();
+    }
     exit 1;
 }
 my $RUNTIME_NAME = ($PODMAN =~ /docker/) ? 'docker' : 'podman';
@@ -110,6 +113,9 @@ my $PROJECT_PATH;
 $PROJECT_PATH //= Cwd::getcwd();
 $PROJECT_PATH = abs_path($PROJECT_PATH)
     or die "ERROR: cannot resolve project path\n";
+# Same canonicalisation as launcher.pl (case-insensitive APFS; no-op elsewhere),
+# so both scripts write under the one spelling of the project path.
+$PROJECT_PATH = HostPlatform::canonical_dir($PROJECT_PATH);
 $PROJECT_PATH =~ s|\\|/|g;
 $PROJECT_PATH =~ s|/+$||;
 $PROJECT_PATH = winify_path($PROJECT_PATH);
@@ -380,8 +386,14 @@ log_step("Step 2/6: ensure $RUNTIME_NAME is reachable and the container image ex
             print STDERR "           podman machine start\n";
             print STDERR "\n";
             print STDERR "       ⚠  HYPER-V BACKEND IS NOT SUPPORTED. Microsoft's 9p host-share silently breaks O_APPEND (claude session resume fails with EIO) and utimensat (Bun's lock manager wedges → TUI freezes every ~60s). WSL2 is the only reliable Windows backend for both docker and podman.\n";
+        } elsif ($^O eq 'darwin') {
+            # A fresh macOS podman install has NO machine, and "start it" cannot
+            # fix that; `podman machine list` tells the two cases apart.
+            my $list  = `$PODMAN machine list --format json 2>/dev/null`;
+            my $state = (defined $list && $list =~ /\A\s*\[\s*\]\s*\z/) ? 'absent' : 'stopped';
+            print STDERR "$_\n" for HostPlatform::machine_remedy_lines('darwin', $state);
         } else {
-            print STDERR "       Start the podman backend (`podman machine start` on macOS, or check the rootless socket on Linux).\n";
+            print STDERR "       Start the podman backend (check the rootless podman socket on Linux).\n";
         }
         print STDERR "\n";
         die_bootstrap("$RUNTIME_NAME backend not reachable — see above");
@@ -445,6 +457,7 @@ if ($? == 0) {
     # Same label as the launcher's build: without it the launcher could not tell
     # this image's Containerfile from an older one (SandboxIdentity::image_inputs_hash).
     my $rc = system($PODMAN, 'build',
+        HostPlatform::build_extra_args($PODMAN),
         '--build-arg', "CLAUDE_VERSION=$host_version",
         '--label', SandboxIdentity::image_inputs_label() . '='
                    . SandboxIdentity::image_inputs_hash($CONTAINER_CONFIG),

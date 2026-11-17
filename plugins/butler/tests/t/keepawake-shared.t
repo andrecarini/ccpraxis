@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # t/111 — the wake-lock is ONE definition, and the FLEET
 # holds it too.
 #
@@ -19,13 +19,26 @@
 # which is how the keeper silently ran a 1-hour floor after the gate had moved
 # to ten minutes. So this file pins BOTH properties: one definition, and both
 # drivers using it.
+#
+# MACOS (bottom of the file): the same apply() contract with caffeinate held by
+# this file's own `hold` command, on the ONE macOS command line
+# (KeepAwake::caffeinate_argv, shared with the launcher: -i -s -w <owner>).
+# Every holder started here runs a FAKE caffeinate (CCPRAXIS_CAFFEINATE_BIN)
+# that asserts nothing, and the holder refuses to start a real one under
+# CCPRAXIS_NO_WAKELOCK.
+BEGIN { $ENV{CCPRAXIS_NO_WAKELOCK} = 1 }
 use strict;
 use warnings;
 use FindBin qw($Bin);
 use Test::More;
 use File::Temp qw(tempdir);
+use Time::HiRes ();
+use JSON::PP ();
 
-(my $S = "$Bin/../../scripts") =~ s{\\}{/}g;
+# Canonical, so BpContinuityLease's own require of bp-keepawake.pl (by its
+# abs_path) finds this one already loaded instead of compiling it twice.
+use Cwd ();
+(my $S = (Cwd::abs_path("$Bin/../../scripts") // "$Bin/../../scripts")) =~ s{\\}{/}g;
 
 require "$S/bp-keepawake.pl";
 
@@ -178,8 +191,15 @@ is(BpKeepAwake::should_be_on('nonsense'),      0, 'unknown phase -> released (fa
     # 576 drive-root strays from exactly that.
     my $dir  = tempdir(CLEANUP => 1);
     my $out  = BpKeepAwake::winify_out("$dir/keepawake.pid");
-    unlike($out, qr{^/},      'winify_out never yields a leading-slash POSIX path');
-    like($out,   qr{^[A-Za-z]:/}, 'winify_out yields a drive-letter path even though the file does not exist');
+    SKIP: {
+        # Only an MSYS path has a drive-letter form to translate to; on macOS
+        # and Linux there is no powershell.exe to hand it and a temp dir is
+        # legitimately "/...".
+        skip 'winify_out maps MSYS paths to drive letters; only a Windows host has them', 2
+            unless $^O =~ /^(MSWin32|msys|cygwin)$/;
+        unlike($out, qr{^/},      'winify_out never yields a leading-slash POSIX path');
+        like($out,   qr{^[A-Za-z]:/}, 'winify_out yields a drive-letter path even though the file does not exist');
+    }
     like($out,   qr{/keepawake\.pid$}, '...and preserves the basename');
 
     # Behavioural: a pid file holding a pid from ANOTHER process must be
@@ -194,6 +214,257 @@ is(BpKeepAwake::should_be_on('nonsense'),      0, 'unknown phase -> released (fa
     });
     is(scalar @spawned, 0,
        'a pid file holding a REAL, cross-process-valid pid suppresses the respawn');
+}
+
+# ---- a host that cannot hold a lock says so ONCE ------------------------------
+{
+    my $dir = tempdir(CLEANUP => 1);
+    my @logged;
+    my %o = (spawn => sub { 1 }, powershell_available => sub { 0 }, log => sub { push @logged, $_[0] });
+    BpKeepAwake::apply('active', $dir, {%o}) for 1 .. 3;
+    if ($^O =~ /^(MSWin32|msys|cygwin)$/ || $^O eq 'darwin') {
+        is(scalar @logged, 1, 'no helper on a host: one warning across three director ticks, not three');
+        like($logged[0] // '', qr/WARN keepawake unsupported here/, '...naming the gap');
+    } else {
+        is(scalar @logged, 0, 'no helper in the Linux sandbox: silent (keep-awake is a documented no-op there)');
+        pass('(no warning to inspect)');
+    }
+    ok(!-e "$dir/keepawake.pid", 'no helper: still no pid file');
+}
+
+# ---- macOS: the release path checks identity before signalling ----------------
+{
+    my @signalled;
+    my $r = BpKeepAwake::stop_holder_darwin(424242,
+        command_of => sub { '/usr/bin/vim notes.txt' }, pid_f => '/x/keepawake.pid');
+    is($r, 'not-ours', 'macOS release: a reused pid running something else is not signalled');
+    $r = BpKeepAwake::stop_holder_darwin(424242, command_of => sub { undef });
+    is($r, 'gone', 'macOS release: a pid that no longer exists is simply gone');
+    $r = BpKeepAwake::stop_holder_darwin(424242,
+        command_of => sub { "/usr/bin/perl /p/bp-keepawake.pl hold --pid-file /other/keepawake.pid" },
+        pid_f => '/x/keepawake.pid');
+    is($r, 'not-ours', 'macOS release: a holder for ANOTHER pid file is not ours to stop');
+}
+
+# ---- macOS: the holder itself, against a fake caffeinate ----------------------
+# The holder is KeepAwake::hold_main (sandbox plugin), reached through this
+# file's `hold` entry. Its power source comes from the AC-loss watch's seam,
+# CCPRAXIS_AC_PROBE_FILE, rewritten mid-test to switch "AC" and "battery"
+# under a running holder; it never reads the real machine's power source.
+SKIP: {
+    skip 'the caffeinate holder runs on macOS (exercised wherever POSIX ps/fork exist)', 32
+        if $^O =~ /^(MSWin32|msys|cygwin)$/;
+    my $dir  = tempdir(CLEANUP => 1);
+    my $fake = "$dir/fake-caffeinate";
+    my $args = "$dir/caffeinate.args";
+    open my $f, '>', $fake or die $!;
+    print {$f} "#!/bin/sh\nprintf '%s\\n' \"\$@\" > '$args'\nexec sleep 300\n";
+    close $f;
+    chmod 0755, $fake;
+    local $ENV{CCPRAXIS_CAFFEINATE_BIN} = $fake;
+    my $power = "$dir/power-source";
+    local $ENV{CCPRAXIS_AC_PROBE_FILE} = $power;
+    my $set_power = sub { open my $p, '>', $power or die $!; print {$p} "$_[0]\n"; close $p };
+    $set_power->('ac');
+    { my $ka = BpKeepAwake::keepawake_lib_path(); require $ka; }   # KeepAwake::*, for the comparisons below
+
+    my $slurp = sub { open my $h, '<', $_[0] or return ''; local $/; my $x = <$h>; close $h; $x // '' };
+    my $wait_for = sub {
+        my ($cond, $secs) = @_;
+        my $end = Time::HiRes::time() + $secs;
+        while (Time::HiRes::time() < $end) { return 1 if $cond->(); Time::HiRes::sleep(0.05) }
+        return $cond->() ? 1 : 0;
+    };
+    my $log_f = "$dir/keepawake.log";
+    my $start = sub {
+        my ($pid_f, @extra) = @_;
+        my $pid = fork();
+        die "fork: $!" unless defined $pid;
+        if ($pid == 0) {
+            exec($^X, "$S/bp-keepawake.pl", 'hold', '--pid-file', $pid_f,
+                 '--log-file', $log_f, @extra) or exit 127;
+        }
+        return $pid;
+    };
+    # The caffeinate pid the holder last logged for itself, and whether that
+    # process is still running (not a zombie).
+    my $caf_of = sub {
+        my ($h) = @_;
+        my @m = $slurp->($log_f) =~ /pid=$h ASSERTED caffeinate=(\d+)/g;
+        return $m[-1];
+    };
+    my $running = sub {
+        my ($p) = @_;
+        return 0 unless defined $p && kill(0, $p);
+        my $st = `ps -o stat= -p $p 2>/dev/null`;
+        return ($st =~ /\S/ && $st !~ /Z/) ? 1 : 0;
+    };
+    my $state_f = KeepAwake::state_path("$dir/keepawake.pid");
+
+    # (a) lease expiry: nobody refreshes the pid file, so the hold lets go.
+    my $pid_f = "$dir/keepawake.pid";
+    my $h = $start->($pid_f, '--lease', '2', '--poll', '0.1');
+    ok($wait_for->(sub { $slurp->($log_f) =~ /pid=$h ASSERTED/ }, 5),
+        'holder: logs ASSERTED once caffeinate is up on AC (what replace() waits for)');
+    is($slurp->($pid_f), "$h\n", 'holder: writes ITS OWN pid into the pid file, as keep-awake.ps1 does');
+    $wait_for->(sub { $slurp->($args) =~ /\n\d+\n\z/ }, 5);   # the fake writes its argv a moment after exec
+    is($slurp->($args), "-i\n-w\n$h\n",
+        'holder: runs caffeinate -i -w <holder pid> and nothing more: no -s/-d/-u/-m, so a closed lid still sleeps the Mac');
+    is(join("\n", (KeepAwake::caffeinate_argv($fake, $h))[1 .. 3]) . "\n", $slurp->($args),
+        'holder: that command line is KeepAwake::caffeinate_argv, the one shared with the launcher');
+    is(KeepAwake::holder_state($pid_f), 'asserted', 'holder: its state file says asserted while caffeinate runs');
+    ok($wait_for->(sub { waitpid($h, 1) == $h }, 8), 'holder: exits once the lease goes stale');
+    ok(!-e $pid_f, 'holder: removes the pid file it owned');
+    ok(!-e $state_f, 'holder: and its state file');
+    like($slurp->($log_f), qr/RELEASE reason=lease-expired/, 'holder: says why it let go');
+
+    # (b) the director's release path: identity check, TERM, clean exit.
+    my $h2 = $start->($pid_f, '--lease', '600', '--poll', '0.1');
+    ok($wait_for->(sub { $slurp->($pid_f) eq "$h2\n" }, 5), 'holder 2: up');
+    my @logged;
+    BpKeepAwake::apply('settled', $dir, { log => sub { push @logged, $_[0] } });
+    ok($wait_for->(sub { waitpid($h2, 1) == $h2 }, 8), 'release: apply(settled) stops the holder');
+    ok(!-e $pid_f, 'release: the pid file is gone');
+    like(join("\n", @logged), qr/keepawake stop winpid=$h2 result=gone/, 'release: logged as a clean stop');
+    like($slurp->($log_f), qr/pid=$h2 RELEASE reason=signal-term/, 'release: the holder released on TERM');
+
+    # (c) ON BATTERY: never started; stopped within the bound on a switch;
+    # taken again when AC returns while the lease is live.
+    $set_power->('dc');
+    unlink $args;
+    my $h3 = $start->($pid_f, '--lease', '600', '--poll', '0.1');
+    ok($wait_for->(sub { $slurp->($log_f) =~ /pid=$h3 STANDBY reason=battery/ }, 5),
+        'battery: a holder started off AC logs STANDBY (replace() counts that as up)');
+    # A stale 'asserted' from a predecessor never speaks for a new holder:
+    # it writes 'standby' with its pid, before its first power read.
+    {
+        my $h5_pid = "$dir/fresh.pid";
+        open my $st, '>', KeepAwake::state_path($h5_pid) or die $!; print {$st} "asserted\n"; close $st;
+        my $h5 = $start->($h5_pid, '--lease', '600', '--poll', '0.1');
+        ok($wait_for->(sub { $slurp->($h5_pid) eq "$h5\n" }, 5), 'fresh holder: up');
+        is(KeepAwake::holder_state($h5_pid), 'standby', 'fresh holder: the stale asserted state is replaced at once');
+        kill 'TERM', $h5;
+        waitpid($h5, 0);
+        ok(!-e KeepAwake::state_path($h5_pid), 'fresh holder: its state file goes with it');
+    }
+    Time::HiRes::sleep(0.5);
+    ok(!-e $args, 'battery: and no caffeinate was ever started');
+    is(KeepAwake::holder_state($pid_f), 'standby', 'battery: its state file says standby');
+    is(BpKeepAwake::_log_has_asserted($log_f, $h3), 1, 'battery: replace() sees a standing-by holder as working');
+    {
+        require "$S/BpContinuityLease.pm";
+        no warnings 'once';
+        local $BpContinuityLease::PLATFORM = 'darwin';
+        is(BpContinuityLease::state($dir, pid_alive => sub { 1 }), 'standby',
+            'battery: the lease reports standby, never held, for a holder that asserts nothing');
+    }
+    $set_power->('ac');
+    ok($wait_for->(sub { $slurp->($log_f) =~ /pid=$h3 ASSERTED caffeinate=\d+ power=ac .*reason=ac-restored/ }, 5),
+        'AC returns: the holder takes the assertion again (lease still live)');
+    my $c3 = $caf_of->($h3);
+    ok($running->($c3), 'AC returns: its caffeinate is running');
+    is(KeepAwake::holder_state($pid_f), 'asserted', 'AC returns: state asserted');
+    $set_power->('dc');
+    my $t0 = Time::HiRes::time();
+    ok($wait_for->(sub { !$running->($c3) }, 5), 'switch to battery: the caffeinate is stopped');
+    my $took = Time::HiRes::time() - $t0;
+    cmp_ok($took, '<', 2, "switch to battery: within one 0.1s poll plus the stop (took ${took}s)");
+    ok($wait_for->(sub { $slurp->($log_f) =~ /pid=$h3 STANDBY reason=battery caffeinate-stopped=$c3/ }, 2),
+        'switch to battery: logged as STANDBY naming the stopped caffeinate');
+    is(KeepAwake::holder_state($pid_f), 'standby', 'switch to battery: state standby');
+    ok(kill(0, $h3), 'switch to battery: the holder itself stays up, ready for AC');
+    $set_power->('garbage');
+    ok($wait_for->(sub { $slurp->($log_f) =~ /pid=$h3 STANDBY reason=power-unknown/ }, 5),
+        'an unreadable power source counts as battery: still standing by');
+    kill 'TERM', $h3;
+    ok($wait_for->(sub { waitpid($h3, 1) == $h3 }, 5), 'battery holder: exits on TERM');
+
+    # (d) the DEFAULT cadence: the bound the docs state (2 s poll + the stop).
+    $set_power->('ac');
+    my $h4 = $start->($pid_f, '--lease', '600');
+    ok($wait_for->(sub { defined $caf_of->($h4) }, 6), 'default poll: asserted on AC');
+    my $c4 = $caf_of->($h4);
+    $set_power->('dc');
+    $t0 = Time::HiRes::time();
+    ok($wait_for->(sub { !$running->($c4) }, 8), 'default poll: caffeinate stopped after the switch to battery');
+    $took = Time::HiRes::time() - $t0;
+    cmp_ok($took, '<=', $KeepAwake::POWER_POLL_SECONDS + 1.5,
+        "default poll: within one $KeepAwake::POWER_POLL_SECONDS s power poll plus the stop (took ${took}s)");
+    kill 'TERM', $h4;
+    waitpid($h4, 0);
+
+    # (e) never a real caffeinate from a test environment.
+    local $ENV{CCPRAXIS_CAFFEINATE_BIN};
+    delete $ENV{CCPRAXIS_CAFFEINATE_BIN};
+    my $rc = system($^X, "$S/bp-keepawake.pl", 'hold', '--pid-file', "$dir/never.pid") >> 8;
+    is($rc, 3, 'holder: refuses the real caffeinate under CCPRAXIS_NO_WAKELOCK');
+}
+
+# The power source, outside the holder: the one pmset parser (shared with the
+# AC-loss watch), and the seam's vocabulary.
+{
+    { my $ka = BpKeepAwake::keepawake_lib_path(); require $ka; }
+    is(KeepAwake::parse_pmset_ps("Now drawing from 'AC Power'\n -InternalBattery-0\t80%; charging\n"), 'ac', 'pmset: AC Power -> ac');
+    is(KeepAwake::parse_pmset_ps("Now drawing from 'Battery Power'\n"), 'dc', 'pmset: Battery Power -> dc');
+    is(KeepAwake::parse_pmset_ps("Now drawing from 'UPS Power'\n"), 'dc', 'pmset: UPS Power -> dc');
+    is(KeepAwake::parse_pmset_ps(undef), 'unknown', 'pmset: nothing read -> unknown (treated as battery)');
+    my $d = tempdir(CLEANUP => 1);
+    local $ENV{CCPRAXIS_AC_PROBE_FILE};
+    delete $ENV{CCPRAXIS_AC_PROBE_FILE};
+    is(KeepAwake::power_source(), 'unknown', 'power_source: a .t never reads the real machine (unknown without the seam)');
+    open my $p, '>', "$d/ps" or die $!; print {$p} "AC\n"; close $p;
+    local $ENV{CCPRAXIS_AC_PROBE_FILE} = "$d/ps";
+    {
+        local $ENV{CCPRAXIS_CAFFEINATE_BIN};
+        delete $ENV{CCPRAXIS_CAFFEINATE_BIN};
+        is(KeepAwake::power_source(), 'unknown',
+            'power_source: the seam is ignored without a substitute caffeinate (a leaked seam never lets the real one run on battery)');
+    }
+    local $ENV{CCPRAXIS_CAFFEINATE_BIN} = '/some/fake';
+    is(KeepAwake::power_source(), 'ac', 'power_source: with a substitute caffeinate, the seam file is read, case-insensitively');
+}
+
+# ---- the macOS doctor (bp-preflight.pl power.sleep_intact) ---------------------
+# What could still break the operator's sleep rule behind ccpraxis's back:
+# SleepDisabled, or a caffeinate holding -s/-d/-u under ccpraxis or a Claude
+# Code session. Pure parsers, both reads seamed.
+{
+    my $pm_ok = "System-wide power settings:\nCurrently in use:\n standby              1\n sleep                1 (sleep prevented by caffeinate, powerd)\n";
+    my $pm_bad = "System-wide power settings:\n SleepDisabled\t\t1\nCurrently in use:\n sleep 1\n";
+    is(BpKeepAwake::pmset_sleep_disabled($pm_ok), 0, 'doctor: an ordinary pmset -g has no SleepDisabled');
+    is(BpKeepAwake::pmset_sleep_disabled($pm_bad), 1, 'doctor: pmset disablesleep 1 is seen');
+    is(BpKeepAwake::pmset_sleep_disabled(" SleepDisabled 0\n"), 0, 'doctor: SleepDisabled 0 is fine');
+    is(BpKeepAwake::caffeinate_flags('caffeinate -i -s -m -t 50400'), 'ism', 'doctor: flags of the incident caffeinate');
+    is(BpKeepAwake::caffeinate_flags('/usr/bin/caffeinate -dims make'), 'dims', 'doctor: a clustered flag word, then the utility');
+    is(BpKeepAwake::caffeinate_flags('caffeinate -i -w 4242'), 'i', 'doctor: -w takes a value');
+    my $ps = join("\n",
+        '    1     0 /sbin/launchd',
+        ' 5448     1 claude',
+        ' 6000  5448 /bin/zsh -c caffeinate -i -s -m -t 50400',
+        ' 6001  6000 caffeinate -i -s -m -t 50400',          # an agent's hand-run one: reported
+        '88224  5448 caffeinate -i -t 300',                 # Claude Code's own: -i only, never reported
+        ' 7000     1 /usr/bin/perl /Users/x/.claude/ccpraxis/plugins/butler/scripts/bp-keepawake.pl hold --pid-file k.pid',
+        ' 7001  7000 /usr/bin/caffeinate -i -w 7000',       # ccpraxis's own, by the rule: not reported
+        ' 7100     1 /usr/bin/perl /Users/x/.claude/ccpraxis/plugins/sandbox/scripts/launcher.pl',
+        ' 7101  7100 /usr/bin/caffeinate -i -s -w 7100',    # an old launcher lock from before the rule: reported
+        ' 8000     1 /bin/zsh',
+        ' 8001  8000 caffeinate -d',                        # the operator's own, outside ccpraxis: not ours to report
+        '');
+    my @o = BpKeepAwake::caffeinate_overrides($ps);
+    is_deeply([map { $_->{pid} } @o], [6001, 7101], 'doctor: reports only -s/-d/-u under ccpraxis or a Claude Code session');
+    is($o[0]{flags}, 's', 'doctor: the hand-run one holds -s');
+    like($o[0]{owner}, qr/^a Claude Code session \(pid 5448\)$/, 'doctor: ...under the claude process');
+    like($o[1]{owner}, qr/^ccpraxis \(pid 7100\)$/, 'doctor: the old launcher lock is ccpraxis\'s');
+    my @f = BpKeepAwake::sleep_override_findings(pmset_g => sub { $pm_bad }, ps => sub { $ps });
+    is(scalar(@f), 3, 'doctor: SleepDisabled plus two overriding caffeinates make three findings');
+    like($f[0], qr/^pmset reports SleepDisabled 1: /, 'doctor: SleepDisabled first, with how to undo it');
+    like($f[1], qr/^caffeinate pid 6001 holds -s under a Claude Code session/, 'doctor: names pid, flags and owner');
+    is_deeply([BpKeepAwake::sleep_override_findings(pmset_g => sub { $pm_ok }, ps => sub { "88224  5448 caffeinate -i -t 300\n 5448 1 claude\n" })],
+        [], 'doctor: a clean Mac with Claude Code\'s own caffeinate has no findings');
+    my $aj = do { open my $h, '<:raw', "$S/../docs/assumptions.json" or die $!; local $/; JSON::PP->new->decode(<$h>) };
+    my ($a) = grep { $_->{id} eq 'power.sleep_intact' } @{ $aj->{assumptions} };
+    ok($a, 'doctor: assumptions.json registers power.sleep_intact for bp-preflight.pl');
+    is_deeply($a && $a->{supported_envs}, ['macos'], 'doctor: macOS only (no lid rule to check elsewhere)');
 }
 
 done_testing();

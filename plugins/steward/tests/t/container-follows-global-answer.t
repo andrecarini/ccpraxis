@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Oracle for blueprint tooling-fixes, package 16-container-follows-global-answer
 # (scripts/backup/Export.pm, plugins/steward/skills/backup/SKILL.md).
 #
@@ -257,6 +257,13 @@ sub write_git_stub {
     my ($scratch) = @_;
     write_text("$scratch/git-stub.pl", $GIT_STUB_PL);
     write_text("$scratch/git-stub.cmd", $GIT_STUB_CMD);
+    # Off Windows a .cmd file is not executable at all (the shell reads
+    # "@echo off" as a command and every git verb fails), so the wrapper is
+    # the perl script itself, run through its shebang.
+    unless ($^O eq q{MSWin32} || $^O eq q{cygwin} || $^O eq q{msys}) {
+        chmod 0755, "$scratch/git-stub.pl";
+        return "$scratch/git-stub.pl";
+    }
     return "$scratch/git-stub.cmd";
 }
 
@@ -282,14 +289,20 @@ sub write_state_raw {
     write_text($path, JSON::PP->new->canonical->pretty->encode($data));
 }
 
+# The preflight's export_target per scenario (2026-10-30): the export runs
+# only for a ready target and writes only into its dev clone.
+my %EXPORT_TARGET;
+
 sub seed_preflight_outcome {
     my ($state_path, $data_or_undef) = @_;
     my $state = fresh_state_shell();
-    if (defined $data_or_undef) {
+    my %items;
+    $items{export_target} = { at => time, data => $EXPORT_TARGET{$state_path} } if $EXPORT_TARGET{$state_path};
+    $items{settings_outcome} = { at => time, data => $data_or_undef } if defined $data_or_undef;
+    if (%items) {
         $state->{phases}{preflight} = {
             status => 'complete', started_at => time, completed_at => time, error => undef,
-            items  => { settings_outcome => { at => time, data => $data_or_undef } },
-            scratch => {},
+            items  => \%items, scratch => {},
         };
     }
     write_state_raw($state_path, $state);
@@ -304,46 +317,65 @@ sub copy_export_into {
     return 1;
 }
 
+# The promote.pl topology: a dev clone with the payload committed, the live
+# install cloned from it. The wrapped scripts run from the live install (so
+# the stubs go there, with the machine-local .backup-preferences.json); the
+# export writes the dev clone's container settings.
 sub setup_root {
     my (%opts) = @_;
     my $scratch = temproot();
     my $home    = make_machine($scratch, $opts{machine_name} // 'host');
     my $ccpx    = "$home/.claude/ccpraxis";
-    make_path($ccpx);
+    my $clone   = "$scratch/devclone";
+    make_path($clone, "$home/.claude");
 
-    _git($home, $ccpx, 'init', '-q');
+    _git($home, $clone, 'init', '-q');
 
-    write_text("$ccpx/README.md", "# ccpraxis\n");
-    write_text("$ccpx/global-config/settings.json", $opts{repo_settings} // "{}\n");
-    write_text("$ccpx/global-config/known_marketplaces.json", "{}\n");
+    write_text("$clone/.gitignore", ".backup-preferences.json\n*.pre-merge.*\n");
+    write_text("$clone/README.md", "# ccpraxis\n");
+    write_text("$clone/global-config/settings.json", $opts{repo_settings} // "{}\n");
+    write_text("$clone/global-config/known_marketplaces.json", "{}\n");
     write_text("$home/.claude/settings.json", $opts{live_settings} // "{}\n");
 
     if (exists $opts{container_settings}) {
-        write_text("$ccpx/plugins/sandbox/container/settings.json", $opts{container_settings})
+        write_text("$clone/plugins/sandbox/container/settings.json", $opts{container_settings})
             if defined $opts{container_settings};
     } else {
-        write_text("$ccpx/plugins/sandbox/container/settings.json", "{}\n");
+        write_text("$clone/plugins/sandbox/container/settings.json", "{}\n");
     }
 
+    # The export loads DevClone.pm from the live install and runs the dev
+    # clone's scripts/promote.pl after committing; a stand-in that succeeds.
+    write_text("$clone/plugins/steward/scripts/DevClone.pm", read_text("$Bin/../../scripts/DevClone.pm"));
+    write_text("$clone/scripts/promote.pl", "#!/usr/bin/env perl\nprint \"promote: stand-in\\n\";\nexit 0;\n");
+
+    _git($home, $clone, 'add', '-A');
+    _git($home, $clone, 'commit', '-q', '-m', 'initial fixture commit');
+
+    my %genv = _git_env($home);
+    {
+        local @ENV{ keys %genv } = values %genv;
+        system('git', 'clone', '-q', _native_path($clone), _native_path($ccpx)) == 0
+            or die "git clone $clone -> $ccpx failed\n";
+    }
     if (defined $opts{prefs}) {
         write_text("$ccpx/.backup-preferences.json", $opts{prefs});
     }
-
     write_stub_scripts($ccpx);
     install_real_diff_scripts($ccpx) if $opts{real_diff};
-
-    _git($home, $ccpx, 'add', '-A');
-    _git($home, $ccpx, 'commit', '-q', '-m', 'initial fixture commit');
 
     my $phase_dir = "$scratch/phases";
     copy_export_into($phase_dir);
     my $git_stub = write_git_stub($scratch);
 
-    return {
-        scratch => $scratch, home => $home, ccpx => $ccpx,
+    my $r = {
+        scratch => $scratch, home => $home, ccpx => $ccpx, clone => $clone,
         phase_dir => $phase_dir, git_stub => $git_stub,
         state_path => "$scratch/state/run.json", log_path => "$scratch/log.txt",
     };
+    $EXPORT_TARGET{ $r->{state_path} } = { ready => 1, live_root => $ccpx, dev_clone => $clone };
+    seed_preflight_outcome($r->{state_path}, undef);
+    return $r;
 }
 
 sub _spawn {
@@ -452,7 +484,7 @@ sub finish_after_content_change {
 
 sub read_container {
     my ($r) = @_;
-    my $raw = read_text("$r->{ccpx}/plugins/sandbox/container/settings.json");
+    my $raw = read_text("$r->{clone}/plugins/sandbox/container/settings.json");
     return defined $raw ? eval { decode_json($raw) } : undef;
 }
 
@@ -698,7 +730,7 @@ sub record_decisions_noop { }
     my $container_before = read_container($r);
     is(canon_json($container_before // {}), canon_json({ k_only_right_live => 'C1', k_only_right_add => 'C2' }),
         'SECTION C (AC5): the container file is unchanged by invocation 1 (nothing applied before being answered)')
-        or diag('container raw: ' . (read_text("$r->{ccpx}/plugins/sandbox/container/settings.json") // '(undef)'));
+        or diag('container raw: ' . (read_text("$r->{clone}/plugins/sandbox/container/settings.json") // '(undef)'));
 
     my $state1 = read_state($r->{state_path});
     ok((defined $state1 && !defined find_note($state1, 'container_followed_global')),
@@ -766,7 +798,7 @@ for my $degrade_case (
     my $resp2 = finish_after_content_change($r, {}, $resp);
     ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), 'SECTION D (AC6): reaches a terminal status') or diag($resp2->{out} . $resp2->{err});
 
-    is(read_text("$r->{ccpx}/plugins/sandbox/container/settings.json"), qq({"prefDiv":"c2"}\n),
+    is(read_text("$r->{clone}/plugins/sandbox/container/settings.json"), qq({"prefDiv":"c2"}\n),
         'SECTION D (AC6): the container settings file is byte-unchanged -- the preference, not the follow rule, applied');
 
     my $state = read_state($r->{state_path});
@@ -837,7 +869,7 @@ sub run_section_e {
     # BOTH F and N mint a decision here, and F may sort first.
     my ($d) = grep { ($_->{data}{key} // '') eq 'N' } @decs;
 
-    is(read_text("$r->{ccpx}/plugins/sandbox/container/settings.json"), qq({"F":"FCONTAINER"}\n),
+    is(read_text("$r->{clone}/plugins/sandbox/container/settings.json"), qq({"F":"FCONTAINER"}\n),
         'SECTION E (AC8): the container file is unchanged by invocation 1');
 
     my $state1 = read_state($r->{state_path});

@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # b06-sandbox-fast-test-io — the immutable test oracle.
 
 # Derived ONLY from specs/07-sandbox-fast-test-io-spec.md (the 1117-line
@@ -130,20 +130,6 @@ my $EMPTY_PATH   = "$ROOT/empty-path";                  # AC-12: PATH with nothi
 my $CHILD_CWD    = "$ROOT/cwd";                         # every child runs here, never in /project
 make_path($STUB_DIR, $EMPTY_PATH, $CHILD_CWD);
 
-# Probe now that $EMPTY_PATH exists: run a trivial `#!/usr/bin/env bash` script
-# under it. 127 means the interpreter could not be resolved, so nothing the
-# script would have done is observable.
-$EMPTY_PATH_STARTS = do {
-    my $probe = "$ROOT/env-probe.sh";
-    if (open(my $ph, '>', $probe)) {
-        print {$ph} "#!/usr/bin/env bash\nexit 42\n";
-        close $ph;
-    }
-    chmod 0755, $probe;
-    system("PATH=" . quotemeta($EMPTY_PATH) . " " . quotemeta($probe) . " >/dev/null 2>&1");
-    (($? >> 8) == 42) ? 1 : 0;
-};
-
 # --- coordinator adjudication (b06, 2026-07-25) -----------------------------
 # AC-12 specifies a "truly empty" PATH. That is unrunnable as written, for two
 # independent reasons, neither of which any implementation could satisfy:
@@ -159,6 +145,28 @@ $EMPTY_PATH_STARTS = do {
 # implementer rather than silently patched; adjudicated and applied here.
 symlink((grep { -x $_ } qw(/bin/bash /usr/bin/bash))[0], "$EMPTY_PATH/bash")
     or die "cannot seed bash into EMPTY_PATH: $!";
+#
+# The seed above must come BEFORE the probe below (moved 2026-10-30). The probe
+# used to run against the still-empty directory, where `env` cannot find bash,
+# so it reported 127 and AC-12/AC-13 skipped: measured on macOS, and true of any
+# host whose `env` searches PATH. That went unnoticed while the image shipped
+# pnpm. Since Node and pnpm left the image, a missing pnpm is the normal state
+# of a sandbox, and AC-12 is the behaviour a coordinator meets first.
+#
+# Probe now that $EMPTY_PATH exists: run a trivial `#!/usr/bin/env bash` script
+# under it. 127 means the interpreter could not be resolved, so nothing the
+# script would have done is observable.
+$EMPTY_PATH_STARTS = do {
+    my $probe = "$ROOT/env-probe.sh";
+    if (open(my $ph, '>', $probe)) {
+        print {$ph} "#!/usr/bin/env bash\nexit 42\n";
+        close $ph;
+    }
+    chmod 0755, $probe;
+    system("PATH=" . quotemeta($EMPTY_PATH) . " " . quotemeta($probe) . " >/dev/null 2>&1");
+    (($? >> 8) == 42) ? 1 : 0;
+};
+
 spit("$STUB_DIR/pnpm", <<'STUB');
 #!/bin/sh
 # AC-17 witness (spec 4.0): appends its argv when $PNPM_WITNESS is set, then
@@ -649,6 +657,11 @@ subtest 'AC-12 pnpm missing aborts with exit 3 and no side effects' => sub {
     is($rc, 3, 'AC-12: exit 3 when command -v pnpm fails') or diag($err);
     like($err, qr/^butler: missing required command: pnpm$/m, 'AC-12: require_cmd house line on stderr');
     like($err, qr/^bp-fast-store: pnpm is required/m,         'AC-12: the bp-fast-store line on stderr');
+    # Since 2026-10-30 the sandbox image ships no pnpm, so this refusal is what a
+    # coordinator sees first: it must say where pnpm comes from now.
+    like($err, qr{^bp-fast-store: pnpm is required[^\n]*/backpack:add --recipe node-pnpm}m,
+         'AC-12: the refusal names the backpack recipe that provides pnpm');
+    unlike($err, qr/\.npmrc this script writes/, 'AC-12: the refusal no longer claims the script writes .npmrc');
     is($out, '', 'AC-12: stdout is empty');
     ok(!-e "$P/pnpm-workspace.yaml", 'AC-12: no pnpm-workspace.yaml was written');
     ok(!-e "$P/.gitignore",'AC-12: no .gitignore was written');
@@ -1138,8 +1151,10 @@ subtest 'AC-28 SKILL.md documents the non-pnpm equivalent and rebuild semantics'
     like($body, qr/rebuild/i, 'AC-28: ... on container rebuild');
     ok((grep { /bind mount/i && /source|ledger/i } split /\n/, $body),
        'AC-28: states that source/ledgers stay on the durable bind mount');
-    ok((grep { /\.npmrc/ && /never commit/i } split /\n/, $body),
-       'AC-28: states that .npmrc must never be committed');
+    # RETARGETED 2026-10-30: the gitignored config is pnpm-workspace.yaml since
+    # b38 (pnpm 10+ ignores the .npmrc keys); the doc said .npmrc until now.
+    ok((grep { /pnpm-workspace\.yaml/ && /never commit/i } split /\n/, $body),
+       'AC-28: states that the generated pnpm-workspace.yaml must never be committed');
 
     done_testing();
 };
@@ -1226,6 +1241,28 @@ subtest 'AC-32 a config path that is a directory fails loudly, not silently' => 
         };
         is(scalar(@stray), 0, "AC-32: no stray temp file was left inside $victim/");
     }
+    done_testing();
+};
+
+subtest 'AC-33 the /root default is refused outside the sandbox' => sub {
+    # /root is the sandbox container's own overlay storage. On a host it names
+    # nothing useful (macOS: the read-only system volume), so using the default
+    # there is a usage error up front, never a half-configured project.
+    # IS_SANDBOX is unset in every child here (%CLEAN_ENV), i.e. a host.
+    my $p = mk_proj('hostdefault');
+    my $P = abs_path($p);
+    my ($rc, $out, $err) = run_fs(args => ['--project', $p]);
+    is($rc, 2, 'AC-33: no --native-root on a host -> exit 2') or diag($err);
+    like($err, qr/^bp-fast-store: the default --native-root \/root is the sandbox container's storage/m,
+         'AC-33: the message says why');
+    is($out, '', 'AC-33: stdout is empty');
+    ok(!-e "$P/pnpm-workspace.yaml", 'AC-33: no pnpm-workspace.yaml was written');
+    ok(!-e "$P/.gitignore", 'AC-33: no .gitignore was written');
+
+    # Both explicit native paths make the default irrelevant: no refusal.
+    my $nat = mk_native();
+    my ($rc2, undef, $err2) = run_fs(args => ['--project', $p, '--store', "$nat/s", '--virtual-store', "$nat/v"]);
+    is($rc2, 0, 'AC-33: --store + --virtual-store on a host need no --native-root') or diag($err2);
     done_testing();
 };
 

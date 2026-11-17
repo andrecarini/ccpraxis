@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # 21 -- oracle for blueprint backup-driver, package
 # 02-preflight-and-config (scripts/backup/Preflight.pm).
 #
@@ -20,9 +20,14 @@
 #   AC4  continue_without_merge: merged==0, HEAD unchanged, dirty file still dirty
 #   AC5  clean tree + remote ahead: auto-merges, HEAD advances, no decision
 #   AC6  merge conflict -> remote_merge_conflict; abort_merge / keep_conflict
-#   AC7  clone/live divergence decision, both shas in data
-#   AC8  under EITHER divergence answer: both trees byte-identical before/after
-#   AC9  no clone locatable -> checked=0, no decision, no failure
+#   AC7-AC9 (2026-10-30, replacing the clone/live divergence decision): the
+#        dev clone is located through the live install's origin; a GitHub
+#        origin, a payload the live install was not promoted with, or a dev
+#        clone off main each skip the ccpraxis export with a note (never a
+#        decision, never a failure); the live install is never mutated; a
+#        merge the backup did not start is left alone; a merge git refuses
+#        stops cleanly.
+#   W1-TOKEN a W1 write never carries an unexpanded ${CCPRAXIS_LIVE}
 #   AC10 two DISTINCT readme_drift decisions for two different files
 #   AC11 gen-readme-tree.pl stub NEVER sees --write/--bootstrap, ever
 #   AC12 filter-diff fixture -> exactly 3 settings_key decisions, 0 for auto_applied
@@ -40,6 +45,11 @@
 #   AC24 environmental failures never phase_died; complete_with_failures instead
 #   AC25 isolation: nothing under the real machine is touched
 #
+# 2026-10-30: the fixture is the promote.pl topology -- a dev clone (whose
+# origin is a bare "GitHub" repo when with_origin is set) and a live install
+# cloned from it. Remote integration, the dirty-tree check and the merge now
+# happen in the DEV CLONE; the live install is only read.
+#
 # Plus, per the dispatch instructions: P1 bounds (write-only-on-answer,
 # installLocation stripped, instruction-only choices stay instructions), the two
 # doc checks being genuinely separate files, Decision 4 (never acted on) and
@@ -52,6 +62,8 @@ use FindBin qw($Bin);
 use lib "$Bin/../lib";
 use File::Path qw(make_path);
 use File::Temp qw(tempfile);
+use File::Spec;
+use Cwd ();
 use JSON::PP;
 use Encode qw(decode FB_CROAK);
 use StewardTest qw(ok is like unlike diag done_testing temproot make_machine init_remote write_text read_text path_exists);
@@ -159,6 +171,35 @@ sub _git_out {
     return defined $out ? $out : '';
 }
 
+sub _git_allow_fail {
+    my ($home, $dir, @args) = @_;
+    my %genv = _git_env($home);
+    local @ENV{ keys %genv } = values %genv;
+    my @translated = map { (defined $_ && /^\//) ? _native_path($_) : $_ } @args;
+    open(my $saved, '>&', \*STDERR) or die;
+    open(STDERR, '>', File::Spec->devnull) or die;
+    open(my $savedo, '>&', \*STDOUT) or die;
+    open(STDOUT, '>', File::Spec->devnull) or die;
+    my $rc = system('git', '-C', _native_path($dir), @translated);
+    open(STDOUT, '>&', $savedo);
+    open(STDERR, '>&', $saved);
+    return $rc == 0 ? 1 : 0;
+}
+
+# Two spellings of one directory (a macOS /var vs /private/var, a Windows
+# C:/ vs /c/, case on a case-insensitive filesystem) compare equal.
+sub DevClone_same {
+    my ($a, $b) = @_;
+    return 0 unless defined $a && defined $b;
+    my $n = sub {
+        my $p = _native_path($_[0]);
+        my $abs = -e $p ? (Cwd::abs_path($p) // $p) : $p;
+        $abs =~ s{\\}{/}g; $abs =~ s{/+\z}{};
+        return ($^O =~ /^(?:MSWin32|cygwin|msys|darwin)$/) ? lc $abs : $abs;
+    };
+    return $n->($a) eq $n->($b) ? 1 : 0;
+}
+
 sub head_sha  { my ($home, $dir) = @_; my $s = _git_out($home, $dir, 'rev-parse', 'HEAD');   $s =~ s/\s+\z//; return $s; }
 sub status_of { my ($home, $dir) = @_; return _git_out($home, $dir, 'status', '--porcelain'); }
 
@@ -264,9 +305,11 @@ sub write_stub_scripts {
 # the REAL scripts (byte copies), per the spec's explicit instruction. These
 # are read as "wrapped scripts the spec names explicitly", never as
 # Preflight.pm implementation detail.
+# MachineLocalSettings.pm rides along: the real json-diff.pl requires it from
+# its own directory when Preflight passes --host-live.
 sub install_real_pref_scripts {
     my ($ccpx) = @_;
-    for my $name (qw(json-diff.pl filter-diff.pl save-preference.pl)) {
+    for my $name (qw(json-diff.pl filter-diff.pl save-preference.pl MachineLocalSettings.pm)) {
         my $src = "$Bin/../../scripts/$name";
         die "AC14 fixture: real script missing: $src" unless -f $src;
         my $body = read_text($src);
@@ -288,55 +331,81 @@ sub copy_preflight_into {
 sub default_readme       { return "# ccpraxis\n\nSee `scripts/backup.pl` for the driver.\n"; }
 sub default_tree         { return "<!-- BEGIN-FILE-TREE -->\n(empty fixture tree)\n<!-- END-FILE-TREE -->\n"; }
 
-# setup_root(%opts) -- builds one throwaway "machine": a temp HOME containing
-# <home>/.claude/ccpraxis as a real git repo, all 6 wrapped scripts stubbed,
-# and (opts-controlled) an origin remote / divergent history / dirty tree.
+# The shared modules Preflight.pm loads from the live install
+# (plugins/steward/scripts/DevClone.pm, MachineLocalSettings.pm). Real copies:
+# locating the dev clone and the payload check are under test here too.
+sub install_shared_modules {
+    my ($ccpx) = @_;
+    for my $name (qw(DevClone.pm MachineLocalSettings.pm)) {
+        my $src = "$Bin/../../scripts/$name";
+        die "fixture: shared module missing: $src" unless -f $src;
+        write_text("$ccpx/plugins/steward/scripts/$name", read_text($src));
+    }
+}
+
+sub commit_in_clone {
+    my ($r, $file, $content, $msg) = @_;
+    write_text("$r->{clone}/$file", $content);
+    _git($r->{home}, $r->{clone}, 'add', '--', $file);
+    _git($r->{home}, $r->{clone}, 'commit', '-q', '-m', $msg);
+}
+
+# setup_root(%opts) -- builds one throwaway "machine" the way promote.pl
+# leaves it (2026-10-30 workflow): a dev clone with the payload committed, a
+# live install at <home>/.claude/ccpraxis CLONED FROM the dev clone (so its
+# origin is the dev clone), all 6 wrapped scripts stubbed in the live install
+# (scripts run from there), and (opts-controlled) a bare "GitHub" origin for
+# the DEV CLONE / an origin ahead of it / a dirty dev clone.
 sub setup_root {
     my (%opts) = @_;
     my $scratch = temproot();
     my $home    = make_machine($scratch, 'host');
+    my $clone   = "$scratch/devclone";
     my $ccpx    = "$home/.claude/ccpraxis";
-    make_path($ccpx);
+    make_path($clone, "$home/.claude");
 
-    _git($home, $ccpx, 'init', '-q');
+    _git($home, $clone, 'init', '-q');
 
-    write_text("$ccpx/README.md",                     $opts{readme}        // default_readme());
-    write_text("$ccpx/docs/repo-layout.md",            $opts{tree}          // default_tree());
-    write_text("$ccpx/global-config/settings.json",    $opts{repo_settings} // "{}\n");
-    write_text("$home/.claude/settings.json",          $opts{live_settings} // "{}\n");
-    write_text("$ccpx/global-config/known_marketplaces.json", $opts{repo_marketplaces} // "{}\n");
+    write_text("$clone/.gitignore",                     ".backup-preferences.json\n*.pre-merge.*\n");
+    write_text("$clone/README.md",                      $opts{readme}        // default_readme());
+    write_text("$clone/docs/repo-layout.md",            $opts{tree}          // default_tree());
+    write_text("$clone/global-config/settings.json",    $opts{repo_settings} // "{}\n");
+    write_text("$clone/global-config/known_marketplaces.json", $opts{repo_marketplaces} // "{}\n");
+    write_text("$home/.claude/settings.json",           $opts{live_settings} // "{}\n");
     if (defined $opts{live_marketplaces}) {
         write_text("$home/.claude/plugins/known_marketplaces.json", $opts{live_marketplaces});
     }
-    if (defined $opts{prefs}) {
-        write_text("$ccpx/.backup-preferences.json", $opts{prefs});
-    }
+    # Everything the live install runs is committed in the dev clone, as on a
+    # real machine, so the live install is a clean clone promote.pl accepts:
+    # the stubbed wrapped scripts, the shared modules, and the REAL
+    # scripts/promote.pl with the modules it loads.
+    write_stub_scripts($clone);
+    install_shared_modules($clone);
+    install_real_pref_scripts($clone) if $opts{real_pref_scripts};
+    write_text("$clone/scripts/promote.pl", read_text("$Bin/../../../../scripts/promote.pl"));
+    write_text("$clone/plugins/steward/scripts/GlobalClaudeMd.pm", read_text("$Bin/../../scripts/GlobalClaudeMd.pm"));
+    # promote.pl imports the shared settings unit model too.
+    write_text("$clone/plugins/steward/scripts/SettingsUnits.pm", read_text("$Bin/../../scripts/SettingsUnits.pm"));
 
-    _git($home, $ccpx, 'add', '-A');
-    _git($home, $ccpx, 'commit', '-q', '-m', 'initial fixture commit');
+    _git($home, $clone, 'add', '-A');
+    _git($home, $clone, 'commit', '-q', '-m', 'initial fixture commit');
 
     my $remote;
     if ($opts{with_origin}) {
         $remote = init_remote($scratch);
-        _git($home, $ccpx, 'remote', 'add', 'origin', $remote);
-        _git($home, $ccpx, 'push', '-q', '-u', 'origin', 'main');
-    }
-    if ($opts{remote_ahead} && $remote) {
-        my $advancer = "$scratch/remote-advancer";
-        _git_clone($home, $remote, $advancer);
-        write_text("$advancer/ahead-marker.txt", "advanced\n");
-        _git($home, $advancer, 'add', '-A');
-        _git($home, $advancer, 'commit', '-q', '-m', 'advance origin ahead of local');
-        _git($home, $advancer, 'push', '-q', 'origin', 'main');
-    }
-    if ($opts{dirty}) {
-        open my $fh, '>>:raw', "$ccpx/README.md" or die "cannot dirty README.md: $!";
-        print {$fh} "\nuncommitted local change\n";
-        close $fh;
+        _git($home, $clone, 'remote', 'add', 'origin', $remote);
+        _git($home, $clone, 'push', '-q', '-u', 'origin', 'main');
     }
 
-    write_stub_scripts($ccpx);
-    install_real_pref_scripts($ccpx) if $opts{real_pref_scripts};
+    # The live install: promote.pl's first run clones the dev clone.
+    _git_clone($home, $clone, $ccpx);
+    if (defined $opts{prefs}) {
+        write_text("$ccpx/.backup-preferences.json", $opts{prefs});
+    }
+    if ($opts{clone_ahead}) {
+        # The dev clone has moved on since the last promotion.
+        commit_in_clone({ home => $home, clone => $clone }, 'ahead-marker.txt', "developed\n", 'development since the last promotion');
+    }
 
     my $phase_dir = "$scratch/phases";
     copy_preflight_into($phase_dir);
@@ -345,6 +414,7 @@ sub setup_root {
         scratch     => $scratch,
         home        => $home,
         ccpx        => $ccpx,
+        clone       => $clone,
         remote      => $remote,
         phase_dir   => $phase_dir,
         state_path  => "$scratch/state/run.json",
@@ -488,7 +558,9 @@ sub find_note {
     # per spec S2.4's list-form-only contract) rather than as bare words --
     # a bare-word grep for e.g. "push" would false-positive on Perl's own
     # `push @array, ...` builtin, which any real implementation will use.
-    my @mutating_verbs = qw(checkout switch restore reset clean push pull commit add);
+    # 2026-10-30: the backup never talks to a remote and merges nothing --
+    # fetch, merge and ls-remote join the list.
+    my @mutating_verbs = qw(checkout switch restore reset clean push pull commit add fetch merge ls-remote);
     for my $verb (@mutating_verbs) {
         my $re = qr/['"]\Q$verb\E['"]/;
         if ($PREFLIGHT_EXISTS) {
@@ -516,8 +588,8 @@ sub find_note {
 # ===========================================================================
 {
     my $src = $PREFLIGHT_EXISTS ? (read_text($PREFLIGHT_SRC) // '') : '';
-    my @owned    = qw(dirty_worktree remote_merge_conflict clone_live_divergence readme_drift settings_key marketplace_key);
-    my @foreign  = qw(file_conflict container_settings_key sensitive_finding push_confirmation vault_conflict project_registration plugin_install step_failure);
+    my @owned    = qw(promote_pending readme_drift settings_key marketplace_key);
+    my @foreign  = qw(dirty_worktree remote_merge_conflict clone_live_divergence file_conflict claude_md_drift container_settings_key sensitive_finding push_confirmation vault_conflict project_registration plugin_install step_failure);
 
     for my $k (@owned) {
         if ($PREFLIGHT_EXISTS) {
@@ -570,263 +642,298 @@ sub isnt {
 }
 
 # ===========================================================================
-# AC2, AC3, AC4 -- Decision 1 (dirty worktree), Decision 7 (ordering).
+# AC2-AC6 (2026-10-30) -- the promotion step, replacing remote integration:
+# the backup never talks to a remote, and the live install changes only
+# through the dev clone's own scripts/promote.pl. When the dev clone's main
+# is ahead, ONE promote_pending decision lists the commits first (Decision 7:
+# nothing else is spawned before it is answered).
 # ===========================================================================
+sub pf_item {
+    my ($r, $key) = @_;
+    my $state = read_state($r->{state_path});
+    return defined $state ? $state->{phases}{preflight}{items}{$key}{data} : undef;
+}
+
 {
-    my $r = setup_root(with_origin => 1, dirty => 1);
-    my $orig_head   = head_sha($r->{home}, $r->{ccpx});
-    my $orig_status = status_of($r->{home}, $r->{ccpx});
-    my $orig_readme = read_text("$r->{ccpx}/README.md");
-
+    # AC2/AC3 -- the question, and nothing moves while it is open.
+    my $r = setup_root(with_origin => 0, clone_ahead => 1);
+    my $live_head   = head_sha($r->{home}, $r->{ccpx});
+    my $live_status = status_of($r->{home}, $r->{ccpx});
     my $resp = run_backup($r, {});
-    is($resp->{exit}, 10, 'AC2: a dirty worktree pauses the run (exit 10)') or diag($resp->{out} . $resp->{err});
-    is(($resp->{json}{status} // ''), 'needs_decision', 'AC2: status == needs_decision');
+    is($resp->{exit}, 10, 'AC2: a dev clone ahead of the live install pauses the run (exit 10)') or diag($resp->{out} . $resp->{err});
     my @decs = decisions_of($resp);
-    is(scalar(@decs), 1, 'AC2: exactly one decision at the dirty-worktree pause') or diag($resp->{out});
-    my $d = $decs[0];
-    if (defined $d) {
-        is($d->{id},   'preflight.dirty_worktree', 'AC2: decision id == preflight.dirty_worktree');
-        is($d->{kind}, 'dirty_worktree',            'AC2: decision kind == dirty_worktree');
-        my @cids = sort map { $_->{id} } @{ $d->{choices} // [] };
-        is(join(',', @cids), 'continue_without_merge,merge_anyway',
-            'AC2: choice ids are exactly continue_without_merge and merge_anyway');
-    } else {
-        ok(0, 'AC2: decision id == preflight.dirty_worktree (no decision present)');
-        ok(0, 'AC2: decision kind == dirty_worktree (no decision present)');
-        ok(0, 'AC2: choice ids are exactly continue_without_merge and merge_anyway (no decision present)');
-    }
-
-    # AC3 -- nothing moved, and no wrapped script was spawned.
-    is(head_sha($r->{home}, $r->{ccpx}), $orig_head,   'AC3: HEAD is unchanged at the dirty-worktree pause');
-    is(status_of($r->{home}, $r->{ccpx}), $orig_status, 'AC3: git status --porcelain is byte-identical at the pause');
-    is(read_text("$r->{ccpx}/README.md"), $orig_readme, 'AC3: the dirty file bytes are unchanged at the pause');
-    is(log_line_count($r->{log_path}), 0,
-        'AC3: the stub-invocation log is EMPTY at the dirty-worktree pause (Decision 7: nothing spawned before the pause)');
-
-    if ($RUNPM_OK && defined $d) {
+    is(scalar(@decs), 1, 'AC2: exactly one decision at the promotion pause') or diag($resp->{out});
+    my $d = $decs[0] // {};
+    is($d->{id},   'preflight.promote_pending', 'AC2: decision id == preflight.promote_pending');
+    is($d->{kind}, 'promote_pending',            'AC2: decision kind == promote_pending');
+    is(join(',', sort map { $_->{id} } @{ $d->{choices} // [] }), 'promote,skip', 'AC2: the choices are promote and skip');
+    like(($d->{detail} // ''), qr/development since the last promotion/, 'AC2: the detail lists the commit');
+    like(($d->{detail} // ''), qr{scripts/promote\.pl}, 'AC2: ...and the command it runs');
+    is(($d->{data} // {})->{count}, 1, 'AC2: data.count is the number of commits');
+    if ($RUNPM_OK) {
         my ($ok2, $reason) = Backup::Run::validate_decision({ %$d });
-        ok($ok2, 'AC16: the dirty_worktree decision passes Backup::Run::validate_decision') or diag($reason // '(none)');
-    } else {
-        ok(0, 'AC16: the dirty_worktree decision passes Backup::Run::validate_decision');
+        ok($ok2, 'AC16: the promote_pending decision passes Backup::Run::validate_decision') or diag($reason // '(none)');
     }
+    is(head_sha($r->{home}, $r->{ccpx}), $live_head,   'AC3: the live install HEAD is unchanged at the pause');
+    is(status_of($r->{home}, $r->{ccpx}), $live_status, 'AC3: the live install status is unchanged at the pause');
+    is(log_line_count($r->{log_path}), 0, 'AC3: nothing was spawned before the promotion question (Decision 7)');
 
-    # AC4 -- continue_without_merge
-    my $token  = $resp->{json}{resume_token};
-    my $resp2  = run_backup($r, {}, '--resume', ($token // ''), '--answer', 'preflight.dirty_worktree=continue_without_merge');
-    ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), 'AC4: resuming with continue_without_merge reaches a terminal status')
-        or diag($resp2->{out} . $resp2->{err});
-    my $state2 = read_state($r->{state_path});
-    if (defined $state2) {
-        my $ri = $state2->{phases}{preflight}{items}{remote_integration}{data};
-        if (defined $ri) {
-            is($ri->{merged}, 0, 'AC4: remote_integration.merged == 0 after continue_without_merge');
-        } else {
-            ok(0, 'AC4: remote_integration.merged == 0 after continue_without_merge (no checkpoint)');
-        }
-    } else {
-        ok(0, 'AC4: remote_integration.merged == 0 after continue_without_merge (no state)');
-    }
-    is(head_sha($r->{home}, $r->{ccpx}), $orig_head, 'AC4: HEAD is still unchanged after continue_without_merge');
-    is(read_text("$r->{ccpx}/README.md"), $orig_readme, 'AC4: the uncommitted change is still present, unmodified');
+    # AC4 -- promote: the dev clone's real promote.pl fast-forwards the live install.
+    my $resp2 = run_backup($r, {}, '--resume', ($resp->{json}{resume_token} // ''), '--answer', 'preflight.promote_pending=promote');
+    ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), 'AC4: answering promote reaches a terminal status') or diag($resp2->{out} . $resp2->{err});
+    is(head_sha($r->{home}, $r->{ccpx}), head_sha($r->{home}, $r->{clone}), 'AC4: the live install is now at the dev clone\'s main');
+    ok(-f "$r->{ccpx}/ahead-marker.txt", 'AC4: ...carrying the promoted commit');
+    is(status_of($r->{home}, $r->{ccpx}), $live_status, 'AC4: the live install is as clean as before (promote.pl fast-forwards)');
+    my $p = pf_item($r, 'promotion') // {};
+    is($p->{ran}, 1, 'AC4: promotion.ran == 1');
+    is($p->{exit}, 0, 'AC4: promotion.exit == 0');
+    like(($p->{output} // ''), qr/^merge: fast-forward /m, 'AC4: promotion.output is promote.pl\'s own report, verbatim');
+    is((pf_item($r, 'export_target') // {})->{ready}, 1, 'AC4: after promoting, the export target is ready');
 }
 
-# ===========================================================================
-# AC5 -- clean tree, remote one commit ahead: auto-merge, no decision.
-# ===========================================================================
 {
-    my $r = setup_root(with_origin => 1, remote_ahead => 1);
+    # AC5 -- skip: the live install stays where it is; a commit outside the
+    # payload does not block the export.
+    my $r = setup_root(with_origin => 0, clone_ahead => 1);
+    my $live_head = head_sha($r->{home}, $r->{ccpx});
     my $resp = run_backup($r, {});
-    ok(($resp->{exit} == 0 || $resp->{exit} == 20), 'AC5: clean tree + remote ahead reaches a terminal status')
-        or diag($resp->{out} . $resp->{err});
-    my @decs = decisions_of($resp);
-    ok(!(grep { ($_->{kind} // '') eq 'dirty_worktree' } @decs), 'AC5: no dirty_worktree decision is emitted');
+    my $resp2 = run_backup($r, {}, '--resume', ($resp->{json}{resume_token} // ''), '--answer', 'preflight.promote_pending=skip');
+    ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), 'AC5: answering skip reaches a terminal status') or diag($resp2->{out} . $resp2->{err});
+    is(head_sha($r->{home}, $r->{ccpx}), $live_head, 'AC5: skip leaves the live install where it was');
+    my $p = pf_item($r, 'promotion') // {};
+    is($p->{answer}, 'skip', 'AC5: promotion.answer == skip');
+    is($p->{ran}, 0, 'AC5: promotion.ran == 0');
+    is((pf_item($r, 'export_target') // {})->{ready}, 1, 'AC5: a skipped promotion of a non-payload commit still allows the export');
 
+    # ...but a skipped promotion of a PAYLOAD commit skips the export too.
+    my $r2 = setup_root(with_origin => 0);
+    commit_in_clone($r2, 'global-config/settings.json', qq({"theme":"light"}\n), 'a payload change');
+    my $resp3 = run_backup($r2, {});
+    my $resp4 = run_backup($r2, {}, '--resume', ($resp3->{json}{resume_token} // ''), '--answer', 'preflight.promote_pending=skip');
+    is($resp4->{exit}, 0, 'AC5: a skipped payload promotion ends cleanly (exit 0)') or diag($resp4->{out} . $resp4->{err});
+    my $et = pf_item($r2, 'export_target') // {};
+    is($et->{ready}, 0, 'AC5: ...with the export skipped');
+    like(($et->{reason} // ''), qr/promotion was skipped/, 'AC5: ...saying promotion was skipped');
+    like(($et->{fix} // ''), qr/promote first/, 'AC5: ...and to promote first');
+}
+
+{
+    # AC6 -- promote.pl refuses (a dirty live install): the ccpraxis part
+    # stops, the run reports it as a failure, and promote.pl's output is kept
+    # verbatim for the report.
+    my $r = setup_root(with_origin => 0, clone_ahead => 1);
+    open my $fh, '>>:raw', "$r->{ccpx}/README.md" or die;
+    print {$fh} "edited inside the live install\n";
+    close $fh;
+    my $live_head = head_sha($r->{home}, $r->{ccpx});
+    my $resp = run_backup($r, { STUB_FILTERDIFF_JSON => encode_json({ status => 'filtered', auto_applied => [],
+        needs_decision => { diverged => { k1 => { left => 'a', right => 'b' } }, only_left => {}, only_right => {} }, has_undecided => JSON::PP::true }) });
+    my $resp2 = run_backup($r, {}, '--resume', ($resp->{json}{resume_token} // ''), '--answer', 'preflight.promote_pending=promote');
+    is($resp2->{exit}, 20, 'AC6: a refusing promote.pl fails the run (exit 20)') or diag($resp2->{out} . $resp2->{err});
+    is(head_sha($r->{home}, $r->{ccpx}), $live_head, 'AC6: the live install did not move');
+    my $p = pf_item($r, 'promotion') // {};
+    is($p->{exit}, 2, 'AC6: promotion.exit is promote.pl\'s exit code');
+    like(($p->{output} // ''), qr/merge: refused-dirty/, 'AC6: promote.pl\'s refusal is in promotion.output verbatim');
+    my $et = pf_item($r, 'export_target') // {};
+    is($et->{ready}, 0, 'AC6: the export is stopped');
+    like(($et->{reason} // ''), qr/promotion failed/, 'AC6: ...because promotion failed');
+    my %c = log_counts($r->{log_path});
+    is($c{'json-diff.pl'} // 0, 0, 'AC6: no settings comparison ran after the failed promotion');
     my $state = read_state($r->{state_path});
-    if (defined $state) {
-        my $ri = $state->{phases}{preflight}{items}{remote_integration}{data};
-        if (defined $ri) {
-            is($ri->{merged}, 1, 'AC5: remote_integration.merged == 1');
-            isnt(($ri->{head_after} // ''), ($ri->{head_before} // ''), 'AC5: head_after != head_before');
-        } else {
-            ok(0, 'AC5: remote_integration.merged == 1 (no checkpoint)');
-            ok(0, 'AC5: head_after != head_before (no checkpoint)');
-        }
-    } else {
-        ok(0, 'AC5: remote_integration.merged == 1 (no state)');
-        ok(0, 'AC5: head_after != head_before (no state)');
-    }
+    like(($state->{phases}{preflight}{error} // ''), qr/promotion: promote\.pl exited 2/, 'AC6: the phase error names it');
+}
+
+{
+    # AC6d -- a refused promotion followed by a decision pause still fails the
+    # run at the end: the failure is durable, not a lexical of the invocation
+    # that saw it.
+    my $r = setup_root(with_origin => 0, clone_ahead => 1);
+    open my $fh, '>>:raw', "$r->{ccpx}/README.md" or die;
+    print {$fh} "edited inside the live install\n";
+    close $fh;
+    my $extra = { STUB_LINT_EXIT => 1, STUB_LINT_STDERR => "README.md:1: missing path scripts/nope.pl\n" };
+    my $resp = run_backup($r, $extra);
+    my $resp2 = run_backup($r, $extra, '--resume', ($resp->{json}{resume_token} // ''), '--answer', 'preflight.promote_pending=promote');
+    is($resp2->{exit}, 10, '(setup) AC6d: after the refused promotion the run pauses for the README drift') or diag($resp2->{out} . $resp2->{err});
+    my $resp3 = run_backup($r, $extra, '--resume', ($resp2->{json}{resume_token} // ''), '--answer', 'preflight.readme_paths=acknowledge');
+    is($resp3->{exit}, 20, 'AC6d: the run still ends complete_with_failures over the refused promotion') or diag($resp3->{out} . $resp3->{err});
+    my $state = read_state($r->{state_path});
+    like(($state->{phases}{preflight}{error} // ''), qr/promotion/, 'AC6d: ...and the phase error names it');
+}
+
+{
+    # AC6b -- uncommitted payload edits in the dev clone: no promotion
+    # question at all, the ccpraxis part is skipped with the reason.
+    my $r = setup_root(with_origin => 0, clone_ahead => 1);
+    write_text("$r->{clone}/global-config/settings.json", qq({"edited":"not committed"}\n));
+    my $resp = run_backup($r, {});
+    is($resp->{exit}, 0, 'AC6b: uncommitted payload edits skip the ccpraxis part cleanly (exit 0)') or diag($resp->{out} . $resp->{err});
+    ok(!(grep { ($_->{kind} // '') eq 'promote_pending' } decisions_of($resp)), 'AC6b: no promotion is offered');
+    my $p = pf_item($r, 'promotion') // {};
+    like(($p->{skipped_reason} // ''), qr/uncommitted payload changes: global-config\/settings\.json/, 'AC6b: the reason names the file');
+    is((pf_item($r, 'export_target') // {})->{ready}, 0, 'AC6b: the export is skipped');
+
+    # AC6c -- a live install with commits of its own: promote.pl would refuse,
+    # so it is not offered; the fix is the pull that brings them over.
+    my $r2 = setup_root(with_origin => 0);
+    write_text("$r2->{ccpx}/live-only.txt", "made in the live install\n");
+    _git($r2->{home}, $r2->{ccpx}, 'add', 'live-only.txt');
+    _git($r2->{home}, $r2->{ccpx}, 'commit', '-q', '-m', 'a commit made in the live install');
+    my $resp2 = run_backup($r2, {});
+    is($resp2->{exit}, 0, 'AC6c: a live install with commits of its own skips the ccpraxis part (exit 0)') or diag($resp2->{out} . $resp2->{err});
+    my $p2 = pf_item($r2, 'promotion') // {};
+    is($p2->{state}, 'live_has_own', 'AC6c: promotion.state == live_has_own');
+    like(($p2->{fix} // ''), qr/pull --no-rebase .* main/, 'AC6c: the fix is the pull that brings them into the dev clone');
 }
 
 # ===========================================================================
-# AC6 -- merge conflict: remote_merge_conflict decision; abort_merge /
-# keep_conflict.
+# AC7-AC9 (2026-10-30) -- the two checkouts. The dev clone is located once,
+# through the live install's origin; anything that makes an export unsafe
+# skips the ccpraxis export with a note, never a decision or a failure; the
+# live install is never mutated.
 # ===========================================================================
-sub setup_conflict_scenario {
+# The settings/marketplace comparisons (json-diff, filter-diff, marketplace-
+# diff) and their writes run only for a ready export target.
+sub diff_units_ran {
+    my ($r) = @_;
+    my @l = log_lines($r->{log_path});
+    return scalar(grep { /^(?:json-diff|filter-diff)\.pl/ || /^ccpraxis-helpers\.pl marketplace-diff/ } @l);
+}
+
+my $UNDECIDED_SETTINGS = encode_json({
+    status => 'filtered', auto_applied => [],
+    needs_decision => { diverged => { k1 => { left => 'a', right => 'b' } }, only_left => {}, only_right => {} },
+    has_undecided => JSON::PP::true,
+});
+
+{
+    # AC7 -- located: origin is the dev clone, payloads equal, on main.
     my $r = setup_root(with_origin => 1);
-    write_text("$r->{ccpx}/conflict.txt", "base\n");
-    _git($r->{home}, $r->{ccpx}, 'add', '-A');
-    _git($r->{home}, $r->{ccpx}, 'commit', '-q', '-m', 'add conflict file');
-    _git($r->{home}, $r->{ccpx}, 'push', '-q', 'origin', 'main');
+    my $resp = run_backup($r, {});
+    ok(($resp->{exit} == 0 || $resp->{exit} == 20), 'AC7: a promoted pair runs to a terminal status') or diag($resp->{out} . $resp->{err});
+    my $ct = pf_item($r, 'ccpraxis_target');
+    is(($ct // {})->{located}, 1, 'AC7: ccpraxis_target.located == 1');
+    ok(DevClone_same(($ct // {})->{dev_clone}, $r->{clone}), 'AC7: ccpraxis_target.dev_clone is the live install\'s origin');
+    is(($ct // {})->{source}, 'origin', 'AC7: found through origin, not an override');
+    ok(DevClone_same(($ct // {})->{live_root}, $r->{ccpx}), 'AC7: ccpraxis_target.live_root is the live install');
+    my $et = pf_item($r, 'export_target');
+    is(($et // {})->{ready}, 1, 'AC7: export_target.ready == 1');
+    ok(diff_units_ran($r) > 0, 'AC7: the settings/marketplace comparisons ran');
+}
 
-    write_text("$r->{ccpx}/conflict.txt", "local change\n");
-    _git($r->{home}, $r->{ccpx}, 'add', '-A');
-    _git($r->{home}, $r->{ccpx}, 'commit', '-q', '-m', 'local edit');
-    $r->{pre_merge_head} = head_sha($r->{home}, $r->{ccpx});
+{
+    # AC8a -- the live install's origin is still GitHub (set up the old way).
+    my $r = setup_root(with_origin => 1);
+    _git($r->{home}, $r->{ccpx}, 'remote', 'set-url', 'origin', 'https://github.com/someone/ccpraxis.git');
+    my $resp = run_backup($r, { STUB_FILTERDIFF_JSON => $UNDECIDED_SETTINGS });
+    is($resp->{exit}, 0, 'AC8a: a GitHub origin skips the ccpraxis part cleanly (exit 0, nothing failed)')
+        or diag($resp->{out} . $resp->{err});
+    my $ct = pf_item($r, 'ccpraxis_target') // {};
+    is($ct->{located}, 0, 'AC8a: ccpraxis_target.located == 0');
+    like(($ct->{reason} // ''), qr{https://github\.com/someone/ccpraxis\.git}, 'AC8a: the reason names the origin');
+    like(($ct->{fix} // ''), qr/promote\.pl/, 'AC8a: the fix names promote.pl');
+    is((pf_item($r, 'export_target') // {})->{ready}, 0, 'AC8a: export_target.ready == 0');
+    my $state = read_state($r->{state_path});
+    my $skip = defined $state ? find_note($state, 'ccpraxis_skipped') : undef;
+    ok((defined $skip && ($skip->{value}{fix} // '') =~ /promote\.pl/), 'AC8a: a ccpraxis_skipped note carries the fix');
+    is(diff_units_ran($r), 0, 'AC8a: no settings/marketplace comparison ran, so no question nothing would act on');
+    ok(!(grep { ($_->{kind} // '') eq 'settings_key' } decisions_of($resp)), 'AC8a: no settings_key decision');
+    my %c = log_counts($r->{log_path});
+    is($c{'lint-readme-paths.pl'} // 0, 1, 'AC8a: the live-install checks (README lint) still ran');
+    is((pf_item($r, 'promotion') // {})->{skipped_reason}, 'the dev clone was not located',
+        'AC8a: promotion was skipped: with no dev clone there is nothing to promote from');
 
-    my $editor = "$r->{scratch}/conflict-remote-editor";
+    # BACKUP_CLONE_DIR stays an explicit override, still validated.
+    my $r2 = setup_root(with_origin => 1);
+    _git($r2->{home}, $r2->{ccpx}, 'remote', 'set-url', 'origin', 'https://github.com/someone/ccpraxis.git');
+    $r2->{clone_dir} = $r2->{clone};
+    run_backup($r2, {});
+    my $ct2 = pf_item($r2, 'ccpraxis_target') // {};
+    is($ct2->{located}, 1, 'AC8a: BACKUP_CLONE_DIR overrides the origin');
+    is($ct2->{source}, 'override', 'AC8a: ...and says so');
+}
+
+{
+    # AC8b -- the dev clone carries a committed payload change the live
+    # install was never promoted with. It is offered for promotion first;
+    # declined, it blocks the export, which would overwrite it.
+    my $r = setup_root(with_origin => 1, repo_settings => qq({"theme":"dark"}\n));
+    write_text("$r->{clone}/global-config/settings.json", qq({"theme":"light"}\n));
+    _git($r->{home}, $r->{clone}, 'commit', '-q', '-am', 'payload change, not promoted');
+    my $extra = { STUB_FILTERDIFF_JSON => $UNDECIDED_SETTINGS };
+    my $resp = run_backup($r, $extra);
+    is(((decisions_of($resp))[0] // {})->{kind}, 'promote_pending', 'AC8b: an unpromoted payload change is offered for promotion');
+    my $resp2 = run_backup($r, $extra, '--resume', ($resp->{json}{resume_token} // ''), '--answer', 'preflight.promote_pending=skip');
+    is($resp2->{exit}, 0, 'AC8b: declined, it skips the export cleanly (exit 0)') or diag($resp2->{out} . $resp2->{err});
+    my $et = pf_item($r, 'export_target') // {};
+    is($et->{ready}, 0, 'AC8b: export_target.ready == 0');
+    is($et->{payload_equal}, 0, 'AC8b: export_target.payload_equal == 0');
+    like(($et->{reason} // ''), qr{global-config/settings\.json \(committed in the dev clone, not promoted\)},
+        'AC8b: the reason names the file and why');
+    like(($et->{fix} // ''), qr/promote first \(perl .*scripts\/promote\.pl\), then back up/, 'AC8b: the fix says to promote first');
+    is(diff_units_ran($r), 0, 'AC8b: no settings comparison ran against a payload that would be overwritten');
+    my $state = read_state($r->{state_path});
+    ok((defined $state && defined find_note($state, 'ccpraxis_skipped')), 'AC8b: a ccpraxis_skipped note is recorded');
+
+    # An uncommitted payload edit is the same problem, and is not promotable.
+    my $r2 = setup_root(with_origin => 0);
+    write_text("$r2->{clone}/global-config/settings.json", qq({"edited":"in the dev clone"}\n));
+    run_backup($r2, {});
+    my $et2 = pf_item($r2, 'export_target') // {};
+    is($et2->{ready}, 0, 'AC8b: an uncommitted payload edit in the dev clone also blocks the export');
+    like(($et2->{reason} // ''), qr/uncommitted payload changes/, 'AC8b: ...and says it is uncommitted');
+}
+
+{
+    # AC8c -- the dev clone is not on main.
+    my $r = setup_root(with_origin => 1);
+    _git($r->{home}, $r->{clone}, 'checkout', '-q', '-b', 'feature-x');
+    my $resp = run_backup($r, { STUB_FILTERDIFF_JSON => $UNDECIDED_SETTINGS });
+    is($resp->{exit}, 0, 'AC8c: a dev clone off main skips the export cleanly (exit 0)') or diag($resp->{out} . $resp->{err});
+    my $et = pf_item($r, 'export_target') // {};
+    is($et->{ready}, 0, 'AC8c: export_target.ready == 0');
+    is($et->{branch}, 'feature-x', 'AC8c: export_target.branch names the branch');
+    like(($et->{reason} // ''), qr/on branch 'feature-x', not main/, 'AC8c: the reason says so');
+    is(diff_units_ran($r), 0, 'AC8c: no settings comparison ran');
+    like(((pf_item($r, 'promotion') // {})->{skipped_reason} // ''), qr/feature-x/,
+        'AC8c: nothing is promoted from a dev clone off main');
+}
+
+{
+    # AC9a -- the live install is never mutated except by promote.pl: a run
+    # with nothing to promote that answers a W2 export and writes W1 leaves the
+    # live install's HEAD, status and payload exactly as they were, and the
+    # dev clone's origin (a "GitHub" remote with new commits) is never
+    # fetched -- the backup talks to no remote at all.
+    my $marketplace_json = encode_json({
+        status => 'different', live => 'live.json', repo => 'repo.json',
+        live_only => [ { name => 'mp_new', source => 'github:org/mp_new' } ],
+        repo_only => [], diverged => [], identical => [], auto_applied => [],
+    });
+    my $r = setup_root(with_origin => 1);
+    my $editor = "$r->{scratch}/remote-advancer";
     _git_clone($r->{home}, $r->{remote}, $editor);
-    write_text("$editor/conflict.txt", "remote change\n");
+    write_text("$editor/upstream.txt", "pushed by another machine\n");
     _git($r->{home}, $editor, 'add', '-A');
-    _git($r->{home}, $editor, 'commit', '-q', '-m', 'remote edit');
+    _git($r->{home}, $editor, 'commit', '-q', '-m', 'another machine');
     _git($r->{home}, $editor, 'push', '-q', 'origin', 'main');
-
-    return $r;
-}
-
-{
-    my $r = setup_conflict_scenario();
-    my $resp = run_backup($r, {});
-    is($resp->{exit}, 10, 'AC6: a conflicting merge pauses the run (exit 10)') or diag($resp->{out} . $resp->{err});
-    my @decs = decisions_of($resp);
-    my $d = $decs[0];
-    if (defined $d) {
-        is($d->{id},   'preflight.remote_merge_conflict', 'AC6: decision id == preflight.remote_merge_conflict');
-        is($d->{kind}, 'remote_merge_conflict',            'AC6: decision kind == remote_merge_conflict');
-    } else {
-        ok(0, 'AC6: decision id == preflight.remote_merge_conflict (no decision present)');
-        ok(0, 'AC6: decision kind == remote_merge_conflict (no decision present)');
-    }
-    my $token = $resp->{json}{resume_token};
-    my $resp2 = run_backup($r, {}, '--resume', ($token // ''), '--answer', 'preflight.remote_merge_conflict=abort_merge');
-    ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), 'AC6: resuming with abort_merge reaches a terminal status')
-        or diag($resp2->{out} . $resp2->{err});
-    is(head_sha($r->{home}, $r->{ccpx}), $r->{pre_merge_head}, 'AC6: abort_merge restores the pre-merge HEAD');
-    ok(!-f "$r->{ccpx}/.git/MERGE_HEAD", 'AC6: abort_merge leaves no in-progress merge (MERGE_HEAD absent)');
-}
-{
-    my $r = setup_conflict_scenario();
-    my $resp = run_backup($r, {});
-    my $token = $resp->{json}{resume_token};
-    my $resp2 = run_backup($r, {}, '--resume', ($token // ''), '--answer', 'preflight.remote_merge_conflict=keep_conflict');
-    is($resp2->{exit}, 20, 'AC6: keep_conflict yields a final run exit of 20 (complete_with_failures)')
-        or diag($resp2->{out} . $resp2->{err});
-    is(($resp2->{json}{status} // ''), 'complete_with_failures', 'AC6: keep_conflict final status == complete_with_failures');
-    ok(-f "$r->{ccpx}/.git/MERGE_HEAD", 'AC6: keep_conflict leaves the in-progress merge on disk (MERGE_HEAD present)');
-    my $state = read_state($r->{state_path});
-    if (defined $state) {
-        like(($state->{phases}{preflight}{error} // ''), qr/conflict/i, 'AC6: the phase error names the conflict');
-    } else {
-        ok(0, 'AC6: the phase error names the conflict (no state)');
-    }
-}
-
-# ===========================================================================
-# AC7, AC8, AC9 -- Decision 4: clone/live divergence reported, never acted on.
-# ===========================================================================
-for my $case (
-    { answer => 'acknowledge',      exit_ok => sub { $_[0] == 0 || $_[0] == 20 } },
-    { answer => 'treat_as_failure', exit_ok => sub { $_[0] == 20 } },
-) {
-    my $scn  = setup_root(with_origin => 0);
-    my $cdir = "$scn->{scratch}/dev-clone";
-    _git_clone($scn->{home}, $scn->{ccpx}, $cdir);
-    write_text("$cdir/clone-only.txt", "clone ahead\n");
-    _git($scn->{home}, $cdir, 'add', '-A');
-    _git($scn->{home}, $cdir, 'commit', '-q', '-m', 'clone-only commit');
-    $scn->{clone_dir} = $cdir;
-
-    my $live_head_before   = head_sha($scn->{home}, $scn->{ccpx});
-    my $clone_head_before  = head_sha($scn->{home}, $cdir);
-    my $live_status_before = status_of($scn->{home}, $scn->{ccpx});
-    my $clone_status_before = status_of($scn->{home}, $cdir);
-    isnt($clone_head_before, $live_head_before, "(setup) AC7: the clone and live HEADs genuinely differ (answer=$case->{answer})");
-
-    my $resp = run_backup($scn, {});
-    is($resp->{exit}, 10, "AC7: clone/live divergence pauses the run (answer=$case->{answer})")
-        or diag($resp->{out} . $resp->{err});
-    my @decs = decisions_of($resp);
-    my $d = find_decision(\@decs, 'preflight.clone_live_divergence');
-    if (defined $d) {
-        is($d->{kind}, 'clone_live_divergence', "AC7: decision kind == clone_live_divergence (answer=$case->{answer})");
-        like(($d->{data}{clone_head} // ''), qr/^[0-9a-f]{7,40}$/, "AC7: data.clone_head is present and sha-shaped (answer=$case->{answer})");
-        like(($d->{data}{live_head}  // ''), qr/^[0-9a-f]{7,40}$/, "AC7: data.live_head is present and sha-shaped (answer=$case->{answer})");
-        isnt(($d->{data}{clone_head} // ''), ($d->{data}{live_head} // ''), "AC7: data carries two DIFFERENT shas (answer=$case->{answer})");
-    } else {
-        ok(0, "AC7: a preflight.clone_live_divergence decision is present (answer=$case->{answer})");
-    }
-
-    my $token = $resp->{json}{resume_token};
-    my $resp2 = run_backup($scn, {}, '--resume', ($token // ''), '--answer', "preflight.clone_live_divergence=$case->{answer}");
-    ok($case->{exit_ok}->($resp2->{exit}), "AC8: the run reaches its expected terminal status under answer=$case->{answer}")
-        or diag($resp2->{out} . $resp2->{err});
-
-    is(head_sha($scn->{home}, $scn->{ccpx}), $live_head_before,  "AC8: live HEAD unchanged after answer=$case->{answer}");
-    is(head_sha($scn->{home}, $cdir),        $clone_head_before, "AC8: clone HEAD unchanged after answer=$case->{answer}");
-    is(status_of($scn->{home}, $scn->{ccpx}), $live_status_before,  "AC8: live git status --porcelain unchanged after answer=$case->{answer}");
-    is(status_of($scn->{home}, $cdir),        $clone_status_before, "AC8: clone git status --porcelain unchanged after answer=$case->{answer}");
-}
-
-{
-    # AC9a -- genuinely nothing to find: no BACKUP_CLONE_DIR, and the running
-    # module's own tree (the scratch phases/ dir) is not a git repo at all.
-    my $r = setup_root(with_origin => 0);
-    my $resp = run_backup($r, {});
-    ok(($resp->{exit} == 0 || $resp->{exit} == 20), 'AC9a: a run with no clone locatable reaches a terminal status')
-        or diag($resp->{out} . $resp->{err});
-    my $state = read_state($r->{state_path});
-    if (defined $state) {
-        my $cl = $state->{phases}{preflight}{items}{clone_live}{data};
-        if (defined $cl) {
-            is($cl->{checked}, 0, 'AC9a: clone_live.checked == 0');
-        } else {
-            ok(0, 'AC9a: clone_live.checked == 0 (no checkpoint)');
-        }
-    } else {
-        ok(0, 'AC9a: clone_live.checked == 0 (no state)');
-    }
-    my @decs = decisions_of($resp);
-    ok(!(grep { ($_->{kind} // '') eq 'clone_live_divergence' } @decs), 'AC9a: no clone_live_divergence decision is emitted');
-}
-
-# ---------------------------------------------------------------------------
-# AC9b -- the REAL, un-hinted resolution path (spec S2.6 rule 2: "else the
-# tree containing the running module -- dirname(dirname(abs_path(__FILE__)))
-# -- if it contains .git and differs from <root>"), exercised WITHOUT
-# BACKUP_CLONE_DIR. This is the legitimate real-world case: a developer runs
-# `backup.pl` directly from their OWN clone (this repo's own layout,
-# <clone>/scripts/backup/Preflight.pm) while <root> (HOME-anchored, spec
-# S2.3) points at a DIFFERENT tree (the live install). Per the coordinator's
-# finding, the shipped rule-2 resolution is broken -- MUST currently fail.
-# ---------------------------------------------------------------------------
-{
-    my $r = setup_root(with_origin => 0);
-    my $devclone = "$r->{scratch}/real-dev-clone";
-    _git_clone($r->{home}, $r->{ccpx}, $devclone);
-    write_text("$devclone/devclone-only-file.txt", "devclone ahead of live\n");
-    _git($r->{home}, $devclone, 'add', '-A');
-    _git($r->{home}, $devclone, 'commit', '-q', '-m', 'devclone-only commit');
-
-    # Mirror production's REAL directory depth: <devclone>/scripts/backup/Preflight.pm,
-    # exactly like this repo's own scripts/backup/Preflight.pm relative to its
-    # own repo root -- so a CORRECTLY dirname-counting resolver would land back
-    # on $devclone (which has .git and differs from <root> == $r->{ccpx}).
-    my $devclone_phase_dir = "$devclone/scripts/backup";
-    copy_preflight_into($devclone_phase_dir);
-
-    my $devclone_head = head_sha($r->{home}, $devclone);
-    my $live_head      = head_sha($r->{home}, $r->{ccpx});
-    isnt($devclone_head, $live_head, '(setup) AC9b: the dev-clone and live HEADs genuinely differ');
-
-    # Deliberately NO BACKUP_CLONE_DIR -- this is the un-hinted path.
-    my $resp = run_backup($r, { BACKUP_PHASE_DIR => $devclone_phase_dir });
-    is($resp->{exit}, 10,
-        'AC9b: the REAL un-hinted resolution path (no BACKUP_CLONE_DIR) locates the dev clone and pauses')
-        or diag($resp->{out} . $resp->{err});
-    my @decs = decisions_of($resp);
-    my $d = find_decision(\@decs, 'preflight.clone_live_divergence');
-    ok((defined $d), 'AC9b: a preflight.clone_live_divergence decision is present WITHOUT any BACKUP_CLONE_DIR hint')
-        or diag('this is spec S2.6 rule 2 (the auto-detect fallback) -- ' .
-                'coordinator-confirmed broken (Preflight.pm:430-439, off-by-one dirname): ' . $resp->{out});
+    my $live_head   = head_sha($r->{home}, $r->{ccpx});
+    my $live_status = status_of($r->{home}, $r->{ccpx});
+    my $live_mp     = read_text("$r->{ccpx}/global-config/known_marketplaces.json");
+    my $clone_head  = head_sha($r->{home}, $r->{clone});
+    my $extra = { STUB_MARKETPLACE_JSON => $marketplace_json, STUB_FILTERDIFF_JSON => $UNDECIDED_SETTINGS };
+    my $resp = run_backup($r, $extra);
+    is($resp->{exit}, 10, '(setup) AC9a: the run pauses for the batch') or diag($resp->{out} . $resp->{err});
+    my $resp2 = run_backup($r, $extra, '--resume', ($resp->{json}{resume_token} // ''),
+        '--answer', 'preflight.marketplace.mp_new=export_to_repo', '--answer', 'preflight.settings.k1=use_repo');
+    ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), 'AC9a: the run completes') or diag($resp2->{out} . $resp2->{err});
+    is(head_sha($r->{home}, $r->{ccpx}), $live_head, 'AC9a: the live install HEAD never moved');
+    is(status_of($r->{home}, $r->{ccpx}), $live_status, 'AC9a: the live install git status is unchanged');
+    is(read_text("$r->{ccpx}/global-config/known_marketplaces.json"), $live_mp, 'AC9a: the live install payload is byte-unchanged');
+    like((read_text("$r->{clone}/global-config/known_marketplaces.json") // ''), qr/mp_new/, 'AC9a: W2 wrote the dev clone instead');
+    ok(!-f "$r->{ccpx}/.git/FETCH_HEAD", 'AC9a: nothing was ever fetched into the live install');
+    ok(!-f "$r->{clone}/.git/FETCH_HEAD", 'AC9a: nothing was ever fetched into the dev clone either');
+    is(head_sha($r->{home}, $r->{clone}), $clone_head, 'AC9a: the dev clone\'s main was not merged into (origin/main is /steward:upstream-sync\'s)');
 }
 
 # ===========================================================================
@@ -1300,19 +1407,19 @@ for my $case (
 # AC19 -- two pauses in one run: every stub still runs exactly once.
 # ===========================================================================
 {
-    my $r = setup_root(with_origin => 1, dirty => 1);
+    my $r = setup_root(with_origin => 0, clone_ahead => 1);
     my $extra = {
         STUB_LINT_EXIT => 1, STUB_LINT_STDERR => "missing\n",
         STUB_TREE_EXIT => 1, STUB_TREE_STDERR => "stale\n",
     };
     my $resp1 = run_backup($r, $extra);
-    is($resp1->{exit}, 10, '(setup) AC19: first pause is the dirty_worktree decision') or diag($resp1->{out} . $resp1->{err});
+    is($resp1->{exit}, 10, '(setup) AC19: first pause is the promote_pending decision') or diag($resp1->{out} . $resp1->{err});
     my @decs1 = decisions_of($resp1);
-    is(($decs1[0]{kind} // ''), 'dirty_worktree', 'AC19: first pause kind == dirty_worktree');
+    is(($decs1[0]{kind} // ''), 'promote_pending', 'AC19: first pause kind == promote_pending');
     is(log_line_count($r->{log_path}), 0, 'AC19: nothing has been spawned before the first pause');
 
     my $token1 = $resp1->{json}{resume_token};
-    my $resp2  = run_backup($r, $extra, '--resume', ($token1 // ''), '--answer', 'preflight.dirty_worktree=continue_without_merge');
+    my $resp2  = run_backup($r, $extra, '--resume', ($token1 // ''), '--answer', 'preflight.promote_pending=skip');
     is($resp2->{exit}, 10, 'AC19: the SECOND pause (the batch) follows the first resume') or diag($resp2->{out} . $resp2->{err});
     # ccpraxis-helpers.pl backs THREE units (sync-skills U5, check-claude-md
     # U6, marketplace-diff U8 -- spec S2.5's unit table), so its count is
@@ -1358,7 +1465,6 @@ for my $case (
 {
     my $r = setup_root(
         with_origin       => 1,
-        remote_ahead      => 1,
         live_settings     => qq({"theme":"dark"}\n),
         repo_settings     => qq({"theme":"light"}\n),
         real_pref_scripts => 1,
@@ -1370,10 +1476,7 @@ for my $case (
         or diag($resp1->{out});
     my $dec_id = $decs1[0]{id} // '';
 
-    my $origin_head = _git_out($r->{home}, $r->{ccpx}, 'rev-parse', 'origin/main');
-    $origin_head =~ s/\s+\z//;
-    is(head_sha($r->{home}, $r->{ccpx}), $origin_head,
-        '(setup) AC20: the clean-tree auto-merge already advanced HEAD to origin/main');
+    my $live_head = head_sha($r->{home}, $r->{ccpx});
 
     my $state = read_state($r->{state_path});
     ok((defined $state), '(setup) AC20: the paused state file exists and parses');
@@ -1408,14 +1511,14 @@ for my $case (
             ok(0, 'AC20: .backup-preferences.json holds exactly one entry for the remembered key');
         }
 
-        is(head_sha($r->{home}, $r->{ccpx}), $origin_head,
-            'AC20: HEAD still equals origin/main -- the re-run merge was a no-op, not a second real merge');
+        is(head_sha($r->{home}, $r->{ccpx}), $live_head,
+            'AC20: the live install HEAD is unchanged across the crash and the re-ask');
     } else {
         ok(0, "AC20: $_") for (
             're-entry after the simulated crash RE-ASKS rather than completing silently',
             'the SAME decision id is re-asked', 'answering again reaches a terminal status',
             'the end state matches an uninterrupted run', 'the remembered key appears exactly once',
-            'HEAD still equals origin/main',
+            'the live install HEAD is unchanged',
         );
     }
 }
@@ -1655,14 +1758,20 @@ for my $case (
     ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), 'P1-W2: answering export_to_repo reaches a terminal status')
         or diag($resp2->{out} . $resp2->{err});
 
-    my $known_raw = read_text("$r->{ccpx}/global-config/known_marketplaces.json");
+    my $known_raw = read_text("$r->{clone}/global-config/known_marketplaces.json");
     if (defined $known_raw) {
-        like($known_raw, qr/mp_export/, 'P1-W2: the reconciled known_marketplaces.json contains the exported entry');
+        like($known_raw, qr/mp_export/, 'P1-W2: the dev clone\'s known_marketplaces.json contains the exported entry');
         unlike($known_raw, qr/installLocation/, 'P1-W2 bound: installLocation is stripped before W2 writes');
     } else {
-        ok(0, 'P1-W2: the reconciled known_marketplaces.json contains the exported entry');
+        ok(0, 'P1-W2: the dev clone\'s known_marketplaces.json contains the exported entry');
         ok(0, 'P1-W2 bound: installLocation is stripped before W2 writes');
     }
+    is(read_text("$r->{ccpx}/global-config/known_marketplaces.json"), "{}\n",
+        'P1-W2: the live install\'s copy is untouched (W2 writes the dev clone)');
+    my $state = read_state($r->{state_path});
+    my $mo = defined $state ? $state->{phases}{preflight}{items}{marketplace_outcome}{data} : undef;
+    is(join(',', @{ (ref($mo) eq 'HASH' ? $mo->{wrote} : undef) // [] }), 'global-config/known_marketplaces.json',
+        'P1-W2: marketplace_outcome.wrote names the file, so the export commits exactly it');
 }
 
 {
@@ -1701,19 +1810,13 @@ for my $case (
 {
     my $r = setup_root(with_origin => 0);
     my $resp = run_backup($r, {});
-    ok(($resp->{exit} == 0 || $resp->{exit} == 20), 'Behavior 5: no remote configured completes without pausing')
+    ok(($resp->{exit} == 0 || $resp->{exit} == 20), 'Behavior 5: a dev clone with no remote completes without pausing')
         or diag($resp->{out} . $resp->{err});
-    my $state = read_state($r->{state_path});
-    if (defined $state) {
-        my $ri = $state->{phases}{preflight}{items}{remote_integration}{data};
-        if (defined $ri) {
-            is($ri->{has_origin}, 0, 'Behavior 5: remote_integration.has_origin == 0 when no origin is configured');
-        } else {
-            ok(0, 'Behavior 5: remote_integration.has_origin == 0 when no origin is configured');
-        }
-    } else {
-        ok(0, 'Behavior 5: remote_integration.has_origin == 0 (no state)');
-    }
+    # 2026-10-30: a remote is /steward:upstream-sync's business; the backup
+    # neither needs nor looks at one.
+    my $et = pf_item($r, 'export_target') // {};
+    is($et->{ready}, 1, 'Behavior 5: a dev clone with no origin of its own is still a ready export target');
+    is((pf_item($r, 'promotion') // {})->{state}, 'same', 'Behavior 5: and nothing needed promoting');
 }
 
 {
@@ -1726,6 +1829,7 @@ for my $case (
     write_text("$ccpx/global-config/settings.json", "{}\n");
     write_text("$home/.claude/settings.json", "{}\n");
     write_stub_scripts($ccpx);
+    install_shared_modules($ccpx);
     my $phase_dir = "$scratch/phases";
     copy_preflight_into($phase_dir);
     my $r = {
@@ -1736,14 +1840,13 @@ for my $case (
     ok(($resp->{exit} == 0 || $resp->{exit} == 20), 'Behavior 7: a non-git <root> does not die') or diag($resp->{out} . $resp->{err});
     my $state = read_state($r->{state_path});
     if (defined $state) {
-        my $ri = $state->{phases}{preflight}{items}{remote_integration}{data};
-        if (defined $ri) {
-            is($ri->{is_git_repo}, 0, 'Behavior 7: remote_integration.is_git_repo == 0 for a non-git root');
-        } else {
-            ok(0, 'Behavior 7: remote_integration.is_git_repo == 0 for a non-git root');
-        }
+        my $p = $state->{phases}{preflight}{items}{promotion}{data};
+        is((defined $p ? $p->{skipped_reason} : undef), 'the dev clone was not located',
+            'Behavior 7: nothing is promoted into a non-git live install');
+        my $ct = $state->{phases}{preflight}{items}{ccpraxis_target}{data};
+        is((defined $ct ? $ct->{located} : undef), 0, 'Behavior 7: a non-git live install has no dev clone to locate');
     } else {
-        ok(0, 'Behavior 7: remote_integration.is_git_repo == 0 (no state)');
+        ok(0, 'Behavior 7: nothing is promoted into a non-git live install (no state)');
     }
 }
 
@@ -1816,6 +1919,57 @@ for my $case (
             "no literal flat top-level key 'container.MAX_MEMORY' exists in live settings.json",
         );
     }
+}
+
+# ===========================================================================
+# W1-TOKEN (2026-10-30) -- a W1 write into ~/.claude/settings.json never
+# carries the payload's ${CCPRAXIS_LIVE} token: it is expanded to the live
+# install, and a write in which the token would survive is refused whole.
+# An unexpanded token in settings.json is what makes every ccpraxis plugin
+# vanish.
+# ===========================================================================
+{
+    my $tok = '${CCPRAXIS_LIVE}';
+    my $filterdiff_json = JSON::PP->new->canonical->encode({
+        status => 'filtered', auto_applied => [],
+        needs_decision => {
+            diverged   => {},
+            only_left  => {},
+            only_right => { 'extraKnownMarketplaces.ccpraxis-local' => { source => { source => 'directory', path => "$tok/plugins" } } },
+        },
+        has_undecided => JSON::PP::true,
+    });
+    my $r = setup_root(with_origin => 0, live_settings => qq({"keep":"me"}\n));
+    my $extra = { STUB_FILTERDIFF_JSON => $filterdiff_json };
+    my $resp = run_backup($r, $extra);
+    is($resp->{exit}, 10, '(setup) W1-TOKEN: the repo-only marketplace key pauses the run') or diag($resp->{out} . $resp->{err});
+    my $resp2 = run_backup($r, $extra, '--resume', ($resp->{json}{resume_token} // ''),
+        '--answer', 'preflight.settings.extraKnownMarketplaces.ccpraxis-local=add_to_live');
+    ok(($resp2->{exit} == 0 || $resp2->{exit} == 20), 'W1-TOKEN: add_to_live completes') or diag($resp2->{out} . $resp2->{err});
+    my $raw = read_text("$r->{home}/.claude/settings.json") // '';
+    unlike($raw, qr/\Q$tok\E/, 'W1-TOKEN: the written settings.json does not contain ${CCPRAXIS_LIVE}');
+    my $live = eval { decode_json($raw) } // {};
+    my $path = $live->{extraKnownMarketplaces}{'ccpraxis-local'}{source}{path} // '';
+    like($path, qr{/\.claude/ccpraxis/plugins\z}, 'W1-TOKEN: the token was expanded to the live install\'s plugins directory');
+    is($live->{keep}, 'me', 'W1-TOKEN: the rest of the file survived');
+
+    # A token where MachineLocalSettings does not honour it cannot be
+    # expanded: the write is refused and the file is left as it was.
+    my $bad_json = JSON::PP->new->canonical->encode({
+        status => 'filtered', auto_applied => [],
+        needs_decision => { diverged => {}, only_left => {}, only_right => { 'statusLine' => { command => "perl $tok/scripts/statusline.pl" } } },
+        has_undecided => JSON::PP::true,
+    });
+    my $r2 = setup_root(with_origin => 0, live_settings => qq({"keep":"me"}\n));
+    my $before = read_text("$r2->{home}/.claude/settings.json");
+    my $resp3 = run_backup($r2, { STUB_FILTERDIFF_JSON => $bad_json });
+    my $resp4 = run_backup($r2, { STUB_FILTERDIFF_JSON => $bad_json }, '--resume', ($resp3->{json}{resume_token} // ''),
+        '--answer', 'preflight.settings.statusLine=add_to_live');
+    is($resp4->{exit}, 20, 'W1-TOKEN: a write that would carry an unexpandable token fails the unit') or diag($resp4->{out} . $resp4->{err});
+    is(read_text("$r2->{home}/.claude/settings.json"), $before, 'W1-TOKEN: ...and settings.json is left byte-for-byte as it was');
+    my $state = read_state($r2->{state_path});
+    like(($state->{phases}{preflight}{error} // ''), qr/refusing to write .*unexpanded \$\{CCPRAXIS_LIVE\} would be written at statusLine\.command/,
+        'W1-TOKEN: the failure names the token and where it was');
 }
 
 # ===========================================================================
@@ -1927,32 +2081,26 @@ for my $case (
 }
 
 # ===========================================================================
-# Item 7 (coordinator ruling P7) -- untracked-file visibility. --untracked-
-# files=no keeps the merge decision scoped to tracked changes, but the phase
-# must now emit an untracked-files NOTE so they are visible before package
-# 03's `git add -A` (SKILL.md:299) sweeps and pushes them. A note, not a
-# decision.
+# Item 7 (coordinator ruling P7), retired 2026-10-30. The untracked-files note
+# existed because the export ran `git add -A` in the live install and would
+# have swept them into a push. The export now stages exactly the files it
+# wrote, in the dev clone, so an untracked file -- in either checkout -- is
+# neither a question nor something a backup can publish. What remains to
+# check: it does not pause or fail the run.
 # ===========================================================================
 {
     my $r = setup_root(with_origin => 0);
     write_text("$r->{ccpx}/untracked-marker-item7.txt", "never added to git\n");
+    write_text("$r->{clone}/untracked-marker-item7.txt", "never added to git\n");
 
     my $resp = run_backup($r, {});
     ok(($resp->{exit} == 0 || $resp->{exit} == 20), 'item7: an untracked file does not pause or fail the run on its own')
         or diag($resp->{out} . $resp->{err});
     my @decs = decisions_of($resp);
     ok(!(grep { ($_->{kind} // '') =~ /untracked/i } @decs), 'item7: untracked files never become a DECISION');
-
     my $state = read_state($r->{state_path});
-    if (defined $state) {
-        my $found = 0;
-        for my $n (notes_of_state($state)) {
-            $found = 1 if index(encode_json($n->{value}), 'untracked-marker-item7.txt') >= 0;
-        }
-        ok($found, 'item7: some note names the untracked file (visible before package 03 sweeps/pushes it)');
-    } else {
-        ok(0, 'item7: some note names the untracked file (no state)');
-    }
+    my $et = defined $state ? $state->{phases}{preflight}{items}{export_target}{data} : undef;
+    is((defined $et ? $et->{ready} : undef), 1, 'item7: an untracked file outside the payload does not block the export');
 }
 
 # ===========================================================================

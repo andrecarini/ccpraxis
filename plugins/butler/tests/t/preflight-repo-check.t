@@ -18,6 +18,9 @@
 # exit code of 0. Every exit-2 assertion is paired with a repo.usable-FAIL-row
 # assertion FROM THE SAME RUN, so the exit-2 can't be misattributed to some other
 # check's unrelated failure.
+# Every spawn inherits HOME; on a Mac that would let preflight's creds checks
+# reach the operator's real Keychain. This file is about repo.usable only.
+BEGIN { $ENV{BP_CREDS_KEYCHAIN} = '0' }
 use strict;
 use warnings;
 use FindBin qw($Bin);
@@ -204,8 +207,8 @@ my $missing_gitdir_target = File::Spec->catdir($b2_dir, 'nonexistent-gitdir-targ
         'AC-6: repo.usable manifest field \'supported_envs\' is an array');
     is_deeply(
         [ sort @{ $entry->{supported_envs} // [] } ],
-        [ 'sandbox-linux', 'win32' ],
-        'AC-6: repo.usable supported_envs covers both win32 and sandbox-linux'
+        [ 'macos', 'sandbox-linux', 'win32' ],
+        'AC-6: repo.usable supported_envs covers win32, macos and sandbox-linux'
     );
 }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # KeepAwake.pm (B5) — the keep-awake decision + the seam-injected lifecycle
 # holder. The actual Windows wake-lock (keep-awake.ps1 / SetThreadExecutionState)
 # and whether the machine really stays awake are verified on a real desktop
@@ -84,6 +84,39 @@ is(KeepAwake::should_stay_awake(300, 600),    1, 'custom larger stale window res
     is($h->handle, undef, 'handle is undef when the seam returns undef');
     is($h->sync(0), 'stop', 'stop still fires (with undef handle)');
     is($stops, 1, 'stop seam called once');
+}
+
+# ---- held(): what is in force, not what is wanted --------------------------
+# running() stays 1 when the start seam produced no helper (missing helper,
+# failed fork, a host with no wake-lock mechanism); the dashboard used to
+# render that as "held". held() needs a real handle and, given an alive seam,
+# a live helper.
+{
+    my $h = KeepAwake->new(start => sub { undef });
+    $h->sync(1);
+    is($h->running, 1, 'held: a start that yields no helper is still running() (unchanged)');
+    is($h->held, 0, 'held: ...but held() is 0 -- no wake-lock is in force');
+
+    my $live = 1;
+    my @stopped;
+    my $h2 = KeepAwake->new(start => sub { 4242 }, stop => sub { push @stopped, $_[0] },
+                            alive => sub { $live });
+    $h2->sync(1);
+    is($h2->held, 1, 'held: a live helper is held');
+    $live = 0;
+    is($h2->held, 0, 'held: a helper that died is no longer held');
+    is($h2->handle, undef, 'held: ...and its handle is dropped, so stop() cannot signal a recycled pid');
+    is($h2->sync(0), 'stop', 'held: the next sync(0) still releases normally');
+    is_deeply(\@stopped, [undef], 'held: ...calling stop with no pid to kill');
+    $live = 1;
+    is($h2->sync(1), 'start', 'held: a later sync(1) starts a fresh helper');
+    is($h2->held, 1, 'held: ...which is held');
+
+    my $h3 = KeepAwake->new(start => sub { 77 });
+    $h3->sync(1);
+    is($h3->held, 1, 'held: with no alive seam a defined handle is taken on trust (Windows behaviour)');
+    $h3->sync(0);
+    is($h3->held, 0, 'held: released -> 0');
 }
 
 # ---- orphan_is_ours($cmdline, $marker) ------------------------------------

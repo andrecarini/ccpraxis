@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Immutable oracle for blueprint 02-launcher-port-alloc.
 # Source-text assertions only — do NOT require/load launcher.pl (side effects).
 # Mirrors the slurp+regex convention of t/launcher-bind-mount-shape.t.

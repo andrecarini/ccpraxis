@@ -26,6 +26,13 @@ use File::Spec ();
 
 my $IS_WIN = ($^O =~ /^(MSWin32|msys|cygwin)$/) ? 1 : 0;
 
+# macOS: APFS (the default volume format) is case-insensitive, and Cwd::abs_path
+# keeps whatever case a path was TYPED with, so "/users/x" and "/Users/x" name
+# one directory there and must compare equal -- otherwise a cwd spelled in the
+# "wrong" case never matches the HOME stop and the walk climbs straight past it.
+# Case folding only: drive forms and 8.3 short names stay Windows-only.
+my $IS_DARWIN = ($^O eq 'darwin') ? 1 : 0;
+
 # ---------------------------------------------------------------------------
 # Lexical path canonicalisation and same_path() (spec §2.1)
 # ---------------------------------------------------------------------------
@@ -95,9 +102,9 @@ sub _lex_canon {
 sub _seg_eq {
     my ($x, $y, $allow_83) = @_;
     $allow_83 = 1 unless defined $allow_83;
-    return $x eq $y unless $IS_WIN;
+    return $x eq $y unless $IS_WIN || $IS_DARWIN;
     return 1 if _fold_ascii($x) eq _fold_ascii($y);
-    return 0 unless $allow_83;
+    return 0 unless $IS_WIN && $allow_83;
 
     # 8.3 tolerance (duplicates WriteGuards::_seg_eq_base's rule; package 02's
     # file is a heavy hook dependency this module must not require).
@@ -165,6 +172,11 @@ sub _compute_stops {
     push @candidates, eval { File::Spec->tmpdir };
     push @candidates, $ENV{TMP}, $ENV{TEMP}, $ENV{TMPDIR};
     push @candidates, $ENV{HOME}, $ENV{USERPROFILE};
+    # macOS has TWO temp roots: $TMPDIR (/var/folders/.../T, which tmpdir()
+    # already returns) and /tmp (really /private/tmp), where Claude Code keeps
+    # its per-session temp dirs and scratchpads. Without the second, a walk
+    # from a scratchpad climbed /private/tmp -> /private -> / unbounded.
+    push @candidates, '/tmp', '/private/tmp' if $IS_DARWIN;
 
     my @stops;
     for my $v (@candidates) {

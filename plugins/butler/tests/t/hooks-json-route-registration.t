@@ -123,8 +123,12 @@ my @EXPECT = (
     # security boundary): its own PreToolUse group on the shell and edit
     # tools, guarded 2.2 template, guard-continuity-state.sh.
     { event => 'PreToolUse',  matcher => 'Bash|Edit|Write|MultiEdit|NotebookEdit',      file => 'guard-continuity-state.sh', args => '' },
+    # 2026-10-30 sleep-control guard: the last entry of the PreToolUse Bash
+    # group, guarded 2.2 template, guard-sleep-control.sh -- denies a Bash
+    # command that changes the machine's sleep behaviour by hand.
+    { event => 'PreToolUse',  matcher => 'Bash',                                        file => 'guard-sleep-control.sh', args => '' },
 );
-is(scalar(@EXPECT), 29, 'sanity: this file\'s own sec 2.3 fixture table has 29 rows (never-halt 06 adds 2, never-halt 07 adds 4, never-halt 11 adds 1, never-halt 12 adds 1, tooling-backlog package 11 adds 1, judged-continuity-disarm package 03 adds 1, the continuity-state guard adds 1)');
+is(scalar(@EXPECT), 30, 'sanity: this file\'s own sec 2.3 fixture table has 30 rows (the sleep-control guard adds 1, never-halt 06 adds 2, never-halt 07 adds 4, never-halt 11 adds 1, never-halt 12 adds 1, tooling-backlog package 11 adds 1, judged-continuity-disarm package 03 adds 1, the continuity-state guard adds 1)');
 
 sub expect_key { my ($r) = @_; return join("\x1e", $r->{event}, $r->{matcher}, $r->{file}, $r->{args}) }
 

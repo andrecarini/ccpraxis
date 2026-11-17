@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # 65 — ORACLE for package 05-render-library (blueprint
 # unified-tui-design-system), specs/05-render-library-spec.md. Written BLIND
 # to any tui/*.pm implementation — none exists yet — directly from the spec's

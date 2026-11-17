@@ -14,7 +14,7 @@ use JSON::PP;
 
 require "$Bin/../../scripts/bp-deps-check.pl";
 
-plan tests => 90;
+plan tests => 93;
 
 # ---------------------------------------------------------------------------
 # Reference clock (spec §4): all fixtures use --now=2026-07-01T00:00:00Z unless
@@ -293,6 +293,27 @@ sub build_no_git_lockfile_fixture {
     is(scalar(@$blocks), 0,
        'AC4: no BLOCK findings at all (node 22 is current and declared by name, exact DAME-failure guard)');
     is($rc, 0, 'AC4: exit 0');
+}
+
+# ---------------------------------------------------------------------------
+# AC4b: an item name that bundles tools with '+' declares each of them. The
+# sanctioned recipe (plugins/backpack/recipes/node-pnpm.json) is "node+pnpm",
+# and klink's real item is "nvm+node22"; both declare node. A name that only
+# CONTAINS the letters (e.g. "nodemon") still does not.
+# ---------------------------------------------------------------------------
+for my $case (['node+pnpm', 0], ['nvm+node22', 0], ['nodemon', 1]) {
+    my ($name, $want_blocks) = @$case;
+    my $dir    = tempdir(CLEANUP => 1);
+    my $bp_dir = tempdir(CLEANUP => 1);
+    write_file("$dir/.nvmrc", "24\n");
+    my $backpack = make_backpack("$bp_dir/backpack.json", { category => 'other', name => $name });
+    my ($report) = BpDepsCheck::run({
+        project => $dir, backpack => $backpack, out => undef,
+        now => NOW, http => http_forbidden(),
+    });
+    is(scalar(find_kind(safe_arr($report, 'blocks'), 'undeclared_runtime')), $want_blocks,
+       $want_blocks ? "AC4b: an item named '$name' does not declare node"
+                    : "AC4b: an item named '$name' declares node -- no undeclared_runtime BLOCK");
 }
 
 # ---------------------------------------------------------------------------

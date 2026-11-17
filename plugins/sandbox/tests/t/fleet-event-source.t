@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # s16: butler fleet + keep-awake events into the activity panel.
 #
 # This file is the IMMUTABLE ORACLE for blueprint sandbox-butler-overhaul,

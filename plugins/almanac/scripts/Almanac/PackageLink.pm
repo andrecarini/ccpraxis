@@ -27,16 +27,18 @@ sub valid_segment {
 # package already linked?". On a case-insensitive, trailing-dot-stripping
 # filesystem (NTFS: MSWin32/cygwin/msys perls), "BP/01-x" and "bp./01-x"
 # resolve to the SAME ledger, so comparing the raw strings let one package
-# be linked twice (where-things-go pkg02 redteam N3). Elsewhere the raw
-# string is the key: those spellings are distinct ledgers there.
-our $FOLD_CASE = ($^O =~ /\A(?:MSWin32|cygwin|msys)\z/) ? 1 : 0;
+# be linked twice (where-things-go pkg02 redteam N3). Default APFS (darwin)
+# folds case too, but keeps trailing dots: there "BP/01-x" and "bp/01-x" are
+# one ledger while "bp./01-x" is another. Elsewhere the raw string is the
+# key: those spellings are distinct ledgers there.
+our $FOLD_CASE           = ($^O =~ /\A(?:MSWin32|cygwin|msys|darwin)\z/) ? 1 : 0;
+our $STRIP_TRAILING_DOTS = ($^O =~ /\A(?:MSWin32|cygwin|msys)\z/) ? 1 : 0;
 sub link_key {
     my ($link) = @_;
     return undef unless defined $link;
     my $k = "$link";
-    return $k unless $FOLD_CASE;
-    $k = lc $k;
-    $k =~ s{\.+(?=/|\z)}{}g;
+    $k = lc $k if $FOLD_CASE;
+    $k =~ s{\.+(?=/|\z)}{}g if $STRIP_TRAILING_DOTS;
     return $k;
 }
 

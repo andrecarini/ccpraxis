@@ -481,4 +481,63 @@ local $BpHook::WriteGuards::CASE_INSENSITIVE = 1;
     is($r22->{rc}, 0, 'AC-15(B22): ledger mode on a scratchpad path gives rc 0 (unchanged)');
 }
 
+# =============================================================================
+# AC-16 (macOS port): the POSIX shape of the same allowance. macOS sets TMPDIR to
+# /var/folders/.../T, but Claude Code hands out its temp root -- scratchpad
+# included -- as /private/tmp/claude-<uid>/<slug>/<sid>/scratchpad, and /tmp is
+# the same directory through a symlink. Neither spelling started with "/tmp/"
+# AND sat under TMPDIR, so the driver's writes to its own scratchpad were
+# denied there. Non-Windows only: on a Windows-family perl the scratchpad is
+# under %TEMP%\claude (AC-1..AC-15). Fixture strings only, never touched.
+# =============================================================================
+SKIP: {
+    skip 'AC-16: the /private/tmp/claude-<uid> shape is a non-Windows concern', 9
+        if $^O =~ /\A(?:MSWin32|msys|cygwin)\z/;
+    my $MSLUG  = '-Users-fx31-proj';
+    my $mac_tp = "/Users/fx31/.claude/projects/$MSLUG/$SID.jsonl";
+    my $mac_env = sub { my ($D) = @_; return env_for($D, TMPDIR => '/var/folders/zz/fx31/T/', LOCALAPPDATA => undef) };
+    my $fx = fixture(members => 2);
+
+    for my $fp ("/private/tmp/claude-501/$MSLUG/$SID/scratchpad/p22-commit.txt",
+                "/tmp/claude-501/$MSLUG/$SID/scratchpad/a/b.txt") {
+        my $r = wg_writes(driver_payload(session_id => $SID, transcript_path => $mac_tp,
+                                         cwd => $fx->{R}, file_path => $fp), env => $mac_env->($fx->{D}));
+        is($r->{rc}, 0, "AC-16: driver Write to its own scratchpad at $fp gives rc 0");
+    }
+
+    # _own_scratchpad on its own (the writes-mode verdict above can also be
+    # reached through _is_temp, which on darwin now knows /private/tmp too).
+    my $R = { mode => 'driver', root => $fx->{R}, data => $fx->{D} };
+    my $p = { session_id => $SID, transcript_path => $mac_tp };
+    my $own = sub {
+        my ($abs) = @_;
+        local %ENV = %ENV;
+        delete @ENV{qw(TMPDIR TEMP TMP LOCALAPPDATA)};
+        $ENV{TMPDIR} = '/var/folders/zz/fx31/T/';
+        return BpHook::WriteGuards::_own_scratchpad($p, BpHook::Guards::Common::canon($abs), $R);
+    };
+    is($own->("/private/tmp/claude-501/$MSLUG/$SID/scratchpad/x.txt"), 1,
+       'AC-16: _own_scratchpad accepts the /private/tmp/claude-<uid> base');
+    is($own->("/tmp/claude-0/$MSLUG/$SID/scratchpad/x.txt"), 1,
+       'AC-16: _own_scratchpad accepts the /tmp/claude-<uid> base (Linux shape)');
+    is($own->("/tmp/claude/$MSLUG/$SID/scratchpad/x.txt"), 1,
+       'AC-16: _own_scratchpad still accepts a bare "claude" segment');
+    is($own->("/private/tmp/claude-501/$MSLUG/$OSID/scratchpad/x.txt"), 0,
+       'AC-16: another session\'s scratchpad is not this driver\'s');
+    is($own->("/private/tmp/claude-x/$MSLUG/$SID/scratchpad/x.txt"), 0,
+       'AC-16: "claude-" must be followed by a numeric uid');
+
+    # darwin: a TMPDIR candidate also counts under its /private spelling.
+    SKIP: {
+        skip 'AC-16: the /var <-> /private/var alias is darwin-only', 2 unless $^O eq 'darwin';
+        local %ENV = %ENV;
+        delete @ENV{qw(TMPDIR TEMP TMP LOCALAPPDATA)};
+        $ENV{TMPDIR} = '/var/folders/zz/fx31/T/';
+        is(BpHook::WriteGuards::_is_temp('/private/var/folders/zz/fx31/T/x.txt', $fx->{R}, $fx->{D}), 1,
+           'AC-16 (darwin): /private/var/... is under TMPDIR=/var/...');
+        is(BpHook::WriteGuards::_is_temp('/private/tmp/anything/x.txt', $fx->{R}, $fx->{D}), 1,
+           'AC-16 (darwin): /private/tmp/... is /tmp/... under its real name');
+    }
+}
+
 done_testing();

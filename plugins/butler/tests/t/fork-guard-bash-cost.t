@@ -53,7 +53,11 @@ my $CLI_PL      = "$SCRIPTS_DIR/butler-fork-ok.pl";
 
 my $REAL_BASH = do { my $p = `bash -c "command -v bash"`; chomp $p; $p };
 BAIL_OUT('cannot resolve a real bash on PATH') unless length $REAL_BASH;
-my $REAL_TIMEOUT = do { my $p = `bash -c "command -v timeout"`; chomp $p; $p };
+my $REAL_TIMEOUT = do { my $p = `bash -c "command -v timeout"`; chomp $p;
+    # macOS has no GNU timeout: fall back to the repo's pure-perl stand-in
+    # (scripts/run-tests.pl already puts it on PATH for a sweep).
+    unless (length $p) { (my $d = __FILE__) =~ s{[^/\\]+\z}{}; my $s = "${d}../../../../scripts/test-bin/timeout"; $p = $s if -x $s; }
+    $p };
 BAIL_OUT('cannot resolve a real timeout utility on PATH') unless length $REAL_TIMEOUT;
 
 # ---------------------------------------------------------------------------
@@ -231,7 +235,7 @@ ok(ref($HOOKS_DOC) eq 'HASH', 'precondition: hooks.json decodes as an object') o
                 $total += scalar(@{ $group->{hooks} // [] });
             }
         }
-        is($total, 29, 'AC-4: hooks.json holds 29 commands total (never-halt 06: +record-prompt.sh, +record-denial.sh; never-halt 07: +denial-breaker.sh x3, +SessionStart denial-breaker.sh; never-halt 11: +arm-nudge-prompt.sh; never-halt 12: +SessionStart session-start-nudge.sh; tooling-backlog 11: +ac-standdown-gate.sh; judged-continuity-disarm package 03: +PreToolUse guard-disarm-judge-readonly.sh; continuity-state guard: +guard-continuity-state.sh)');
+        is($total, 30, 'AC-4: hooks.json holds 30 commands total (sleep-control guard: +guard-sleep-control.sh; never-halt 06: +record-prompt.sh, +record-denial.sh; never-halt 07: +denial-breaker.sh x3, +SessionStart denial-breaker.sh; never-halt 11: +arm-nudge-prompt.sh; never-halt 12: +SessionStart session-start-nudge.sh; tooling-backlog 11: +ac-standdown-gate.sh; judged-continuity-disarm package 03: +PreToolUse guard-disarm-judge-readonly.sh; continuity-state guard: +guard-continuity-state.sh)');
         my @hits = _find_commands($HOOKS_DOC, 'continuity-off-check.sh');
         is(scalar(@hits), 1, 'AC-4: continuity-off-check.sh is registered exactly once');
         SKIP: {

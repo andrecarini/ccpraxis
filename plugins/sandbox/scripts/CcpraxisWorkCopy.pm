@@ -284,7 +284,7 @@ sub _ccpraxis_markers {
         'plugins/sandbox/.claude-plugin/plugin.json',   # M3
         'plugins/sandbox/scripts/MountSpec.pm',         # M4
         'plugins/sandbox/bin/claude-sandbox.sh',        # M5
-        'plugins/sandbox/docs/working-on-ccpraxis.md',  # M6
+        'docs/working-on-ccpraxis.md',                  # M6 (moved from plugins/sandbox/docs/ on 2026-10-30)
         # MAJOR-1: repo-root markers sharing no ancestor with M1-M6 above —
         # every prior marker lives under plugins/ (five under
         # plugins/sandbox/), so a single `mv plugins plugins.x` dropped the
@@ -343,19 +343,24 @@ sub workcopy_refusal_outcome {
         . "\n"
         . "This is the ccpraxis installation Claude Code is running from — its plugins, skills and launcher are in use right now. Sandboxing it here would edit the tooling while it is running, and git inside the container would not work.\n"
         . "\n"
-        . "Work on a separate clone instead. Pick any ordinary directory outside this install (for example C:/Development/ccpraxis on Windows, or ~/src/ccpraxis on macOS or Linux), then run:\n"
+        . "Work in your dev clone instead: the checkout you cloned from GitHub (normally ~/Projects/ccpraxis), the only one that talks to GitHub. Promotion makes it this installation\x27s origin, so this prints where it is:\n"
         . "\n"
-        . "  git clone --no-hardlinks $live <your-clone-dir>\n"
-        . "  cd <your-clone-dir>\n"
+        . "  git -C $live remote get-url origin\n"
+        . "\n"
+        . "(A GitHub URL there means this machine still has the old setup; docs/working-on-ccpraxis.md, \"Moving a machine from the old workflow\", covers the move.) Then:\n"
+        . "\n"
+        . "  cd <your-dev-clone>\n"
         . "  claude-sandbox\n"
         . "\n"
-        . "The --no-hardlinks flag is required: a local clone hardlinks the object store by default, which would silently re-couple the clone to this installation.\n"
+        . "No dev clone on this machine yet? Clone your repository from GitHub into any ordinary directory outside this installation:\n"
         . "\n"
-        . "That clone is an ordinary project — git works normally inside the container, and nothing it does can reach this installation. To bring changes back, merge them into this install from the host:\n"
+        . "  git clone https://github.com/<you>/ccpraxis.git ~/Projects/ccpraxis\n"
         . "\n"
-        . "  git -C $live pull <your-clone-dir> main\n"
+        . "The dev clone is an ordinary project: git works normally inside the container, and nothing it does can reach this installation. To bring changes back, commit them on the dev clone\x27s main and promote them from the host:\n"
         . "\n"
-        . "That alone promotes them: this repo IS the installed plugin tree. Re-run install.pl only if the PATH wiring or the set of plugins changed. See plugins/sandbox/docs/working-on-ccpraxis.md.\n"
+        . "  perl <your-dev-clone>/scripts/promote.pl\n"
+        . "\n"
+        . "It fast-forwards this installation to the dev clone\x27s main and syncs global-config/ into ~/.claude. Promotion is the only way this installation changes: never git pull, commit or push in it. Re-run install.pl only if the PATH wiring or the set of plugins changed. See docs/working-on-ccpraxis.md.\n"
         . "\n"
         . "Aborting.";
     return {

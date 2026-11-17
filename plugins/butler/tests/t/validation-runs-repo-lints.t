@@ -834,7 +834,7 @@ sub make_h1_lint_root {
 # lane, regardless of the flag -- otherwise they would be compared against a
 # CONTAINER's copy of a git ref instead of the real working tree, hiding a
 # working-tree-only regression. The run's own positional target is written
-# with `# platform: windows` (never container-eligible by marker alone) so
+# with `# platform: host` (never container-eligible by marker alone) so
 # the only container-eligible files in the whole selection are the 3 lints
 # themselves -- the summary's "0 container" is unambiguous proof that none of
 # them were routed there, not an accident of some OTHER file filling the
@@ -846,7 +846,7 @@ sub make_h1_lint_root {
 {
     my $counters_dir = tempdir_n();
     my $lint_root = make_lint_root_with($counters_dir);
-    my $win_src = "#!/usr/bin/env perl\n# platform: windows\nprint \"ok 1 - fixture pass\\n\";\nexit 0;\n";
+    my $win_src = "#!/usr/bin/env perl\n# platform: host\nprint \"ok 1 - fixture pass\\n\";\nexit 0;\n";
     my $fixture = make_fixture_tree('quick-green-win.t' => $win_src);
     my $ledger_path = File::Spec->catfile($fixture, 'tests', 't', 'quick-green-win.t');
     my $state_dir = tempdir(CLEANUP => 1);

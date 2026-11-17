@@ -1,0 +1,1 @@
+pure-perl stand-in for GNU timeout; scripts/run-tests.pl puts it on PATH only when the host has none (macOS)

@@ -12,6 +12,12 @@
 package StewardTest;
 use strict;
 use warnings;
+
+# Never the operator's login Keychain from a test (BpCreds.pm). A direct
+# `perl x.t` keeps the real HOME, which is exactly when BpCreds would read it.
+# A test that exercises the Keychain path opts in locally with
+# BP_CREDS_KEYCHAIN=1 and a stub named by BP_CREDS_SECURITY_BIN.
+BEGIN { $ENV{BP_CREDS_KEYCHAIN} = '0' }
 use Exporter 'import';
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
@@ -151,18 +157,40 @@ sub temproot {
         $base =~ s|\\|/|g;
         $base =~ s|^([a-zA-Z]):/|"/" . lc($1) . "/"|e;
     } else {
-        # Fallthrough tail, unchanged from before this package: only
-        # reached when scratch_root() is undef (non-Windows, no override).
+        # Fallthrough tail: only reached when scratch_root() is undef
+        # (non-Windows, no override). A candidate that IS, or sits inside,
+        # the current $HOME is skipped: scenarios here check that the HOME
+        # they started under never leaks into produced paths (backup-closeout
+        # AC27), and a scratch tree inside that HOME makes every scratch path
+        # a "leak". scripts/run-tests.pl points TEMP/TMP at the per-file
+        # sandbox HOME off Windows (on Windows TEMP is a separate tree), so
+        # under the runner this lands on /tmp exactly as a standalone run does.
+        my $home_real = (defined $ENV{HOME} && length $ENV{HOME}) ? (abs_path($ENV{HOME}) // $ENV{HOME}) : undef;
         for my $cand ($ENV{TEMP}, $ENV{TMP}, '/tmp') {
             next unless defined $cand && length $cand;
             my $p = $cand;
             $p =~ s|\\|/|g;
             $p =~ s|^([a-zA-Z]):/|"/" . lc($1) . "/"|e;
+            if (defined $home_real && -d $p) {
+                my $p_real = abs_path($p) // $p;
+                next if $p_real eq $home_real || index("$p_real/", "$home_real/") == 0;
+            }
             if (-d $p && -w $p) { $base = $p; last; }
         }
         die "StewardTest: no writable temp base found\n" unless $base;
     }
     my $root = tempdir('steward-test-XXXXXX', DIR => $base, CLEANUP => 1);
+    # Off Windows, hand back the PHYSICAL path. On macOS /tmp is a symlink to
+    # /private/tmp (and $TMPDIR lives under /var -> /private/var), while the
+    # code under test pins its cwd with Cwd::cwd()/abs_path, which resolve the
+    # link. A scenario that chdir()s into "/tmp/steward-test-X/proj" then sees
+    # "/private/tmp/steward-test-X/proj" come back, and every byte-identity
+    # assertion on the pinned cwd compares two spellings of one directory.
+    # Linux /tmp is a real directory, so this is a no-op there; Windows keeps
+    # the /c/-form contract described above untouched.
+    unless ($^O eq 'MSWin32' || $^O eq 'cygwin' || $^O eq 'msys') {
+        $root = abs_path($root) // $root;
+    }
     $root =~ s|\\|/|g;
     $root =~ s|^([a-zA-Z]):/|"/" . lc($1) . "/"|e;
     return $root;

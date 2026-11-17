@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # b45 oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b45-spec.md
 # section 5 (C1..C10), section 3 (the `rotate` contract), section 1 (the conformance-gate

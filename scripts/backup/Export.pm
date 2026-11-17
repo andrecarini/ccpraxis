@@ -3,44 +3,55 @@
 #
 # Absorbs today's SKILL.md Steps 2 (detect differences), 3 (handle each
 # file + settings merge), 3.5 (container settings sync), 4 (sensitive-data
-# scan) and 5 (commit and push). See the spec for the full contract:
+# scan) and 5 (commit; the push moved to /steward:upstream-sync on
+# 2026-10-30). See the spec for the original contract:
 #   .ccpraxis-local-data/blueprints/backup-driver/specs/03-export-and-push-spec.md
 # including its BINDING coordinator rulings (S8, P10-P12), which supersede
-# anything earlier in that document that conflicts.
+# anything earlier in that document that conflicts -- and the 2026-10-30
+# retarget below, which supersedes the spec wherever they disagree.
 #
 # THIS MODULE WRAPS EXISTING SCRIPTS. It reimplements none of their logic --
 # no JSON diffing, no preference matching, no merge algorithm, no secret
 # scanning. Its job is ordering, exit-code interpretation, turning
 # genuinely-undecided things into decision records, applying answered
 # choices, checkpointing so an interrupted run does not redo finished work,
-# and making a mid-push death safe.
+# and making a mid-commit death safe.
 #
-# THE REPOSITORY EVERY GIT OPERATION TARGETS is <home>/.claude/ccpraxis (the
-# live install / export repo) -- never the dev clone. Decision 4 forbids
-# this module from touching the clone/live relationship at all.
+# THE TWO CHECKOUTS (2026-10-30; plugins/steward/scripts/DevClone.pm has the
+# model). The live install (<home>/.claude/ccpraxis) is produced by promote.pl
+# alone and is only READ here: the wrapped scripts run from it, and its
+# .backup-preferences.json holds this machine's answers. EVERY WRITE AND EVERY
+# GIT OPERATION TARGETS THE DEV CLONE: the export goes into its working tree,
+# and only the files this run wrote are committed there (never `git add -A`,
+# never the developer's other changes or untracked files). Then the dev
+# clone's promote.pl fast-forwards the live install to that commit, so a run
+# ends with the live install at the dev clone's main and ~/.claude consistent
+# with the payload. Nothing here talks to a remote: fetching, integrating and
+# pushing are /steward:upstream-sync's. Which dev clone, and whether exporting
+# into it is safe at all, is decided ONCE by the preflight phase and read here
+# from its 'export_target' checkpoint; anything but a ready target skips this
+# whole phase (status 'skipped') with the reason.
 #
-# Decision 4 + ruling R6 (01-driver-skeleton-spec.md S8): the push NEVER
-# happens without an explicitly answered push_confirmation, and R6 wipes a
-# phase's stored answers/items on re-entry after a "running" (mid-execution
-# kill) prior status -- so consent can never be silently replayed. Because
-# R6 wipes checkpoints too, this module never trusts its own state to know
-# whether a push already happened after a crash; it asks GIT: a clean
-# worktree with 0 unpushed commits means the push already completed (no
-# second push, no decision asked); N > 0 unpushed means it died between
-# commit and push (ask again); a dirty worktree means it died before the
-# commit (ask again with the full pending set). See _do_commit_review /
-# _do_push_confirmation_and_push.
+# Ruling R6 (01-driver-skeleton-spec.md S8) wipes a phase's stored
+# answers/items on re-entry after a "running" (mid-execution kill) prior
+# status. So this module never trusts its own state to know whether the
+# commit already happened after a crash; it asks GIT, in the dev clone: the
+# units re-run (each is idempotent: the merge writes the same file again),
+# nothing is pending, and the export commit the interrupted run made is what
+# U9 finds between the live install and the dev clone's main -- and promotes.
+# See _do_commit / _do_promote_after_commit.
 #
 # Ruling P10 (spec S8): sync-export.pl's real emitted status set is
-# {export_only, identical, linked, live_only, missing, not_linked,
-# settings_changed, tracked} -- NOT the SKILL.md-documented set (which
-# includes three statuses -- conflict, container_settings_diverged,
-# marketplace_changed -- that are never actually emitted). This module
-# branches on the REAL set; an unrecognised status is a reported unit
-# failure, never silently ignored. file_conflict decisions are driven by
-# not_linked (a live regular file that differs from the repo copy) rather
-# than the never-emitted 'conflict' (handled generically too, in case a
-# future sync-export.pl version emits it).
+# {claude_md_differs, export_only, identical, linked, live_only, missing,
+# not_linked, settings_changed, tracked}. This module branches on the REAL
+# set; an unrecognised status is a reported unit failure, never silently
+# ignored. ~/.claude/CLAUDE.md is built by promote.pl from the live install's
+# payload, so a difference there (claude_md_differs) cannot be exported -- a
+# line carries no record of which part it came from -- and becomes a
+# claude_md_drift decision: rebuild it (after a backup copy) or leave it, with
+# the differing lines shown and the instruction to fold them into the dev
+# clone's payload by hand. Any other differing regular file (not_linked, or
+# the never-emitted 'conflict') is a file_conflict decision.
 #
 # Ruling P11: the skip-keys handoff from package 02 is read via
 # $ctx->{get_phase_item}->('preflight', 'settings_outcome') -- never by
@@ -57,19 +68,29 @@
 # both paths for a human to reconcile. See reports/parity/03-export-and-push.md.
 #
 # Decision 10: the decision-kind enum is CLOSED. This module emits exactly
-# four kinds: file_conflict, container_settings_key, sensitive_finding,
-# push_confirmation.
+# five kinds: file_conflict, claude_md_drift, container_settings_key,
+# sandbox_settings_key, sensitive_finding. The commit and the promotion after
+# it are deterministic and ask nothing.
+#
+# THE SANDBOX PAIR (U5b/U6b, 2026-11-02): the sandbox preset vs each
+# registered sandbox's own settings.json. It reads three modules from the live
+# install rather than wrapping a script -- SandboxRegistry.pm (where the
+# sandboxes are), SandboxSettings.pm (reading them, and reverting a unit with
+# a backup) and SettingsUnits.pm (the unit model every settings sync shares)
+# -- and still leaves preference matching to filter-diff.pl and preference
+# writes to save-preference.pl.
 #
 # Decision 7 barriers, enforced in code (not prose):
 #   B1 -- the container diff (U5/U6) does not run unless settings_merge
 #         (U4) checkpointed (on either its success path or its
 #         nothing-to-merge path). A failed U4 leaves the key unset, so U5/U6
-#         are skipped this pass.
+#         are skipped this pass. The sandbox pair (U5b/U6b) runs only once
+#         the container diff checkpointed, after U6, so it compares each
+#         sandbox with the preset as this run left it.
 #   B2 -- no git verb of any kind is spawned until sensitive_scan (U7)
 #         checkpoints clean. U8/U9 are both gated on is_done('sensitive_scan').
 #   B3 -- sensitive_finding is never batched with anything else (returned
-#         alone, immediately); push_confirmation is likewise always the
-#         sole decision in its needs_decision return.
+#         alone, immediately).
 #
 # This module must never depend on package 01's engine module or its
 # sibling (spec S2.0): everything this
@@ -122,7 +143,7 @@ sub phase_spec {
         name      => 'export',
         order     => 200,   # spec S8 P2: preflight=100, export=200, vault=300, closeout=400
         resumable => 1,
-        title     => 'Export: file differences, settings merge, container settings, sensitive scan, commit and push',
+        title     => 'Export: into the dev clone -- file differences, settings merge, container settings, sandbox settings, sensitive scan, commit, promote',
     };
 }
 
@@ -144,14 +165,37 @@ sub run_phase {
     # Perl stores unwidened because the codepoint fits in one byte, and
     # which survives an env-var handoff to a child process as that same
     # single byte) is NOT valid UTF-8 on its own. Every decision/note/
-    # checkpoint this module builds embeds $root somewhere (subject, title,
+    # checkpoint this module builds embeds a path somewhere (subject, title,
     # path fields), so normalise ONCE here and everything downstream
     # inherits guaranteed-valid UTF-8 bytes.
     $home_n = _ensure_utf8_bytes($home_n);
+    # The live install: the scripts run from here; nothing is written here.
     my $root = "$home_n/.claude/ccpraxis";
     unless (-d $root) {
         return { status => 'failed', error => "ccpraxis install not found at $root" };
     }
+
+    # ---- the export target, decided once by the preflight phase ----
+    unless (exists $ctx->{get_phase_item}) {
+        return { status => 'failed',
+                 error  => "export target handoff unavailable: \$ctx->{get_phase_item} is missing" };
+    }
+    my $target = $ctx->{get_phase_item}->('preflight', 'export_target');
+    unless (ref($target) eq 'HASH' && $target->{ready}) {
+        my $reason = ref($target) eq 'HASH'
+            ? ($target->{reason} // 'the export target is not ready')
+            : 'preflight established no export target';
+        my $fix = ref($target) eq 'HASH' ? $target->{fix} : undef;
+        $ctx->{note}->('ccpraxis_export_skipped', { reason => _item_bytes($reason), fix => _item_bytes($fix) });
+        return { status => 'skipped', reason => _item_bytes($reason) };
+    }
+    my $repo = _item_bytes($target->{dev_clone});
+    unless (defined $repo && length $repo && -d _native_path($repo)) {
+        return { status => 'failed',
+                 error  => 'the dev clone preflight chose is not a directory: ' . ($repo // '(none)') };
+    }
+    $repo =~ s{\\}{/}g;
+    $repo =~ s{(?<=.)/+\z}{};
 
     # WHY a durable record, not just this lexical: @failed_units is a
     # per-INVOCATION list. Every unit below is gated by
@@ -170,9 +214,8 @@ sub run_phase {
     # the order failures were first observed within THIS invocation for
     # units that ran here, then any pre-existing durable entries, so the
     # emitted names/first message stay deterministic.
-    my @failed_units;   # [ unit_name, message ] -- still used for the
-                         # push_confirmation warning text (THIS invocation
-                         # only; unchanged behaviour).
+    my @failed_units;   # [ unit_name, message ] -- THIS invocation only;
+                         # orders the names in the final error.
     my $failure_key = 'unit_failures';
     my $load_failures = sub {
         my $h = $ctx->{get_item}->($failure_key);
@@ -202,7 +245,7 @@ sub run_phase {
 
     # ---- U1: file_status (SKILL.md Step 2) ----
     unless ($ctx->{is_done}->('file_status')) {
-        my $res = _do_file_status($ctx, $root);
+        my $res = _do_file_status($ctx, $root, $repo);
         if ($res->{failed}) { $record_failure->('file_status', $res->{failed}); }
         else                 { $record_success->('file_status'); }
     }
@@ -212,7 +255,7 @@ sub run_phase {
     if ($ctx->{is_done}->('file_status')) {
         # ---- U2: file_conflicts (Step 3, may pause as a batch) ----
         unless ($ctx->{is_done}->('file_conflicts')) {
-            my $res = _do_file_conflicts($ctx, $root, $home_n);
+            my $res = _do_file_conflicts($ctx, $root, $repo, $home_n);
             if ($res->{decisions}) {
                 # MAJOR (reviewer B1): reaching a decisions/pause branch IS
                 # the unit doing its job correctly this invocation (it
@@ -228,10 +271,10 @@ sub run_phase {
             else                 { $record_success->('file_conflicts'); }
         }
 
-        # ---- U3: file_outcome (apply answered file_conflict choices) ----
+        # ---- U3: file_outcome (apply answered file_conflict / claude_md_drift choices) ----
         if ($ctx->{is_done}->('file_conflicts')) {
             unless ($ctx->{is_done}->('file_outcome')) {
-                my $res = _do_file_outcome($ctx, $root, $home_n);
+                my $res = _do_file_outcome($ctx, $root, $repo);
                 if ($res->{failed}) { $record_failure->('file_outcome', $res->{failed}); }
                 else                 { $record_success->('file_outcome'); }
             }
@@ -243,7 +286,7 @@ sub run_phase {
     # outcome or content (AC6/AC11 exercise this with an EMPTY sync-export
     # report and still expect the merge to run exactly once).
     unless ($ctx->{is_done}->('settings_merge')) {
-        my $res = _do_settings_merge($ctx, $root);
+        my $res = _do_settings_merge($ctx, $root, $repo);
         if ($res->{failed}) { $record_failure->('settings_merge', $res->{failed}); }
         else                 { $record_success->('settings_merge'); }
     }
@@ -253,7 +296,7 @@ sub run_phase {
     #      nothing-to-merge path). A failed U4 leaves this unset. ----
     if ($ctx->{is_done}->('settings_merge')) {
         unless ($ctx->{is_done}->('container_diff')) {
-            my $res = _do_container_diff($ctx, $root, $home_n);
+            my $res = _do_container_diff($ctx, $root, $repo);
             if ($res->{decisions}) {
                 $record_success->('container_diff');   # see file_conflicts' identical comment above
                 return { status => 'needs_decision', decisions => $res->{decisions} };
@@ -264,16 +307,37 @@ sub run_phase {
 
         if ($ctx->{is_done}->('container_diff')) {
             unless ($ctx->{is_done}->('container_outcome')) {
-                my $res = _do_container_outcome($ctx, $root);
+                my $res = _do_container_outcome($ctx, $root, $repo);
                 if ($res->{failed}) { $record_failure->('container_outcome', $res->{failed}); }
                 else                 { $record_success->('container_outcome'); }
+            }
+
+            # ---- U5b/U6b: the sandbox preset vs each registered sandbox's
+            #      own settings.json (2026-11-02). After U6, so the preset
+            #      they are compared with already holds this run's
+            #      global->container writes. ----
+            unless ($ctx->{is_done}->('sandbox_diff')) {
+                my $res = _do_sandbox_diff($ctx, $root, $repo, $home_n);
+                if ($res->{decisions}) {
+                    $record_success->('sandbox_diff');   # see file_conflicts' identical comment above
+                    return { status => 'needs_decision', decisions => $res->{decisions} };
+                }
+                if ($res->{failed}) { $record_failure->('sandbox_diff', $res->{failed}); }
+                else                 { $record_success->('sandbox_diff'); }
+            }
+            if ($ctx->{is_done}->('sandbox_diff')) {
+                unless ($ctx->{is_done}->('sandbox_outcome')) {
+                    my $res = _do_sandbox_outcome($ctx, $root, $repo, $home_n);
+                    if ($res->{failed}) { $record_failure->('sandbox_outcome', $res->{failed}); }
+                    else                 { $record_success->('sandbox_outcome'); }
+                }
             }
         }
     }
 
     # ---- U7: sensitive_scan (Step 4) -- BARRIER B3: always alone. ----
     unless ($ctx->{is_done}->('sensitive_scan')) {
-        my $res = _do_sensitive_scan($ctx, $root);
+        my $res = _do_sensitive_scan($ctx, $root, $repo);
         if ($res->{pause}) {
             $record_success->('sensitive_scan');   # see file_conflicts' identical comment above
             return { status => 'needs_decision', decisions => [ $res->{pause} ] };
@@ -282,25 +346,21 @@ sub run_phase {
         else                 { $record_success->('sensitive_scan'); }
     }
 
-    # ---- U8/U9: commit review + push (Step 5) -- BARRIER B2: no git verb
-    #      of any kind may be spawned until sensitive_scan checkpointed
-    #      clean. ----
+    # ---- U8/U9: commit the export, then promote it (Step 5, local since
+    #      2026-10-30) -- BARRIER B2: no git verb of any kind may be spawned
+    #      until sensitive_scan checkpointed clean. ----
     if ($ctx->{is_done}->('sensitive_scan')) {
-        unless ($ctx->{is_done}->('commit_review')) {
-            my $res = _do_commit_review($ctx, $root);
-            if ($res->{failed}) { $record_failure->('commit_review', $res->{failed}); }
-            else                 { $record_success->('commit_review'); }
+        unless ($ctx->{is_done}->('committed')) {
+            my $res = _do_commit($ctx, $repo);
+            if ($res->{failed}) { $record_failure->('committed', $res->{failed}); }
+            else                 { $record_success->('committed'); }
         }
 
-        if ($ctx->{is_done}->('commit_review')) {
-            unless ($ctx->{is_done}->('pushed')) {
-                my $res = _do_push_confirmation_and_push($ctx, $root, \@failed_units, $load_failures);
-                if ($res->{pause}) {
-                    $record_success->('pushed');   # see file_conflicts' identical comment above
-                    return { status => 'needs_decision', decisions => [ $res->{pause} ] };
-                }
-                if ($res->{failed}) { $record_failure->('pushed', $res->{failed}); }
-                else                 { $record_success->('pushed'); }
+        if ($ctx->{is_done}->('committed')) {
+            unless ($ctx->{is_done}->('promote_after_commit')) {
+                my $res = _do_promote_after_commit($ctx, $root, $home_n, $repo);
+                if ($res->{failed}) { $record_failure->('promote_after_commit', $res->{failed}); }
+                else                 { $record_success->('promote_after_commit'); }
             }
         }
     }
@@ -334,13 +394,27 @@ sub run_phase {
     return { status => 'complete' };
 }
 
+# A string read back out of the run-state file (get_item / get_phase_item)
+# as the raw bytes it was checkpointed as. Run.pm's reader (JSON::PP without
+# ->utf8) can hand such a string back utf8-FLAGGED without transcoding; used
+# as a path or a child's argv that flag would double-encode a non-ASCII
+# byte. Every character is < 256 there, so downgrading is lossless.
+sub _item_bytes {
+    my ($s) = @_;
+    return $s unless defined $s && !ref $s;
+    my $c = $s;
+    utf8::downgrade($c, 1) or $c = Encode::encode('UTF-8', $c);
+    return $c;
+}
+
 # ===========================================================================
 # U1 -- file_status (sync-export.pl). Never pauses.
 # ===========================================================================
 sub _do_file_status {
-    my ($ctx, $root) = @_;
+    my ($ctx, $root, $repo) = @_;
 
-    my $r = _run_capture($^X, "$root/plugins/steward/scripts/sync-export.pl");
+    my $r = _run_capture($^X, "$root/plugins/steward/scripts/sync-export.pl",
+        '--live-root', $root, '--repo-root', $repo);
     unless ($r->{spawned}) {
         return { failed => 'sync-export.pl failed to spawn' };
     }
@@ -364,18 +438,38 @@ sub _do_file_status {
 }
 
 # ===========================================================================
-# U2 -- file_conflicts (Step 3). Ruling P10: branch on the REAL status set;
-# not_linked (live regular file differing from the repo copy) is the
-# both-sides-differ signal on this Windows host; a live DIRECTORY is a note,
-# never a decision. An unrecognised status is a reported unit failure.
+# U2 -- file_conflicts (Step 3). Ruling P10: branch on the REAL status set.
+# claude_md_differs becomes the claude_md_drift decision; not_linked (a live
+# regular file differing from its counterpart) a file_conflict decision; a
+# live DIRECTORY is a note, never a decision. An unrecognised status is a
+# reported unit failure.
 # ===========================================================================
+use constant CLAUDE_MD_DRIFT_ID => 'export.claude_md_drift';
+
+sub _lines_text {
+    my ($label, $lines, $max) = @_;
+    $max //= 40;
+    my @l = ref($lines) eq 'ARRAY' ? @$lines : ();
+    return () unless @l;
+    my @out = ($label);
+    for my $i (0 .. $#l) {
+        last if $i >= $max;
+        my $e = $l[$i];
+        push @out, '  L' . (ref($e) eq 'HASH' ? ($e->{n} // '?') : '?') . ': '
+                 . (ref($e) eq 'HASH' ? ($e->{text} // '') : '');
+    }
+    push @out, '  ... and ' . (scalar(@l) - $max) . ' more' if @l > $max;
+    return @out;
+}
+
 sub _do_file_conflicts {
-    my ($ctx, $root, $home_n) = @_;
+    my ($ctx, $root, $repo, $home_n) = @_;
 
     my $status_arr = $ctx->{get_item}->('file_status');
     $status_arr = [] unless ref($status_arr) eq 'ARRAY';
 
     my @conflict_items;
+    my $claude_md;
     for my $item (@$status_arr) {
         next unless ref($item) eq 'HASH';
         my $file   = $item->{file};
@@ -403,18 +497,28 @@ sub _do_file_conflicts {
             # no per-file action here even on the rare chance this status
             # is ever emitted.
         }
+        elsif ($status eq 'claude_md_differs') {
+            # ~/.claude/CLAUDE.md is built from the live install's payload;
+            # a difference cannot be exported, only rebuilt away or folded
+            # into the payload by hand. A link to some other file cannot be
+            # rebuilt over safely (install-claude-md refuses it, as promote
+            # does), so it is reported, not asked.
+            if (($item->{claude_md_status} // 'differs') eq 'differs') {
+                $claude_md = $item;
+            }
+            else {
+                $ctx->{note}->('claude_md_symlinked_elsewhere', { file => $file, target => $item->{target},
+                                                                  note => $item->{note} });
+            }
+        }
         elsif ($status eq 'not_linked' || $status eq 'conflict') {
-            # Pair by the item's own identity, never by basename alone.
-            # sync-export.pl's repo_file tells us the repo-relative path
-            # this live $file is actually mapped to (they diverge for
-            # CLAUDE.md: live ~/.claude/CLAUDE.md pairs with repo
-            # global-config/CLAUDE.md, NOT a same-named file at the repo
-            # root -- see bug report 20260922-211416-1b92). Fall back to
-            # $file only for older sync-export.pl output that predates the
-            # repo_file field.
+            # Pair by the item's own identity, never by basename alone:
+            # sync-export.pl's repo_file is the repo-relative path this live
+            # $file is mapped to (bug report 20260922-211416-1b92). Fall back
+            # to $file only for older sync-export.pl output without it.
             my $repo_file = $item->{repo_file} // $file;
             my $live_path = "$home_n/.claude/$file";
-            my $repo_path = "$root/$repo_file";
+            my $repo_path = "$repo/$repo_file";
             if (-d $live_path) {
                 $ctx->{note}->('file_status_directory', { file => $file, note => $item->{note} });
                 next;
@@ -433,47 +537,65 @@ sub _do_file_conflicts {
                 return { failed => "cannot read '$file': " . ($live_err // $repo_err) };
             }
             next if $live_text eq $repo_text;   # not actually differing
-            push @conflict_items, { file => $file, live_path => $live_path, repo_path => $repo_path,
-                                     live_text => $live_text, repo_text => $repo_text };
+            push @conflict_items, { file => $file, repo_file => $repo_file, live_path => $live_path,
+                                     repo_path => $repo_path, live_text => $live_text, repo_text => $repo_text };
         }
         else {
             return { failed => "sync-export.pl reported an unrecognized status '$status' for '$file'" };
         }
     }
 
-    unless (@conflict_items) {
+    unless (@conflict_items || $claude_md) {
         $ctx->{checkpoint}->('file_conflicts', []);
         return {};
     }
 
-    my @pairs = _mint_ids('export.file_conflict', map { $_->{file} } @conflict_items);
     my @decisions;
+    my @inventory;
+
+    if ($claude_md) {
+        my $extra   = ref($claude_md->{extra_lines})   eq 'ARRAY' ? $claude_md->{extra_lines}   : [];
+        my $missing = ref($claude_md->{missing_lines}) eq 'ARRAY' ? $claude_md->{missing_lines} : [];
+        my $resolve = $claude_md->{resolve} // '';
+        my @detail  = (
+            "~/.claude/CLAUDE.md is not what promote.pl builds for this host from the live install's payload"
+            . (defined $claude_md->{note} ? " ($claude_md->{note})" : '') . '.',
+            _lines_text('only in ~/.claude/CLAUDE.md:', $extra),
+            _lines_text("only in the build (global-config/CLAUDE.md + this host's part):", $missing),
+        );
+        push @detail, "A difference is never exported: a line carries no record of which part it belongs to. "
+                    . "To keep a line, $resolve" if @$extra;
+        push @decisions, $ctx->{decision}->(
+            kind    => 'claude_md_drift',
+            id      => CLAUDE_MD_DRIFT_ID,
+            title   => '~/.claude/CLAUDE.md differs from its build from the live install ('
+                     . scalar(@$extra) . ' line(s) only there, ' . scalar(@$missing) . ' missing)',
+            subject => 'CLAUDE.md',
+            detail  => join("\n", @detail),
+            data    => { file => 'CLAUDE.md', live_path => "$home_n/.claude/CLAUDE.md",
+                         host_part => $claude_md->{host_part}, extra_lines => $extra,
+                         missing_lines => $missing, resolve => $resolve },
+            choices => [
+                { id => 'rerender', label => 'Rebuild ~/.claude/CLAUDE.md from the live install (the current file is backed up to ~/.claude/.promotion-backups/ first)' },
+                { id => 'leave',    label => 'Leave it as it is (fold the lines into the dev clone\'s payload and promote)' },
+            ],
+        );
+        push @inventory, { kind => 'claude_md', file => 'CLAUDE.md', live_path => "$home_n/.claude/CLAUDE.md",
+                           extra_lines_count => scalar(@$extra), resolve => $resolve };
+    }
+
+    my @pairs = _mint_ids('export.file_conflict', map { $_->{file} } @conflict_items);
     for my $i (0 .. $#conflict_items) {
         my ($file, $id) = @{ $pairs[$i] };
         my $it = $conflict_items[$i];
         # HARDEN item9b: live_text/repo_text are RAW file bytes -- unlike
-        # every other value this module hands to $ctx (see run_phase's
-        # $home_n normalisation and _sanitize_utf8's header comment), they
-        # never passed through _ensure_utf8_bytes. backup.pl's stdout
-        # encoder has no ->utf8 (spec S2.6) and just passes string bytes
-        # through unescaped; a genuinely invalid byte (a lone Latin-1 byte,
-        # a truncated multi-byte sequence -- not a Perl-widened string,
-        # since _read_file_raw reads ':raw') then reaches stdout as-is and
-        # breaks the "exactly one parseable JSON object" invariant outright
-        # -- not merely lossy, UNPARSEABLE by a strict UTF-8 JSON consumer,
-        # which also destroys the resume token a paused run depends on.
-        # _ensure_utf8_bytes repairs this the SAME way it already repairs
-        # $home_n: valid UTF-8 (including real non-ASCII content) is left
-        # byte-for-byte untouched -- this is exactly why the round-trip
-        # assertions exercising genuine non-ASCII file content stay green
-        # -- while a genuinely invalid byte is Latin-1-reinterpreted into
-        # its nearest real character. That is a deliberate choice over a
-        # lossy U+FFFD substitution: a replacement character would LOOK
-        # like faithful content to the operator choosing between
-        # use_live/use_export (whole-file copies) while silently not being
-        # the file's real bytes; the Latin-1 reinterpretation at least
-        # keeps the codepoint meaningful and never renders as the generic
-        # "this was altered" glyph a substitution would.
+        # every other value this module hands to $ctx, they never passed
+        # through _ensure_utf8_bytes; a genuinely invalid byte reaching
+        # backup.pl's non-utf8 stdout encoder makes the whole object
+        # unparseable (and loses the resume token). Repair the same way as
+        # $home_n: valid UTF-8 untouched, an invalid byte Latin-1-
+        # reinterpreted rather than replaced with U+FFFD, which would LOOK
+        # like faithful content while not being the file's real bytes.
         my $live_repaired = _ensure_utf8_bytes($it->{live_text});
         my $repo_repaired = _ensure_utf8_bytes($it->{repo_text});
         my ($lt, $lt_trunc) = _clamp_text($live_repaired);
@@ -481,7 +603,7 @@ sub _do_file_conflicts {
         push @decisions, $ctx->{decision}->(
             kind    => 'file_conflict',
             id      => $id,
-            title   => "file '" . _title_key($file) . "' differs between live and the repo",
+            title   => "file '" . _title_key($file) . "' differs between live and the dev clone",
             subject => $file,
             detail  => '',
             data    => { file => $file, live_path => $it->{live_path}, repo_path => $it->{repo_path},
@@ -489,53 +611,86 @@ sub _do_file_conflicts {
                          live_bytes => length($it->{live_text}), repo_bytes => length($it->{repo_text}),
                          truncated => ($lt_trunc || $rt_trunc) ? 1 : 0 },
             choices => [
-                { id => 'use_live',       label => 'Use the live version (copy live over the repo copy)' },
-                { id => 'use_export',     label => 'Use the export/repo version (copy repo over the live copy)' },
+                { id => 'use_live',       label => 'Use the live version (copy it over the dev clone\'s copy)' },
+                { id => 'use_export',     label => 'Use the dev clone\'s version (copy it over the live copy)' },
                 { id => 'merge_manually', label => 'Merge manually (write nothing; report both paths)' },
             ],
         );
+        # Just the paths (not the bulky text) -- U3 only needs these.
+        push @inventory, { kind => 'file', file => $file, repo_file => $it->{repo_file},
+                           live_path => $it->{live_path}, repo_path => $it->{repo_path} };
     }
 
-    # Checkpoint just the paths (not the bulky text) -- U3 only needs these
-    # to perform the byte-copy; the text was only needed transiently to
-    # build the decision's data payload.
-    my @inventory = map { { file => $_->{file}, live_path => $_->{live_path}, repo_path => $_->{repo_path} } }
-                    @conflict_items;
     $ctx->{checkpoint}->('file_conflicts', \@inventory);
-
     return { decisions => \@decisions };
 }
 
 # ===========================================================================
-# U3 -- file_outcome: apply answered file_conflict choices. use_live/
+# U3 -- file_outcome: apply answered choices. file_conflict: use_live /
 # use_export byte-copy; merge_manually writes nothing (ruling P12) and
-# records an instruction note naming both paths.
+# records an instruction note naming both paths. claude_md_drift: rerender
+# runs ccpraxis-helpers.pl install-claude-md (backup copy, then the build of
+# the live payload); leave writes nothing and notes where the lines go.
+# Checkpoints 'wrote': the dev-clone files this unit changed.
 # ===========================================================================
 sub _do_file_outcome {
-    my ($ctx, $root, $home_n) = @_;
+    my ($ctx, $root, $repo) = @_;
 
     my $inventory = $ctx->{get_item}->('file_conflicts');
     $inventory = [] unless ref($inventory) eq 'ARRAY';
     return {} unless @$inventory;
 
-    my @pairs = _mint_ids('export.file_conflict', map { $_->{file} } @$inventory);
-    my (@resolved, @instructions, @failed_msgs);
+    my @files = grep { ref($_) eq 'HASH' && ($_->{kind} // 'file') eq 'file' } @$inventory;
+    my ($cm)  = grep { ref($_) eq 'HASH' && ($_->{kind} // '') eq 'claude_md' } @$inventory;
+    my @pairs = _mint_ids('export.file_conflict', map { $_->{file} } @files);
+    my (@resolved, @instructions, @failed_msgs, @wrote);
+    my $claude_md_outcome;
 
-    for my $i (0 .. $#$inventory) {
+    if ($cm) {
+        my $choice = $ctx->{answers}{ CLAUDE_MD_DRIFT_ID() };
+        if (defined $choice && $choice eq 'rerender') {
+            my $r = _run_capture($^X, "$root/plugins/steward/scripts/ccpraxis-helpers.pl",
+                'install-claude-md', '--live-root', $root);
+            my $j = $r->{spawned} ? eval { decode_json($r->{out}) } : undef;
+            if ($r->{spawned} && $r->{exit} == 0 && ref($j) eq 'HASH') {
+                $j = _sanitize_utf8($j);
+                $claude_md_outcome = { choice => $choice, status => $j->{status}, backup => $j->{backup} };
+                $ctx->{note}->('claude_md_rerendered', { backup => $j->{backup}, status => $j->{status} });
+            }
+            else {
+                my $why = ref($j) eq 'HASH' ? ($j->{error} // "exited $r->{exit}")
+                        : $r->{spawned} ? "exited $r->{exit}" : 'failed to spawn';
+                push @failed_msgs, 'claude_md_drift: install-claude-md ' . _sanitize_utf8($why);
+                $claude_md_outcome = { choice => $choice, status => 'failed' };
+            }
+        }
+        elsif (defined $choice && $choice eq 'leave') {
+            $claude_md_outcome = { choice => $choice };
+            $ctx->{note}->('claude_md_left', { extra_lines_count => $cm->{extra_lines_count},
+                                               resolve => $cm->{resolve} });
+        }
+    }
+
+    for my $i (0 .. $#files) {
         my ($file, $id) = @{ $pairs[$i] };
-        my $it     = $inventory->[$i];
+        my $it     = $files[$i];
         my $choice = $ctx->{answers}{$id};
         next unless defined $choice;
+        my $live_path = _item_bytes($it->{live_path});
+        my $repo_path = _item_bytes($it->{repo_path});
 
         if ($choice eq 'use_live') {
-            my $ok = eval { _copy_file_bytes($it->{live_path}, $it->{repo_path}); 1 };
-            if ($ok) { push @resolved, { file => $file, choice => $choice }; }
-            else      { push @failed_msgs, "file_conflict '$file': cannot copy live->repo: $@"; }
+            my $ok = eval { _copy_file_bytes($live_path, $repo_path); 1 };
+            if ($ok) {
+                push @resolved, { file => $file, choice => $choice };
+                push @wrote, $it->{repo_file} // $file;
+            }
+            else { push @failed_msgs, "file_conflict '$file': cannot copy live->dev clone: $@"; }
         }
         elsif ($choice eq 'use_export') {
-            my $ok = eval { _copy_file_bytes($it->{repo_path}, $it->{live_path}); 1 };
+            my $ok = eval { _copy_file_bytes($repo_path, $live_path); 1 };
             if ($ok) { push @resolved, { file => $file, choice => $choice }; }
-            else      { push @failed_msgs, "file_conflict '$file': cannot copy repo->live: $@"; }
+            else      { push @failed_msgs, "file_conflict '$file': cannot copy dev clone->live: $@"; }
         }
         elsif ($choice eq 'merge_manually') {
             push @instructions, { file => $file, live_path => $it->{live_path}, repo_path => $it->{repo_path} };
@@ -544,7 +699,8 @@ sub _do_file_outcome {
 
     $ctx->{note}->('file_conflicts_resolved', \@resolved) if @resolved;
     $ctx->{note}->('file_conflict_merge_manually', \@instructions) if @instructions;
-    $ctx->{checkpoint}->('file_outcome', { resolved => \@resolved, instructions => \@instructions });
+    $ctx->{checkpoint}->('file_outcome', { resolved => \@resolved, instructions => \@instructions,
+                                           claude_md => $claude_md_outcome, wrote => \@wrote });
 
     my $ret = {};
     $ret->{failed} = join('; ', @failed_msgs) if @failed_msgs;
@@ -557,7 +713,7 @@ sub _do_file_outcome {
 # skip-keys.
 # ===========================================================================
 sub _do_settings_merge {
-    my ($ctx, $root) = @_;
+    my ($ctx, $root, $repo) = @_;
 
     unless (exists $ctx->{get_phase_item}) {
         return { failed => "skip-keys handoff unavailable: \$ctx->{get_phase_item} is missing" };
@@ -579,8 +735,38 @@ sub _do_settings_merge {
         }
     }
 
-    my @args = ('settings-export-merge');
-    push @args, ('--skip-key', $_) for @$skip_keys;
+    # What goes to the payload is exactly what the operator (per key, in the
+    # preflight) sent there: to_payload takes the ~/.claude value,
+    # remove_from_payload drops the key. An older settings_outcome without the
+    # lists carries the same facts in its answers (use_live / export_to_repo /
+    # remove_from_repo occur for one relation each).
+    my $answers = ref($outcome->{answers}) eq 'HASH' ? $outcome->{answers} : {};
+    my @to_payload = ref($outcome->{to_payload}) eq 'ARRAY' ? @{ $outcome->{to_payload} }
+                   : sort grep { my $c = $answers->{$_} // ''; $c eq 'use_live' || $c eq 'export_to_repo' } keys %$answers;
+    my @remove_from_payload = ref($outcome->{remove_from_payload}) eq 'ARRAY' ? @{ $outcome->{remove_from_payload} }
+                   : sort grep { ($answers->{$_} // '') eq 'remove_from_repo' } keys %$answers;
+    for my $k (@to_payload, @remove_from_payload) {
+        return { failed => 'settings handoff malformed: a to-payload key is a non-scalar or empty element' }
+            unless defined $k && !ref($k) && length $k;
+    }
+    $_ = _item_bytes($_) for @to_payload, @remove_from_payload;
+
+    # Nothing sent to the payload: nothing is merged, and the payload file is
+    # not even rewritten (a rewrite alone could reformat it into a commit).
+    unless (@to_payload || @remove_from_payload) {
+        $ctx->{checkpoint}->('settings_merge', { status => 'nothing_to_export', wrote => [],
+            preferences_applied => [], preferences_ignored => [], skip_keys_unmatched => [] });
+        $ctx->{note}->('settings_merge', { status => 'nothing_to_export' });
+        return {};
+    }
+
+    # --live-root: the directory ${CCPRAXIS_LIVE} stands for (collapse
+    # against it); --repo-root: the dev clone, the only thing written.
+    # --only-key / --remove-key make the merge selective: no other unit moves.
+    my @args = ('settings-export-merge', '--live-root', $root, '--repo-root', $repo);
+    push @args, ('--skip-key', $_)   for @$skip_keys;
+    push @args, ('--only-key', $_)   for @to_payload;
+    push @args, ('--remove-key', $_) for @remove_from_payload;
     my $r = _run_capture($^X, "$root/plugins/steward/scripts/ccpraxis-helpers.pl", @args);
     unless ($r->{spawned}) {
         return { failed => 'ccpraxis-helpers.pl settings-export-merge failed to spawn' };
@@ -596,6 +782,11 @@ sub _do_settings_merge {
         return { failed => "settings-export-merge: $msg" };
     }
     $j = _sanitize_utf8($j);
+    # settings-export-merge rewrote the dev clone's settings.json; the commit
+    # takes it only if that changed anything.
+    $j->{wrote} = [ 'global-config/settings.json' ];
+    $j->{to_payload} = [ @to_payload ];
+    $j->{remove_from_payload} = [ @remove_from_payload ];
 
     $ctx->{checkpoint}->('settings_merge', $j);
     $ctx->{note}->('settings_merge', { status => $j->{status}, merge_rule => $j->{merge_rule} });
@@ -611,10 +802,11 @@ sub _do_settings_merge {
 # gating (this sub is only called once settings_merge has checkpointed).
 # ===========================================================================
 sub _do_container_diff {
-    my ($ctx, $root, $home_n) = @_;
+    my ($ctx, $root, $repo) = @_;
 
-    my $container_path = "$root/plugins/sandbox/container/settings.json";
-    my $global_path     = "$root/global-config/settings.json";
+    # Both files are the dev clone's: the export target, just merged into.
+    my $container_path = "$repo/plugins/sandbox/container/settings.json";
+    my $global_path     = "$repo/global-config/settings.json";
 
     # -e (not -f): a path OCCUPIED by something odd (e.g. a directory
     # blocking a later write, AC33's fixture) must still reach json-diff.pl
@@ -672,16 +864,17 @@ sub _do_container_diff {
 # (_delete_nested) -- never a literal flat "env.X" top-level key.
 # ===========================================================================
 sub _do_container_outcome {
-    my ($ctx, $root) = @_;
+    my ($ctx, $root, $repo) = @_;
 
     my $diff = $ctx->{get_item}->('container_diff');
     my @decisions = (ref($diff) eq 'HASH') ? _container_decisions($ctx, $diff) : ();
     my @followed  = (ref($diff) eq 'HASH') ? _container_followed_list($diff)   : ();
     return {} unless @decisions || @followed;
 
-    my $container_path = "$root/plugins/sandbox/container/settings.json";
+    my $container_rel  = 'plugins/sandbox/container/settings.json';
+    my $container_path = "$repo/$container_rel";
     my $prefs_path      = "$root/.backup-preferences.json";
-    my (@applied, @removed, @prefs_saved, @failed_msgs);
+    my (@applied, @removed, @prefs_saved, @failed_msgs, @wrote);
     my (%writes, %deletes);
     my $need_write = 0;
 
@@ -700,7 +893,9 @@ sub _do_container_outcome {
         if (my $pair = $remember_map{$choice}) {
             my ($category, $action) = @$pair;
             my $sp = _run_capture($^X, "$root/plugins/steward/scripts/save-preference.pl",
-                '--prefs', $prefs_path, '--scope', 'global_vs_container', '--key', $key,
+                # _item_bytes: the key came off the run-state file flagged;
+                # as argv it would reach the child encoded twice.
+                '--prefs', $prefs_path, '--scope', 'global_vs_container', '--key', _item_bytes($key),
                 '--category', $category, '--action', $action);
             if ($sp->{spawned} && $sp->{exit} == 0) {
                 push @prefs_saved, { key => $key, category => $category, action => $action };
@@ -760,7 +955,8 @@ sub _do_container_outcome {
             _assign_nested($data, _widen_utf8($_), _widen_utf8($writes{$_})) for keys %writes;
             _delete_nested($data, _widen_utf8($_)) for keys %deletes;
             my $ok = eval { _write_json_file($container_path, $data); 1 };
-            unless ($ok) {
+            if ($ok) { push @wrote, $container_rel; }
+            else {
                 push @failed_msgs, "container_outcome: cannot write $container_path: $@";
                 $write_ok = 0;
             }
@@ -775,7 +971,8 @@ sub _do_container_outcome {
     $ctx->{note}->('container_followed_global', \@followed_out) if @followed_out;
     $ctx->{checkpoint}->('container_outcome', { applied => \@applied, removed => \@removed,
                                                   preferences_saved => \@prefs_saved,
-                                                  followed_global => \@followed_out });
+                                                  followed_global => \@followed_out,
+                                                  wrote => \@wrote });
     $ctx->{note}->('container_preferences_saved', \@prefs_saved) if @prefs_saved;
 
     my $ret = {};
@@ -945,6 +1142,433 @@ sub _container_decisions {
 }
 
 # ===========================================================================
+# U5b -- sandbox_diff: the sandbox preset (the dev clone's
+# plugins/sandbox/container/settings.json) against each sandbox's own
+# settings.json, for every project in this machine's sandbox list
+# (plugins/sandbox/scripts/SandboxRegistry.pm, written by the launcher).
+#
+# The third preference pair, beside live_vs_repo and global_vs_container. A
+# sandbox's settings start as the preset and are merged with it on every
+# container create (SandboxSettings.pm); what the sandbox changed since stays
+# in that sandbox unless it is carried back here. A unit is a decision only
+# when it is the SANDBOX's change: when the sandbox still holds the value the
+# preset gave it last time (its BASE, .launcher/container-settings.json),
+# the difference is the preset moving on, which the sandbox's next merge
+# takes by itself -- asking "put the sandbox's value into the preset" there
+# would offer to undo the preset's change. Those units are only counted
+# (pending_merge). With no base on record every difference is asked about.
+#
+# A saved preference answers a unit without a decision: scope
+# container_vs_sandbox:<project id> in .backup-preferences.json, so a
+# "keep it in this sandbox" remembered for one project never applies to
+# another, and survives renaming the project (the id is SandboxRegistry's).
+# Matching is filter-diff.pl's, fed a json-diff-shaped report (left = the
+# sandbox, right = the preset). The unit model is SettingsUnits.pm's.
+#
+# Only projects registered by a launcher with the live install's identity
+# (SandboxIdentity $ID) are compared: a fork's sandboxes follow its own
+# preset. A project that cannot be reached (directory gone, no or unreadable
+# settings.json) is skipped with a note. Checkpoints 'sandbox_diff':
+#   { status, preset, projects => [ { id, path, name, skipped?, pending_merge,
+#     auto_applied, units => [ { key, path, relation, sandbox_found,
+#     sandbox_value, preset_found, preset_value } ] } ] }
+# ===========================================================================
+sub _do_sandbox_diff {
+    my ($ctx, $root, $repo, $home_n) = @_;
+    my $done = sub {
+        my ($data) = @_;
+        $ctx->{checkpoint}->('sandbox_diff', _sanitize_utf8($data));
+        return {};
+    };
+
+    my $load_err = _load_sandbox_shared($root);
+    if (defined $load_err) {
+        $ctx->{note}->('sandbox_settings_skipped', { reason => $load_err });
+        return $done->({ status => 'unavailable', reason => $load_err, projects => [] });
+    }
+    my $registry = SandboxRegistry::registry_path("$home_n/.claude");
+    my $ours = do { no warnings q{once}; $SandboxIdentity::ID };
+    my ($entries, $reg_err) = SandboxRegistry::entries(registry => $registry, launcher => $ours);
+    if (defined $reg_err) {
+        return { failed => "sandbox_diff: the machine's sandbox list is unreadable: $reg_err" };
+    }
+    return $done->({ status => 'no_sandboxes', projects => [] }) unless @$entries;
+
+    my $preset_rel  = 'plugins/sandbox/container/settings.json';
+    my $preset_path = "$repo/$preset_rel";
+    my ($preset, $preset_err, $preset_exists) = SandboxSettings::read_json($preset_path);
+    unless ($preset_exists) {
+        $ctx->{note}->('sandbox_settings_skipped', { reason => "no sandbox preset at $preset_path" });
+        return $done->({ status => 'preset_absent', projects => [] });
+    }
+    return { failed => "sandbox_diff: $preset_err" } if defined $preset_err;
+
+    my $prefs_path = "$root/.backup-preferences.json";
+    my (@projects, @skipped);
+    for my $e (@$entries) {
+        my $path = $e->{path};
+        my $name = $path;
+        $name =~ s{.*[/\\]}{};
+        my %p = (id => $e->{id}, path => $path, name => $name, units => [], auto_applied => [],
+                 pending_merge => []);
+        my $home = SandboxRegistry::claude_home_for($path);
+        my $why;
+        if (!-d $path) {
+            $why = 'the project directory is not reachable';
+        }
+        else {
+            my ($sandbox, $err, $exists) = SandboxSettings::read_json("$home/settings.json");
+            if (!$exists) {
+                $why = 'it has no settings.json yet (no container has been created)';
+            }
+            elsif (defined $err) {
+                $why = $err;
+            }
+            else {
+                my ($base, $base_err, $base_exists) = SandboxSettings::read_json("$home/.launcher/container-settings.json");
+                $base = undef if defined $base_err || !$base_exists;
+                my @cand;
+                for my $u (SettingsUnits::compute_units($sandbox, $preset)) {
+                    next if $u->{relation} eq 'identical';
+                    if ($base) {
+                        my ($sf, $sv) = SettingsUnits::value_at_path($sandbox, $u->{path});
+                        my ($bf, $bv) = SettingsUnits::value_at_path($base, $u->{path});
+                        if ($sf == $bf && (!$sf || SettingsUnits::same_value($sv, $bv))) {
+                            push @{ $p{pending_merge} }, $u->{name};
+                            next;
+                        }
+                    }
+                    push @cand, $u;
+                }
+                $p{base_missing} = $base ? 0 : 1;
+                if (@cand) {
+                    my $f = _sandbox_filter_prefs($root, $prefs_path, $e->{id}, \@cand);
+                    return { failed => "sandbox_diff ($path): $f->{failed}" } if $f->{failed};
+                    $p{auto_applied} = $f->{auto_applied};
+                    for my $u (@{ $f->{needs} }) {
+                        push @{ $p{units} }, {
+                            key => $u->{name}, path => $u->{path}, relation => $u->{relation},
+                            sandbox_found => ($u->{relation} eq 'only_right' ? 0 : 1), sandbox_value => $u->{live_val},
+                            preset_found  => ($u->{relation} eq 'only_left'  ? 0 : 1), preset_value  => $u->{payload_val},
+                        };
+                    }
+                }
+            }
+        }
+        if (defined $why) {
+            $p{skipped} = $why;
+            push @skipped, { project => $path, id => $e->{id}, reason => $why };
+        }
+        push @projects, \%p;
+    }
+    # Everything below comes out of the sanitised copy: filter-diff.pl's
+    # output (the auto_applied keys) is widened text, and a widened string
+    # reaching a note would leave a raw Latin-1 byte in backup.pl's output.
+    my $data = _sanitize_utf8({ status => 'compared', preset => $preset_rel, projects => \@projects });
+    $ctx->{note}->('sandbox_settings_skipped_projects', _sanitize_utf8(\@skipped)) if @skipped;
+    my @auto = map { my $p = $_; map { { %$_, project => $p->{path} } } @{ $p->{auto_applied} } } @{ $data->{projects} };
+    $ctx->{note}->('sandbox_settings_auto_applied', \@auto) if @auto;
+    $ctx->{checkpoint}->('sandbox_diff', $data);
+    my @decisions = _sandbox_decisions($ctx, $data);
+    return @decisions ? { decisions => \@decisions } : {};
+}
+
+# filter-diff.pl over one project's candidate units, scope
+# container_vs_sandbox:<id>. Returns { auto_applied => [..], needs => [units] }.
+sub _sandbox_filter_prefs {
+    my ($root, $prefs_path, $id, $units) = @_;
+    my (%only_left, %only_right, %diverged);
+    for my $u (@$units) {
+        if    ($u->{relation} eq 'only_left')  { $only_left{ $u->{name} }  = $u->{live_val}; }
+        elsif ($u->{relation} eq 'only_right') { $only_right{ $u->{name} } = $u->{payload_val}; }
+        else  { $diverged{ $u->{name} } = { left => $u->{live_val}, right => $u->{payload_val} }; }
+    }
+    my $report = JSON::PP->new->utf8->canonical->allow_nonref->encode({
+        status => 'different', identical => [],
+        only_left => \%only_left, only_right => \%only_right, diverged => \%diverged });
+    my $fd = _run_with_stdin($report, $^X, "$root/plugins/steward/scripts/filter-diff.pl",
+        '--prefs', $prefs_path, '--scope', "container_vs_sandbox:$id");
+    return { failed => 'filter-diff.pl failed to spawn' } unless $fd->{spawned};
+    return { failed => "filter-diff.pl exited $fd->{exit}" } unless $fd->{exit} == 0;
+    my $j = eval { decode_json($fd->{out}) };
+    return { failed => 'filter-diff.pl produced unparseable output' } unless ref($j) eq 'HASH';
+    my %auto = map { (ref($_) eq 'HASH' && defined $_->{key}) ? ($_->{key} => $_) : () } @{ $j->{auto_applied} // [] };
+    return {
+        auto_applied => [ map { { key => $_->{key}, category => $_->{category}, action => $_->{action} } }
+                          sort { $a->{key} cmp $b->{key} } values %auto ],
+        needs        => [ grep { !$auto{ $_->{name} } } @$units ],
+    };
+}
+
+# Pure function of a sandbox_diff checkpoint: one decision per unit, in
+# project order then unit order, with ids U6b can regenerate exactly.
+sub _sandbox_decisions {
+    my ($ctx, $diff) = @_;
+    return () unless ref($diff) eq 'HASH' && ref($diff->{projects}) eq 'ARRAY';
+    my @decisions;
+    my $jv = JSON::PP->new->canonical->allow_nonref;
+    for my $p (@{ $diff->{projects} }) {
+        next unless ref($p) eq 'HASH' && ref($p->{units}) eq 'ARRAY' && @{ $p->{units} };
+        my @pairs = _mint_ids("export.sandbox.$p->{id}", map { $_->{key} } @{ $p->{units} });
+        (my $pname = $p->{name} // q{}) =~ s/[\x00-\x1f\x7f]+/ /g;
+        $pname = _clip_utf8_bytes($pname, 40);
+        for my $i (0 .. $#{ $p->{units} }) {
+            my ($key, $id) = @{ $pairs[$i] };
+            my $u   = $p->{units}[$i];
+            my $rel = $u->{relation};
+            (my $kd = $key) =~ s/[\s\x00-\x1f\x7f]+/ /g;
+            $kd = _clip_utf8_bytes($kd, 83);
+            my $sec  = _sandbox_key_is_sensitive($u->{path}) ? 1 : 0;
+            # A value a sensitive key carries goes to every sandbox on a
+            # to_preset, so it is shown whole; others are clipped.
+            my $show = sub { my ($f, $v) = @_; return '(not set)' unless $f;
+                             my $s = $jv->encode($v); return $sec ? $s : _clip_utf8_bytes($s, 1000) };
+            # With no record of what the sandbox was last given, a key on one
+            # side only may as well be the preset's doing: say so, and never
+            # claim the sandbox removed it.
+            my $nb = $p->{base_missing} ? 1 : 0;
+            my @detail = ("project: $p->{path}",
+                          'this sandbox:       ' . $show->($u->{sandbox_found}, $u->{sandbox_value}),
+                          'the sandbox preset: ' . $show->($u->{preset_found},  $u->{preset_value}));
+            push @detail, 'No record of the preset this sandbox was last given, so this may be a change the preset made, not the sandbox.' if $nb;
+            push @detail, "This key can run commands, hold credentials or widen what Claude may do: sent to the preset it reaches every sandbox at its next container create. Read the whole value before choosing to_preset." if $sec;
+            push @detail, 'Every sandbox takes the preset\'s value on its next merge unless it changed the key itself.';
+            push @decisions, $ctx->{decision}->(
+                kind    => 'sandbox_settings_key',
+                id      => $id,
+                title   => _clip_utf8_bytes(
+                             $rel eq 'only_left'          ? "sandbox '$pname': settings key '$kd' is in this sandbox but not in the sandbox preset"
+                           : $rel eq 'only_right' && $nb ? "sandbox '$pname': settings key '$kd' is in the sandbox preset but not in this sandbox"
+                           : $rel eq 'only_right'        ? "sandbox '$pname': settings key '$kd' was removed in this sandbox but is in the sandbox preset"
+                           :                               "sandbox '$pname': settings key '$kd' differs from the sandbox preset", 200),
+                subject => $key,
+                detail  => join("\n", @detail),
+                data    => { project_id => $p->{id}, project_path => $p->{path}, project_name => $p->{name},
+                             key => $key, path => $u->{path}, relation => $rel, base_missing => $nb,
+                             security_relevant => $sec,
+                             sandbox_found => $u->{sandbox_found}, sandbox_value => $u->{sandbox_value},
+                             preset_found => $u->{preset_found}, preset_value => $u->{preset_value} },
+                choices => _sandbox_choices($rel),
+            );
+        }
+    }
+    return @decisions;
+}
+
+# Settings keys whose value can run a command, carry a credential helper or
+# widen what Claude may do -- a to_preset of one of these reaches every
+# sandbox, so its decision says so and shows the whole value. Top-level names
+# (a unit under one, such as env.X or permissions.allow, counts).
+my %SANDBOX_SENSITIVE_KEYS = map { $_ => 1 } qw(
+    hooks statusLine apiKeyHelper awsAuthRefresh awsCredentialExport otelHeadersHelper
+    env permissions enabledPlugins extraKnownMarketplaces enableAllProjectMcpServers
+    enabledMcpjsonServers disableAllHooks skipDangerousModePermissionPrompt
+);
+sub _sandbox_key_is_sensitive {
+    my ($path) = @_;
+    return 0 unless ref($path) eq 'ARRAY' && @$path;
+    return $SANDBOX_SENSITIVE_KEYS{ $path->[0] } ? 1 : 0;
+}
+
+sub _sandbox_choices {
+    my ($rel) = @_;
+    my $to_preset = $rel eq 'only_left'  ? "Add it to the dev clone's sandbox preset (every sandbox gets it on its next merge)"
+                  : $rel eq 'only_right' ? "Remove it from the dev clone's sandbox preset (every sandbox loses it on its next merge)"
+                  :                        "Put this sandbox's value into the dev clone's sandbox preset (every sandbox gets it on its next merge)";
+    my $revert    = $rel eq 'only_left'  ? "Remove it from this sandbox's settings.json (the file is backed up first)"
+                  :                        "Put the preset's value back into this sandbox's settings.json (the file is backed up first)";
+    return [
+        { id => 'to_preset',                label => $to_preset },
+        { id => 'keep_in_sandbox',          label => 'Keep it in this sandbox only, this time (asked again next backup)' },
+        { id => 'keep_in_sandbox_remember', label => 'Keep it in this sandbox only, always (remembered for this project)' },
+        { id => 'revert_sandbox',           label => $revert },
+    ];
+}
+
+# ===========================================================================
+# U6b -- sandbox_outcome: apply answered sandbox_settings_key choices.
+#   to_preset                 the sandbox's value (or its absence) goes into
+#                             the dev clone's preset; committed with the
+#                             other export files. Two sandboxes sending one
+#                             unit different values is refused for that unit.
+#   keep_in_sandbox           nothing.
+#   keep_in_sandbox_remember  a container_vs_sandbox:<id> preference.
+#   revert_sandbox            the preset's value into that sandbox's
+#                             settings.json, after a backup to its
+#                             .launcher/backups/ (SandboxSettings::apply_units);
+#                             nothing else is written.
+# Checkpoints 'sandbox_outcome': { to_preset, reverted, kept, preferences_saved,
+# refused, wrote }.
+# ===========================================================================
+sub _do_sandbox_outcome {
+    my ($ctx, $root, $repo, $home_n) = @_;
+    # Off the run-state file every string comes back utf8-FLAGGED around raw
+    # UTF-8 bytes (Run.pm reads without ->utf8). Used as it is, a non-ASCII
+    # path or key would be encoded a second time -- in a child's argv (a
+    # preference saved under "cafÃ©", never matched again), a file path, a
+    # note. Back to plain bytes first, numbers left as numbers.
+    my $diff = _item_bytes_deep($ctx->{get_item}->('sandbox_diff'));
+    my @decisions = _sandbox_decisions($ctx, $diff);
+    return {} unless @decisions;
+
+    my $load_err = _load_sandbox_shared($root);
+    return { failed => "sandbox_outcome: $load_err" } if defined $load_err;
+
+    my $preset_rel  = 'plugins/sandbox/container/settings.json';
+    my $preset_path = "$repo/$preset_rel";
+    my $prefs_path  = "$root/.backup-preferences.json";
+    my (@to_preset, @reverted, @kept, @prefs_saved, @refused, @failed_msgs, @wrote);
+    my (%preset_units, %revert_by_project);
+
+    my %remember = (diverged => 'skip-always', only_left => 'left-only', only_right => 'right-only');
+    for my $d (@decisions) {
+        my $choice = $ctx->{answers}{ $d->{id} };
+        next unless defined $choice;
+        my $dd  = $d->{data};
+        my $rel = $dd->{relation};
+        if ($choice eq 'to_preset') {
+            push @{ $preset_units{ $dd->{key} } }, $dd;
+        }
+        elsif ($choice eq 'revert_sandbox') {
+            push @{ $revert_by_project{ $dd->{project_id} } }, $dd;
+        }
+        elsif ($choice eq 'keep_in_sandbox') {
+            push @kept, { project => $dd->{project_path}, key => $dd->{key} };
+        }
+        elsif ($choice eq 'keep_in_sandbox_remember') {
+            my $scope = "container_vs_sandbox:$dd->{project_id}";
+            my $sp = _run_capture($^X, "$root/plugins/steward/scripts/save-preference.pl",
+                '--prefs', $prefs_path, '--scope', $scope, '--key', $dd->{key},
+                '--category', $rel, '--action', $remember{$rel});
+            if ($sp->{spawned} && $sp->{exit} == 0) {
+                push @prefs_saved, { scope => $scope, project => $dd->{project_path}, key => $dd->{key},
+                                     category => $rel, action => $remember{$rel} };
+            }
+            else {
+                push @failed_msgs, "save-preference.pl for '$dd->{key}' ($dd->{project_path})";
+            }
+        }
+    }
+
+    # to_preset: one value per unit, or nothing for that unit. Units of
+    # different granularity overlap (one sandbox's whole env against
+    # another's env.B): writing both would let the second replace the first
+    # wholesale, so overlapping units sent by different sandboxes are refused
+    # together, like one unit sent with two values.
+    my $canon = JSON::PP->new->canonical->allow_nonref;
+    my (@writes, %refuse);
+    my @keys = sort keys %preset_units;
+    for my $key (@keys) {
+        my @from = @{ $preset_units{$key} };
+        my %distinct = map { (($_->{sandbox_found} ? 'v:' . $canon->encode($_->{sandbox_value}) : 'absent') => 1) } @from;
+        $refuse{$key} = 'different values' if keys(%distinct) > 1;
+    }
+    for my $i (0 .. $#keys) {
+        for my $j ($i + 1 .. $#keys) {
+            my ($pa, $pb) = ($preset_units{ $keys[$i] }[0]{path}, $preset_units{ $keys[$j] }[0]{path});
+            next unless $pa->[0] eq $pb->[0] && (@$pa == 1 || @$pb == 1);
+            $refuse{ $keys[$i] } //= "overlaps '$keys[$j]'";
+            $refuse{ $keys[$j] } //= "overlaps '$keys[$i]'";
+        }
+    }
+    for my $key (@keys) {
+        my @from = @{ $preset_units{$key} };
+        if (my $why = $refuse{$key}) {
+            push @refused, { key => $key, reason => $why, projects => [ map { $_->{project_path} } @from ] };
+            push @failed_msgs, "sandbox_outcome: '$key' was sent to the preset from "
+                             . scalar(@from) . " sandbox(es) with $why; nothing was written for it";
+            next;
+        }
+        push @writes, $from[0];
+    }
+    if (@writes) {
+        my ($data, $read_err) = _read_or_init_json_file($preset_path);
+        if (defined $read_err) {
+            push @failed_msgs, "sandbox_outcome: $read_err";
+        }
+        else {
+            for my $w (@writes) {
+                my $from = {};
+                my $path = _widen_utf8($w->{path});
+                SettingsUnits::set_at_path($from, $path, _widen_utf8($w->{sandbox_value})) if $w->{sandbox_found};
+                SettingsUnits::take_at_path($data, $path, $from);
+            }
+            my $ok = eval { _write_json_file($preset_path, $data); 1 };
+            if ($ok) {
+                push @wrote, $preset_rel;
+                push @to_preset, map { { key => $_->{key}, from => $_->{project_path},
+                                         removed => $_->{sandbox_found} ? 0 : 1 } } @writes;
+            }
+            else {
+                push @failed_msgs, "sandbox_outcome: cannot write $preset_path: $@";
+            }
+        }
+    }
+
+    # revert_sandbox: per project, one backup, one write.
+    for my $pid (sort keys %revert_by_project) {
+        my @units = @{ $revert_by_project{$pid} };
+        my $project = _item_bytes($units[0]{project_path});
+        my $home = SandboxRegistry::claude_home_for($project);
+        my $r = SandboxSettings::apply_units(
+            target       => "$home/settings.json",
+            launcher_dir => "$home/.launcher",
+            backup_dir => SandboxSettings::backup_dir_maker("$home/.launcher", time),
+            units      => [ map { { name => _widen_utf8($_->{key}), path => _widen_utf8($_->{path}),
+                                    found => $_->{preset_found}, value => _widen_utf8($_->{preset_value}) } } @units ],
+        );
+        if (defined $r->{error}) {
+            push @failed_msgs, "sandbox_outcome: revert in $project: $r->{error}";
+            next;
+        }
+        push @reverted, { project => $project, keys => [ map { $_->{key} } @units ], backup => $r->{backup} };
+    }
+
+    # All of it is plain bytes already (the checkpoint was un-flagged above),
+    # so _sanitize_utf8 leaves valid UTF-8 untouched.
+    my $out = _sanitize_utf8({ to_preset => \@to_preset, reverted => \@reverted, kept => \@kept,
+                               preferences_saved => \@prefs_saved, refused => \@refused, wrote => \@wrote });
+    $ctx->{checkpoint}->('sandbox_outcome', $out);
+    $ctx->{note}->('sandbox_settings_to_preset', $out->{to_preset}) if @to_preset;
+    $ctx->{note}->('sandbox_settings_reverted', $out->{reverted}) if @reverted;
+    $ctx->{note}->('sandbox_preferences_saved', $out->{preferences_saved}) if @prefs_saved;
+    my $ret = {};
+    $ret->{failed} = join('; ', @failed_msgs) if @failed_msgs;
+    return $ret;
+}
+
+# _item_bytes over a whole checkpointed structure: every string back to plain
+# bytes, every key too; a genuine JSON number stays a number (downgrading one
+# would stringify it, and the preset would get "1" for 1) and a boolean stays
+# a boolean.
+sub _item_bytes_deep {
+    my ($v) = @_;
+    my $r = ref($v);
+    return { map { _item_bytes($_) => _item_bytes_deep($v->{$_}) } keys %$v } if $r eq 'HASH';
+    return [ map { _item_bytes_deep($_) } @$v ] if $r eq 'ARRAY';
+    return $v if $r || !defined $v || _json_number($v);
+    return _item_bytes($v);
+}
+
+# The sandbox modules, from the live install (the tree every wrapped script
+# runs from): SandboxIdentity (which launcher's sandboxes are ours),
+# SandboxRegistry (where they are), SandboxSettings (reading, and reverting a
+# unit with a backup) -- which loads SettingsUnits from the steward scripts.
+# Returns undef on success, else why not.
+sub _load_sandbox_shared {
+    my ($root) = @_;
+    my $dir = "$root/plugins/sandbox/scripts";
+    local @INC = ($dir, @INC);
+    for my $m (qw(SandboxIdentity SandboxRegistry SandboxSettings)) {
+        next if $INC{"$m.pm"};
+        return "$dir/$m.pm is missing" unless -f "$dir/$m.pm";
+        my $ok = eval { require "$m.pm"; 1 };
+        return "cannot load $dir/$m.pm: " . ($@ || 'unknown error') unless $ok;
+    }
+    return undef;
+}
+
+# ===========================================================================
 # U7 -- sensitive_scan (Step 4). BARRIER B2/B3: gates every git operation;
 # always returned alone. <attempt> is derived from the contiguous run of
 # 'rescan' answers (spec S2.5), so a still-dirty rescan mints a fresh id.
@@ -988,7 +1612,7 @@ sub _parse_sensitive_findings {
 }
 
 sub _do_sensitive_scan {
-    my ($ctx, $root) = @_;
+    my ($ctx, $root, $repo) = @_;
 
     my $attempt = _sensitive_attempt($ctx);
     my $id      = "export.sensitive_finding.$attempt";
@@ -997,13 +1621,24 @@ sub _do_sensitive_scan {
         return { failed => 'sensitive scan: aborted by operator (findings not resolved)' };
     }
 
-    my $r = _run_capture($^X, "$root/plugins/steward/scripts/sensitive-check.pl", $root);
+    # Exactly the files the export commit can contain -- the ones this run
+    # wrote into the dev clone (the commit takes those of them git sees as
+    # changed, and nothing else). The developer's untracked work in progress
+    # is not the backup's to commit, so it is not the backup's to scan:
+    # /steward:upstream-sync scans what a push actually sends.
+    my @files = grep { -f "$repo/$_" } _written_paths($ctx);
+    unless (@files) {
+        $ctx->{checkpoint}->('sensitive_scan', { attempt => $attempt, clean => 1, files => [] });
+        $ctx->{note}->('sensitive_scan', { attempt => $attempt, clean => 1, files => [] });
+        return {};
+    }
+    my $r = _run_capture($^X, "$root/plugins/steward/scripts/sensitive-check.pl", $repo, map { ('--file', $_) } @files);
     unless ($r->{spawned}) {
         return { failed => 'sensitive-check.pl failed to spawn' };
     }
     if ($r->{exit} == 0) {
-        $ctx->{checkpoint}->('sensitive_scan', { attempt => $attempt, clean => 1 });
-        $ctx->{note}->('sensitive_scan', { attempt => $attempt, clean => 1 });
+        $ctx->{checkpoint}->('sensitive_scan', { attempt => $attempt, clean => 1, files => [ @files ] });
+        $ctx->{note}->('sensitive_scan', { attempt => $attempt, clean => 1, files => [ @files ] });
         return {};
     }
     if ($r->{exit} == 1) {
@@ -1012,7 +1647,7 @@ sub _do_sensitive_scan {
             kind    => 'sensitive_finding',
             id      => $id,
             title   => "the sensitive-data scan found $data->{count} match(es) in $data->{file_count} file(s)",
-            subject => $root,
+            subject => $repo,
             detail  => $detail,
             data    => $data,
             choices => [
@@ -1026,393 +1661,227 @@ sub _do_sensitive_scan {
 }
 
 # ===========================================================================
-# U8 -- commit_review (Step 5, part 1). Ruling P4: refuse while MERGE_HEAD
-# exists. Read-only: computes the pending change set and unpushed-commit
-# count without staging anything. Recomputed fresh whenever this unit is
-# not yet checkpointed -- which, after an R6/R1 clear, is what makes the
-# post-crash "ask git" behaviour (S2.6) work without any special-casing.
+# U8 -- commit, in the DEV CLONE. Ruling P4: refuse while MERGE_HEAD exists.
+# Commits the files this run WROTE that git sees as changed -- nothing else:
+# never `git add -A`, never the developer's other edits or untracked files,
+# and (through the commit's pathspec) never anything they had staged. No
+# question: the scan above was the gate, and this commit is local -- it
+# reaches GitHub only through /steward:upstream-sync, which shows every
+# outgoing commit before it pushes. Checkpoints 'committed'.
+#
+# Crash safety asks git, not this module's state: after an R6 clear the units
+# re-run, the merge writes the same content again, nothing is pending, and
+# the commit an interrupted run already made is found by U9 instead.
 # ===========================================================================
-sub _do_commit_review {
-    my ($ctx, $root) = @_;
 
-    # MAJOR (redteam/reviewer): `-f "$root/.git/MERGE_HEAD"` is a pure
-    # filesystem probe that silently never fires when $root/.git is not a
-    # directory -- exactly the case for a linked worktree or a submodule,
-    # where .git is a FILE containing "gitdir: <path elsewhere>". Ruling
-    # P4 then never fires and a merge-in-progress (conflict markers and
-    # all) is committed and pushed into the only backup. Resolve the REAL
-    # git-dir first (a plain one-line file read -- no git spawn needed,
-    # and none would help: a redirect file written with a POSIX-style
-    # target, as any /c/... style root produces, is NOT something git.exe
-    # itself can resolve via `-C`, so a `git rev-parse` here would fail
-    # with "not a git repository" for reasons unrelated to MERGE_HEAD).
-    my $git_dir = _resolve_git_dir($root);
+use constant EXPORT_SUBJECT_RE => qr/^backup: sync ccpraxis config \(\d+ file\(s\)\)\z/;
+
+# Repo-relative paths written into the dev clone by this run: the
+# preflight's W2 (marketplace_outcome.wrote) and this phase's own units.
+sub _written_paths {
+    my ($ctx) = @_;
+    my %w;
+    my @sources = ( $ctx->{get_phase_item}->('preflight', 'marketplace_outcome'),
+                    map { $ctx->{get_item}->($_) } qw(file_outcome settings_merge container_outcome sandbox_outcome) );
+    for my $it (@sources) {
+        next unless ref($it) eq 'HASH' && ref($it->{wrote}) eq 'ARRAY';
+        for my $p (@{ $it->{wrote} }) {
+            next unless defined $p && !ref($p) && length $p;
+            my $b = _item_bytes($p);
+            $b =~ s{\\}{/}g;
+            # Only ever a path inside the dev clone.
+            next if $b =~ m{^/} || $b =~ m{^[A-Za-z]:} || $b =~ m{(?:^|/)\.\.(?:/|\z)};
+            $w{$b} = 1;
+        }
+    }
+    return sort keys %w;
+}
+
+sub _do_commit {
+    my ($ctx, $repo) = @_;
+
+    # MAJOR (redteam/reviewer): `-f "$repo/.git/MERGE_HEAD"` silently never
+    # fires when .git is a FILE (a linked worktree -- a dev clone can be
+    # one). Resolve the REAL git-dir first, so a merge in progress, conflict
+    # markers and all, is never committed (ruling P4).
+    my $git_dir = _resolve_git_dir($repo);
     if (defined $git_dir && -f "$git_dir/MERGE_HEAD") {
-        return { failed => 'a merge is in progress (MERGE_HEAD present) -- resolve it before committing' };
+        return { failed => 'a merge is in progress in the dev clone (MERGE_HEAD present) -- resolve it before the export can be committed' };
     }
 
     # MAJOR (redteam/reviewer): `--is-inside-work-tree` succeeds from a
-    # SUBDIRECTORY of a repo too (git walks up to find one) -- it does not
-    # prove $root IS the top level. A ccpraxis install that is a plain
-    # directory (a copy, not a clone) sitting inside an ancestor repo
-    # (e.g. ~/.claude itself a repo) would silently target that ancestor:
-    # `git add -A` (no pathspec) sweeps the WHOLE ancestor worktree, and
-    # sensitive-check.pl only ever scanned $root, so anything outside it
-    # (~/.claude/.credentials*.json) reaches the remote unscanned. Compare
-    # against --show-toplevel instead.
-    my $top = _git_capture($root, 'rev-parse', '--show-toplevel');
+    # SUBDIRECTORY too. The staged paths are relative to the dev clone, so
+    # it must BE the top level: compare canonical paths (HARDEN
+    # item4a-followup -- a textual compare rejects a mere respelling).
+    my $top = _git_capture($repo, 'rev-parse', '--show-toplevel');
     unless ($top->{spawned} && $top->{exit} == 0) {
-        return { failed => 'not a git repository' };
+        return { failed => 'the dev clone is not a git repository' };
     }
     (my $t = $top->{out} // '') =~ s/\s+\z//;
-    # HARDEN item4a-followup: this used to compare $t and $root as plain
-    # STRINGS. A directory has many spellings that all name the exact same
-    # entry (an 8.3 short name, a doubled separator embedded mid-path, `\`
-    # vs `/`, a symlink hop) -- git always answers --show-toplevel in its
-    # own canonical spelling, which need not match whatever spelling $root
-    # happens to carry, so a textual compare rejects real matches for a
-    # reason that has nothing to do with the thing this check exists to
-    # catch (a $root that is a genuine SUBDIRECTORY of the real top level).
-    # Resolve both sides to their real, canonical path first and compare
-    # THAT -- Cwd::abs_path (realpath) collapses exactly this class of
-    # spelling difference while still distinguishing a true ancestor/
-    # descendant pair, which is what item4a (above) still needs refused.
-    my $root_real = abs_path(_native_path($root));
+    my $repo_real = abs_path(_native_path($repo));
     my $top_real  = abs_path(_native_path($t));
-    # abs_path returns undef when it cannot resolve a path at all (a
-    # missing component, a permission error, a broken link) rather than
-    # for a mere spelling difference. $root is already known to exist --
-    # run_phase's own `-d $root` check ran before this unit could be
-    # reached -- so a resolution failure here is a genuinely exceptional
-    # filesystem condition, not the common case this fix targets. Refuse
-    # (the safe direction: this check exists to stop unscanned content
-    # outside $root reaching the remote via an unqualified `git add -A`),
-    # but keep the message narrow and name both raw paths so the operator
-    # can act on it rather than guess.
-    unless (defined $root_real && defined $top_real) {
-        return { failed => "cannot resolve '$root' or the reported top level '$t' to a canonical path -- refusing to assume they name the same directory" };
+    unless (defined $repo_real && defined $top_real) {
+        return { failed => "cannot resolve '$repo' or the reported top level '$t' to a canonical path -- refusing to assume they name the same directory" };
     }
-    unless (_native_path($root_real) eq _native_path($top_real)) {
-        return { failed => "$root is not the top level of its git repository (that is " . _clamp($t, 300) . ")" };
+    unless (_native_path($repo_real) eq _native_path($top_real)) {
+        return { failed => "$repo is not the top level of its git repository (that is " . _clamp($t, 300) . ")" };
     }
 
-    # core.quotePath=false: git's default quotes any path containing
-    # non-ASCII bytes as a C-style-escaped string ("caf\303\251.txt")
-    # rather than the real filename -- harmless while this list was only
-    # ever DISPLAYED, but MAJOR-5's fix below stages exactly these paths
-    # via `git add --`, where the quoted form is not a real pathspec and
-    # `git add` fails outright on any non-ASCII filename.
-    my $status = _git_capture($root, '-c', 'core.quotePath=false', 'status', '--porcelain', '--untracked-files=all');
-    unless ($status->{spawned} && $status->{exit} == 0) {
-        return { failed => 'git status failed: ' . _clamp($status->{err} // '') };
+    # The preflight checked main; a checkout since then would put the
+    # export commit on some other branch.
+    my $branch = _git_current_branch($repo);
+    unless (defined $branch && $branch eq 'main') {
+        return { failed => 'the dev clone is ' . (defined $branch ? "on branch '" . _title_key($branch) . "'" : 'on a detached HEAD')
+                         . ', not main: the exported files were written but nothing is committed' };
     }
 
-    my (@added, @modified, @deleted, @untracked, @files);
-    for my $line (split /\r?\n/, ($status->{out} // '')) {
-        next unless length $line;
-        next unless $line =~ /^(..)\s(.*)$/;
-        my ($code, $path) = ($1, $2);
-        push @files, "$code $path";
-        if    ($code eq '??') { push @untracked, $path; }
-        elsif ($code =~ /D/)  { push @deleted, $path; }
-        elsif ($code =~ /A/)  { push @added, $path; }
-        else                   { push @modified, $path; }
-    }
-
-    my $branch = _git_current_branch($root);
-    my $remote_list = _git_capture($root, 'remote');
-    my $has_origin = 0;
-    if ($remote_list->{spawned} && $remote_list->{exit} == 0) {
-        $has_origin = 1 if grep { $_ eq 'origin' } split(/\r?\n/, $remote_list->{out} // '');
-    }
-
-    my $unpushed;
-    if ($has_origin && defined($branch) && $branch eq 'main') {
-        my $rl = _git_capture($root, 'rev-list', '--count', 'origin/main..HEAD');
-        if ($rl->{spawned} && $rl->{exit} == 0) {
-            (my $n = $rl->{out} // '0') =~ s/\s+//g;
-            $unpushed = $n + 0 if $n =~ /^\d+$/;
+    # core.quotePath=false: these exact paths are staged via `git add --`,
+    # where git's C-quoted form of a non-ASCII name is not a pathspec.
+    my @written = _written_paths($ctx);
+    my (@added, @modified, @deleted, @untracked, @files, @paths);
+    if (@written) {
+        my $status = _git_capture($repo, '-c', 'core.quotePath=false', 'status', '--porcelain',
+                                  '--untracked-files=all', '--', @written);
+        unless ($status->{spawned} && $status->{exit} == 0) {
+            return { failed => 'git status failed in the dev clone: ' . _clamp($status->{err} // '') };
+        }
+        for my $line (split /\r?\n/, ($status->{out} // '')) {
+            next unless length $line;
+            next unless $line =~ /^(..)\s(.*)$/;
+            my ($code, $path) = ($1, $2);
+            push @files, "$code $path";
+            push @paths, $path;
+            if    ($code eq '??') { push @untracked, $path; }
+            elsif ($code =~ /D/)  { push @deleted, $path; }
+            elsif ($code =~ /A/)  { push @added, $path; }
+            else                   { push @modified, $path; }
         }
     }
 
-    my $data = {
-        has_origin => $has_origin, branch => $branch,
-        added => scalar(@added), modified => scalar(@modified),
-        deleted => scalar(@deleted), untracked => scalar(@untracked),
-        files => \@files, unpushed_commits => $unpushed,
-    };
-    $ctx->{checkpoint}->('commit_review', $data);
+    my %counts = (added => scalar(@added), modified => scalar(@modified),
+                  deleted => scalar(@deleted), untracked => scalar(@untracked));
+    unless (@paths) {
+        $ctx->{checkpoint}->('committed', { committed => 0, written => [ @written ], %counts, files => [] });
+        $ctx->{note}->('nothing_to_commit', { repo => $repo, written => [ @written ] });
+        return {};
+    }
+
+    my $n = scalar(@paths);
+    my $subject = "backup: sync ccpraxis config ($n file(s))";
+    my $add = _git_capture($repo, 'add', '--', @paths);
+    unless ($add->{spawned} && $add->{exit} == 0) {
+        return { failed => 'git add failed: ' . _clamp($add->{err} // '') };
+    }
+    my $commit = _git_capture($repo, 'commit', '-m', $subject, '-m', "run: $ctx->{run_id}", '--', @paths);
+    unless ($commit->{spawned} && $commit->{exit} == 0) {
+        return { failed => 'git commit failed: ' . _clamp($commit->{err} // '') };
+    }
+    my $new_head = _git_head($repo);
+    $ctx->{checkpoint}->('committed', { committed => 1, sha => $new_head, subject => $subject,
+                                        files => [ sort @files ], written => [ @written ], %counts });
+    $ctx->{note}->('commit', { sha => $new_head, subject => $subject, files => [ sort @files ] });
     return {};
 }
 
 # ===========================================================================
-# U9 -- push_confirmation + stage/commit/push (Step 5, part 2). Decision 4:
-# the push never happens without an explicitly answered push_confirmation.
-# Nothing is staged before consent (U8 only reads). Checkpoints staged /
-# committed / pushed the instant each git call returns, so a mid-push kill
-# leaves an accurate record for the NEXT invocation's git-truth check.
+# U9 -- promote_after_commit: run the dev clone's promote.pl so the live
+# install fast-forwards to include the export commit, and ~/.claude stays
+# what the payload says. No question: it promotes ONLY when every commit the
+# live install lacks is a backup export commit. Anything else on main -- a
+# promotion the operator skipped this run, a commit made during a pause --
+# is never promoted silently; it is reported. Checkpoints
+# 'promote_after_commit': { needed, ran, exit, output, commits, reason, fix }.
 # ===========================================================================
-sub _do_push_confirmation_and_push {
-    my ($ctx, $root, $failed_units_ref, $load_failures_ref) = @_;
+sub _do_promote_after_commit {
+    my ($ctx, $root, $home_n, $repo) = @_;
 
-    my $review = $ctx->{get_item}->('commit_review');
-    return { failed => 'commit_review data missing' } unless ref($review) eq 'HASH';
+    my $load_err = _load_shared($root);
+    return { failed => "promote_after_commit: $load_err" } if defined $load_err;
 
-    my $n_changes = ($review->{added} // 0) + ($review->{modified} // 0)
-                   + ($review->{deleted} // 0) + ($review->{untracked} // 0);
-    my $unpushed        = $review->{unpushed_commits};
-    my $nothing_pending  = ($n_changes == 0);
+    my $rel = DevClone::relation(live_root => $root, dev_clone => $repo, git => _git_runner());
+    my %d = (needed => 0, ran => 0, exit => undef, output => undef, commits => [], reason => undef, fix => undef,
+             live_head => $rel->{live_head}, clone_main => $rel->{clone_main}, keep_keys => [], refusals => []);
+    my $done = sub {
+        my ($ret) = @_;
+        my $data = _sanitize_utf8(\%d);
+        $ctx->{checkpoint}->('promote_after_commit', $data);
+        return $ret // {};
+    };
 
-    # MAJOR (redteam MAJOR-3): "already in sync" and "no remote configured"
-    # are DIFFERENT facts and must not collapse into one note/reason. "In
-    # sync" asserts there IS a remote and it is confirmed caught up; with
-    # no origin at all there is nothing to be in sync WITH, and reporting
-    # it anyway tells the operator they are backed up when there has never
-    # been an off-machine copy.
-    if ($nothing_pending && !$review->{has_origin}) {
-        $ctx->{checkpoint}->('staged', { staged => 0 });
-        $ctx->{checkpoint}->('committed', { committed => 0 });
-        $ctx->{checkpoint}->('pushed', { pushed => 0, reason => 'no remote configured' });
-        $ctx->{note}->('no_remote_configured', { root => $root });
-        return {};
+    if (defined $rel->{error}) {
+        $d{reason} = $rel->{error};
+        return $done->({ failed => "promote_after_commit: $rel->{error}" });
     }
-    # An unresolvable ahead-count (fresh remote, never fetched) must ask
-    # rather than assume synced (spec S5 edge case) -- only a CONFIRMED
-    # unpushed == 0 short-circuits here.
-    if ($nothing_pending && defined($unpushed) && $unpushed == 0) {
-        $ctx->{checkpoint}->('staged', { staged => 0 });
-        $ctx->{checkpoint}->('committed', { committed => 0 });
-        $ctx->{checkpoint}->('pushed', { pushed => 0, reason => 'already in sync' });
-        $ctx->{note}->('already_in_sync', { root => $root });
-        return {};
+    return $done->() if $rel->{state} eq 'same';
+    if ($rel->{state} eq 'live_has_own') {
+        $d{reason} = 'the live install has commits the dev clone does not';
+        $d{fix}    = $rel->{fix};
+        $ctx->{note}->('promote_not_run', { reason => $d{reason}, fix => $d{fix} });
+        return $done->();
     }
 
-    my $id     = 'export.push_confirmation';
-    my $answer = $ctx->{answers}{$id};
-
-    # MAJOR (redteam MAJOR-4 / reviewer M1): $offer_push is false for THREE
-    # distinct reasons (no origin at all, detached HEAD, non-main branch)
-    # that a single hard-coded "no remote is configured" label collapsed
-    # into one -- factually false in the second and third cases, telling
-    # the operator to do something (configure a remote) that is already
-    # done. Compute and surface the REAL reason.
-    my $push_reason;
-    if    (!$review->{has_origin})            { $push_reason = 'no remote is configured'; }
-    elsif (!defined($review->{branch}))        { $push_reason = 'HEAD is detached (not on any branch)'; }
-    elsif ($review->{branch} ne 'main')        { $push_reason = "the current branch is '" . _title_key($review->{branch}) . "', not main"; }
-    my $offer_push = !defined($push_reason);
-
-    # MAJOR (redteam MAJOR-7): the decision never named WHERE the push
-    # goes -- $root/subject/title are all the SOURCE. The operator
-    # consents to publish their whole config tree without being shown the
-    # destination. `remote` is on AC37's allowed-verb list.
-    my $remote_url;
-    if ($review->{has_origin}) {
-        my $ru = _git_capture($root, 'remote', 'get-url', 'origin');
-        if ($ru->{spawned} && $ru->{exit} == 0) {
-            ($remote_url = $ru->{out} // '') =~ s/\s+\z//;
-            # Displayed paths throughout this module stay in the SAME
-            # POSIX-style form $root is kept in (never the native
-            # drive-letter form git hands back for a local-path remote) --
-            # inverse of _native_path, a no-op for a genuine URL scheme.
-            $remote_url =~ s{\\}{/}g;
-            $remote_url =~ s{^([A-Za-z]):/}{'/' . lc($1) . '/'}e;
-            $remote_url = _redact_credentials($remote_url);
-        }
+    my @commits = map { substr($_->{sha}, 0, 7) . ' ' . $_->{subject} } @{ $rel->{commits} };
+    $d{commits} = \@commits;
+    $d{needed}  = 1;
+    my @foreign = grep { ($_->{subject} // '') !~ EXPORT_SUBJECT_RE } @{ $rel->{commits} };
+    if (@foreign) {
+        $d{reason} = "the dev clone's main has " . scalar(@foreign) . ' commit(s) the live install lacks that are not '
+                   . 'backup exports; they are promoted only when the operator says so (promote_pending, or promote.pl)';
+        $d{fix}    = 'perl ' . DevClone::git_path($repo) . '/scripts/promote.pl';
+        $ctx->{note}->('promote_not_run', { reason => $d{reason}, fix => $d{fix}, commits => \@commits });
+        return $done->();
     }
 
-    unless (defined $answer) {
-        my @choices = $offer_push
-            ? ( { id => 'push',   label => 'Push it (commit and push to origin main)' },
-                { id => 'abort',  label => 'Abort (nothing staged, nothing committed, nothing pushed)' } )
-            : ( { id => 'commit_only', label => "Commit only ($push_reason -- push not offered)" },
-                { id => 'abort',       label => 'Abort (nothing staged, nothing committed)' } );
+    # The settings units the operator answered "skip" this run: the promotion
+    # must leave them exactly as ~/.claude has them (promote.pl --keep-key).
+    # The remembered answers reach promote.pl through .backup-preferences.json.
+    my $outcome = $ctx->{get_phase_item}->('preflight', 'settings_outcome');
+    my $answers = (ref($outcome) eq 'HASH' && ref($outcome->{answers}) eq 'HASH') ? $outcome->{answers} : {};
+    my @keep = map { _item_bytes($_) } sort grep { ($answers->{$_} // '') eq 'skip' } keys %$answers;
+    $d{keep_keys} = \@keep;
 
-        my @lines;
-        push @lines, sprintf('modified: %d, deleted: %d, added: %d, untracked: %d',
-            $review->{modified} // 0, $review->{deleted} // 0, $review->{added} // 0, $review->{untracked} // 0);
-        push @lines, 'remote: ' . $remote_url if defined $remote_url;
-        my @files = sort @{ $review->{files} // [] };
-        my $shown = 0;
-        for my $f (@files) {
-            last if $shown >= 200;
-            push @lines, $f;
-            $shown++;
-        }
-        push @lines, '... and ' . (scalar(@files) - 200) . ' more' if scalar(@files) > 200;
-        push @lines, 'unpushed commits: ' . (defined $unpushed ? $unpushed : 'unknown');
-
-        my $settings_merge = $ctx->{get_item}->('settings_merge');
-        my $skip_unmatched = (ref($settings_merge) eq 'HASH' && ref($settings_merge->{skip_keys_unmatched}) eq 'ARRAY')
-            ? $settings_merge->{skip_keys_unmatched} : [];
-        if (@$skip_unmatched) {
-            push @lines, 'WARNING: ' . scalar(@$skip_unmatched) . ' skip-key(s) matched nothing: '
-                       . join(', ', @$skip_unmatched);
-        }
-        # MAJOR (redteam MAJOR-2): the durable unit_failures record (P13),
-        # NOT the per-invocation @failed_units lexical -- a unit that
-        # failed and checkpointed anyway (U3/U6, "never retried") on an
-        # EARLIER invocation must still show here on a LATER one, or
-        # consent is given blind to a merge that never happened.
-        my $durable_failures = $load_failures_ref->();
-        my (%seen_unit, @failed_names);
-        for my $pair (@$failed_units_ref) {
-            my $u = $pair->[0];
-            next unless exists $durable_failures->{$u};
-            next if $seen_unit{$u}++;
-            push @failed_names, $u;
-        }
-        for my $u (sort keys %$durable_failures) {
-            next if $seen_unit{$u}++;
-            push @failed_names, $u;
-        }
-        if (@failed_names) {
-            push @lines, 'WARNING: ' . scalar(@failed_names) . ' earlier step(s) failed: ' . join(', ', @failed_names);
-        }
-        if (!$offer_push) {
-            $ctx->{note}->('push_not_offered', { reason => $push_reason, branch => $review->{branch}, has_origin => $review->{has_origin} });
-        }
-
-        my $dec = $ctx->{decision}->(
-            kind    => 'push_confirmation',
-            id      => $id,
-            # MINOR (redteam): Run.pm's validate_decision rejects a title
-            # over 200 chars and $ctx->{decision} DIES on rejection -- a
-            # long $root (a redirected/roaming HOME, a deep test scratch
-            # root) would abort the whole run on a purely environmental
-            # condition. Clamp the title; $root stays intact in subject/data.
-            title   => 'commit and push ' . $n_changes . ' change(s) to ' . _title_key($root) . '?',
-            subject => $root,
-            detail  => join("\n", @lines),
-            data    => { modified => $review->{modified}, deleted => $review->{deleted},
-                         added => $review->{added}, untracked => $review->{untracked},
-                         files => \@files, unpushed_commits => $unpushed,
-                         remote_url => $remote_url },
-            choices => \@choices,
-        );
-        return { pause => $dec };
+    my $r = _run_capture(DevClone::promote_argv(dev_clone => $repo, live_root => $root, home => $home_n, keep_keys => \@keep));
+    $d{ran}    = 1;
+    $d{exit}   = $r->{spawned} ? $r->{exit} : -1;
+    $d{output} = _clamp(join('', $r->{out} // '', (length($r->{err} // '') ? $r->{err} : '')), 8000);
+    my $po = DevClone::promote_outcome(exit => $d{exit}, output => $d{output},
+                                       live_head_after => _git_head($root), target => $rel->{clone_main});
+    $d{refusals} = $po->{refusals};
+    unless ($po->{ok}) {
+        $d{reason} = $po->{reason};
+        return $done->({ failed => "promote_after_commit: $d{reason}; its output is in the report" });
     }
-
-    if ($answer eq 'abort') {
-        $ctx->{checkpoint}->('pushed', { pushed => 0, reason => 'aborted by operator' });
-        $ctx->{note}->('push_aborted', { root => $root });
-        return {};
-    }
-
-    unless ($nothing_pending) {
-        # MAJOR (redteam MAJOR-5): commit_review snapshots the pending set
-        # ONCE, checkpointed; an unbounded human pause sits between that
-        # and this `git add`, and merge_manually (P12) actively invites an
-        # edit in that very window. `git add -A` would sweep the LIVE
-        # worktree -- anything that appeared during the pause (never
-        # reviewed, never scanned for secrets) alongside it. Stage exactly
-        # the reviewed set instead.
-        my @paths;
-        for my $f (@{ $review->{files} // [] }) {
-            (my $p = $f) =~ s/^..\s//;
-            next unless length $p;
-            # $review came back through $ctx->{get_item} -- Run.pm's own
-            # read (NO ->utf8, per _widen_utf8's doc comment above) sets
-            # the utf8 flag on every decoded string WITHOUT transcoding,
-            # so a non-ASCII path survives the checkpoint round-trip
-            # flagged-but-unwidened. Passed straight to `git add --` as
-            # argv, that mis-flagging silently mangles the bytes (proven:
-            # AC24's non-ASCII fixture) and `git add` fails outright with
-            # "pathspec did not match any files". Re-widen exactly like
-            # the container-settings write path already does.
-            push @paths, _widen_utf8($p);
-        }
-        my $add = @paths ? _git_capture($root, 'add', '--', @paths)
-                          : _git_capture($root, 'add', '-A');
-        unless ($add->{spawned} && $add->{exit} == 0) {
-            return { failed => 'git add failed: ' . _clamp($add->{err} // '') };
-        }
-        $ctx->{checkpoint}->('staged', { staged => 1, files => $n_changes });
-        $ctx->{note}->('staged_files', { count => $n_changes });
-
-        my $subject = "backup: sync ccpraxis config ($n_changes file(s))";
-        my $commit = _git_capture($root, 'commit', '-m', $subject, '-m', "run: $ctx->{run_id}");
-        unless ($commit->{spawned} && $commit->{exit} == 0) {
-            return { failed => 'git commit failed: ' . _clamp($commit->{err} // '') };
-        }
-        my $new_head = _git_head($root);
-        $ctx->{checkpoint}->('committed', { sha => $new_head, subject => $subject });
-        $ctx->{note}->('commit', { sha => $new_head, subject => $subject });
-    }
-    else {
-        $ctx->{checkpoint}->('staged', { staged => 0 })       unless $ctx->{is_done}->('staged');
-        $ctx->{checkpoint}->('committed', { committed => 0 }) unless $ctx->{is_done}->('committed');
-    }
-
-    if ($answer eq 'commit_only') {
-        $ctx->{checkpoint}->('pushed', { pushed => 0, reason => ($push_reason // 'no remote configured') });
-        $ctx->{note}->('commit_only', { root => $root });
-        return {};
-    }
-
-    my $push = _git_capture($root, 'push', 'origin', 'main');
-    # MAJOR (redteam MAJOR-6): git prints the configured remote URL,
-    # userinfo included, in transport/auth failure text -- redact BEFORE
-    # this reaches the checkpoint, notes or a failure message, all three
-    # of which land in the on-disk state file / package 05's report.
-    my $push_err = _redact_credentials($push->{err} // '');
-    my ($verdict, $warnings) = _classify_push($push->{exit}, $push_err);
-    if ($verdict eq 'pushed') {
-        # BLOCKER (coordinator hardening, item 1 effect B): `git` here is
-        # whatever _git_bin() resolves to -- on this host that is
-        # frequently a wrapper spawned through a native shell (spec
-        # S2.11's BACKUP_GIT_BIN test seam is exactly this shape). Windows
-        # process exit codes carry no signal bit, and the POSIX-style
-        # wait-status this module (and Perl's own $?) computes for a
-        # foreign child only ever keeps the LOW byte of that code -- a
-        # push client killed by a signal one hop down can leave the exit
-        # code this module observes looking exactly like a clean 0. Do
-        # not trust "exit 0" alone for something this consequential:
-        # confirm independently, by asking the REMOTE itself (read-only,
-        # `ls-remote`, already local-only in every test scenario) that it
-        # actually advanced to the commit just made, before recording a
-        # durable pushed => 1.
-        my $new_head = _git_head($root);
-        if (defined $new_head && length $new_head) {
-            my $confirm = _git_capture($root, 'ls-remote', 'origin', 'refs/heads/main');
-            if ($confirm->{spawned} && $confirm->{exit} == 0) {
-                (my $remote_sha) = split /\s+/, ($confirm->{out} // '');
-                if (!defined($remote_sha) || $remote_sha ne $new_head) {
-                    return { failed => 'git push reported success (exit ' . $push->{exit}
-                        . ') but origin/main does not reflect the new commit -- the exit code'
-                        . ' cannot be trusted here (e.g. a signal-killed push client); treating'
-                        . ' this as a failed push rather than recording a false pushed:1' };
-                }
-            }
-        }
-        $ctx->{checkpoint}->('pushed', { pushed => 1, exit => $push->{exit}, warnings => $warnings });
-        $ctx->{note}->('push_warnings', $warnings) if @$warnings;
-        return {};
-    }
-    return { failed => "git push rejected (exit $push->{exit}): " . _clamp($push_err) };
+    # Exit 1 after the fast-forward (a refused payload file): the live
+    # install has the commit; the refusal lines go to the report.
+    $d{reason} = $po->{reason};
+    $ctx->{note}->('promote_refusals', { lines => $po->{refusals}, reason => $po->{reason} }) if defined $po->{reason};
+    $ctx->{note}->('promoted_after_commit', { commits => \@commits });
+    return $done->();
 }
 
-# Exit-code-only verdict (spec S2.6): exit 0 is ALWAYS 'pushed', regardless
-# of stderr content -- a protected-ref bypass warning with exit 0 is a
-# documented SUCCESS (.ccpraxis-local-data/guidance/push-straight-to-main.md),
-# never scanned for words like "rejected"/"protected".
-sub _classify_push {
-    my ($exit, $stderr) = @_;
-    my @warnings = grep { length $_ } split /\r?\n/, ($stderr // '');
-    return ($exit == 0) ? ('pushed', \@warnings) : ('rejected', \@warnings);
+# Shared modules, loaded from the live install (the tree every wrapped script
+# runs from). Returns undef on success, else why not.
+sub _load_shared {
+    my ($root) = @_;
+    my $dir = "$root/plugins/steward/scripts";
+    for my $m (qw(DevClone)) {
+        next if $INC{"$m.pm"};
+        return "$dir/$m.pm is missing" unless -f "$dir/$m.pm";
+        local @INC = ($dir, @INC);
+        my $ok = eval { require "$m.pm"; 1 };
+        return "cannot load $dir/$m.pm: " . ($@ || 'unknown error') unless $ok;
+    }
+    return undef;
 }
 
-# MAJOR (redteam MAJOR-6): one redaction applied everywhere `git push`
-# stderr is captured -- a credential-bearing transport/auth-failure URL
-# (`https://user:TOKEN@host/...`) must never survive verbatim into the
-# state file, notes or stdout. Mirrors the spec's own rule for decision
-# `detail` one section earlier (S5): only the shape survives, not the
-# secret.
-sub _redact_credentials {
-    my ($s) = @_;
-    return $s unless defined $s;
-    $s =~ s{(://)[^/@\s]+@}{$1<redacted>@}g;
-    return $s;
+# DevClone's git-runner contract, over this module's own spawner (so the
+# BACKUP_GIT_BIN test seam sees these calls too).
+sub _git_runner {
+    return sub {
+        my ($dir, @args) = @_;
+        my $r = _git_capture($dir, @args);
+        return ($r->{spawned} ? $r->{exit} : -1, $r->{out} // '', $r->{err} // '');
+    };
 }
 
 # ===========================================================================
@@ -1695,6 +2164,18 @@ sub _clamp {
     my $t = substr($s, 0, $max);
     $t =~ s/[\x80-\xBF]+\z//;
     return $t;
+}
+
+# _clip_utf8_bytes($s, $max) -> $s, or at most $max bytes of it ending in an
+# ellipsis, cut on a CHARACTER boundary (a decision title is limited in bytes,
+# and a cut through a multi-byte sequence would leave invalid UTF-8 for
+# backup.pl's stdout encoder).
+sub _clip_utf8_bytes {
+    my ($s, $max) = @_;
+    return $s unless defined $s && length($s) > $max;
+    my $head = substr($s, 0, $max - 3);
+    my $chars = Encode::decode('UTF-8', $head, Encode::FB_QUIET());   # stops before a cut sequence
+    return Encode::encode('UTF-8', $chars) . "\xE2\x80\xA6";
 }
 
 # Text clamp for a file_conflict decision's live_text/repo_text -- returns

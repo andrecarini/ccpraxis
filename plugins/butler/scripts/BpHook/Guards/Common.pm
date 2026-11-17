@@ -172,15 +172,24 @@ sub subagent_tool_use_id {
 # rather than any quote-stripped text (mirrors GuardBash's own "shellword"
 # escape, spec sec 3.1, reused here for spec sec 3.7's R1).
 # ---------------------------------------------------------------------------
+# CMD_PREFIX -- what may stand between a command-position anchor and a
+# command's name while the shell still runs that command: a path to it
+# (/bin/bash, ./bin/git, C:\Git\cmd\git), zsh's "=" (zsh replaces a word
+# "=git" with the path of git; the macOS Bash tool runs zsh), or a
+# backslash ("\git" bypasses an alias, nothing more). No capture group, so
+# callers' own group numbering is unchanged. The run excludes '=' so an
+# assignment ("FOO=/usr/bin/git stash" runs stash) is not read as git.
+my $CMD_PREFIX = q{(?:=|\\\\)?(?:[^\s;&|()<>='"\x60]*[/\\\\])?};
+
 # Redteam M2: a combined flag cluster ("-lc", "-ec") carries -c just as much
 # as a standalone "-c" token does -- the flag-cluster group below now
 # requires the LAST flag token to merely CONTAIN a "c", not equal "-c".
-my $SHELL_C_RE = qr/(^|[;&|\s])(ba|z|k|da)?sh[[:space:]]+(-[a-zA-Z]*[[:space:]]+)*-[a-zA-Z]*c[a-zA-Z]*\b/;
+my $SHELL_C_RE = qr/(^|[;&|\s])${CMD_PREFIX}(ba|z|k|da)?sh[[:space:]]+(-[a-zA-Z]*[[:space:]]+)*-[a-zA-Z]*c[a-zA-Z]*\b/;
 my $EVAL_RE    = qr/(^|[;&|\s])eval\b/;
 # Redteam M2 (heredoc half): "bash <<'EOF' ... EOF" feeds a heredoc body
 # straight into a shell, and Shell::strip_noise deliberately blanks every
 # heredoc line, so a caller must fall back to the RAW command here too.
-my $HEREDOC_SHELL_RE = qr/(^|[;&|\s])(ba|z|k|da)?sh\b[^\n]*<</;
+my $HEREDOC_SHELL_RE = qr/(^|[;&|\s])${CMD_PREFIX}(ba|z|k|da)?sh\b[^\n]*<</;
 
 sub is_shell_or_eval_invocation {
     my ($cmd) = @_;
@@ -203,6 +212,23 @@ sub is_shell_or_eval_invocation {
 sub git_opt_re {
     return '(?:(?:-C|-c|--git-dir|--work-tree|--namespace)[[:space:]]+[^\s]+[[:space:]]+|-[^\s]+[[:space:]]+)*';
 }
+
+# ---------------------------------------------------------------------------
+# cmd_prefix_re() -> pattern text (not compiled; no capture group) for what
+# may precede a command name in command position while the shell still runs
+# that command: a path to it, zsh's "=name" expansion, or "\name". See
+# $CMD_PREFIX above.
+#
+# git_word_re() -> pattern text for the command word "git" as a shell
+# resolves it: "git", "/usr/bin/git", "=git" (zsh: the path of git),
+# "\git", "git.exe", in any letter case (macOS and Windows resolve a command
+# name case-insensitively; elsewhere "GIT" is merely not found, so matching
+# it only ever over-denies). Used between the caller's own anchor and
+# git_opt_re() by GuardBash and GuardGitMutations, so "=git stash" and
+# "/usr/bin/git stash" are denied exactly like "git stash".
+# ---------------------------------------------------------------------------
+sub cmd_prefix_re { return $CMD_PREFIX }
+sub git_word_re   { return $CMD_PREFIX . '(?i:git)(?i:\.exe)?' }
 
 # ---------------------------------------------------------------------------
 # line_match($re, $text) -> true iff some "\n"-separated line of $text

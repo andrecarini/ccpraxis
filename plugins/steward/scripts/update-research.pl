@@ -363,7 +363,10 @@ sub platforms_named {
     $t = lc($t // '');
     my %p;
     $p{windows} = 1 if $t =~ /\bwindows\b|\bwin32\b|\bwin64\b|\bmsix\b|\bpowershell\b/;
-    $p{macos}   = 1 if $t =~ /\bmacos\b|\bmac os\b|\bdarwin\b|\bapple silicon\b|\bmonterey\b|\bsonoma\b/;
+    # Release names through Tahoe (macOS 26) plus the generic spellings: a
+    # report that only says "Sequoia" or "OS X" is still a Mac report, and the
+    # operator now runs a Mac too.
+    $p{macos}   = 1 if $t =~ /\bmacos\b|\bmac ?os ?x?\b|\bos ?x\b|\bdarwin\b|\bapple silicon\b|\bm[1-4] (?:pro|max|ultra|mac)\b|\bbig sur\b|\bmonterey\b|\bventura\b|\bsonoma\b|\bsequoia\b|\btahoe\b/;
     $p{linux}   = 1 if $t =~ /\blinux\b|\bglibc\b|\bubuntu\b|\barch\b|\bdebian\b|\bfedora\b|\bcachyos\b|\bwsl\b/;
     return [ sort keys %p ];
 }

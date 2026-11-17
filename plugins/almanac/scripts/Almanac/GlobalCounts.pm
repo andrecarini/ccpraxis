@@ -323,8 +323,9 @@ sub _recorded_roots {
 # _root_key($p) -> the dedup key for a project root. Almanac::Store::
 # _canonical_path keeps the case it was given (Cwd::abs_path does on this
 # host), so on a case-insensitive filesystem "C:/Dev/x" and "c:/dev/x"
-# counted one project twice (pkg02 redteam S4). Fold case there.
-our $FOLD_CASE = ($^O =~ /\A(?:MSWin32|cygwin|msys)\z/) ? 1 : 0;
+# counted one project twice (pkg02 redteam S4). Fold case there. macOS is
+# one too: default APFS ignores case and Cwd::abs_path keeps the caller's.
+our $FOLD_CASE = ($^O =~ /\A(?:MSWin32|cygwin|msys|darwin)\z/) ? 1 : 0;
 sub _root_key {
     my ($p) = @_;
     my $c = Almanac::Store::_canonical_path($p);

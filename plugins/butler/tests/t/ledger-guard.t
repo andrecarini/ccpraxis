@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # b12-ledger-write-integrity oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b12-ledger-write-integrity-spec.md
 # §2 (contracts), §3 (behaviours B1..B26), §4 (AC-1..AC-39) and §5 (edge cases E1..E12).
@@ -60,7 +60,12 @@ my $HOOK      = "$HOOKS/ledger-guard.sh";
 my $HOOKSJSON = "$HOOKS/hooks.json";
 
 my $J    = JSON::PP->new->canonical;
-my $ROOT = tempdir(CLEANUP => 1);
+# macOS's per-user temp root (/var/folders/../T, /private/var/... once
+# realpath'd) is long enough that a ledger path under it overflows the
+# guard's 90-char path echo, and AC-4/AC-5 read that path back out of the
+# message. /tmp keeps it short there, as the temp root already is on Windows
+# and Linux.
+my $ROOT = tempdir(CLEANUP => 1, ($^O eq 'darwin' && -d '/tmp' ? (DIR => '/tmp') : ()));
 my $pn   = 0;
 my $bpn  = 0;
 
@@ -71,11 +76,19 @@ sub fwd { (my $p = shift) =~ s{\\}{/}g; $p }
 # A hook test must control the hook's environment COMPLETELY (wait-shape-guard.t:54-58).
 my %CLEAN_ENV = map { ($_ => $ENV{$_}) } grep { !/^BP_/ } keys %ENV;
 
+# `realpath -m` is GNU coreutils; BSD realpath (macOS) has no -m and prints
+# its usage instead, which left every fixture path empty there. Every path
+# this file normalises already exists, so Cwd::realpath gives the same
+# answer whenever the GNU form is unavailable.
 sub realpath_m {
     my ($p) = @_;
     local %ENV = (%CLEAN_ENV, P => $p);
-    open(my $f, '-|', 'bash', '-c', 'realpath -m "$P"') or die "bash: $!";
-    my $o = do { local $/; <$f> }; close $f; $o =~ s/\s+\z//; return $o;
+    open(my $f, '-|', 'bash', '-c', 'realpath -m "$P" 2>/dev/null') or die "bash: $!";
+    my $o = do { local $/; <$f> }; close $f; $o = '' unless defined $o; $o =~ s/\s+\z//;
+    return $o if length $o;
+    require Cwd;
+    my $r = Cwd::realpath($p);
+    return defined $r ? fwd($r) : $p;
 }
 
 diag("subject under test: $HOOK "
@@ -1000,8 +1013,19 @@ SKIP: {
     # =================================================================================
     # AC-31 [M9] fail-CLOSED with jq missing from PATH. M9's text is verbatim the old shared bash guard library --
     # emitted by bp_hook_require_jq, never reimplemented.
+    #
+    # AC-31 and AC-32 are RETIRED (macOS port, 2026-10-29), and skipped on every host. Both pin
+    # the bash implementation's plumbing, which the hook-core remake replaced: ledger-guard.sh
+    # now execs run-hook.sh and WriteGuards.pm, which never call jq (guards-remake-bash.t lists
+    # "jq-availability plumbing" as LIB, not re-expressed), and run-hook.sh exits 0 when perl
+    # cannot be started -- deliberately, every hook path fails open there, pinned by
+    # hook-core-spawn-budget.t S5f ("PATH with only the bash shim (no perl) -> exit 0"). The two
+    # cases could only run where jq is installed, so the Windows host never saw them fail; on
+    # macOS they did, against the newer oracle's own contract.
     # =================================================================================
-    {
+    SKIP: {
+        skip 'AC-31 pins the retired bash plumbing: the remake never calls jq '
+           . '(guards-remake-bash.t, jq-availability plumbing | LIB)', 2;
         my ($bp, $proj) = mk_bp();
         my %env = env_for($bp, $proj);
         $env{PATH} = path_without('jq');
@@ -1011,9 +1035,11 @@ SKIP: {
     }
 
     # =================================================================================
-    # AC-32 [M10] fail-CLOSED with perl missing from PATH.
+    # AC-32 [M10] fail-CLOSED with perl missing from PATH. RETIRED with AC-31, see above.
     # =================================================================================
-    {
+    SKIP: {
+        skip 'AC-32 pins the retired bash plumbing: run-hook.sh fails open without perl by design '
+           . '(hook-core-spawn-budget.t S5f)', 3;
         my ($bp, $proj) = mk_bp();
         my %env = env_for($bp, $proj);
         $env{PATH} = path_without('perl');

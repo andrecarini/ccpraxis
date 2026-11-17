@@ -143,7 +143,8 @@ my $V = '/c/H/.claude/claude-code-vault/almanac/note/n1.md';
 # =============================================================================
 # AC1 (DC1, 2.1) -- hooks.json gains exactly one new PreToolUse entry, matcher
 # "Bash", one hook object, type command, timeout 15, exact command string.
-# AC2 (DC1, 2.1) -- the Edit|Write|MultiEdit|NotebookEdit entry is untouched.
+# AC2 (DC1, 2.1) -- exactly one Edit|Write|MultiEdit|NotebookEdit entry, run
+# through the same bash wrapper (and timeout) as the Bash entry.
 # =============================================================================
 my $G = q{unset BASH_ENV ; f="${CLAUDE_PLUGIN_ROOT}/hooks/guard-almanac-write.sh" ; [ -f "$f" ] || exit 0 ; exec env -u SHELLOPTS bash "$f"};
 
@@ -181,16 +182,63 @@ my $G = q{unset BASH_ENV ; f="${CLAUDE_PLUGIN_ROOT}/hooks/guard-almanac-write.sh
         fail('AC1: hook command equals the spec string exactly');
     }
 
+    # AC2 originally pinned the Edit entry's bare form ("<root>/hooks/guard-
+    # almanac-write.sh", exec'd by path). That form depends on the file's exec
+    # bit and shebang, inherits BASH_ENV/SHELLOPTS, and carried no timeout; it
+    # now runs through the same bash wrapper as the Bash entry, with the same
+    # 15s timeout.
     is(scalar(@edit_entries), 1, 'AC2: exactly one entry has matcher Edit|Write|MultiEdit|NotebookEdit');
     if (@edit_entries) {
         my $hooks = $edit_entries[0]{hooks} || [];
         is(scalar(@$hooks), 1, 'AC2: still exactly one hook object');
-        is($hooks->[0]{command}, '${CLAUDE_PLUGIN_ROOT}/hooks/guard-almanac-write.sh',
-           'AC2: its command is unchanged (bare form)');
+        is($hooks->[0]{timeout}, 15, 'AC2: the Edit entry has a 15s timeout');
+        is($hooks->[0]{command}, $G,
+           'AC2: its command is the bash wrapper form the Bash entry uses');
     } else {
         fail('AC2: still exactly one hook object');
-        fail('AC2: its command is unchanged (bare form)');
+        fail('AC2: the Edit entry has a 15s timeout');
+        fail('AC2: its command is the bash wrapper form the Bash entry uses');
     }
+}
+
+# =============================================================================
+# AC2b -- the Edit entry's registration string, run the way Claude Code runs
+# a hook on macOS and Linux (/bin/sh -c, where sh may be bash 3.2 or dash),
+# denies an Edit on a bug report. The bare form exited 126 wherever the
+# script had lost its exec bit, and its stdin read was bash >= 4.1 only.
+# =============================================================================
+{
+    my $edit_cmd;
+    my $cfg = eval { JSON::PP->new->decode(slurp_raw($HOOKS_JSON) // '') };
+    if (ref $cfg eq 'HASH') {
+        for my $blk (@{ $cfg->{hooks}{PreToolUse} || [] }) {
+            next unless ($blk->{matcher} // '') eq 'Edit|Write|MultiEdit|NotebookEdit';
+            $edit_cmd = $blk->{hooks}[0]{command};
+        }
+    }
+    ok(defined $edit_cmd, 'AC2b: the Edit entry has a command to run');
+    my (undef, $script) = tempfile('alm-ac2b-XXXXXX', SUFFIX => '.sh', TMPDIR => 1);
+    open(my $sfh, '>', $script) or die "cannot write $script: $!";
+    print {$sfh} ($edit_cmd // 'exit 99') . "\n";
+    close $sfh;
+    my (undef, $in) = tempfile('alm-ac2b-in-XXXXXX', TMPDIR => 1);
+    open(my $ifh, '>:raw', $in) or die "cannot write $in: $!";
+    print {$ifh} $J->encode({ hook_event_name => 'PreToolUse', tool_name => 'Edit', tool_input => { file_path => $R } });
+    close $ifh;
+    my $errp = "$in.err";
+
+    local %ENV = %ENV;
+    delete $ENV{$_} for grep { /^BP_/ } keys %ENV;
+    $ENV{CLAUDE_PLUGIN_ROOT} = $ALM;
+    $ENV{HOME}               = $FRESH_HOME;
+    $ENV{USERPROFILE}        = $FRESH_HOME;
+    $ENV{ALMANAC_HOME}       = $FRESH_HOME;
+
+    my $rc = system(qq{sh "$script" < "$in" > /dev/null 2> "$errp"});
+    my $err = slurp_raw($errp) // '';
+    unlink $script, $in, $errp;
+    is($rc >> 8, 2, 'AC2b: the Edit registration string, run by sh, denies an Edit on a bug report') or diag($err);
+    like($err, qr/^BLOCKED: Edit on a bug report/, 'AC2b: ...with the bug-report denial') or diag($err);
 }
 
 # =============================================================================
@@ -465,6 +513,16 @@ my $G = q{unset BASH_ENV ; f="${CLAUDE_PLUGIN_ROOT}/hooks/guard-almanac-write.sh
         close $dst;
     }
     chmod 0755, $copy;
+    # An installed almanac plugin carries its own payload reader,
+    # scripts/read-payload.sh (the hook sources it; butler has an identical
+    # copy of its own, so this fixture's "butler absent" still holds).
+    File::Path::make_path("$noButlerRoot/almanac/scripts");
+    {
+        my $bytes = slurp_raw("$ALM/scripts/read-payload.sh");
+        open(my $dst, '>:raw', "$noButlerRoot/almanac/scripts/read-payload.sh") or die "cannot write read-payload.sh: $!";
+        print {$dst} $bytes;
+        close $dst;
+    }
     ok(!-d "$noButlerRoot/butler", 'AC16 fixture: no ../../butler sibling exists next to the copy');
 
     assert_allow_bash("sed -i s/a/b/ $R", 'AC16: butler absent -- sed -i on R allows', guard => $copy);
@@ -778,6 +836,36 @@ my $G = q{unset BASH_ENV ; f="${CLAUDE_PLUGIN_ROOT}/hooks/guard-almanac-write.sh
     # allow.
     assert_allow_bash(q{cd "C:\P\plugins\almanac" && touch x},
         'MF2d: cd "C:\\P\\plugins\\almanac" && touch x (backslash path unrelated to the store -- must allow)');
+}
+
+# =============================================================================
+# Z-ALM -- zsh spellings (the macOS Bash tool runs zsh). Read as bash,
+# "echo x >! R" writes a file named "!" and leaves R an argument, and
+# "=rm R" is a command not found; zsh writes / deletes R. Measured before
+# the fix: every case below was ALLOWED and zsh did the write. The parsing
+# itself is pinned in plugins/butler/tests/t/zsh-command-spellings.t.
+# =============================================================================
+{
+    for my $op ('>!', '>>!', '&>!', '&>>', '&>|', '>&!', '>&|', '>>&', '>>|', '&>>!', '>>&!', '2>!') {
+        assert_deny_bash("echo x $op $R", "Z-ALM: echo x $op R");
+    }
+    assert_deny_bash("print -r -- x >>! $R", 'Z-ALM: print -r -- x >>! R');
+    assert_deny_bash("echo x>!$R", 'Z-ALM: a glued x>!R');
+    assert_deny_bash("echo x >! $T", 'Z-ALM: echo x >! T (a store record)');
+    assert_deny_bash("=rm $R", 'Z-ALM: =rm R');
+    assert_deny_bash("=tee $T < /dev/null", 'Z-ALM: =tee T');
+    assert_deny_bash("=sed -i s/a/b/ $R", 'Z-ALM: =sed -i on R');
+    assert_deny_bash("noglob rm $R", 'Z-ALM: noglob rm R (a zsh precommand modifier)');
+    assert_deny_bash("nocorrect rm $R", 'Z-ALM: nocorrect rm R');
+    assert_deny_bash("- rm $R", 'Z-ALM: "- rm R" (zsh runs rm with a dash argv[0])');
+    assert_deny_bash("noglob cd /c/P/.ccpraxis-local-data/bug-reports && rm a.md",
+        'Z-ALM: noglob cd <store> && rm a.md (the cd behind the modifier still counts)');
+    assert_deny_bash(q{=python3 -c "import os; os.remove('/c/P/.ccpraxis-local-data/bug-reports/a.md')"},
+        'Z-ALM: =python3 -c one-liner (rule I reads the =word as python3)');
+
+    assert_allow_bash(qq{echo '>! $R'}, 'Z-ALM: a single-quoted ">! R" is text, not a redirect');
+    assert_allow_bash('echo x >! /tmp/elsewhere.md', 'Z-ALM: >! onto an unrelated path allows');
+    assert_allow_bash("=cat $R", 'Z-ALM: =cat R only reads');
 }
 
 # ---- Decision 43's accepted residual risk is deliberately NOT tested here:

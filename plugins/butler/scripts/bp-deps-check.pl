@@ -193,13 +193,20 @@ sub eol_status {
 }
 
 # is_declared(\@items,$runtime) -> bool. NAME-based, never category-based.
+# is_declared(\@items, $runtime) -> bool. An item name may bundle several
+# tools with '+': the sanctioned Node recipe is named "node+pnpm" and klink's
+# item "nvm+node22". Each part is normalized on its own, so either name
+# declares node; matched as a whole string, neither did, and a project that
+# had declared Node drew an undeclared_runtime BLOCK.
 sub is_declared {
     my ($items, $runtime) = @_;
     return 0 unless ref $items eq 'ARRAY' && defined $runtime;
     for my $it (@$items) {
-        next unless ref $it eq 'HASH' && defined $it->{name};
-        my $norm = normalize_runtime($it->{name});
-        return 1 if defined $norm && $norm eq $runtime;
+        next unless ref $it eq 'HASH' && defined $it->{name} && !ref $it->{name};
+        for my $part (split /\+/, $it->{name}) {
+            my $norm = normalize_runtime($part);
+            return 1 if defined $norm && $norm eq $runtime;
+        }
     }
     return 0;
 }

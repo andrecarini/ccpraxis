@@ -145,48 +145,39 @@ ENV COLORTERM=truecolor
 # autonomy" model breaks. See anthropics/claude-code#9184.
 ENV IS_SANDBOX=1
 
-# Supply chain hardening — env vars take effect whenever runtimes are installed
+# Supply chain hardening. Environment variables, not installs: they cost
+# nothing while no Node is present and take effect the moment a project's
+# backpack installs one. The pnpm half is further down.
 ENV npm_config_ignore_scripts=true
 ENV NODE_OPTIONS="--dns-result-order=ipv4first"
 
-# Node + pnpm toolchain (b38-node-pnpm-toolchain).
+# NO NODE IN THE IMAGE (operator decision, 2026-10-30). From 2026-08-03 this
+# step installed an exactly pinned Node 24 tarball and pnpm
+# (b38-node-pnpm-toolchain). Nothing in ccpraxis needs Node inside the
+# container -- Claude Code comes from its native installer above -- so Node was
+# the one project runtime every sandbox got whether it used it or not, at a
+# version no project chose, and it shadowed a project's own Node: klink links
+# its nvm-installed Node 22 into /root/.local/bin, behind /opt/node24/bin on
+# PATH, so its backpack verify (`node -v | grep ^v22`) could not pass outside
+# an nvm-initialised shell. A project now declares Node in its backpack like any
+# other runtime:
+#   /backpack:add --recipe node-pnpm      (plugins/backpack/recipes/node-pnpm.json)
+# What b38 measured and hardened stays, because it protects whichever Node a
+# project installs later: the npm and pnpm environment variables in this file.
 #
-# Versions are EXACT pins, measured 2026-08-03 against the repo's >=7-day
-# supply-chain rule -- do NOT "helpfully" bump to latest/lts without
-# re-running that measurement:
-#   Node v24.18.1 was 6 days old on 2026-08-03 (too new); v24.18.0 (2026-06-23,
-#   41 days old) is the newest ELIGIBLE Active-LTS release. Node 20 is EOL;
-#   Node 24 "Krypton" is Active LTS.
-#   pnpm 11.19.0 (3d) and 11.18.0/dist-tag latest (5d) were both too new;
-#   11.17.0 (2026-07-23, 11 days old) is the newest ELIGIBLE release.
-# Installed by tarball (not apt/nodesource) so the version is pinned exactly.
-# --connect-timeout/--max-time/--retry* added fix-batch step 7 (finding F4);
-# see the identical note above the Claude Code installer RUN step. --max-time
-# is larger here (the node tarball is a much bigger download).
-RUN curl -sSL --connect-timeout 10 --max-time 180 --retry 2 --retry-delay 3 --retry-all-errors https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz -o /tmp/node.tar.xz \
-    && tar -xf /tmp/node.tar.xz -C /tmp \
-    && mv /tmp/node-v24.18.0-linux-x64 /opt/node24 \
-    && ln -sf /opt/node24/bin/node /usr/local/bin/node \
-    && ln -sf /opt/node24/bin/npm /usr/local/bin/npm \
-    && rm -f /tmp/node.tar.xz \
-    && npm install -g pnpm@11.17.0
-
-# /opt/node24/bin MUST be on PATH. npm derives its global prefix from the REAL
-# path of the node binary -- dirname(dirname(realpath(process.execPath))) --
-# which resolves through the /usr/local/bin/node symlink to /opt/node24, NOT to
-# /usr/local. So `npm install -g <tool>` drops its bin into /opt/node24/bin,
-# which nothing else puts on PATH: the two `ln -sf` lines above cover exactly
-# node and npm and nothing else.
-#
-# Measured: the build died at the very next step with `/bin/sh: 1: pnpm: not
-# found` immediately after npm reported "added 1 package". The install had
-# succeeded; only the lookup failed.
-#
-# Fixing the CLASS (PATH) rather than the INSTANCE (one more symlink for pnpm)
-# is deliberate: every `npm install -g` an agent or a backpack item runs inside
-# the container hits the same wall, and would "succeed" and then be unreachable
-# -- a silent failure far harder to diagnose than this loud one.
-ENV PATH="/opt/node24/bin:${PATH}"
+# /opt/tools/node/bin IS ON PATH for that recipe. npm derives its global prefix
+# from the REAL path of the node binary, so `npm install -g <tool>` (pnpm
+# included) puts the tool's bin into <prefix>/bin, which nothing else puts on
+# PATH; b38's build died on exactly that with "pnpm: not found". The recipe
+# installs Node under the fixed prefix /opt/tools/node, inside the backpack's
+# install root, and this entry makes node, npm, npx, corepack and every global
+# tool reachable by name from every process the container starts, hooks and the
+# Bash tool included. The backpack's /etc/profile.d fragment only reaches shells
+# that read /etc/profile. With no Node installed the directory does not exist,
+# and a PATH entry that does not resolve costs nothing. It sits where
+# /opt/node24/bin did, ahead of /root/.local/bin and the system directories, so
+# Debian's own nodejs package (18, end of life) can never shadow it.
+ENV PATH="/opt/tools/node/bin:${PATH}"
 
 # ccpraxis plugin shims, so the verbs a hook tells the agent to run are
 # reachable BY NAME inside a sandbox and not only on the host.
@@ -218,6 +209,12 @@ ENV PNPM_CONFIG_MINIMUM_RELEASE_AGE=10080
 # whole age control if left unset. Must be pinned explicitly.
 ENV PNPM_CONFIG_MINIMUM_RELEASE_AGE_IGNORE_MISSING_TIME=false
 ENV PNPM_CONFIG_MINIMUM_RELEASE_AGE_STRICT=true
+# NOT COVERED: minimumReleaseAgeExclude. No variable here sets it, so a
+# project's pnpm-workspace.yaml can still exempt named packages from the age
+# floor (b38 measured env > pnpm-workspace.yaml for the keys above, but never
+# measured how pnpm reads a list-valued key from the environment, so pinning it
+# empty here would be a guess). Closing it needs that measurement in a sandbox
+# with pnpm installed.
 
 # Git defaults
 RUN git config --global core.autocrlf input \
@@ -254,20 +251,48 @@ WORKDIR /project
 # for a real worker: any process that opens /dev/null for redirection, or reads
 # /dev/urandom for entropy, will misbehave against an empty regular file.
 #
-# Baking the nodes here is the only place mknod is available (image build runs
-# privileged), so a jail built on a container from THIS image gets real devices
-# and bp-jail.pl's fallback never fires.
+# Baking the nodes here is the only place mknod CAN be available, so a jail
+# built on a container from THIS image gets real devices and bp-jail.pl's
+# fallback never fires.
+#
+# ...EXCEPT ON A ROOTLESS BUILD, where it is not available either. Measured on
+# a rootless podman machine (macOS, podman 6.1): `mknod c 1 3` inside `podman
+# build` fails with "Operation not permitted", because a user namespace may not
+# create device nodes, whatever capabilities it holds. A ROOTFUL podman build
+# needs the capability granted too: podman leaves CAP_MKNOD out of a build
+# step's defaults, so every build passes --cap-add MKNOD
+# (HostPlatform::build_extra_args; measured 2026-10-30 on a rootful podman
+# 6.1.4 machine, which baked the nodes only with it). This step used to read
+# `mknod ... && chmod && cp ... || true && cp ... || true && printf ...`, and
+# shell precedence made the first `|| true` swallow the mknod failure along
+# with everything chained before it: the build went green with no device
+# nodes, no 1777 /tmp and no nsswitch/hosts copies, and nothing said so.
+#
+# Now each part stands on its own. The /tmp, passwd and group skeleton is
+# built unconditionally and any failure there fails the build. The device
+# nodes are attempted as a group; if the builder cannot make them, the build
+# says so on its log and leaves a marker file naming why, rather than failing
+# every rootless host outright -- bp-jail.pl then uses its documented
+# empty-file fallback. The two cp's are optional by design and only they are
+# allowed to fail quietly, each in its own group.
 RUN mkdir -p /opt/bp-jail-skel/dev /opt/bp-jail-skel/etc/ssl /opt/bp-jail-skel/tmp \
-    && mknod -m 666 /opt/bp-jail-skel/dev/null    c 1 3 \
-    && mknod -m 666 /opt/bp-jail-skel/dev/zero    c 1 5 \
-    && mknod -m 444 /opt/bp-jail-skel/dev/random  c 1 8 \
-    && mknod -m 444 /opt/bp-jail-skel/dev/urandom c 1 9 \
     && chmod 1777 /opt/bp-jail-skel/tmp \
-    && cp -a /etc/nsswitch.conf /etc/hosts /opt/bp-jail-skel/etc/ 2>/dev/null || true \
-    && cp -a /etc/ssl/certs /opt/bp-jail-skel/etc/ssl/ 2>/dev/null || true \
     && printf 'root:x:0:0:root:/root:/bin/sh\nbpworker:x:4242:4242:bp jail worker:/work:/bin/sh\n' \
        > /opt/bp-jail-skel/etc/passwd \
-    && printf 'root:x:0:\nbpworker:x:4242:\n' > /opt/bp-jail-skel/etc/group
+    && printf 'root:x:0:\nbpworker:x:4242:\n' > /opt/bp-jail-skel/etc/group \
+    && { cp -a /etc/nsswitch.conf /etc/hosts /opt/bp-jail-skel/etc/ 2>/dev/null || true; } \
+    && { cp -a /etc/ssl/certs /opt/bp-jail-skel/etc/ssl/ 2>/dev/null || true; } \
+    && if mknod -m 666 /opt/bp-jail-skel/dev/null    c 1 3 \
+       && mknod -m 666 /opt/bp-jail-skel/dev/zero    c 1 5 \
+       && mknod -m 444 /opt/bp-jail-skel/dev/random  c 1 8 \
+       && mknod -m 444 /opt/bp-jail-skel/dev/urandom c 1 9; then \
+           echo 'bp-jail-skel: device nodes baked'; \
+       else \
+           rm -f /opt/bp-jail-skel/dev/null /opt/bp-jail-skel/dev/zero /opt/bp-jail-skel/dev/random /opt/bp-jail-skel/dev/urandom; \
+           echo 'mknod is not permitted in this image build (a rootless build cannot create device nodes, and a podman build without --cap-add MKNOD lacks the capability); bp-jail.pl falls back to empty-file /dev stand-ins' \
+             > /opt/bp-jail-skel/dev/.no-device-nodes; \
+           echo 'WARNING: bp-jail-skel: mknod denied (rootless machine, or a build without --cap-add MKNOD) -- jailed workers get bp-jail.pl empty-file /dev stand-ins; see /opt/bp-jail-skel/dev/.no-device-nodes' >&2; \
+       fi
 # resolv.conf is deliberately NOT baked: it is generated per-container by the
 # runtime, so a build-time copy would pin a stale nameserver. bp-jail.pl copies
 # the live /etc/resolv.conf into each jail at create time (DNS is criterion C6).

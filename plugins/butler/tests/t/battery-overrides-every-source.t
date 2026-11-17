@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 #
 # ORACLE for package 09-battery-for-every-source (blueprint
 # wake-and-pause-consolidation), AC1-AC14 of

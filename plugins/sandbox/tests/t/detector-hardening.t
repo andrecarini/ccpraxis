@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Tests for q02 — the anchor-set / marker-count / branch-(A)
 # hardening of CcpraxisWorkCopy (spec:
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/q02-spec.md).

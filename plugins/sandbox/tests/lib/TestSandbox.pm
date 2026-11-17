@@ -17,6 +17,12 @@ package TestSandbox;
 
 use strict;
 use warnings;
+
+# Never the operator's login Keychain from a test (BpCreds.pm). A direct
+# `perl x.t` keeps the real HOME, which is exactly when BpCreds would read it.
+# A test that exercises the Keychain path opts in locally with
+# BP_CREDS_KEYCHAIN=1 and a stub named by BP_CREDS_SECURITY_BIN.
+BEGIN { $ENV{BP_CREDS_KEYCHAIN} = '0' }
 use FindBin qw($Bin);
 use lib "$Bin/../../scripts";
 use MountSpec qw(winify_path convert_v_to_mount);
@@ -56,20 +62,81 @@ our @EXPORT_OK = qw(
     orphan_container_names
     container_runtime_reachable
     container_unreachable_reason
+    scratch_unshared_reason
 );
 
+# HostPlatform.pm and PodmanMachine.pm, resolved from THIS file's own location
+# for the same reason HostCaps is above: $Bin belongs to whichever test loaded us.
+use lib dirname(abs_path(__FILE__)) . "/../../scripts";
+require HostPlatform;
+require PodmanMachine;
+
 our $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/;
-# Detect docker OR podman — both supported. Same detection as
-# launcher.pl / bootstrap.pl: probe `<cli> --version`, prefer docker.
+# Detect docker OR podman — both supported. The SAME detection launcher.pl
+# and bootstrap.pl use (HostPlatform::detect_container_cli): the
+# CCPRAXIS_CONTAINER_CLI override, then the platform's own preference order.
+#
+# NO CLI IS NOT A LOAD-TIME DEATH ANY MORE. This used to `die` here, which
+# killed every caller at `use TestSandbox` with exit 255 -- including callers
+# that only wanted catalog helpers (new_temp_dir) and callers whose own
+# reachability skip (import(), below) would have said exactly why. Now $PODMAN
+# is undef, the catalog helpers keep working, and a caller that imports a
+# symbol that needs a runtime gets a clean skip_all naming the cause.
+my $CLI_ERROR;
 sub _detect_container_cli {
-    for my $candidate ($WINDOWS_FAMILY ? ('docker.exe', 'podman.exe') : ('docker', 'podman')) {
-        my $rc = system("$candidate --version > /dev/null 2>&1");
-        return $candidate if $rc == 0;
-    }
-    return undef;
+    my ($cli, $err) = HostPlatform::detect_container_cli();
+    $CLI_ERROR = $err;
+    return $cli;
 }
-our $PODMAN = _detect_container_cli() // die "TestSandbox: no container CLI on PATH (docker / podman)\n";
+our $PODMAN = _detect_container_cli();
 our $PROBE_IMAGE = 'docker.io/library/debian:bookworm-slim';
+
+# A SANDBOXED HOME HIDES THE PODMAN MACHINE (macOS).
+#
+# scripts/run-tests.pl gives every test file its own throwaway HOME. On macOS
+# podman is a remote client: it finds its machine and connection under
+# ~/.config/containers, so with HOME moved it fell back to a local socket that
+# does not exist ("dial unix /tmp/ccpraxis-sweep-*/storage-run-501/podman/
+# podman.sock") and every container test skipped as "runtime unreachable"
+# while the machine was up. Point it at the machine's API socket instead
+# (CONTAINER_HOST, which podman reads before any config file): the socket path
+# comes from `podman machine inspect` run against the OS-recorded home, read
+# once, here. podman derives that socket's directory from TMPDIR, which the
+# runner moves too, so the inspect also gets macOS's own per-user temp dir
+# (`getconf DARWIN_USER_TEMP_DIR`, independent of the environment). Only when
+# HOME is not the OS-recorded home, only on darwin with podman, and never over
+# an explicit CONTAINER_HOST the caller already set.
+#
+# _machine_inspect_raw() -> `podman machine inspect` stdout, run as the
+# OS-recorded account (its HOME and per-user temp dir) whenever HOME is
+# redirected; memoized. The share check below reads the same document.
+my ($INSPECT_RAW, $INSPECT_DONE);
+sub _machine_inspect_raw {
+    return $INSPECT_RAW if $INSPECT_DONE;
+    $INSPECT_DONE = 1;
+    return undef unless defined $PODMAN && $^O eq 'darwin' && $PODMAN =~ /podman/i;
+    my $owner = HostPlatform::owner_home();
+    if (defined $owner && (($ENV{HOME} // '') ne $owner)) {
+        chomp(my $utmp = `getconf DARWIN_USER_TEMP_DIR 2>/dev/null` // '');
+        $INSPECT_RAW = do {
+            local $ENV{HOME} = $owner;
+            local $ENV{TMPDIR} = $utmp if length $utmp;
+            `$PODMAN machine inspect 2>/dev/null`;
+        };
+    } else {
+        $INSPECT_RAW = `$PODMAN machine inspect 2>/dev/null`;
+    }
+    return $INSPECT_RAW;
+}
+if (defined $PODMAN && $^O eq 'darwin' && $PODMAN =~ /podman/i
+    && !(defined $ENV{CONTAINER_HOST} && length $ENV{CONTAINER_HOST})) {
+    my $owner = HostPlatform::owner_home();
+    if (defined $owner && (($ENV{HOME} // '') ne $owner)) {
+        my $info = HostPlatform::parse_machine_inspect(_machine_inspect_raw());
+        my $sock = $info ? $info->{api_socket} : undef;
+        $ENV{CONTAINER_HOST} = "unix://$sock" if defined $sock && -S $sock;
+    }
+}
 
 # Disable MSYS argv conversion process-wide. Same reasoning as launcher.pl:
 # without this, podman -v HOST:CONTAINER args get split on `:`, each side
@@ -109,6 +176,13 @@ sub probe_image { $PROBE_IMAGE }
 my ($REACHABLE, $REACHABLE_REASON);
 sub container_runtime_reachable {
     return $REACHABLE if defined $REACHABLE;
+    unless (defined $PODMAN) {
+        $REACHABLE = 0;
+        $REACHABLE_REASON = defined $CLI_ERROR
+            ? "no usable container CLI: $CLI_ERROR"
+            : 'no container CLI on PATH (looked for ' . join(', ', HostPlatform::cli_candidates()) . ')';
+        return $REACHABLE;
+    }
     my $quoted_podman = _arg_quote($PODMAN);
     my $cmd = "$quoted_podman info " . _arg_quote('--format') . ' ' . _arg_quote('{{.Host.Arch}}') . ' 2>&1';
     my $out;
@@ -161,6 +235,18 @@ sub container_unreachable_reason {
 # did before this probe existed.
 my %NEEDS_REACHABLE_RUNTIME = (podman_run_capture => 1, create_probe_container => 1);
 
+# Symbols whose callers bind new_temp_dir() fixtures into containers. On macOS
+# that needs the podman machine to share the scratch folder read-write
+# (podman-machine.pl's test-scratch share); without it they skip, naming the
+# remedy, rather than fail on a bare statfs error.
+my %NEEDS_SCRATCH_SHARE = (create_probe_container => 1);
+
+# Symbols that are meaningless without SOME container CLI on PATH, reachable or
+# not: podman_bin hands the caller the CLI name to spawn, and the sweep/orphan
+# helpers drive it. With no CLI at all, importing one of these is a clean
+# skip_all rather than the load-time die this module used to perform.
+my %NEEDS_CLI = (%NEEDS_REACHABLE_RUNTIME, podman_bin => 1, sweep_orphan_containers => 1);
+
 # Custom import (Decision 120(a), package 36): still exports symbols exactly
 # as Exporter's default import would, THEN -- only when the CLI exists (the
 # pre-existing die above already covers "no CLI at all", unchanged) but
@@ -175,10 +261,21 @@ sub import {
     my $class = shift;
     my @syms = @_;
     $class->export_to_level(1, $class, @syms);
+    if (!defined $PODMAN && grep { exists $NEEDS_CLI{$_} } @syms) {
+        container_runtime_reachable();
+        require Test::More;
+        Test::More::plan(skip_all => container_unreachable_reason());
+    }
     if (grep { exists $NEEDS_REACHABLE_RUNTIME{$_} } @syms) {
         unless (container_runtime_reachable()) {
             require Test::More;
             Test::More::plan(skip_all => container_unreachable_reason());
+        }
+    }
+    if (grep { exists $NEEDS_SCRATCH_SHARE{$_} } @syms) {
+        if (defined(my $why = scratch_unshared_reason())) {
+            require Test::More;
+            Test::More::plan(skip_all => $why);
         }
     }
 }
@@ -207,16 +304,26 @@ sub new_container_name { return _tag() . '-c' }
 # branch now -- on this Windows host scratch_root() is always defined, so
 # requiring HOME/USERPROFILE to be set when nothing downstream needs either
 # would be a new, avoidable failure mode with no compensating benefit.
-sub new_temp_dir {
+#
+# macOS, no override: the base is the podman machine's dedicated read-write
+# test-scratch share (PodmanMachine::test_scratch_dir), laid out under the
+# OS-recorded account home (getpwuid) -- NOT $HOME, which the runner moves to
+# /tmp/ccpraxis-sweep-*. The machine shares only that folder (and the
+# project directories in its list) read-write, so a fixture anywhere else
+# could not be bind-mounted; it also used to work only because the default
+# machine shared all of /private.
+sub _scratch_base {
     my $scratch = HostCaps::scratch_root();
-    my $base;
-    if (defined $scratch) {
-        $base = "$scratch/sandbox";
-    } else {
-        my $home = $ENV{HOME} // $ENV{USERPROFILE};
-        die "neither HOME nor USERPROFILE set" unless defined $home;
-        $base = "$home/.cache/sandbox-tests";
-    }
+    return ("$scratch/sandbox", 1) if defined $scratch;
+    my $mac = PodmanMachine::test_scratch_dir();
+    return ($mac, 0) if defined $mac;
+    my $home = $ENV{HOME} // $ENV{USERPROFILE};
+    die "neither HOME nor USERPROFILE set" unless defined $home;
+    return ("$home/.cache/sandbox-tests", 0);
+}
+
+sub new_temp_dir {
+    my ($base) = _scratch_base();
     require File::Path;
     File::Path::make_path($base) unless -d $base;
     # CLEANUP => 1, not 0: this used to opt out of File::Temp's own cleanup
@@ -232,15 +339,51 @@ sub new_temp_dir {
     # loss. Leaving it at 1 costs nothing (both mechanisms check -d before
     # acting) and covers a caller that forgets to invoke cleanup_all().
     my $d = tempdir(DIR => $base, CLEANUP => 1);
+    # macOS: the path is used exactly as spelled, symlinks NOT resolved. podman
+    # hands a bind source to the VM literally, and the machine shares the
+    # scratch folder under the literal account-home path podman-machine.pl
+    # recorded; resolving a symlinked home would step outside that share. (The
+    # old resolution existed for a fixture under the runner's /tmp HOME, which
+    # the machine reached only through its /private share; no fixture lives
+    # there any more.) An explicit CCPRAXIS_SCRATCH_ROOT is likewise used as
+    # given (HostCaps refuses to canonicalise it, by design).
     $d = winify_path($d);
     register_cleanup_dir($d);
     return $d;
+}
+
+# scratch_unshared_reason() -> undef, or why containers cannot bind
+# new_temp_dir() fixtures here: on macOS with podman, the machine's share list
+# (read through HostPlatform, the same reader the launcher's refusal uses) does
+# not serve the scratch base read-write. undef whenever that cannot be told
+# (not darwin, no podman, unreadable machine config): a probe that cannot
+# decide never blocks a test. Memoized.
+my ($SCRATCH_DONE, $SCRATCH_REASON);
+sub scratch_unshared_reason {
+    return $SCRATCH_REASON if $SCRATCH_DONE;
+    $SCRATCH_DONE = 1;
+    return undef unless defined $PODMAN && $^O eq 'darwin' && $PODMAN =~ /podman/i;
+    my $shares = eval { HostPlatform::machine_shares(inspect => sub { _machine_inspect_raw() }) };
+    return undef unless ref $shares eq 'ARRAY' && @$shares;
+    my ($base, $explicit) = eval { _scratch_base() };
+    return undef unless defined $base;
+    my @outside = HostPlatform::sources_outside_shares([$base], $shares);
+    my @ro = HostPlatform::rw_binds_under_ro_shares([{ source => $base, readonly => 0 }], $shares);
+    return undef unless @outside || @ro;
+    my $remedy = $explicit
+        ? 'share it with the machine, or unset CCPRAXIS_SCRATCH_ROOT to use the test-scratch share'
+        : 'run: perl ' . HostPlatform::machine_script_path() . ' test-scratch on --confirm';
+    $SCRATCH_REASON = "the podman machine does not share $base "
+        . (@outside ? 'at all' : 'read-write')
+        . ", so container tests cannot bind their fixtures; $remedy";
+    return $SCRATCH_REASON;
 }
 
 # Run a podman command. Returns ($exit_status >> 8, $combined_output).
 # Uses system() with a list arg so MSYS doesn't get a second crack at the
 # command string; captures stdout+stderr via a temp file redirect.
 sub podman_run_capture {
+    die "TestSandbox::podman_run_capture: no container CLI on PATH\n" unless defined $PODMAN;
     my @args = convert_v_to_mount(@_);
     require File::Temp;
     my ($fh, $tmp) = File::Temp::tempfile();
@@ -282,6 +425,9 @@ sub _arg_quote {
 sub create_probe_container {
     my %opts = @_;
     my $mounts = $opts{mounts} || [];
+    if (@$mounts && defined(my $why = scratch_unshared_reason())) {
+        die "create_probe_container: $why\n";
+    }
     my $name = new_container_name();
     my @cmd = ('run', '-d', '--name', $name);
     push @cmd, @$mounts;
@@ -296,6 +442,7 @@ sub register_cleanup_container { push @CLEANUP_CONTAINERS, $_[0] }
 sub register_cleanup_dir       { push @CLEANUP_DIRS,       $_[0] }
 
 sub cleanup_all {
+    @CLEANUP_CONTAINERS = () unless defined $PODMAN;
     for my $c (@CLEANUP_CONTAINERS) {
         system("$PODMAN rm -f " . _arg_quote($c) . " > /dev/null 2>&1");
     }
@@ -384,6 +531,7 @@ sub orphan_container_names {
 # or erroring must never fail a test run, so every failure path returns empty
 # rather than dying.
 sub sweep_orphan_containers {
+    return () unless defined $PODMAN;
     my ($rc, $out) = eval { podman_run_capture('ps', '-a', '--format', '{{.Names}}') };
     return () if $@ || !defined $rc || $rc != 0;
     my @names = grep { length } map { s/\s+\z//r } split /\n/, ($out // '');

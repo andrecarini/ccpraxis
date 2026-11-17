@@ -1,6 +1,6 @@
 #!/usr/bin/perl
-# claude-binary-backup.pl — snapshot, list, restore, prune, verify, detect
-# operations on the Claude Code binary.
+# claude-binary-backup.pl — snapshot, list, restore, prune, verify, detect and
+# install-command operations on the Claude Code binary.
 #
 # Purpose: give /update a deterministic safety net. Before any installer
 # runs, snapshot the current binary; if the installer leaves a broken or
@@ -117,8 +117,9 @@ sub lock_path {
     return File::Spec->catfile(backup_root(), '.lock');
 }
 
-# Default binary path. /update detects npm/brew installs separately; for now
-# this script targets the native install path. Override via --binary.
+# Default binary path: the native install. install-command (below) tells a
+# native install from an npm or Homebrew one; snapshot/restore target this
+# path unless --binary says otherwise.
 sub default_binary_path {
     my $home = home_dir();
     if (is_windows()) {
@@ -129,6 +130,55 @@ sub default_binary_path {
 
 sub utc_timestamp {
     return strftime('%Y-%m-%dT%H%M%SZ', gmtime);
+}
+
+# File::Copy::copy creates its destination with the default 0666 & ~umask
+# mode, so on Linux/macOS a copied executable comes out 0644. Harmless for a
+# snapshot nobody runs, fatal for a restore: the restored `claude` would not be
+# executable. Give $dst the permission bits of $mode_src. Windows has no mode
+# bits worth carrying (and exec-ness is the .exe name), so it is left alone.
+sub copy_mode {
+    my ($mode_src, $dst) = @_;
+    return 1 if is_windows();
+    my @st = stat($mode_src);
+    return 0 unless @st;
+    return chmod($st[2] & 07777, $dst) ? 1 : 0;
+}
+
+# Mode for a restored binary when there is no live file to take it from: the
+# snapshot's own bits, plus an exec bit wherever there is a read bit (a
+# snapshot taken before copy_mode existed is 0644), and always owner-exec.
+sub restore_mode_from_snapshot {
+    my ($snap_bin) = @_;
+    my @st = stat($snap_bin);
+    my $m = @st ? ($st[2] & 07777) : 0644;
+    return $m | (($m & 0444) >> 2) | 0100;
+}
+
+# The file a restore must write when $path is a symlink. On macOS (and the
+# Linux native installer) ~/.local/bin/claude is a symlink into
+# ~/.local/share/claude/versions/<v>; renaming a staged file over the link
+# would replace the link itself with a plain file and orphan the layout the
+# installer manages. Restore THROUGH it instead: follow the chain (relative
+# targets resolve against the link's own directory) to the real file, which
+# may not exist any more. Returns $path unchanged for a non-link or on Windows.
+sub resolve_restore_target {
+    my ($path) = @_;
+    return $path if is_windows();
+    my $p = $path;
+    for (1 .. 40) {
+        last unless -l $p;
+        my $t = readlink($p);
+        last unless defined $t && length $t;
+        unless (File::Spec->file_name_is_absolute($t)) {
+            my ($vol, $dir) = File::Spec->splitpath($p);
+            $t = File::Spec->catpath($vol, $dir, $t);
+        }
+        $p = $t;
+    }
+    my ($vol, $dir, $file) = File::Spec->splitpath($p);
+    my $real_dir = abs_path(File::Spec->catpath($vol, $dir, ''));
+    return defined $real_dir ? File::Spec->catfile($real_dir, $file) : $p;
 }
 
 sub emit_json {
@@ -194,16 +244,19 @@ sub free_bytes {
         return undef unless $out =~ /^\d+$/;
         return 0 + $out;
     }
-    # POSIX, cygwin, msys — `df -k` works fine
-    my $out = `df -k "$dir" 2>/dev/null`;
+    # POSIX, cygwin, msys. -P asks for the POSIX format: one line per
+    # filesystem, "Filesystem 1024-blocks Used Available Capacity Mounted on".
+    # Without it macOS df adds iused/ifree/%iused columns, so the old
+    # "third column from the end" read the free-INODE count as free bytes.
+    # Matched by shape rather than by column index because both ends can hold
+    # spaces: the mount point ("/Volumes/My Disk") and, on MSYS, the
+    # filesystem ("C:/Program Files/Git").
+    my $out = `df -kP "$dir" 2>/dev/null`;
     return undef unless $out;
     my @lines = split /\n/, $out;
     return undef unless @lines >= 2;
-    # POSIX df: Filesystem 1024-blocks Used Available Capacity Mounted
-    my @cols = split /\s+/, $lines[-1];
-    return undef unless @cols >= 4;
-    my $avail_k = $cols[-3];
-    return undef unless $avail_k =~ /^\d+$/;
+    my ($avail_k) = $lines[-1] =~ /\s(?:\d+)\s+(?:\d+)\s+(\d+)\s+\d+%\s/;
+    return undef unless defined $avail_k;
     return $avail_k * 1024;
 }
 
@@ -377,6 +430,136 @@ sub cmd_detect {
     exit($exists ? 0 : 1);
 }
 
+# ─── install-command ──────────────────────────────────────────────────────
+#
+# /steward:update installs the version the user chose, and the command that
+# does it depends on how Claude Code was installed and on the OS. The skill
+# used to list every OS's installer command and ask the agent to pick the
+# matching line; the pick is made here instead, from the claude actually on
+# PATH, and the skill runs the one command this prints.
+
+# The OS the installer command is chosen for. CLAUDE_BINARY_OS is a test seam
+# (windows | macos | linux), like CLAUDE_BINARY_BACKUP_ROOT -- never document
+# it in user-facing surfaces.
+sub install_os {
+    my $o = $ENV{CLAUDE_BINARY_OS};
+    return $o if defined $o && $o =~ /\A(?:windows|macos|linux)\z/;
+    return 'windows' if is_windows();
+    return $^O eq 'darwin' ? 'macos' : 'linux';
+}
+
+# One spelling of a path for comparison: forward slashes, an MSYS /c/... as
+# c:/..., no trailing slash, and lower case on the case-insensitive
+# filesystems (Windows, APFS).
+sub _cmp_path {
+    my ($p, $os) = @_;
+    return '' unless defined $p && length $p;
+    $p =~ s{\\}{/}g;
+    $p =~ s{\A/([A-Za-z])(?=/|\z)}{$1:};
+    $p =~ s{/+\z}{} unless $p eq '/';
+    return ($os eq 'windows' || $os eq 'macos') ? lc $p : $p;
+}
+
+# find_claude_on_path($os) -> the first claude on PATH, or undef.
+sub find_claude_on_path {
+    my ($os) = @_;
+    require Config;
+    my $sep = $Config::Config{path_sep} || ':';
+    my @names = $os eq 'windows' ? ('claude.exe', 'claude.cmd', 'claude') : ('claude');
+    for my $dir (split /\Q$sep\E/, (defined $ENV{PATH} ? $ENV{PATH} : '')) {
+        next unless length $dir;
+        for my $n (@names) {
+            my $p = File::Spec->catfile($dir, $n);
+            return $p if -f $p && ($os eq 'windows' || -x $p);
+        }
+    }
+    return undef;
+}
+
+# classify_install(path => $found, resolved => $realpath, home => $home,
+#                  os => $os) -> 'npm' | 'brew' | 'native' | 'unknown'
+# npm first: an npm prefix of ~/.local puts its shim at ~/.local/bin/claude,
+# which would otherwise read as native.
+sub classify_install {
+    my (%a) = @_;
+    my $os   = $a{os};
+    my $path = _cmp_path($a{path}, $os);
+    my $real = _cmp_path($a{resolved}, $os);
+    my $home = _cmp_path($a{home}, $os);
+    my @both = grep { length } ($path, $real);
+    return 'unknown' unless @both;
+
+    return 'npm' if grep { m{/node_modules/} } @both;
+    if (defined $a{path} && $a{path} =~ /\.(?:cmd|ps1)\z/i) {
+        my $dir = $a{path};
+        $dir =~ s{[\\/][^\\/]+\z}{};
+        return 'npm' if -d File::Spec->catdir($dir, 'node_modules', '@anthropic-ai', 'claude-code');
+    }
+    return 'brew' if grep { m{/(?:caskroom|cellar)/}i } @both;
+    return 'brew' if $path =~ m{\A(?:/opt/homebrew|/home/linuxbrew/\.linuxbrew)/};
+    if (length $home) {
+        return 'native' if $path eq "$home/.local/bin/claude" || $path eq "$home/.local/bin/claude.exe";
+        # The resolved path is canonical (on macOS, /var/... comes back as
+        # /private/var/...), so compare it with the canonical home as well.
+        my $home_real = (defined $a{home} && -d $a{home}) ? _cmp_path(abs_path($a{home}), $os) : '';
+        for my $h (grep { length } ($home, $home_real)) {
+            return 'native' if index($real, "$h/.local/share/claude/") == 0;
+        }
+    }
+    return 'unknown';
+}
+
+# install_command($method, $version, $os) -> ($command | undef, $note)
+sub install_command {
+    my ($method, $v, $os) = @_;
+    if ($method eq 'native') {
+        return ($os eq 'windows'
+            ? qq{powershell -Command "& ([scriptblock]::Create((irm https://claude.ai/install.ps1))) $v"}
+            : "curl -fsSL https://claude.ai/install.sh | bash -s $v",
+            "native install: the official installer, pinned to $v");
+    }
+    if ($method eq 'npm') {
+        return ("npm install -g \@anthropic-ai/claude-code\@$v", "npm global install, pinned to $v");
+    }
+    if ($method eq 'brew') {
+        return (undef, "Homebrew install: Homebrew installs only the version its own formula currently ships, so $v cannot be pinned. Tell the user, and run nothing unless they choose Homebrew's version or another install method.");
+    }
+    return (undef, 'could not tell how Claude Code was installed from the claude found on PATH (see binary_path). Ask the user how it was installed before running anything.');
+}
+
+sub cmd_install_command {
+    my (@args) = @_;
+    my ($version, $binary);
+    GetOptionsFromArray(\@args, 'version=s' => \$version, 'binary=s' => \$binary)
+        or die_json(3, 'Usage: install-command --version <x.y.z> [--binary <path>]');
+    die_json(3, 'install-command needs --version <x.y.z>') unless defined $version;
+    # The version lands in a shell command line, so only a version shape gets
+    # through: digits and dots, an optional pre-release tag of [0-9A-Za-z.-].
+    die_json(3, "not a version: '$version'")
+        unless $version =~ /\A\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\z/;
+
+    my $os    = install_os();
+    my $found = defined $binary ? $binary : find_claude_on_path($os);
+    my $real  = (defined $found && -e $found) ? (abs_path($found) // $found) : undef;
+    my $method = defined $found
+        ? classify_install(path => $found, resolved => $real, home => home_dir(), os => $os)
+        : 'unknown';
+    my ($command, $note) = install_command($method, $version, $os);
+    $note = 'no claude found on PATH. Ask the user how Claude Code was installed before running anything.'
+        unless defined $found;
+    emit_json({
+        status        => (defined $command ? 'ok' : 'no-command'),
+        os            => $os,
+        method        => $method,
+        binary_path   => $found,
+        resolved_path => $real,
+        version       => $version,
+        command       => $command,
+        note          => $note,
+    });
+    exit(defined $command ? 0 : 1);
+}
+
 sub cmd_snapshot {
     my (@args) = @_;
     my ($binary, $reason, $mark);
@@ -438,6 +621,11 @@ sub cmd_snapshot {
         my $err = $!;
         remove_tree($tmp);
         die_json(2, "Copy failed: $err");
+    }
+    unless (copy_mode($binary, $tmp_bin)) {
+        my $err = $!;
+        remove_tree($tmp);
+        die_json(2, "Cannot carry the binary's mode onto the snapshot: $err");
     }
 
     # Post-copy verification: re-hash the destination
@@ -714,6 +902,12 @@ sub cmd_restore {
             close $lfh;
             die_json(2, "Pre-restore copy failed: $e");
         }
+        unless (copy_mode($binary, $tmp_bin)) {
+            my $e = $!;
+            remove_tree($tmp);
+            close $lfh;
+            die_json(2, "Pre-restore copy could not take the binary's mode: $e");
+        }
         my $dst_sha = sha256_file($tmp_bin);
         unless (defined $dst_sha && $dst_sha eq $src_sha) {
             remove_tree($tmp);
@@ -752,15 +946,19 @@ sub cmd_restore {
     }
 
     # Copy snapshot binary to a .tmp next to the live binary, verify,
-    # then atomic rename.
-    my ($vol, $dir, undef) = File::Spec->splitpath($binary);
+    # then atomic rename. When $binary is a symlink (~/.local/bin/claude on
+    # macOS points into ~/.local/share/claude/versions/), the file written is
+    # the link's target and the link itself is left in place -- see
+    # resolve_restore_target.
+    my $target = resolve_restore_target($binary);
+    my ($vol, $dir, undef) = File::Spec->splitpath($target);
     my $tgt_dir = File::Spec->catpath($vol, $dir, '');
     unless (-d $tgt_dir) {
         close $lfh;
         die_json(2, "Target binary dir does not exist: $tgt_dir");
     }
 
-    my $stage = $binary . '.restore.tmp';
+    my $stage = $target . '.restore.tmp';
     # Clean up any leftover .restore.tmp from a prior killed restore
     if (-e $stage) { unlink $stage; }
 
@@ -770,6 +968,20 @@ sub cmd_restore {
         close $lfh;
         die_json(2, "Restore copy to staging failed: $e",
                   pre_restore_snapshot => $pre_snapshot_id);
+    }
+
+    # The live binary keeps the mode it had; a binary that is gone gets the
+    # snapshot's, made executable (restore_mode_from_snapshot). Without this
+    # the staged copy is 0644 and the restored claude cannot be run.
+    unless (is_windows()) {
+        my $mode = (-f $target) ? ((stat($target))[2] & 07777) : restore_mode_from_snapshot($snap_bin);
+        unless (chmod($mode, $stage)) {
+            my $e = $!;
+            unlink $stage if -e $stage;
+            close $lfh;
+            die_json(2, "Cannot set the restored binary's mode: $e",
+                      pre_restore_snapshot => $pre_snapshot_id);
+        }
     }
 
     my $stage_sha = sha256_file($stage);
@@ -799,7 +1011,7 @@ sub cmd_restore {
         }
     }
 
-    unless (rename($stage, $binary)) {
+    unless (rename($stage, $target)) {
         my $e = $!;
         unlink $stage if -e $stage;
         close $lfh;
@@ -808,7 +1020,7 @@ sub cmd_restore {
     }
 
     # Final verification: live binary should now match the manifest SHA.
-    my $live_sha = sha256_file($binary);
+    my $live_sha = sha256_file($target);
     unless (defined $live_sha && $live_sha eq $m->{sha256}) {
         close $lfh;
         die_json(2, "Post-restore SHA mismatch — live binary may be corrupted",
@@ -822,6 +1034,7 @@ sub cmd_restore {
         status                 => 'restored',
         restored_from          => $entry->{id},
         target_binary          => $binary,
+        restored_path          => $target,
         sha256                 => $live_sha,
         pre_restore_snapshot   => $pre_snapshot_id,
         manifest               => $m,
@@ -904,6 +1117,9 @@ Subcommands:
   detect     [--binary <path>]
              Report whether the binary exists, its version, size, and SHA.
 
+  install-command --version <x.y.z> [--binary <path>]
+             Work out how the claude on PATH (or --binary) was installed and print the one command that installs version x.y.z on this machine. Exit 1 when there is no such command (a Homebrew install, or an unknown method); see "note".
+
   snapshot   [--binary <path>] [--reason <text>] [--mark <label>]
              Capture the current binary into a new versioned snapshot.
 
@@ -934,6 +1150,7 @@ my $sub = shift @ARGV;
 $sub //= 'help';
 
 if    ($sub eq 'detect')   { cmd_detect(@ARGV); }
+elsif ($sub eq "install-command") { cmd_install_command(@ARGV); }
 elsif ($sub eq 'snapshot') { cmd_snapshot(@ARGV); }
 elsif ($sub eq 'list')     { cmd_list(@ARGV); }
 elsif ($sub eq 'verify')   { cmd_verify(@ARGV); }

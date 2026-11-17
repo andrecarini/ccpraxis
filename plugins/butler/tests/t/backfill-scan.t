@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Oracle for blueprint package 02-backfill-scan (blueprint test-platform-split).
 # Derived ONLY from
 # .ccpraxis-local-data/blueprints/test-platform-split/specs/02-backfill-scan-spec.md
@@ -38,7 +38,7 @@
 #
 # AC -> block mapping (spec section 4):
 #   AC-1  -> PART 5's SIGNAL FIXTURES sub-block (9 signals x positive fixture,
-#            each asserted for windows classification + exact signal name)
+#            each asserted for host classification + exact signal name)
 #   AC-2  -> PART 1 (source-level single-table check + its own counter-fixture)
 #   AC-3  -> PART 3 (default GLOB against the real repo tree)
 #   AC-4  -> PART 5's "footer sums" assertions, on both the 29-fixture dir and
@@ -49,7 +49,7 @@
 #   AC-7  -> PART 5's post-apply-#1 TestPlatform sweep (every originally-absent
 #            fixture now parses legal)
 #   AC-8  -> PART 5's apply-#2 block (idempotence: hash-unchanged, zero
-#            second-round windows/any, and TestPlatform's own `raw` array
+#            second-round host/any, and TestPlatform's own `raw` array
 #            length used to rule out a stacked duplicate marker)
 #   AC-9  -> PART 5 (row18, the needs-review fixture, checked untouched after
 #            both applies)
@@ -211,16 +211,16 @@ sub count_substr {
 # parse_report($text) -- pinned line-shape regexes straight from spec section
 # 2's "Report format" block. Returns a hashref: header_order (arrayref, in
 # the order headers appeared), counts (bucket name -> the header's own <n>),
-# footer (undef or {scanned,windows,any,already_marked,needs_review,errors}),
+# footer (undef or {scanned,host,any,already_marked,needs_review,errors}),
 # files (bucket name -> arrayref of {relpath, existing|reason (if
-# applicable), signals (arrayref of {name,text,line}, windows only)}).
+# applicable), signals (arrayref of {name,text,line}, host only)}).
 sub parse_report {
     my ($text) = @_;
     my %result = (
         header_order => [],
         counts       => {},
         footer       => undef,
-        files        => { windows => [], any => [], 'already-marked' => [], 'needs-review' => [] },
+        files        => { host => [], any => [], 'already-marked' => [], 'needs-review' => [] },
     );
     my @lines = split /\n/, $text;
     my $cur_bucket;
@@ -233,10 +233,10 @@ sub parse_report {
             $cur_file = undef;
             next;
         }
-        if ($line =~ /^TOTAL:\s*(\d+)\s+scanned,\s*(\d+)\s+windows,\s*(\d+)\s+any,\s*(\d+)\s+already-marked,\s*(\d+)\s+needs-review(?:,\s*errors:\s*(\d+))?\s*$/) {
+        if ($line =~ /^TOTAL:\s*(\d+)\s+scanned,\s*(\d+)\s+host,\s*(\d+)\s+any,\s*(\d+)\s+already-marked,\s*(\d+)\s+needs-review(?:,\s*errors:\s*(\d+))?\s*$/) {
             $result{footer} = {
                 scanned        => $1 + 0,
-                windows        => $2 + 0,
+                host           => $2 + 0,
                 any            => $3 + 0,
                 already_marked => $4 + 0,
                 needs_review   => $5 + 0,
@@ -387,7 +387,7 @@ sub find_entry_by_basename {
     }
     my $r = parse_report($out);
     if ($r->{footer}) {
-        my $sum = $r->{footer}{windows} + $r->{footer}{any}
+        my $sum = $r->{footer}{host} + $r->{footer}{any}
                 + $r->{footer}{already_marked} + $r->{footer}{needs_review};
         is($sum, $r->{footer}{scanned},
             'AC-4 (real tree): the footer\'s four bucket counts sum to <scanned>');
@@ -444,62 +444,62 @@ my @FIXTURES;
 push @FIXTURES, {
     file => 'row01-msys2-shebang.t',
     content => "#!/usr/bin/env perl\n# uses MSYS2_ARG_CONV_EXCL\n",
-    bucket => 'windows', signals => [['msys2-arg-conv-excl', 2]],
-    after => "#!/usr/bin/env perl\n" . marker_line('windows') . "# uses MSYS2_ARG_CONV_EXCL\n",
+    bucket => 'host', signals => [['msys2-arg-conv-excl', 2]],
+    after => "#!/usr/bin/env perl\n" . marker_line('host') . "# uses MSYS2_ARG_CONV_EXCL\n",
 };
 push @FIXTURES, {
     file => 'row01b-msys2-oneline.t',
     content => "# uses MSYS2_ARG_CONV_EXCL\n",
-    bucket => 'windows', signals => [['msys2-arg-conv-excl', 1]],
-    after => marker_line('windows') . "# uses MSYS2_ARG_CONV_EXCL\n",
+    bucket => 'host', signals => [['msys2-arg-conv-excl', 1]],
+    after => marker_line('host') . "# uses MSYS2_ARG_CONV_EXCL\n",
 };
 push @FIXTURES, {
     file => 'row02-cp1252.t',
     content => "# talks about CP1252 decoding\n",
-    bucket => 'windows', signals => [['cp1252-or-bom', 1]],
-    after => marker_line('windows') . "# talks about CP1252 decoding\n",
+    bucket => 'host', signals => [['cp1252-or-bom', 1]],
+    after => marker_line('host') . "# talks about CP1252 decoding\n",
 };
 push @FIXTURES, {
     file => 'row03-bom.t',
     content => "# mentions a BOM\n",
-    bucket => 'windows', signals => [['cp1252-or-bom', 1]],
-    after => marker_line('windows') . "# mentions a BOM\n",
+    bucket => 'host', signals => [['cp1252-or-bom', 1]],
+    after => marker_line('host') . "# mentions a BOM\n",
 };
 push @FIXTURES, {
     file => 'row04-mswin32.t',
     content => q{# checks the special var eq 'MSWin32'} . "\n",
-    bucket => 'windows', signals => [['mswin32-or-cygwin', 1]],
-    after => marker_line('windows') . q{# checks the special var eq 'MSWin32'} . "\n",
+    bucket => 'host', signals => [['mswin32-or-cygwin', 1]],
+    after => marker_line('host') . q{# checks the special var eq 'MSWin32'} . "\n",
 };
 push @FIXTURES, {
     file => 'row05-cygwin.t',
     content => "# runs under cygwin\n",
-    bucket => 'windows', signals => [['mswin32-or-cygwin', 1]],
-    after => marker_line('windows') . "# runs under cygwin\n",
+    bucket => 'host', signals => [['mswin32-or-cygwin', 1]],
+    after => marker_line('host') . "# runs under cygwin\n",
 };
 push @FIXTURES, {
     file => 'row06-cygpath.t',
     content => "# shells out to cygpath -w\n",
-    bucket => 'windows', signals => [['cygpath', 1]],
-    after => marker_line('windows') . "# shells out to cygpath -w\n",
+    bucket => 'host', signals => [['cygpath', 1]],
+    after => marker_line('host') . "# shells out to cygpath -w\n",
 };
 push @FIXTURES, {
     file => 'row07-podman-machine.t',
     content => "# starts a podman machine\n",
-    bucket => 'windows', signals => [['podman-machine', 1]],
-    after => marker_line('windows') . "# starts a podman machine\n",
+    bucket => 'host', signals => [['podman-machine', 1]],
+    after => marker_line('host') . "# starts a podman machine\n",
 };
 push @FIXTURES, {
     file => 'row08-nul.t',
     content => "# writes to NUL\n",
-    bucket => 'windows', signals => [['nul-device', 1]],
-    after => marker_line('windows') . "# writes to NUL\n",
+    bucket => 'host', signals => [['nul-device', 1]],
+    after => marker_line('host') . "# writes to NUL\n",
 };
 push @FIXTURES, {
     file => 'row09-drive-root.t',
     content => "# guards against a drive-root stray\n",
-    bucket => 'windows', signals => [['drive-root', 1]],
-    after => marker_line('windows') . "# guards against a drive-root stray\n",
+    bucket => 'host', signals => [['drive-root', 1]],
+    after => marker_line('host') . "# guards against a drive-root stray\n",
 };
 push @FIXTURES, {
     file => 'row10-any-top.t',
@@ -554,51 +554,51 @@ push @FIXTURES, {
 };
 push @FIXTURES, {
     file => 'row18-needs-review.t',
-    content => miscased_marker_line('windows'),
+    content => miscased_marker_line('host'),
     bucket => 'needs-review', reason => 'malformed-marker-line',
-    after => miscased_marker_line('windows'),
+    after => miscased_marker_line('host'),
 };
 push @FIXTURES, {
     file => 'row19-multi-signal.t',
     content => "# uses cygpath and starts a podman machine\n",
-    bucket => 'windows', signals => [['cygpath', 1], ['podman-machine', 1]],
-    after => marker_line('windows') . "# uses cygpath and starts a podman machine\n",
+    bucket => 'host', signals => [['cygpath', 1], ['podman-machine', 1]],
+    after => marker_line('host') . "# uses cygpath and starts a podman machine\n",
 };
 push @FIXTURES, {
     file => 'row20-powershell.t',
     content => "# invokes powershell.exe to check status\n",
-    bucket => 'windows', signals => [['powershell-or-ps1', 1]],
-    after => marker_line('windows') . "# invokes powershell.exe to check status\n",
+    bucket => 'host', signals => [['powershell-or-ps1', 1]],
+    after => marker_line('host') . "# invokes powershell.exe to check status\n",
 };
 push @FIXTURES, {
     file => 'row21-ps1-ext.t',
     content => "# runs helper.ps1 on a schedule\n",
-    bucket => 'windows', signals => [['powershell-or-ps1', 1]],
-    after => marker_line('windows') . "# runs helper.ps1 on a schedule\n",
+    bucket => 'host', signals => [['powershell-or-ps1', 1]],
+    after => marker_line('host') . "# runs helper.ps1 on a schedule\n",
 };
 push @FIXTURES, {
     file => 'row22-es-display-required.t',
     content => "# sets ES_DISPLAY_REQUIRED during the session\n",
-    bucket => 'windows', signals => [['powershell-or-ps1', 1]],
-    after => marker_line('windows') . "# sets ES_DISPLAY_REQUIRED during the session\n",
+    bucket => 'host', signals => [['powershell-or-ps1', 1]],
+    after => marker_line('host') . "# sets ES_DISPLAY_REQUIRED during the session\n",
 };
 push @FIXTURES, {
     file => 'row23-keepawake-noHyphen.t',
     content => "# calls the keepawake helper script directly\n",
-    bucket => 'windows', signals => [['powershell-or-ps1', 1]],
-    after => marker_line('windows') . "# calls the keepawake helper script directly\n",
+    bucket => 'host', signals => [['powershell-or-ps1', 1]],
+    after => marker_line('host') . "# calls the keepawake helper script directly\n",
 };
 push @FIXTURES, {
     file => 'row24-keep-awake-hyphen.t',
     content => "# keep-awake.ps1 exits on that alone\n",
-    bucket => 'windows', signals => [['powershell-or-ps1', 1]],
-    after => marker_line('windows') . "# keep-awake.ps1 exits on that alone\n",
+    bucket => 'host', signals => [['powershell-or-ps1', 1]],
+    after => marker_line('host') . "# keep-awake.ps1 exits on that alone\n",
 };
 push @FIXTURES, {
     file => 'row25-win32-namespace.t',
     content => "# uses Win32::Process to spawn a native command\n",
-    bucket => 'windows', signals => [['win32-namespace', 1]],
-    after => marker_line('windows') . "# uses Win32::Process to spawn a native command\n",
+    bucket => 'host', signals => [['win32-namespace', 1]],
+    after => marker_line('host') . "# uses Win32::Process to spawn a native command\n",
 };
 # fix-batch A2 -- a shebang line with NO trailing newline anywhere in the
 # file. Before the fix, compute_insertion() glued the marker directly onto
@@ -669,8 +669,8 @@ push @FIXTURES, {
 push @FIXTURES, {
     file => 'nuance01-order-reversed.t',
     content => "# starts a podman machine, and also shells out to cygpath -w\n",
-    bucket => 'windows', signals => [['cygpath', 1], ['podman-machine', 1]],
-    after => marker_line('windows') . "# starts a podman machine, and also shells out to cygpath -w\n",
+    bucket => 'host', signals => [['cygpath', 1], ['podman-machine', 1]],
+    after => marker_line('host') . "# starts a podman machine, and also shells out to cygpath -w\n",
 };
 {
     my $c = "# line one, nothing special here yet\n"
@@ -679,8 +679,8 @@ push @FIXTURES, {
     push @FIXTURES, {
         file => 'nuance02-first-line-only.t',
         content => $c,
-        bucket => 'windows', signals => [['msys2-arg-conv-excl', 2]],
-        after => marker_line('windows') . $c,
+        bucket => 'host', signals => [['msys2-arg-conv-excl', 2]],
+        after => marker_line('host') . $c,
     };
 }
 {
@@ -690,8 +690,8 @@ push @FIXTURES, {
     push @FIXTURES, {
         file => 'nuance03-truncation.t',
         content => $c,
-        bucket => 'windows', signals => [['nul-device', 1]],
-        after => marker_line('windows') . $c,
+        bucket => 'host', signals => [['nul-device', 1]],
+        after => marker_line('host') . $c,
         expect_text => { 1 => substr($line, 0, 77) . '...' },
     };
 }
@@ -719,13 +719,13 @@ my %before_dry = map { $_->{file} => read_file_raw("$TDIR/$_->{file}") } @FIXTUR
     my $r = parse_report($out);
     ok(defined $r->{footer}, 'PART 5 dry-run: a TOTAL footer line was found and parsed');
 
-    is_deeply([sort @{ $r->{header_order} }], [sort qw(windows any already-marked needs-review)],
+    is_deeply([sort @{ $r->{header_order} }], [sort qw(host any already-marked needs-review)],
         'AC-6: all four pinned bucket headers are present');
     is(scalar(@{ $r->{header_order} }), 4, 'AC-6: exactly four bucket headers printed, no duplicates');
 
     if ($r->{footer}) {
         is($r->{footer}{scanned}, $n_fixtures, 'AC-3/AC-4: scanned count equals the fixture count');
-        my $sum = $r->{footer}{windows} + $r->{footer}{any}
+        my $sum = $r->{footer}{host} + $r->{footer}{any}
                 + $r->{footer}{already_marked} + $r->{footer}{needs_review};
         is($sum, $r->{footer}{scanned}, 'AC-4: the four bucket counts sum to <scanned>');
     }
@@ -736,7 +736,7 @@ my %before_dry = map { $_->{file} => read_file_raw("$TDIR/$_->{file}") } @FIXTUR
             or next;
         ok($entry->{relpath} !~ /\\/, "AC-6: $fx->{file}'s reported relpath uses forward slashes only");
 
-        if ($fx->{bucket} eq 'windows') {
+        if ($fx->{bucket} eq 'host') {
             my @got_names = map { $_->{name} } @{ $entry->{signals} };
             my @want_names = map { $_->[0] } @{ $fx->{signals} };
             is_deeply(\@got_names, \@want_names,
@@ -774,9 +774,9 @@ my %before_dry = map { $_->{file} => read_file_raw("$TDIR/$_->{file}") } @FIXTUR
         is($got, $fx->{after}, "AC-10/AC-9: $fx->{file} content after --apply matches the pinned expectation exactly");
     }
 
-    # AC-7: every originally-absent fixture (windows/any) now parses legal,
+    # AC-7: every originally-absent fixture (host/any) now parses legal,
     # through TestPlatform -- never a second regex -- with the correct value.
-    for my $fx (grep { $_->{bucket} eq 'windows' || $_->{bucket} eq 'any' } @FIXTURES) {
+    for my $fx (grep { $_->{bucket} eq 'host' || $_->{bucket} eq 'any' } @FIXTURES) {
         my $r = marker_result("$TDIR/$fx->{file}");
         is($r->{outcome}, 'legal', "AC-7: $fx->{file} parses TestPlatform outcome legal after apply#1");
         is($r->{value}, $fx->{bucket}, "AC-7: $fx->{file}'s legal value equals its classified bucket");
@@ -810,11 +810,11 @@ my %after_apply1 = map { $_->{file} => read_file_raw("$TDIR/$_->{file}") } @FIXT
 
     my $r = parse_report($out);
     if ($r->{footer}) {
-        is($r->{footer}{windows}, 0, 'AC-8: second apply run classifies zero files as windows');
+        is($r->{footer}{host}, 0, 'AC-8: second apply run classifies zero files as host');
         is($r->{footer}{any}, 0, 'AC-8: second apply run classifies zero files as any');
-        my $expect_already = scalar(grep { $_->{bucket} eq 'windows' || $_->{bucket} eq 'any' } @FIXTURES) + 1;
+        my $expect_already = scalar(grep { $_->{bucket} eq 'host' || $_->{bucket} eq 'any' } @FIXTURES) + 1;
         is($r->{footer}{already_marked}, $expect_already,
-            'AC-8: second run\'s already-marked count covers every previously windows/any file plus the original one');
+            'AC-8: second run\'s already-marked count covers every previously host/any file plus the original one');
         is($r->{footer}{needs_review}, 1, 'AC-8: the needs-review fixture is still needs-review, not already-marked');
     } else {
         fail('AC-8: could not parse a TOTAL footer from the second apply run');
@@ -829,7 +829,7 @@ my %after_apply1 = map { $_->{file} => read_file_raw("$TDIR/$_->{file}") } @FIXT
         'AC-8: applying twice is a no-op -- every file\'s content after run 2 equals its content after run 1')
         or diag('mutated on second apply: ' . join(', ', @mutated));
 
-    for my $fx (grep { $_->{bucket} eq 'windows' || $_->{bucket} eq 'any' } @FIXTURES) {
+    for my $fx (grep { $_->{bucket} eq 'host' || $_->{bucket} eq 'any' } @FIXTURES) {
         my $r2 = marker_result("$TDIR/$fx->{file}");
         is($r2->{outcome}, 'legal', "AC-8: $fx->{file} still parses legal after the second apply");
         is(scalar(@{ $r2->{raw} }), 1,
@@ -854,12 +854,12 @@ my %after_apply1 = map { $_->{file} => read_file_raw("$TDIR/$_->{file}") } @FIXT
     is($rc, 0, 'PART 6: dry-run over a 3-file, two-empty-bucket set exits 0');
     my $r = parse_report($out);
 
-    is_deeply([sort @{ $r->{header_order} }], [sort qw(windows any already-marked needs-review)],
+    is_deeply([sort @{ $r->{header_order} }], [sort qw(host any already-marked needs-review)],
         'AC-6: all four headers print even when two of the four buckets are empty');
     if ($r->{footer}) {
         is($r->{footer}{already_marked}, 0, 'AC-6: already-marked header shows 0 (still printed, per PART 6 header-order check above)');
         is($r->{footer}{needs_review}, 0, 'AC-6: needs-review header shows 0 (still printed, per PART 6 header-order check above)');
-        is($r->{footer}{windows}, 1, 'AC-6: windows bucket has exactly 1 (non-vacuous -- proves it is not always 0)');
+        is($r->{footer}{host}, 1, 'AC-6: host bucket has exactly 1 (non-vacuous -- proves it is not always 0)');
         is($r->{footer}{any}, 2, 'AC-6: any bucket has exactly 2 (non-vacuous -- proves it is not always 0)');
     }
 
@@ -904,7 +904,7 @@ my %after_apply1 = map { $_->{file} => read_file_raw("$TDIR/$_->{file}") } @FIXT
         is($r->{footer}{scanned}, 1,
             'PART 7 (judgment call -- see report): <scanned> counts only the successfully-classified file, '
           . 'excluding the one that errored, so the four-bucket-sum invariant (AC-4) holds unconditionally');
-        my $sum = $r->{footer}{windows} + $r->{footer}{any}
+        my $sum = $r->{footer}{host} + $r->{footer}{any}
                 + $r->{footer}{already_marked} + $r->{footer}{needs_review};
         is($sum, $r->{footer}{scanned}, 'AC-4 holds even on a run with a per-file error');
         is($r->{footer}{errors}, 1, 'PART 7: the footer carries an "errors: 1" suffix');
@@ -912,7 +912,7 @@ my %after_apply1 = map { $_->{file} => read_file_raw("$TDIR/$_->{file}") } @FIXT
         fail('PART 7: could not parse a TOTAL footer from the error-run report');
     }
     ok((find_entry_by_basename($r->{files}{any}, 'ok-file.t')
-        || find_entry_by_basename($r->{files}{windows}, 'ok-file.t')),
+        || find_entry_by_basename($r->{files}{host}, 'ok-file.t')),
         'PART 7: the run continues past the errored file -- the other real file is still classified');
 
     # fix-batch A4 -- a bare "errors: N" on the footer is unactionable across

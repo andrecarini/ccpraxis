@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Immutable oracle for blueprint where-things-go, package 12-statusline-threads
 # (specs/12-statusline-threads-spec.md). Written BLIND to scripts/statusline.pl,
 # plugins/almanac/scripts/gen-statusline-counters.pl and
@@ -26,6 +26,13 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+# macOS ships no `timeout`: the runner puts scripts/test-bin/timeout on PATH
+# for a sweep, and a file run on its own puts it there itself (the same rule
+# as GuardHarness.pm), so every `timeout` below resolves either way.
+unless (grep { -x "$_/timeout" } split /:/, ($ENV{PATH} // q{})) {
+    $ENV{PATH} = "$Bin/../../../../scripts/test-bin:" . ($ENV{PATH} // q{})
+        if -x "$Bin/../../../../scripts/test-bin/timeout";
+}
 use lib "$Bin/../../scripts";
 use Test::More;
 use File::Temp qw(tempdir tempfile);
@@ -129,6 +136,12 @@ sub make_tput {
     my ($cols) = @_;
     spew_raw("$SHIM_DIR/tput", "#!/bin/sh\necho $cols\n");
     chmod 0755, "$SHIM_DIR/tput";
+    # statusline.pl asks $COLUMNS and the controlling terminal (stty size
+    # </dev/tty) before tput off Windows; pin both so the shim decides the
+    # width even when this file is run from an interactive terminal.
+    spew_raw("$SHIM_DIR/stty", "#!/bin/sh\nexit 1\n");
+    chmod 0755, "$SHIM_DIR/stty";
+    delete $ENV{COLUMNS};
 }
 sub make_git_absent {
     # No toplevel/branch files -> the shim's git always exits 1. The thread

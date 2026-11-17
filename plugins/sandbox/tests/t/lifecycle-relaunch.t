@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # s12-recovery: the [l] relaunch/recover control + the
 # shared recovery seam.
 #

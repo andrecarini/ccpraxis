@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 #
 # todo 20261104-035939-482d0000: a stray
 # Microsoft/Windows/PowerShell/ModuleAnalysisCache kept appearing at the repo

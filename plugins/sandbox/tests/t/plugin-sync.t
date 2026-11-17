@@ -15,7 +15,7 @@ use File::Path qw(make_path);
 use JSON::PP;
 use PluginSync qw(reconcile_copy_plan prune_empty_parents safe_dest_rel);
 
-plan tests => 26;
+plan tests => 31;
 
 my $root = tempdir(CLEANUP => 1);
 sub spew { my ($p,$c)=@_; my ($d)=$p=~m{^(.*)/[^/]+$}; make_path($d) if $d && !-d $d;
@@ -103,6 +103,38 @@ ok(-e "$outside/keep.txt", 'safe: a ../ dest_rel in the prior plan does NOT dele
        'utf8 manifest: non-ASCII src round-trips byte-faithfully (->utf8 decode)');
     is(length($plan->[0]{src}), length($src_in),
        'utf8 manifest: src char-length preserved (é not split into two Latin-1 chars)');
+}
+
+# --- permission bits survive the copy (macOS: virtiofs shows REAL modes) -------
+#     A read-then-write copy creates the destination with 0666 & ~umask, so a
+#     plugin's executable hooks and bin/ shims arrived in claude-home without
+#     their x bit. The Windows bind mount hid that (everything reads 0777 in
+#     the container); a macOS podman machine does not. Windows hosts keep the
+#     old behaviour, so the assertions only apply elsewhere.
+SKIP: {
+    skip 'mode bits are not carried on a Windows host (its bind mount shows 0777)', 5
+        if $^O =~ /^(MSWin32|cygwin|msys)$/;
+    my $msrc = "$root/modes-src";
+    spew("$msrc/bin/tool",       "#!/bin/sh\necho hi\n");
+    spew("$msrc/hooks/hook.pl",  "#!/usr/bin/perl\n");
+    spew("$msrc/data/ro.txt",    "read-only");
+    chmod 0755, "$msrc/bin/tool";
+    chmod 0750, "$msrc/hooks/hook.pl";
+    chmod 0444, "$msrc/data/ro.txt";
+    my $mdest = "$root/modes-dest";
+    my $M = { key=>'M', src=>$msrc, dest_rel=>'cache/m/M/1.0' };
+    reconcile_copy_plan([], [$M], $mdest);
+    my $mode = sub { (stat $_[0])[2] & 07777 };
+    is(sprintf('%04o', $mode->("$mdest/cache/m/M/1.0/bin/tool")), '0755',
+       'modes: an executable script keeps 0755 through the copy');
+    is(sprintf('%04o', $mode->("$mdest/cache/m/M/1.0/hooks/hook.pl")), '0750',
+       'modes: a 0750 hook keeps its exact bits');
+    ok(-x "$mdest/cache/m/M/1.0/bin/tool", 'modes: ...so it is executable at the destination');
+    is(sprintf('%04o', $mode->("$mdest/cache/m/M/1.0/data/ro.txt")), '0644',
+       'modes: a 0444 source lands owner-writable (0644), so the next refresh can overwrite it');
+    spew("$msrc/data/ro.txt.new", "v2"); rename "$msrc/data/ro.txt.new", "$msrc/data/ro.txt"; chmod 0444, "$msrc/data/ro.txt";
+    reconcile_copy_plan([$M], [$M], $mdest);
+    is(slurp("$mdest/cache/m/M/1.0/data/ro.txt"), 'v2', 'modes: ...and the refresh does overwrite it');
 }
 
 # --- robust removal of READ-ONLY trees (github marketplace .git object packs) --

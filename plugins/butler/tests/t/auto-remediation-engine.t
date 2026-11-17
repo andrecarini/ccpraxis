@@ -1249,4 +1249,25 @@ sub mk_runs_verdict {
     }
 }
 
+# ---- Node left the sandbox image on 2026-10-30: a declare_backpack ledger for node points
+#      the worker at the sanctioned recipe; one for another runtime does not. -------------
+for my $case (['node', 1], ['python', 0]) {
+    my ($rt, $want) = @$case;
+    my $bpdir = "$ROOT/ledger-declare-$rt"; make_path("$bpdir/packages"); mk_runs_verdict($bpdir);
+    my $finding = mk_finding(kind => 'undeclared_runtime', subject => $rt, detail => "$rt is not declared",
+        remedy => { action => 'declare_backpack', runtime => $rt }, evidence => {});
+    my $entry = mk_entry(id => "remediation-undeclared-$rt-r1", finding_key => "undeclared-$rt",
+        action => 'declare_backpack', write_set => '.ccpraxis-local-data/claude-home/backpack.json',
+        finding => $finding, source => 'deps');
+    my $path = try1(sub { BpRemediate::author_ledger($bpdir, $entry, mk_ctx()) });
+    if (my $d = died($path)) { fail("declare_backpack($rt): author_ledger returns a path"); diag("died: $d"); next; }
+    my $txt = slurp($path);
+    like($txt, qr/Declare runtime \Q$rt\E in the backpack/, "declare_backpack($rt): the ledger carries the remedy sentence");
+    if ($want) {
+        like($txt, qr{/backpack:add --recipe node-pnpm}, 'declare_backpack(node): the ledger names the node-pnpm recipe');
+    } else {
+        unlike($txt, qr{--recipe}, "declare_backpack($rt): no recipe is suggested for a runtime that has none");
+    }
+}
+
 done_testing();

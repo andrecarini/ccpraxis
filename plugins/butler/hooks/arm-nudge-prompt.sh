@@ -5,7 +5,8 @@
 # 11-arming-nudges-spec.md sec 2.3. Pure bash: it never execs run-hook.sh,
 # never starts perl, and uses no command substitution and no pipe. The only
 # external command it may start is "mkdir -p" when the prompted/ directory
-# is missing. It never writes to stderr and always exits 0.
+# is missing (and, on a bash older than 4.2, "date +%s" -- see step 9). It
+# never writes to stderr and always exits 0.
 #
 # It records the epoch of every main-thread operator prompt in one
 # per-session marker (<state_dir>/prompted/<sid>, read back by
@@ -18,8 +19,23 @@ set -f
 # Step 1: a coordinator or judge environment is not an operator prompt.
 [ -n "$BP_LEDGER" ] && exit 0
 
-# Step 2: read the payload once, bounded.
-IFS= read -r -N 8388608 -t 10 P
+# Step 2: read the payload once, bounded, through scripts/read-payload.sh (the
+# one reader the bash hooks of butler and almanac share; sourced, so no
+# process). It keeps "read -N" on bash >= 4.1 and reads NUL-delimited on
+# macOS /bin/bash 3.2. A nudge is advisory, so its fail direction is quiet:
+# a timeout leaves P empty on every bash and the hook exits below, and a
+# missing library exits too. A payload over 8 MiB is still read up to the
+# cap, as before; only its first 4096 characters are ever looked at.
+_d=${BASH_SOURCE[0]//\\//}
+case $_d in
+    */*) _d=${_d%/*} ;;
+    *) _d=. ;;
+esac
+[ -f "$_d/../scripts/read-payload.sh" ] || exit 0
+. "$_d/../scripts/read-payload.sh"
+declare -F ccp_read_payload >/dev/null || exit 0
+P=
+ccp_read_payload P
 [ -n "$P" ] || exit 0
 
 # Step 3: must be a main-thread UserPromptSubmit payload.
@@ -85,16 +101,24 @@ fi
 [ -n "$root" ] || exit 0
 
 # Step 9: record the prompt epoch. $EPOCHSECONDS is bash >= 5.0; the
-# "%(%s)T" printf format is bash >= 4.2. On an older bash, E stays empty and
-# nothing is written -- a quiet no-op, never a failure.
+# "%(%s)T" printf format is bash >= 4.2. Both are builtins, so the bash a
+# Windows host runs never starts a process here. An older bash (macOS
+# /bin/bash 3.2) has no builtin clock at all: it used to write nothing, so
+# the chart reminder's N5 nudge never saw an operator prompt on that host.
+# There, "date +%s" writes the same "<epoch>\n" bytes straight into the
+# marker (a redirect, not a command substitution): one process, once per
+# operator prompt, and only on that host. Should date itself fail, the
+# marker is left empty, which last_prompt_epoch reads as "no prompt known".
 E=$EPOCHSECONDS
 if [[ ! $E =~ ^[0-9]+$ ]]; then
     E=
     printf -v E '%(%s)T' -1 2>/dev/null
 fi
+[ -d "$root/prompted" ] || mkdir -p "$root/prompted" 2>/dev/null
 if [[ $E =~ ^[0-9]+$ ]]; then
-    [ -d "$root/prompted" ] || mkdir -p "$root/prompted" 2>/dev/null
     { printf '%s\n' "$E" > "$root/prompted/$sid"; } 2>/dev/null
+else
+    { date +%s > "$root/prompted/$sid"; } 2>/dev/null
 fi
 
 # Step 10: armed -- recorded, no nudge.

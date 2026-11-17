@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 #
 # Oracle for 01-compact-oracle-records (bug 20260926-155710-2c57), derived ONLY from
 # .ccpraxis-local-data/blueprints/tooling-fixes/specs/01-compact-oracle-records-spec.md

@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # agent-telemetry package 04-runstate-run-and-package-facts: orchestrator
 # liveness/start-time, per-package attempts, pipeline step, and next action
 # on RunState::summarize_dir's return hash.

@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # ORACLE for package 11-ac-loss-clean-suspend-cycle (blueprint tooling-backlog),
 # AC-8 and AC-14 of .ccpraxis-local-data/blueprints/tooling-backlog/specs/
 # 11-ac-loss-clean-suspend-cycle-spec.md sec 2.5/3.5/3.9/3.10: the

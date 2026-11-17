@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Oracle tests for b39, derived from
 #   .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b39-spec.md
 #
@@ -49,6 +49,7 @@
 #   AC-2  : B-1 -- disableArtifact/disableRemoteControl/disableClaudeAiConnectors
 #           are JSON boolean true, in both files
 #   AC-3  : B-2 -- skillOverrides is exactly the 17 names -> 'off', in both files
+#           (15 at authoring; two more exported by /steward:backup, eee2780)
 #   AC-4  : B-3 -- skillOverrides has no update-config/keybindings-help/`:`-key
 #   AC-5  : B-4 -- the four env keys are exactly '1', in both files
 #   AC-6  : B-5 -- disableFastMode absent; no anthropic-skills enabledPlugins key
@@ -234,6 +235,10 @@ ok(!exists $container_data->{todoFeatureEnabled},
 my @BOOL_SWITCHES = qw(disableArtifact disableRemoteControl disableClaudeAiConnectors);
 my @ENV_SWITCHES  = qw(CLAUDE_CODE_DISABLE_ADVISOR_TOOL CLAUDE_CODE_DISABLE_FAST_MODE
                        DISABLE_BUG_COMMAND DISABLE_FEEDBACK_COMMAND);
+# The original 15 (03-strip-claude-code-bloat, 2026-09-27) plus algorithmic-art
+# and google-workspace, which the operator switched off on the live host and
+# /steward:backup exported to both payloads on 2026-10-26 (eee2780). The
+# payloads are the newer statement of intent; this list followed them.
 my @SKILL_NAMES = qw(
     algorithmic-art artifact-capabilities artifact-design artifact-diagramming batch claude-api
     code-review dataviz fewer-permission-prompts google-workspace loop run run-skill-generator
@@ -439,7 +444,13 @@ my $HOST_BASELINE = {
     },
     extraKnownMarketplaces => {
         'ccpraxis-local' => {
-            source => { path => 'C:/Users/André/.claude/ccpraxis/plugins', source => 'directory' },
+            # DELIBERATE DECLARATION, macOS port 2026-10-29: the payload no
+            # longer carries the Windows host's absolute path. ${CCPRAXIS_LIVE}
+            # is expanded per machine by promote.pl and folded back by the
+            # backup export (plugins/steward/scripts/MachineLocalSettings.pm),
+            # so the Windows live value stays C:/Users/André/... byte for byte
+            # while a Mac gets its own path. Pinned by machine-local-settings.t.
+            source => { path => '${CCPRAXIS_LIVE}/plugins', source => 'directory' },
         },
         'notion-plugin-marketplace' => {
             source => { repo => 'makenotion/claude-code-notion-plugin', source => 'github' },
@@ -543,8 +554,9 @@ my $HOST_BASELINE = {
     # keybindings-help are deliberately NOT keys here (they are not on the
     # operator's list and must stay "on" -- see B-3 below). Re-check this
     # list on every Claude Code update, since skillOverrides matches by name.
-    # algorithmic-art and google-workspace were added by the operator on 2026-10-26 (backup
-    # sync eee2780), bringing the list from 15 to 17.
+    # algorithmic-art and google-workspace: switched off by the operator on the
+    # live host and exported here by /steward:backup on 2026-10-26 (eee2780),
+    # bringing the list from 15 to 17.
     skillOverrides => {
         'algorithmic-art'          => 'off',
         'artifact-capabilities'    => 'off',
@@ -687,6 +699,36 @@ my $CONTAINER_BASELINE = {
                 ],
             },
         ],
+        # DELIBERATE DECLARATION, 2026-11-02 (the node-pnpm recipe as the one
+        # way to get Node): the same auto-declare.pl command on two more Bash
+        # events, container only. PreToolUse refuses an ad-hoc Node or pnpm
+        # install and names `/backpack:add --recipe node-pnpm`; PostToolUseFailure
+        # names the recipe when a command fails because node/npm/npx/pnpm/corepack
+        # is missing. The hook dispatches on hook_event_name and answers through
+        # JSON on stdout, so the `|| true` that keeps a missing mount harmless
+        # cannot swallow a refusal. Contract: plugins/backpack/tests/t/node-recipe-hooks.t.
+        PostToolUseFailure => [
+            {
+                matcher => 'Bash',
+                hooks   => [
+                    {
+                        command => '[ -f "$HOME/.claude/auto-declare.pl" ] && perl "$HOME/.claude/auto-declare.pl" || true',
+                        type    => 'command',
+                    },
+                ],
+            },
+        ],
+        PreToolUse => [
+            {
+                matcher => 'Bash',
+                hooks   => [
+                    {
+                        command => '[ -f "$HOME/.claude/auto-declare.pl" ] && perl "$HOME/.claude/auto-declare.pl" || true',
+                        type    => 'command',
+                    },
+                ],
+            },
+        ],
     },
     inputNeededNotifEnabled      => JSON::PP::true,
     promptSuggestionEnabled      => JSON::PP::false,
@@ -706,8 +748,9 @@ my $CONTAINER_BASELINE = {
     # keybindings-help are deliberately NOT keys here (they are not on the
     # operator's list and must stay "on" -- see B-3 below). Re-check this
     # list on every Claude Code update, since skillOverrides matches by name.
-    # algorithmic-art and google-workspace were added by the operator on 2026-10-26 (backup
-    # sync eee2780), bringing the list from 15 to 17.
+    # algorithmic-art and google-workspace: switched off by the operator on the
+    # live host and exported here by /steward:backup on 2026-10-26 (eee2780),
+    # bringing the list from 15 to 17.
     skillOverrides => {
         'algorithmic-art'          => 'off',
         'artifact-capabilities'    => 'off',
@@ -933,13 +976,18 @@ like($launcher_src, qr{\$CONTAINER_CONFIG\s*=\s*"\$SANDBOX_PLUGIN/container"},
 like($launcher_src, qr{\$CONTAINER_SETTINGS_JSON\s*=\s*"\$LAUNCHER_DIR},
     'A6: $CONTAINER_SETTINGS_JSON is assigned a path under $LAUNCHER_DIR');
 
-like($launcher_src,
-    qr{_copy_file\(\s*"\$CONTAINER_CONFIG/settings\.json"\s*,\s*\$CONTAINER_SETTINGS_JSON\s*\)},
-    'A6: $CONTAINER_CONFIG/settings.json is copied to $CONTAINER_SETTINGS_JSON');
-
-like($launcher_src,
-    qr{_copy_file\(\s*\$CONTAINER_SETTINGS_JSON\s*,\s*"\$host_data/settings\.json"\s*\)},
-    'A6: $CONTAINER_SETTINGS_JSON is copied to a settings.json under the host-data (claude-home) dir');
+# Since 2026-11-02 the preset is MERGED into the sandbox's own settings.json
+# at create (SandboxSettings::merge_settings, base = the preset it was last
+# given), not copied over it, so the wiring asserted is that one call: the
+# preset file is the merge's source and claude-home/settings.json its target.
+my ($merge_call) = $launcher_src =~ m{(SandboxSettings::merge_settings\(.*?\);)}s;
+ok(defined $merge_call, 'A6: the launcher calls SandboxSettings::merge_settings');
+like($merge_call // '', qr{preset\s*=>\s*"\$CONTAINER_CONFIG/settings\.json"},
+    'A6: $CONTAINER_CONFIG/settings.json is the preset merged into the sandbox settings');
+like($merge_call // '', qr{target\s*=>\s*"\$host_data/settings\.json"},
+    'A6: the merge target is settings.json under the host-data (claude-home) dir');
+like($merge_call // '', qr{base\s*=>\s*\$CONTAINER_SETTINGS_JSON},
+    'A6: $CONTAINER_SETTINGS_JSON (the preset the sandbox was last given) is the merge base');
 
 # =====================================================================
 # A7 — struck by the operator's six-month ruling (spec §4/A7). No

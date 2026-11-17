@@ -11,3 +11,8 @@
 # .claude-data/ is bind-mounted at /root/.claude/ — the container runs
 # as root).
 ~/.claude/backpack.json
+
+# Example locations the reader chooses. The dev clone's folder differs per
+# machine (the original Windows machine uses C:/Development/ccpraxis), so the
+# default named in README.md need not exist on the host running this lint.
+~/Projects/ccpraxis

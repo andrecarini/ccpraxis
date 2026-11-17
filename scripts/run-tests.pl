@@ -555,13 +555,14 @@ sub _lint_root {
 # (spec section 2.4): Cwd::abs_path, falling back to the path itself when
 # abs_path can't resolve it (e.g. a path under a HEAD snapshot that no
 # longer exists by the time this is called), backslashes folded to forward
-# slashes, lowercased on a Windows-family perl (case-insensitive filesystem).
+# slashes, lowercased on a Windows-family perl or macOS (case-insensitive
+# filesystems; abs_path keeps the case it was given on both).
 sub _path_identity {
     my ($p) = @_;
     my $id = Cwd::abs_path($p);
     $id = $p unless defined $id;
     $id =~ s{\\}{/}g;
-    $id = lc($id) if $^O =~ /^(MSWin32|cygwin|msys)$/;
+    $id = lc($id) if $^O =~ /^(MSWin32|cygwin|msys|darwin)$/;
     return $id;
 }
 
@@ -949,7 +950,26 @@ sub _cores {
         close $c;
         return $n if $n;
     }
+    # macOS (and the BSDs) have neither of the above, which left an 18-core
+    # Mac at the fallback of 4, i.e. two workers after the cores-2 default.
+    for my $cmd ('getconf _NPROCESSORS_ONLN 2>/dev/null', 'sysctl -n hw.ncpu 2>/dev/null') {
+        my $n = `$cmd`;
+        return $1 if defined $n && $n =~ /^\s*(\d+)\s*$/ && $1 > 0;
+    }
     return 4;
+}
+
+# _ensure_timeout_on_path() -- see run_sweep()'s first statement. Only acts
+# when no `timeout` resolves on PATH; never shadows a real one.
+sub _ensure_timeout_on_path {
+    my $sep = ($^O eq 'MSWin32') ? ';' : ':';
+    for my $dir (split /\Q$sep\E/, $ENV{PATH} // '') {
+        next unless length $dir;
+        return if -x "$dir/timeout" && !-d "$dir/timeout";
+    }
+    my $bin = "$ROOT_ABS/scripts/test-bin";
+    return unless -x "$bin/timeout";
+    $ENV{PATH} = "$bin$sep" . ($ENV{PATH} // '');
 }
 
 # _resolve_jobs(%args) -> $jobs
@@ -1117,6 +1137,13 @@ sub run_one {
     $ENV{CCPRAXIS_NO_WAKELOCK}              = 1;
     # spend-token-report Decision 8: no per-file sandbox ever performs a live pricing fetch.
     $ENV{CCPRAXIS_SPEND_NO_FETCH}           = 1;
+    # No test reads the operator's macOS login Keychain (BpCreds.pm). The
+    # sandboxed HOME above already switches the automatic rule off; this is
+    # the explicit opt-out, which also covers a test that restores the real
+    # HOME. Set after the BP_ scrub, so an ambient value cannot survive it. A
+    # test of the Keychain path opts back in locally, with a stub
+    # BP_CREDS_SECURITY_BIN.
+    $ENV{BP_CREDS_KEYCHAIN}                 = 0;
 
     # FIX-BATCH M2 (review, step 7): GIT_CONFIG_GLOBAL used to point straight
     # at the operator's REAL ~/.gitconfig -- git has no read-only mode for
@@ -1188,23 +1215,30 @@ sub _marker_fix_message {
     my $rel = _relpath($file);
     my $body;
     if ($marker->{outcome} eq 'absent') {
-        $body = 'no platform marker found. Fix: add "# platform: windows|linux|any" near the top '
+        $body = 'no platform marker found. Fix: add "# platform: host|linux|any" near the top '
               . 'of the file (within the first 4096 bytes).';
     } elsif ($marker->{outcome} eq 'invalid' && $marker->{reason} eq 'unrecognized-value') {
         my $raw = _escape_marker_text($marker->{raw}[0] // '');
-        $body = qq{unrecognized platform value "$raw". Fix: change it to one of: windows, linux, any.};
+        # Retired values (TestPlatform::renamed_values) get the exact fix, data-driven.
+        my %renamed = TestPlatform::renamed_values();
+        my $rename_hint = '';
+        if (exists $renamed{$marker->{raw}[0] // ''}) {
+            my $old = $marker->{raw}[0];
+            $rename_hint = qq{ "$old" was renamed to "$renamed{$old}"; change the line to "# platform: $renamed{$old}".};
+        }
+        $body = qq{unrecognized platform value "$raw". Fix: change it to one of: host, linux, any.$rename_hint};
     } elsif ($marker->{outcome} eq 'invalid' && $marker->{reason} eq 'conflicting-markers') {
         my $joined = join(', ', map { _escape_marker_text($_) } @{ $marker->{raw} // [] });
         $body = "conflicting platform markers found ($joined). Fix: keep exactly one "
               . '"# platform: ..." line with a single legal value.';
     } elsif ($marker->{outcome} eq 'invalid' && $marker->{reason} eq 'malformed-marker-line') {
         my $raw = _escape_marker_text($marker->{raw}[0] // '');
-        $body = qq{malformed platform marker line ("$raw"). Fix: use exactly "# platform: windows|linux|any" }
+        $body = qq{malformed platform marker line ("$raw"). Fix: use exactly "# platform: host|linux|any" }
               . '(lowercase keyword "platform", one legal value, no trailing text).';
     } else {
         # Defensive fallback for any future fourth reason value -- must never
         # fire against today's TestPlatform.pm.
-        $body = 'platform marker is not legal. Fix: use exactly "# platform: windows|linux|any".';
+        $body = 'platform marker is not legal. Fix: use exactly "# platform: host|linux|any".';
     }
     return "PLATFORM MARKER REFUSED: $rel -- $body";
 }
@@ -1269,7 +1303,9 @@ sub classify_file {
     if ($serial) {
         return { lane => 'host-serial', marker => $marker, serial => 1 };
     }
-    if ($marker->{value} eq 'windows') {
+    # `host` = "must run on the host, not in the container lane" -- NOT "Windows
+    # only" (those tests skip themselves off Windows, inside the file).
+    if ($marker->{value} eq 'host') {
         return { lane => 'host-parallel', marker => $marker, serial => 0 };
     }
     # 'any' or 'linux', not serial-classified.
@@ -1587,6 +1623,13 @@ sub _path_attributed {
 sub run_sweep {
     my @argv = @_;
     local @ARGV = @argv;
+
+    # macOS ships no GNU `timeout`, and the hook harnesses plus a hundred-odd
+    # test files call `timeout N cmd ...` directly. When none is on PATH, put
+    # scripts/test-bin (a pure-perl stand-in with GNU's interface and exit
+    # codes) in front for every file this sweep runs. Hosts that have a real
+    # one (Git for Windows, Linux) are left exactly as they were.
+    _ensure_timeout_on_path();
 
     my ($fast, $jobs, $nice, $state_mode, @targets) = (0, 0, 0, 0);
     while (@ARGV) {

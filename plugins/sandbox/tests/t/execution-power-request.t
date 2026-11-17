@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 #
 # 01-execution-power-request (host-wake-and-suspend blueprint).
 #

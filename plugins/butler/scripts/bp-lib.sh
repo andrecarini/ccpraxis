@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # bp-lib.sh — butler's copy of the shared base helpers PLUS sandbox-only execution helpers.
 # Sourced by scripts/ and hooks/. Must stay dependency-light: bash, coreutils, jq, flock.
+# The shared base helpers also run on a host, so they stay portable: bash 3.2
+# (macOS /bin/bash) and BSD userland as well as bash 5 + GNU coreutils.
 #
 # SUBSET/SUPERSET RELATIONSHIP: The 7 shared base helpers (bp_project_root,
 # bp_data_dir, bp_dir, bp_ledger, fm_get, iso_now, file_age_min) at the top of
@@ -62,8 +64,11 @@ fm_get() {
 iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 file_age_min() {  # minutes since last mtime of $1
+  # GNU stat (Linux, Git for Windows) first, then BSD stat (macOS), whose -c
+  # does not exist; a file neither can read counts as age 0.
   local now mt
-  now=$(date +%s); mt=$(stat -c %Y "$1" 2>/dev/null || echo "$now")
+  now=$(date +%s)
+  mt=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo "$now")
   echo $(( (now - mt) / 60 ))
 }
 # ---------------------- butler-only: sandbox execution helpers ---------------

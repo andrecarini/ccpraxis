@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # No test may actuate a real OS wake-lock.
 #
 # WHY THIS FILE EXISTS, AND WHY THE RULE IT ENFORCES IS NOT THE OBVIOUS ONE.

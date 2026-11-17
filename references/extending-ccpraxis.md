@@ -110,7 +110,7 @@ perl scripts/_install-bin-helper.pl <plan|apply> <abs-bindir>
 
 It handles:
 
-- **Linux/macOS**: `chmod +x` for `*.sh` files in the bindir; create extensionless symlinks (so `claude-foo` works alongside `claude-foo.sh`); append `export PATH="$HOME/<bindir-rel>:$PATH"` to the user's shell rc (picks `.zshrc` if zsh, else `.bashrc`, else `.profile`).
+- **Linux/macOS**: `chmod +x` for `*.sh` files in the bindir; create an extensionless symlink for any `claude-foo.sh` that has no `claude-foo` beside it; append `export PATH="$HOME/<bindir-rel>:$PATH"` to the user's shell rc (picks `.zshrc` if zsh, else `.bashrc`, else `.profile`). The helper runs against the live install, so neither of the first two may actually change anything there: a mode change shows as a modification on a `core.fileMode=true` clone, a new symlink is an untracked file, and promote.pl refuses to merge into a live install with either. Commit the `.sh` as 100755 (`git update-index --chmod=+x`) and ship the extensionless alias as a tracked file (copy `plugins/sandbox/bin/claude-sandbox`), and the helper finds nothing to do.
 - **Windows**: prepend the dir to `HKCU\Environment\Path`; if `.PS1` is missing from `HKCU\Environment\PATHEXT`, add it (seeded from the Machine PATHEXT so the user doesn't accidentally narrow what runs).
 
 Idempotent. Two-phase (`plan`/`apply`). Uses base64-encoded values when talking to `powershell.exe` so usernames with non-ASCII characters round-trip correctly through the console codepage.
@@ -248,6 +248,7 @@ plugins/flux/
 │   ├── flux.pl                # plugin's internal helper
 │   └── claude-flux.pl         # CLI logic (TUI, dispatcher, whatever)
 ├── bin/
+│   ├── claude-flux            # tracked extensionless alias, a copy of plugins/sandbox/bin/claude-sandbox
 │   ├── claude-flux.sh
 │   └── claude-flux.ps1
 └── skills/
@@ -281,7 +282,9 @@ exec perl "$HOME/.claude/ccpraxis/plugins/flux/scripts/claude-flux.pl" "$@"
 
 **6. Register the plugin** in `plugins/.claude-plugin/marketplace.json` and enable it in `settings.json` under `enabledPlugins`.
 
-**7. Run `perl install.pl`** — orchestrator discovers the new hook, plans the PATH edit; `--confirm` applies.
+**7. Commit with the bin scripts executable** (`git update-index --chmod=+x plugins/flux/bin/claude-flux plugins/flux/bin/claude-flux.sh`), on `main` in the dev clone, and promote: `perl scripts/promote.pl`.
+
+**8. Run the live install's `perl ~/.claude/ccpraxis/install.pl`** — orchestrator discovers the new hook, plans the PATH edit; `--confirm` applies. Afterwards `git -C ~/.claude/ccpraxis status --porcelain` should print nothing.
 
 That's the whole loop. No edits to `install.pl`. No edits to anything in ccpraxis core. The plugin is self-contained.
 

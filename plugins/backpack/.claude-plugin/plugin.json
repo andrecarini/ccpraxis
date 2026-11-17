@@ -1,7 +1,7 @@
 {
   "name": "backpack",
   "version": "0.1.0",
-  "description": "What you pack to take into the /sandbox container. Declares the tools, runtimes, and project-setup commands a project needs so they're automatically restored on every container rebuild. Slash commands: /backpack:add, /backpack:remove, /backpack:list, /backpack:install, /backpack:audit. A PostToolUse hook on Bash detects install commands and proposes pre-filled /backpack:add invocations the agent can decide to keep or skip.",
+  "description": "What you pack to take into the /sandbox container. Declares the tools, runtimes, and project-setup commands a project needs so they're automatically restored on every container rebuild. Slash commands: /backpack:add, /backpack:remove, /backpack:list, /backpack:install, /backpack:audit. A Bash hook in the sandbox proposes pre-filled /backpack:add invocations after install commands, and keeps Node.js and pnpm on the node-pnpm recipe: it refuses other Node installs and names the recipe when a command finds Node missing.",
   "author": {
     "name": "ccpraxis"
   }

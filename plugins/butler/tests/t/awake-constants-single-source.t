@@ -478,6 +478,14 @@ subtest 'Sandbox-only fixture: no butler plugin present (AC-14)' => sub {
         },
     }, $src_root);
 
+    # The launcher's SandboxSettings.pm loads the steward plugin's unit model
+    # (SettingsUnits.pm, a sibling-plugin require that came with the sandbox
+    # settings backup). This fixture is about BUTLER being absent, so the one
+    # steward file the launcher needs is copied in beside it.
+    make_path("$Tf/plugins/steward/scripts");
+    copy("$Bin/../../../steward/scripts/SettingsUnits.pm", "$Tf/plugins/steward/scripts/SettingsUnits.pm")
+        or diag("copy SettingsUnits.pm failed: $!");
+
     ok(!-e "$Tf/plugins/butler", 'precondition: no butler plugin exists in the fixture');
 
     # Step 2: perl -c on the fixture's launcher.pl

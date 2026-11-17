@@ -17,7 +17,9 @@
 # read are holder pids, written by a holder's own $$ and read back through
 # /proc/<pid>/cmdline in the SAME (MSYS) namespace. Never /proc/*/stat,
 # /proc/*/status or /proc/*/winpid; never ps -W, tasklist, taskkill or
-# Get-Process; never a WINPID compared with an MSYS pid.
+# Get-Process; never a WINPID compared with an MSYS pid. darwin has no /proc
+# and no second namespace: there, and only there, a holder pid's start time
+# comes from `ps -o lstart= -p <pid>` (start_fp).
 package BpHook;
 use strict;
 use warnings;
@@ -547,6 +549,13 @@ sub holder_live {
 # running_work (spec 38 sec 2.2): the record's pid is alive and, where
 # /proc exists, its cmdline still hashes to the record's fp, so a recycled
 # pid never reads as the holder. Same MSYS pid namespace as the writer.
+#
+# macOS has no /proc, so there the check used to be kill(0) alone, and a
+# recycled pid read as the live holder. butler-hold writes a "ps:<start>"
+# fp on darwin instead (start_fp below), and a record carrying one is
+# compared against the pid's current start time. Any other fp on darwin
+# (empty because ps failed at become, or a fixture's placeholder) keeps the
+# old kill(0) answer, as does a ps that cannot run at all.
 sub _holder_proc_alive {
     my ($h) = @_;
     return 0 unless ref $h eq 'HASH';
@@ -560,7 +569,62 @@ sub _holder_proc_alive {
         return 0 unless defined $cmdline && length $cmdline;
         return sha1_hex($cmdline) eq $fp ? 1 : 0;
     }
-    return kill(0, $pid) ? 1 : 0;
+    return 0 unless kill(0, $pid);
+    if ($^O eq 'darwin') {
+        my $fp = $h->{fp};
+        if (_is_plain_string($fp) && $fp =~ /\Aps:/) {
+            my $have = start_fp($pid);
+            return 1 unless defined $have;
+            return $have eq $fp ? 1 : 0;
+        }
+    }
+    return 1;
+}
+
+# start_fp($pid) -> "ps:<start time>" | undef. darwin's stand-in for the
+# /proc cmdline hash: `LC_ALL=C ps -o lstart= -p <pid>`, whitespace
+# collapsed, so a recycled pid (a different process, started later) never
+# matches the record its predecessor wrote. Same MSYS-free namespace as
+# everything else here: on darwin $$ and ps share one pid space.
+#
+# This is the one process this module starts, and only on the darwin
+# branch of a holder check (the Stop gate, butler-hold, the power journal),
+# never on the per-tool-call path. /bin/ps by absolute path (it is part of
+# the base system), stderr to /dev/null so a hook prints nothing, and a
+# 2-second per-pid cache so one Stop evaluation that asks holder_live and
+# running_work about the same holder pays for one ps, not three. undef when
+# ps cannot run or prints nothing (the pid is gone); undef is not cached.
+my %START_FP_CACHE;
+sub start_fp {
+    my ($pid) = @_;
+    return undef unless defined $pid && "$pid" =~ /^[1-9][0-9]{0,9}$/;
+    my $now = time();
+    my $hit = $START_FP_CACHE{$pid};
+    return $hit->[1] if $hit && $now - $hit->[0] < 2 && $now >= $hit->[0];
+    my $ps = -x '/bin/ps' ? '/bin/ps' : 'ps';
+    my $out;
+    {
+        local $?;
+        local $ENV{LC_ALL} = 'C';
+        my $kid = open(my $ph, '-|');
+        return undef unless defined $kid;
+        if (!$kid) {
+            open(STDERR, '>', '/dev/null');
+            { no warnings 'exec'; exec { $ps } 'ps', '-o', 'lstart=', '-p', "$pid"; }
+            POSIX::_exit(127);
+        }
+        local $/;
+        $out = <$ph>;
+        close $ph;
+    }
+    return undef unless defined $out;
+    $out =~ s/\s+/ /g;
+    $out =~ s/\A //;
+    $out =~ s/ \z//;
+    return undef unless length $out;
+    my $fp = "ps:$out";
+    $START_FP_CACHE{$pid} = [$now, $fp];
+    return $fp;
 }
 
 # ------------------------------------------------------------ running work -
@@ -1501,6 +1565,56 @@ sub file_stop_bug {
 # parsed for real commands, even when it sits inside an outer pair of double
 # quotes. Its matching ')'/backtick pops back to the enclosing frame, which
 # resumes with whatever quote state it had frozen at push time.
+#
+# zsh redirection spellings. The Bash tool runs zsh on macOS, and zsh has
+# output redirections bash does not: ">!" (">|": clobber even under
+# noclobber), ">>!" / ">>|" (append, creating the file), "&>!" / "&>|" /
+# ">&!" / ">&|" (stdout and stderr, clobbering), ">>&" and "&>>!" / "&>>|" /
+# ">>&!" / ">>&|" (append both). Read as bash, ">! f" redirects to a file
+# named "!" and leaves f a mere argument, and "a >>| f" tears into a
+# redirect with no target plus a pipe into a command named f -- so every
+# guard that parses a command as bash judged the wrong file (measured: the
+# almanac guard allowed "echo x >! <bug report>" and zsh wrote it). Each is
+# mapped to the bash operator with the same effect, padded with spaces to
+# the same length so every offset into the text stays valid. ">|" itself is
+# bash too; it is mapped to ">" for the same reason (its "|" is otherwise a
+# pipe to every splitter here). Under bash proper ">! f" really does write
+# a file named "!"; reading it the zsh way only ever judges the named file
+# instead, which is the one a person writing ">!" means.
+my $ZSH_REDIR_RE = qr/>>&[!|]?|&>>[!|]|>>[!|]|(?:&>|>&)[!|]|>[!|]/;
+my %BASH_FOR_ZSH_REDIR = (
+    '>!'   => '> ',   '>|'   => '> ',
+    '>>!'  => '>> ',  '>>|'  => '>> ',
+    '&>!'  => '&> ',  '&>|'  => '&> ',  '>&!' => '&> ', '>&|' => '&> ',
+    '>>&'  => '&>>',
+    '&>>!' => '&>> ', '&>>|' => '&>> ', '>>&!' => '&>> ', '>>&|' => '&>> ',
+);
+
+# _zsh_redirect_at($text, $i) -> the bash spelling (same length) of the zsh
+# redirection operator starting at offset $i of $text, or undef. Callers
+# only ask at an unquoted '>' or '&'; _segments() below is the quote-aware
+# one, so it is the place a shell command's text should be lexed.
+sub _zsh_redirect_at {
+    my ($text, $i) = @_;
+    my $w = substr($text, $i, 4);
+    return undef unless $w =~ /\A($ZSH_REDIR_RE)/;
+    return $BASH_FOR_ZSH_REDIR{$1};
+}
+
+# normalize_redirects($text) -> $text with every zsh redirection spelling
+# above rewritten to its bash form, same length. NOT quote-aware: for text
+# whose quoted parts and heredoc bodies are already blanked (Guards::Shell::
+# strip_noise output), or for heuristics that read a command's text without
+# lexing it. A separately quote-tracking pass would be the very desync
+# _segments() was rebuilt to avoid; _segments() applies the same mapping
+# inside its own walk instead.
+sub normalize_redirects {
+    my ($text) = @_;
+    return $text unless defined $text && $text =~ $ZSH_REDIR_RE;
+    $text =~ s/($ZSH_REDIR_RE)/$BASH_FOR_ZSH_REDIR{$1}/g;
+    return $text;
+}
+
 sub _segments {
     my ($text) = @_;
     # never-halt/01 fix-batch 3 (M2): work on a BYTE copy. A decoded
@@ -1791,6 +1905,17 @@ sub _segments {
             $i++;
             next;
         }
+        # An unquoted zsh redirection spelling (">!", ">>|", "&>!", ">>&",
+        # ...; see %BASH_FOR_ZSH_REDIR) becomes the bash operator it means
+        # before the '|' or '&' inside it can split the segment.
+        if ($c eq '>' || $c eq '&') {
+            my $rep = _zsh_redirect_at($text, $i);
+            if (defined $rep) {
+                $frame->{buf} .= $rep;
+                $i += length $rep;
+                next;
+            }
+        }
         if ($c eq ';' || $c eq '|') {
             push @segs, $frame->{buf};
             $frame->{buf} = '';
@@ -2063,7 +2188,8 @@ sub _reduce_and_match {
             $progress = 1;
             if ($i < $n && defined $words->[$i]{literal} && $words->[$i]{literal} eq '-n') { $i += 2 }
         }
-        elsif ($lit eq 'nohup' || $lit eq 'command' || $lit eq 'exec') {
+        elsif ($lit eq 'nohup' || $lit eq 'command' || $lit eq 'exec'
+            || $lit eq 'noglob' || $lit eq 'nocorrect') {   # the last two: zsh precommand modifiers
             $i++;
             $progress = 1;
         }
@@ -2090,6 +2216,7 @@ sub _reduce_and_match {
     $cmd = $words->[$i]{tail} unless defined $cmd;
     return undef unless defined $cmd;
     my $base = $cmd;
+    $base =~ s{\A=(?=[^=])}{};   # zsh: "=name" runs the name found on PATH
     $base =~ s{.*[/\\]}{};
     return undef unless $base =~ /^\Q$name\E(?:\.sh|\.pl)?$/;
 
@@ -2269,13 +2396,20 @@ sub _fast_ascii_escape_decode {
     return undef unless defined $raw && length $raw;
     my $esc = $raw;
     my $bad = 0;
+    # One _utf8_seq_escape call per DISTINCT sequence, not per occurrence:
+    # real text repeats a handful of non-ASCII characters, and the sub call
+    # was a third of the non-ASCII decode cost (1 MiB of U+00E9: 0.18s of
+    # 0.83s on macOS perl 5.34, which put worker-bash-hygiene.t AC-58's
+    # 4x-of-ASCII ratio at 4.06). The output is identical: a bad sequence
+    # still sets $bad on its first occurrence, which is all the caller reads.
+    my %memo;
     $esc =~ s{
         ( [\xC2-\xDF][\x80-\xBF]
         | [\xE0-\xEF][\x80-\xBF]{2}
         | [\xF0-\xF4][\x80-\xBF]{3}
         )
     }{
-        _utf8_seq_escape($1, \$bad)
+        $memo{$1} //= _utf8_seq_escape($1, \$bad)
     }gex;
     return undef if $bad;
     # A stray/malformed byte that never matched the pattern above (a lone

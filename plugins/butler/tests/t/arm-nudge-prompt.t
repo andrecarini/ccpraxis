@@ -137,6 +137,7 @@ sub mkpayload {
 sub fire_hook {
     my ($payload, %env) = @_;
     my $cmd  = delete $env{__cmd} // current_U();
+    my $stdin_from = delete $env{__stdin};   # a ready stdin path (fire_hook_held's fifo)
     my $root = $env{CLAUDE_PLUGIN_ROOT} // $BUTLER;
 
     my (undef, $script) = tempfile(SUFFIX => '.sh');
@@ -144,10 +145,13 @@ sub fire_hook {
     print {$sfh} "#!/usr/bin/env bash\n$cmd\n";
     close $sfh;
 
-    my (undef, $in) = tempfile();
-    open(my $ifh, '>:raw', $in) or die "cannot write $in: $!";
-    print {$ifh} encode_payload($payload);
-    close $ifh;
+    my $in = $stdin_from;
+    unless (defined $in) {
+        (undef, $in) = tempfile();
+        open(my $ifh, '>:raw', $in) or die "cannot write $in: $!";
+        print {$ifh} encode_payload($payload);
+        close $ifh;
+    }
 
     my (undef, $out) = tempfile();
     my (undef, $err) = tempfile();
@@ -165,8 +169,35 @@ sub fire_hook {
     my $rc = $? >> 8;
     my $o  = slurp($out) // '';
     my $e  = slurp($err) // '';
-    unlink $script, $in, $out, $err;
+    unlink $script, (defined $stdin_from ? () : $in), $out, $err;
     return { rc => $rc, out => $o, err => $e };
+}
+
+# fire_hook_held($payload, %env) -> fire_hook()'s result, or undef with no
+# mkfifo. stdin is a fifo whose writer sends the whole payload and then holds
+# the pipe open for 20 s (its lifetime bounds the run), so the hook's read can
+# only end by its timeout -- pass BP_PAYLOAD_READ_TIMEOUT => 1 to keep it short.
+sub fire_hook_held {
+    my ($payload, %env) = @_;
+    require POSIX;
+    require File::Spec;
+    my $dir = tempdir(CLEANUP => 1);
+    my $fifo = "$dir/stdin.fifo";
+    POSIX::mkfifo($fifo, 0600) or return undef;
+    my $writer = fork();
+    die "fork: $!" unless defined $writer;
+    if ($writer == 0) {
+        open(STDOUT, '>', File::Spec->devnull);
+        open(STDERR, '>', File::Spec->devnull);
+        open(my $w, '>', $fifo) or POSIX::_exit(1);
+        syswrite($w, encode_payload($payload));
+        sleep 20;
+        POSIX::_exit(0);
+    }
+    my $r = fire_hook($payload, %env, __stdin => $fifo);
+    kill 'KILL', $writer;
+    waitpid($writer, 0);
+    return $r;
 }
 
 # fresh_state_base() -- like GuardHarness::fresh_state(), but returns the
@@ -264,6 +295,25 @@ sub assert_nudge_line {
     is($r->{err}, '', 'AC-3: stderr empty');
     assert_nudge_line($r->{out}, 'AC-3');
     ok(-f marker_path($state, $sid), 'AC-3: the marker was written');
+}
+
+# ===========================================================================
+# AC-3b: the same matching prompt, but the payload never finishes arriving
+# (the writer holds stdin open). A nudge is advisory, so it stays quiet --
+# and identically on every bash: scripts/read-payload.sh empties a timed-
+# out read everywhere, where bash >= 4 used to keep the partial text (and
+# nudge on it) while macOS bash 3.2 dropped it.
+# ===========================================================================
+SKIP: {
+    my $sid = fresh_sid();
+    my $state = fresh_state_base();
+    my $r = fire_hook_held(mkpayload(sid => $sid, prompt => q{please keep going while I'm away}),
+        BUTLER_STATE_DIR => $state, BP_PAYLOAD_READ_TIMEOUT => 1);
+    skip 'AC-3b: no mkfifo on this host', 4 unless defined $r;
+    is($r->{rc}, 0, 'AC-3b: a held-open payload exits 0');
+    is($r->{out}, '', 'AC-3b: ...with no nudge');
+    is($r->{err}, '', 'AC-3b: ...and nothing on stderr');
+    ok(!-e marker_path($state, $sid), 'AC-3b: ...and no prompt marker written from a payload it never read in full');
 }
 
 # ===========================================================================

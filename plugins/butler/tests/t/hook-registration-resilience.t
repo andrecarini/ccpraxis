@@ -52,7 +52,11 @@ my $HOOKS_JSON = "$HOOKS/hooks.json";
 
 my $REAL_BASH_ABS = do { my $p = `bash -c "command -v bash"`; chomp $p; $p };
 BAIL_OUT('cannot resolve a real bash on PATH') unless length $REAL_BASH_ABS;
-my $REAL_TIMEOUT_ABS = do { my $p = `bash -c "command -v timeout"`; chomp $p; $p };
+my $REAL_TIMEOUT_ABS = do { my $p = `bash -c "command -v timeout"`; chomp $p;
+    # macOS has no GNU timeout: fall back to the repo's pure-perl stand-in
+    # (scripts/run-tests.pl already puts it on PATH for a sweep).
+    unless (length $p) { (my $d = __FILE__) =~ s{[^/\\]+\z}{}; my $s = "${d}../../../../scripts/test-bin/timeout"; $p = $s if -x $s; }
+    $p };
 BAIL_OUT('cannot resolve a real timeout utility on PATH') unless length $REAL_TIMEOUT_ABS;
 
 sub read_bytes { GuardHarness::read_bytes(@_) }
@@ -78,12 +82,12 @@ sub read_json {
         arm-on-entry.sh bind-dispatch.sh context-ceiling.sh continuity-off-check.sh
         denial-breaker.sh
         gate-shutdown.sh guard-ask-operator.sh guard-bash.sh guard-blueprint-write.sh
-        guard-continuity-state.sh guard-disarm-judge-readonly.sh
+        guard-continuity-state.sh guard-disarm-judge-readonly.sh guard-sleep-control.sh
         guard-fork.sh guard-git-mutations.sh guard-writes.sh hooks.json ledger-guard.sh
         record-denial.sh record-prompt.sh
         run-hook.sh session-start-nudge.sh stop-gate.sh track-dispatch.sh wait-shape-guard.sh
     );
-    is(scalar(@EXPECT_FILES), 25, 'sanity: this file\'s own sec 2.4 fixture list has 25 entries (never-halt 06 adds record-prompt.sh, record-denial.sh; never-halt 07 adds denial-breaker.sh; never-halt 11 adds arm-nudge-prompt.sh; never-halt 12 adds session-start-nudge.sh; tooling-backlog package 11 adds ac-standdown-gate.sh; judged-continuity-disarm package 03 adds guard-disarm-judge-readonly.sh; the continuity-state guard adds guard-continuity-state.sh)');
+    is(scalar(@EXPECT_FILES), 26, 'sanity: this file\'s own sec 2.4 fixture list has 26 entries (the sleep-control guard adds guard-sleep-control.sh; never-halt 06 adds record-prompt.sh, record-denial.sh; never-halt 07 adds denial-breaker.sh; never-halt 11 adds arm-nudge-prompt.sh; never-halt 12 adds session-start-nudge.sh; tooling-backlog package 11 adds ac-standdown-gate.sh; judged-continuity-disarm package 03 adds guard-disarm-judge-readonly.sh; the continuity-state guard adds guard-continuity-state.sh)');
 
     opendir(my $dh, $HOOKS) or BAIL_OUT("cannot opendir $HOOKS: $!");
     my (@actual_files, @subdirs);
@@ -222,8 +226,8 @@ sub all_registered_commands {
         all_registered_commands($hooksjson, 'hooks.json'),
         all_registered_commands($settings,  'settings.json'),
     );
-    is(scalar(@combined), 30,
-       'B6a: exactly 30 commands are registered in total across hooks.json + settings.json (never-halt 06 adds 2, never-halt 07 adds 4: PreToolUse/PostToolUse/PostToolUseFailure/SessionStart denial-breaker.sh; never-halt 11 adds 1: UserPromptSubmit arm-nudge-prompt.sh; never-halt 12 adds 1: SessionStart session-start-nudge.sh; tooling-backlog package 11 adds 1: PreToolUse ac-standdown-gate.sh; judged-continuity-disarm package 03 adds 1: PreToolUse guard-disarm-judge-readonly.sh; the continuity-state guard adds 1: PreToolUse guard-continuity-state.sh)')
+    is(scalar(@combined), 31,
+       'B6a: exactly 31 commands are registered in total across hooks.json + settings.json (the sleep-control guard adds 1: PreToolUse guard-sleep-control.sh; never-halt 06 adds 2, never-halt 07 adds 4: PreToolUse/PostToolUse/PostToolUseFailure/SessionStart denial-breaker.sh; never-halt 11 adds 1: UserPromptSubmit arm-nudge-prompt.sh; never-halt 12 adds 1: SessionStart session-start-nudge.sh; tooling-backlog package 11 adds 1: PreToolUse ac-standdown-gate.sh; judged-continuity-disarm package 03 adds 1: PreToolUse guard-disarm-judge-readonly.sh; the continuity-state guard adds 1: PreToolUse guard-continuity-state.sh)')
         or diag('found ' . scalar(@combined) . ' registered commands');
 
     my (@bad_127, @bad_rc, @slow);

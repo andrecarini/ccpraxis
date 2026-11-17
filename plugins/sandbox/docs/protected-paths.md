@@ -301,7 +301,7 @@ An older, narrower check (`CcpraxisWorkCopy::workcopy_route`) still runs immedia
 guard, as a fail-safe. It also consults the launcher's own `__FILE__`-derived anchor for the live
 ccpraxis install, so it still refuses to sandbox the live install in place even on a machine where
 the marketplace registry cannot be read and this guard's `ccpraxis-install` root is therefore
-missing. See `plugins/sandbox/docs/working-on-ccpraxis.md` for the clone workflow that refusal
+missing. See `docs/working-on-ccpraxis.md` for the clone workflow that refusal
 points you to.
 
 ## 10. Refusal markers: a directory that refuses on its own

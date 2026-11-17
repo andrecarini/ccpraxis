@@ -49,6 +49,10 @@ use CcpraxisWorkCopy qw(workcopy_route workcopy_refusal_outcome);
 use ProtectedPaths qw(path_relation protected_roots target_self_codes normalize_path);
 use RefusalMarker ();  # .claude-sandbox-refuse markers: refuse before anything is written
 use SandboxIdentity ();  # launcher identity + this checkout's own install root
+use HostPlatform ();     # container CLI choice, machine shares, darwin path case
+use PodmanMachine ();    # the macOS machine: its share folders and the script that keeps them
+use LiveMirror ();       # macOS: the copy of the install root the podman machine shares instead of it
+use ContainerClaudeMd ();  # the container CLAUDE.md, built for this host and runtime
 use LaunchLog ();   # B1: durable per-launch diagnostic log (next to us in scripts/)
 use Dashboard ();   # B2: the raw-ANSI TUI dashboard framework
 use WtProfile ();   # sandbox-wt-profile/02: [c]-press profile fragment ensure + name
@@ -165,6 +169,8 @@ use PortAlloc ();         # fix-multiple-running-sandboxes: per-container port-b
 use SandboxLock ();       # 04-build-race-lock: generalised mkdir lock + global build-race guard
 use ProjectSandbox ();    # claude-sandbox.json: a project's image layer + allowlisted run settings
 use BoundedRun ();        # bug 20261110-165535-d71b: every pre-dashboard podman call is bounded
+use SandboxSettings ();   # the sandbox's settings.json merge / CLAUDE.md refresh at create, with backups
+use SandboxRegistry ();   # this machine's list of sandboxed projects (read by /steward:backup)
 use JSON::PP ();          # parse backpack.json + write the approved install-set
 use Errno ();              # 04-run-panel-ledger-truth: %! (EPERM) for _pid_alive's kill(0,...) probe
 use File::Path qw(make_path);
@@ -185,25 +191,28 @@ binmode STDERR, ':raw';
 
 my $WINDOWS_FAMILY = $^O =~ /^(MSWin32|cygwin|msys)$/;
 
-# Detect which container CLI is installed: prefer docker (Docker Desktop's
-# `docker.exe` is the more universally installed runtime), fall back to
-# podman. Probing by spawning `<cli> --version` is the only reliable check
-# on Windows — relying on file-existence in $PATH is fragile because of
-# .exe vs extensionless shim hijacks (Docker Desktop historically dropped
-# an extensionless `docker` shell-wrapper alongside `docker.exe` that
-# Git-for-Windows perl's POSIX `PATH` search would find first and fail to
-# spawn). Always name the .exe explicitly on Windows.
+# Detect which container CLI is installed. The decision lives in
+# HostPlatform::detect_container_cli, shared with bootstrap.pl and the test
+# harness: CCPRAXIS_CONTAINER_CLI wins when set; otherwise the Windows family
+# probes docker.exe then podman.exe (unchanged -- named with .exe because
+# Git-for-Windows perl's PATH search finds an extensionless shim first and
+# fails to spawn it), macOS probes podman then docker (podman is the supported
+# runtime there, and a Mac can carry an unrelated docker wrapper on PATH), and
+# Linux keeps docker then podman. Probing by spawning `<cli> --version` is the
+# only reliable check on Windows.
+my $CLI_DETECT_ERROR;
 sub _detect_container_cli {
-    for my $candidate ($WINDOWS_FAMILY ? ('docker.exe', 'podman.exe') : ('docker', 'podman')) {
-        my $rc = system("$candidate --version > /dev/null 2>&1");
-        return $candidate if $rc == 0;
-    }
-    return undef;
+    my ($cli, $err) = HostPlatform::detect_container_cli();
+    $CLI_DETECT_ERROR = $err;
+    return $cli;
 }
 my $PODMAN = _detect_container_cli();
 unless (defined $PODMAN) {
-    print STDERR "ERROR: no container CLI on PATH (looked for docker, podman).\n";
-    print STDERR "       Install Docker Desktop (https://docker.com) or Podman Desktop (https://podman-desktop.io/) and re-run.\n";
+    if (defined $CLI_DETECT_ERROR) {
+        print STDERR "ERROR: $CLI_DETECT_ERROR\n";
+    } else {
+        print STDERR "$_\n" for HostPlatform::no_cli_message();
+    }
     exit 1;
 }
 
@@ -276,6 +285,20 @@ use constant SELECT_SESSION_FORK_FAILED_EXIT => 3;
 # screen frame is a byte the screen restore is about to discard.
 my $PICK_ERROR;
 my $HOST_PLUGINS_DIR  = "$CLAUDE_HOST_CONFIG/plugins";
+# macOS: the podman machine shares no part of ~/.claude, so host files a
+# container reads are copied into its read-only container-files share and bound
+# from there (MountSpec::stage_global_counts_copy). undef on every other host,
+# where they are bound in place.
+my $CONTAINER_FILES_DIR = PodmanMachine::container_files_dir();
+# macOS: the podman machine does not share the install root either -- the VM can
+# write an "ro" share, and the Mac runs that code. It shares a copy of what
+# containers mount from it (plugins/, skills/, scripts/statusline.pl), which
+# _refresh_live_mirror brings up to date before each create and start, and
+# every bind out of the install root is served from that copy (LiveMirror.pm).
+# Keyed by install root, so a fork's or a clone's launcher has its own. undef on
+# every other host, where the install root is bound in place.
+my $LIVE_MIRROR = LiveMirror::mirror_dir(home => PodmanMachine::account_home(),
+                                         install_root => $INSTALL_ROOT);
 # B2: the canonical entry paths the dashboard spawns for a new claude session,
 # and whether the raw-ANSI TUI is even possible (else the plain heartbeat loop).
 my $LAUNCHER_PL       = "$SANDBOX_PLUGIN/scripts/launcher.pl";
@@ -484,6 +507,12 @@ if (length $RESUME_SESSION
 my $PROJECT_PATH = @POSITIONAL ? $POSITIONAL[0] : Cwd::getcwd();
 $PROJECT_PATH = abs_path($PROJECT_PATH)
     or die "ERROR: cannot resolve project path '$POSITIONAL[0]'\n";
+# APFS is case-insensitive and abs_path keeps the TYPED case on macOS, so
+# `claude-sandbox ~/projects/foo` and `claude-sandbox ~/Projects/foo` would
+# name two containers (the name hashes this path) and look for host sessions
+# under a directory Claude Code never wrote (it names them from getcwd(), which
+# reports the stored case). canonical_dir is a no-op off darwin.
+$PROJECT_PATH = HostPlatform::canonical_dir($PROJECT_PATH);
 $PROJECT_PATH =~ s|\\|/|g;
 $PROJECT_PATH =~ s|/+$||;
 # f15e: Cwd::abs_path() on this host hands back a lowercase-drive POSIX path
@@ -644,13 +673,20 @@ sub _pp_advice {
     my ($reason, $root) = @_;
 
     if ($reason eq 'ccpraxis-install') {
-        return q{Work on a separate clone instead. Pick any ordinary directory outside this install (for example C:/Development/ccpraxis on Windows, or ~/src/ccpraxis on macOS or Linux), then run:
+        return q{Work in your dev clone instead: the checkout you cloned from GitHub (normally ~/Projects/ccpraxis). Promotion makes it this installation's origin, so this prints where it is:
 
-  git clone --no-hardlinks } . $root . q{ <your-clone-dir>
-  cd <your-clone-dir>
+  git -C } . $root . q{ remote get-url origin
+
+Then run claude-sandbox there:
+
+  cd <your-dev-clone>
   claude-sandbox
 
-The --no-hardlinks flag is required: a local clone hardlinks the object store by default, which would silently re-couple the clone to this installation. See plugins/sandbox/docs/working-on-ccpraxis.md.};
+No dev clone on this machine yet? Clone your repository from GitHub into any ordinary directory outside this installation:
+
+  git clone https://github.com/<you>/ccpraxis.git ~/Projects/ccpraxis
+
+Bring changes back by committing on the dev clone's main and running perl <your-dev-clone>/scripts/promote.pl on the host. Promotion is the only way this installation changes: never git pull into it. See docs/working-on-ccpraxis.md.};
     }
 
     if ($reason eq 'marketplace-install' || $reason eq 'marketplace-source') {
@@ -1088,15 +1124,22 @@ my $HOST_ONLY_MASKS_SIGNATURE_FILE = "$LAUNCHER_DIR/.host-only-masks-signature";
 my $EMPTY_SKILL_DIR            = "$LAUNCHER_DIR/empty-skill";
 my $MARKETPLACES_COPY_MANIFEST = "$LAUNCHER_DIR/.host-tier-marketplaces.json";
 my $SKILLS_COPY_MANIFEST       = "$LAUNCHER_DIR/.host-tier-skills.json";
-# Container CLAUDE.md and settings.json: per-project copies (blueprint
-# model). Container can modify these freely; changes never propagate
-# back to ccpraxis. Drift from upstream is detected via stored hash;
-# user picks rebuild to refresh.
+# Container CLAUDE.md and settings.json: what this sandbox was last given.
+# container-CLAUDE.md is the last render it got; container-settings.json is
+# the preset it was last merged with (the BASE of the next merge). The
+# sandbox's own claude-home/settings.json is its own: a container create
+# merges the current preset into it (SandboxSettings::merge_settings) instead
+# of overwriting it, and /steward:backup can carry its changes back into the
+# preset. Drift from upstream is detected via stored hash; a preset version
+# the operator answered "Continue" to is remembered in the *-declined-hash
+# files, so the prompt does not ask about it again until it changes.
 my $CONTAINER_CLAUDE_MD       = "$LAUNCHER_DIR/container-CLAUDE.md";
 my $CONTAINER_SETTINGS_JSON   = "$LAUNCHER_DIR/container-settings.json";
 my $CLAUDE_MD_HASH_FILE       = "$LAUNCHER_DIR/.container-CLAUDE-md-hash";
 my $SETTINGS_HASH_FILE        = "$LAUNCHER_DIR/.container-settings-json-hash";
-my $LOCK_DIR                  = "$LAUNCHER_DIR/.launcher.lock";
+my $CLAUDE_MD_DECLINED_FILE   = "$LAUNCHER_DIR/.container-CLAUDE-md-declined-hash";
+my $SETTINGS_DECLINED_FILE    = "$LAUNCHER_DIR/.container-settings-json-declined-hash";
+my $LOCK_DIR                  = SandboxSettings::launch_lock_dir($LAUNCHER_DIR);  # /steward:backup checks it before reverting a setting
 
 # B1: per-launch diagnostic log. Opened just after the lock is acquired (below);
 # declared here so the signal handlers / END block can close it. log_ev() is a
@@ -2589,6 +2632,21 @@ sub _ensure_machine_ready {
     my $state = eval { _machine_state() } // 'unknown';
     return 1 if $state eq 'n/a' || $state eq 'running';
 
+    # NO MACHINE AT ALL is not a stopped one. `podman machine start` has nothing
+    # to start, so attempting it only produces podman's own "VM does not exist"
+    # and a "try podman machine start" remedy that cannot work. The operator's
+    # one missing step is `podman machine init` -- the normal state of a fresh
+    # macOS install -- so say exactly that.
+    if ($state eq 'absent') {
+        log_ev('machine_absent', {});
+        _fail_visibly(
+            "ERROR: podman is installed but no podman machine exists.",
+            HostPlatform::machine_remedy_lines($^O, 'absent'),
+            "  Then run claude-sandbox again.",
+        );
+        return 0;
+    }
+
     # 'unknown' degrades toward TRYING rather than aborting: _machine_state
     # answers 'unknown' for an unparseable probe, and refusing to launch on an
     # unrecognised schema would be worse than attempting a start that reports
@@ -2606,7 +2664,8 @@ sub _ensure_machine_ready {
         "ERROR: the podman machine is not running and could not be started.",
         "  reason: " . ($r->{detail} // 'unknown error'),
         "",
-        "  Try, in a terminal:   podman machine start",
+        (ref $r->{remedy} eq 'ARRAY' && @{ $r->{remedy} }
+            ? @{ $r->{remedy} } : HostPlatform::machine_remedy_lines($^O, $state)),
         "  Then run claude-sandbox again.",
     );
     return 0;
@@ -2646,6 +2705,106 @@ sub _resource_limit_warning {
         . "for rootless containers), so the sandbox runs without one."), "\n");
 }
 
+# _machine_shares() -> [ { source, target, readonly } ] | undef: what the
+# podman machine shares into its VM. Memoized for the launch. darwin + podman
+# only: a macOS podman machine (applehv/libkrun) sees ONLY the folders it was
+# created with -- the ones podman-machine.pl lists: the live install and
+# ccpraxis's own folders read-only, project directories read-write -- and a
+# bind source anywhere else fails `podman create` with "statfs <path>: no such
+# file or directory", which names neither the machine nor the remedy. On
+# Windows the WSL machine reaches every drive through /mnt, and Linux has no
+# machine at all, so neither is asked. undef ("could not tell") never refuses
+# anything.
+my ($MACHINE_SHARES, $MACHINE_SHARES_DONE);
+sub _machine_shares {
+    return $MACHINE_SHARES if $MACHINE_SHARES_DONE;
+    $MACHINE_SHARES_DONE = 1;
+    return undef unless $^O eq 'darwin' && $PODMAN =~ /podman/i;
+    $MACHINE_SHARES = eval {
+        HostPlatform::machine_shares(
+            inspect => sub { _run_timed(qq{$PODMAN machine inspect 2>/dev/null}, 10) });
+    };
+    return $MACHINE_SHARES;
+}
+
+# _refuse_unshared_mounts($stage, @binds) -- exit with an explanation if any
+# bind ({ source, readonly }, as HostPlatform::bind_mounts returns them) lies
+# outside the podman machine's shares, or is read-write through a share the
+# machine has read-only. Returns quietly when every bind is served or when the
+# shares cannot be determined. The message names podman-machine.pl
+# (add-project <dir>), never hand-typed `podman machine` flags.
+sub _refuse_unshared_mounts {
+    my ($stage, @binds) = @_;
+    my $shares = _machine_shares();
+    return unless ref $shares eq 'ARRAY' && @$shares;
+    my @outside = HostPlatform::sources_outside_shares(\@binds, $shares);
+    my @ro      = HostPlatform::rw_binds_under_ro_shares(\@binds, $shares);
+    return unless @outside || @ro;
+    log_ev('launch_failed', { reason => 'bind source not served by the podman machine shares',
+                              outside => join(' ', @outside),
+                              rw_under_ro => join(' ', map { $_->{source} } @ro) });
+    _launch_fail($stage, (@outside ? 'a bind-mount source is outside the podman machine shares'
+                                   : 'a read-write bind lies under a read-only podman machine share'), undef);
+    _fail_visibly(HostPlatform::outside_shares_message(\@outside, $shares,
+        read_only => \@ro, project => $PROJECT_PATH));
+    LaunchLog::close_log($LAUNCH_LOG);
+    SandboxLock::release($LOCK_DIR);
+    reset_terminal();
+    exit 1;
+}
+
+# _refresh_live_mirror($stage, quiet => 0|1) -> 1 | 0. macOS: bring the
+# live-install mirror ($LIVE_MIRROR, LiveMirror.pm) up to date with this
+# launcher's install root before a container is created ('create') or started
+# ('start', 'recover'). Everywhere else there is no mirror and this returns 1.
+# A failed refresh is a warning, not a refusal: the mirror keeps the whole files
+# of its last refresh, so the container sees the code as of then. Entries the
+# refresh had to leave (something the VM planted) are warned about too: they
+# mean a process got out of a container. Returns 0 only when the mirror lacks
+# something a bind needs (LiveMirror::complete). `quiet` logs without printing,
+# for callers inside the dashboard's alt-screen.
+sub _refresh_live_mirror {
+    my ($stage, %o) = @_;
+    return 1 unless defined $LIVE_MIRROR;
+    my $r = LiveMirror::refresh(source => $INSTALL_ROOT, mirror => $LIVE_MIRROR, create => 1);
+    my @warn = @{ $r->{warnings} || [] };
+    log_ev('live_mirror_refresh', { stage => $stage, ok => ($r->{ok} ? 1 : 0),
+                                    updated => $r->{updated}, removed => $r->{removed},
+                                    (defined $r->{error} ? (error => $r->{error}) : ()),
+                                    (@warn ? (warnings => join(' | ', @warn)) : ()) });
+    unless ($o{quiet}) {
+        _emit_err(_c_warn('WARNING:'), " the sandbox's copy of the live install was not refreshed: $r->{error}\n",
+                  "  $LIVE_MIRROR keeps the files of its last refresh.\n")
+            unless $r->{ok};
+        _emit_err(_c_warn('WARNING:'), " the sandbox's copy of the live install held entries the Mac never wrote,",
+                  " which only a process outside a container could have put there:\n",
+                  (map { "  $_\n" } @warn),
+                  "  Treat the podman machine as compromised: recreate it (podman machine rm, then podman-machine.pl apply --confirm), and delete $LIVE_MIRROR, which the next launch rebuilds.\n")
+            if @warn;
+    }
+    return LiveMirror::complete($INSTALL_ROOT, $LIVE_MIRROR) ? 1 : 0;
+}
+
+# _stage_container_copies($stage, quiet => 0|1) -- macOS: refresh what a
+# container's binds read from the machine's ccpraxis shares, before a container
+# (re)starts: the copy of the global-counts snapshot (its single-file bind
+# re-resolves on start, so a restarted container sees counts as fresh as the
+# host's) and the live-install mirror. Both are best effort and no-ops
+# elsewhere. One sub for every start path, so the cold launch and the [l]
+# recover flow cannot drift: ~/.cache cleanup tools empty these folders, and
+# _machine_start_bounded recreates them empty.
+sub _stage_container_copies {
+    my ($stage, %o) = @_;
+    if (defined $CONTAINER_FILES_DIR && defined &MountSpec::stage_global_counts_copy) {
+        my $src = "${CLAUDE_HOST_CONFIG}/almanac-global-counts.json";
+        if (-f $src) {
+            my ($ok, $reason) = MountSpec::stage_global_counts_copy($src, $CONTAINER_FILES_DIR);
+            log_ev('global_counts_copy', { ok => ($ok ? 1 : 0), reason => $reason, stage => $stage });
+        }
+    }
+    return _refresh_live_mirror($stage, %o);
+}
+
 sub build_image {
     # Before the build, not after it fails: a cold machine makes `podman build`
     # exit 125 with a socket error that reads like a broken install.
@@ -2671,6 +2830,7 @@ sub build_image {
     my $ssh_host_keys_cachebust = int(time() / (7 * 86400));
     my $build_mem = _podman_host_mem_bytes() ? ProjectSandbox::memory_limit(undef, _podman_host_mem_bytes()) : undef;
     my $rc = _tee_system($PODMAN, 'build',
+        HostPlatform::build_extra_args($PODMAN),
         (defined $build_mem ? ('--memory', $build_mem) : ()),
         '--build-arg', "CLAUDE_VERSION=${HOST_VERSION}",
         '--build-arg', "P02_SSH_HOST_KEYS_CACHEBUST=${ssh_host_keys_cachebust}",
@@ -2857,12 +3017,12 @@ my $IMAGE_EXISTS;
     # cannot be brought up aborts.
     if (!$IMAGE_EXISTS && $probe =~ /cannot connect|connection refused|unable to connect|no such host|dial tcp/i) {
         unless (_ensure_machine_ready()) {
+            # _ensure_machine_ready has already explained the failure and named
+            # the remedy (start for a stopped machine, init for a missing one),
+            # and held the screen for it. A second "start it" message here
+            # contradicted the init remedy and asked for Enter twice.
             log_ev('launch_failed', { reason => 'podman machine unavailable at preflight' });
             _launch_fail('preflight', 'podman machine unavailable', 125);
-            _fail_visibly(
-                "ERROR: cannot reach podman.",
-                "  The sandbox cannot be built, created or started without it.",
-                "  Start it with `podman machine start` and re-run claude-sandbox.");
             LaunchLog::close_log($LAUNCH_LOG);
             SandboxLock::release($LOCK_DIR);
             reset_terminal();
@@ -2876,6 +3036,22 @@ my $IMAGE_EXISTS;
 }
 # Preflight began before the podman probe (see _preflight_podman_probe's call).
 _launch_stage_end('preflight', 'ok');
+
+# A project the podman machine cannot see is refused HERE, before the skills
+# picker and the rebuild prompt, rather than after the operator has answered
+# them and `podman create` fails with a bare statfs error. The project tree
+# (which holds claude-home) and this checkout (statusline, plugin tree) are
+# the sources every launch mounts -- the project read-write (/project and
+# claude-home), the checkout read-only; the full list is checked again at create.
+# On macOS the checkout's binds come from its mirror, so the mirror is what the
+# machine must share. A connector (--session / --resume-session) never creates
+# or starts a container -- it only joins a running one, whose binds are already
+# made -- so it is not refused here: after a promotion changes what the machine
+# must share, the sandboxes still running from before stay reachable until the
+# operator recreates the machine.
+_refuse_unshared_mounts('preflight', { source => $PROJECT_PATH, readonly => 0 },
+                                     { source => ($LIVE_MIRROR // $INSTALL_ROOT), readonly => 1 })
+    unless $SESSION_MODE || length $RESUME_SESSION;
 
 # =====================================================================
 # Container name (generate + persist)
@@ -3560,22 +3736,34 @@ sub _enumerate_inuse_host_ports {
 }
 
 # Container-config blueprint drift (CLAUDE.md + settings.json).
-my $CURRENT_CLAUDE_MD_HASH = md5_of_file("$CONTAINER_CONFIG/CLAUDE.md");
+#
+# The container's CLAUDE.md is not a copy of container/CLAUDE.md: it is that
+# shared file plus the parts for this host and this container runtime
+# (ContainerClaudeMd), so a container started from a Mac is never told about
+# WSL. The drift hash is taken over that rendered text, so editing a part that
+# applies to this launch is noticed exactly as an edit to the shared file is,
+# and so is a launch under a different runtime than the copy was made for.
+my $CONTAINER_CLAUDE_MD_TEXT = ContainerClaudeMd::render_dir($CONTAINER_CONFIG,
+    HostPlatform::os_family(), HostPlatform::runtime_family($PODMAN));
+die "ERROR: container CLAUDE.md template missing: $CONTAINER_CONFIG/CLAUDE.md\n"
+    unless defined $CONTAINER_CLAUDE_MD_TEXT;
+my $CURRENT_CLAUDE_MD_HASH = md5_of_string($CONTAINER_CLAUDE_MD_TEXT);
 my $CURRENT_SETTINGS_HASH  = md5_of_file("$CONTAINER_CONFIG/settings.json");
-if (-f $CLAUDE_MD_HASH_FILE) {
-    my $saved = _read_file($CLAUDE_MD_HASH_FILE);
-    chomp $saved if defined $saved;
-    if (defined $saved && $saved ne $CURRENT_CLAUDE_MD_HASH) {
-        push @STALE_REASONS, "  - Container CLAUDE.md upstream changed since last sandbox refresh";
-    }
-}
-if (-f $SETTINGS_HASH_FILE) {
-    my $saved = _read_file($SETTINGS_HASH_FILE);
-    chomp $saved if defined $saved;
-    if (defined $saved && $saved ne $CURRENT_SETTINGS_HASH) {
-        push @STALE_REASONS, "  - Container settings.json upstream changed since last sandbox refresh";
-    }
-}
+# 'changed' asks; 'declined' is a version the operator already answered
+# "Continue" to (remembered below, after the answer), so it does not ask again
+# until the upstream file changes once more; 'none' is no drift or no record.
+my $CLAUDE_MD_DRIFT = SandboxSettings::drift_state(
+    saved    => _read_file($CLAUDE_MD_HASH_FILE),
+    current  => $CURRENT_CLAUDE_MD_HASH,
+    declined => _read_file($CLAUDE_MD_DECLINED_FILE));
+my $SETTINGS_DRIFT = SandboxSettings::drift_state(
+    saved    => _read_file($SETTINGS_HASH_FILE),
+    current  => $CURRENT_SETTINGS_HASH,
+    declined => _read_file($SETTINGS_DECLINED_FILE));
+push @STALE_REASONS, "  - Container CLAUDE.md upstream changed since last sandbox refresh"
+    if $CLAUDE_MD_DRIFT eq 'changed';
+push @STALE_REASONS, "  - Container settings.json upstream changed since last sandbox refresh"
+    if $SETTINGS_DRIFT eq 'changed';
 
 sub _skill_divergence_msg {
     return '' unless -f $SELECTION_FILE;
@@ -3667,6 +3855,19 @@ elsif (plan_wants_prompt(%plan_state)) {
 
 my $PLAN = decide_launch_plan(%plan_state, operator => $answer);
 
+# "Continue" over an upstream CLAUDE.md or preset change is an answer about
+# THAT version: remember it, so the next launch does not ask again until the
+# file changes once more. A container created by this launch merges the
+# current preset anyway and records it as given, which makes the memory moot.
+# Only an answer somebody gave counts: with no terminal the prompt's line
+# path reads EOF and returns 'continue' by default, and remembering that
+# would silence the notice for good without anyone having seen it.
+my $ANSWER_WAS_INTERACTIVE = (($LAUNCH_MODE ne 'plain' && $LAUNCH_HOST && $LAUNCH_HOST->{active}) || -t STDIN) ? 1 : 0;
+if (defined $answer && $answer eq 'continue' && $ANSWER_WAS_INTERACTIVE) {
+    _write_file($SETTINGS_DECLINED_FILE,  "$CURRENT_SETTINGS_HASH\n")  if $SETTINGS_DRIFT eq 'changed';
+    _write_file($CLAUDE_MD_DECLINED_FILE, "$CURRENT_CLAUDE_MD_HASH\n") if $CLAUDE_MD_DRIFT eq 'changed';
+}
+
 if ($PLAN->{cancel}) {
     tui::LaunchScreens::host_leave($LAUNCH_HOST) if $LAUNCH_HOST;
     _emit_out("Cancelled.\n");
@@ -3721,13 +3922,13 @@ if ($do_rebuild) {
     _tee_system($PODMAN, 'rm', '-f', $CONTAINER_NAME) if $PLAN->{remove_container};
     $CONTAINER_EXISTS_NOW = 0;
 
-    # Refresh per-project container blueprint copies from upstream
-    # (plugins/sandbox/container/). Any in-container modifications get
-    # overwritten — that's the explicit opt-in semantic of Rebuild.
-    _copy_file("$CONTAINER_CONFIG/CLAUDE.md",    $CONTAINER_CLAUDE_MD);
-    _copy_file("$CONTAINER_CONFIG/settings.json", $CONTAINER_SETTINGS_JSON);
-    _write_file($CLAUDE_MD_HASH_FILE, $CURRENT_CLAUDE_MD_HASH);
-    _write_file($SETTINGS_HASH_FILE,  $CURRENT_SETTINGS_HASH);
+    # The per-project copies (container-CLAUDE.md, container-settings.json)
+    # are NOT refreshed here any more. They record what the sandbox was last
+    # given, and the create below needs exactly that: it merges the current
+    # preset into the sandbox's settings.json against it, backs up a CLAUDE.md
+    # the sandbox edited, and only then records the new versions
+    # (apply_blueprints_to_host_data). Refreshing them here used to make the
+    # create overwrite every in-sandbox change with no merge and no backup.
     # Regenerate container name.
     unlink "$LAUNCHER_DIR/container-name";
     my $path_hash = substr(md5_of_string($PROJECT_PATH), 0, 8);
@@ -3878,9 +4079,24 @@ sub plan_wants_prompt {
     return (($s{stale_count} // 0) > 0) ? 1 : 0;
 }
 
+# sandbox_settings_create_note() -> lines for the stale prompt: what creating a
+# container (every Rebuild does) does to the sandbox's settings.json and
+# CLAUDE.md. One element per paragraph: the frame and the terminal wrap long
+# lines, the code never does (no-hard-wrapped-output.t).
+sub sandbox_settings_create_note {
+    return (
+        "  A new container (every Rebuild makes one) keeps this sandbox's own settings: settings.json is merged with the preset key by key, and a key changed on both sides is asked about (default: keep the sandbox's). The old file is backed up first, to .ccpraxis-local-data/claude-home/.launcher/backups/.",
+        "  CLAUDE.md is regenerated; a copy edited in the sandbox is backed up there too.",
+    );
+}
+
 sub prompt_stale_action {
     my ($reasons_ref, $host_version, $state) = @_;
     my @reasons = @$reasons_ref;
+    # SAY WHAT A NEW CONTAINER DOES TO THE SANDBOX'S OWN SETTINGS. A Rebuild (and
+    # any create) used to overwrite them silently; it merges now, and the
+    # operator choosing between these options should know that before choosing.
+    push @reasons, '', sandbox_settings_create_note();
     $state = {} unless ref $state eq 'HASH';
     my $have_image     = $state->{image_exists}     ? 1 : 0;
     my $have_container = $state->{container_exists} ? 1 : 0;
@@ -4374,9 +4590,12 @@ if (-f "$HOST_PLUGINS_DIR/known_marketplaces.json") {
 # non-zero exit here is warned and the launch proceeds with no masks -- a
 # host-only skill left visible, no worse than before this package existed.
 if (@PLUGIN_MOUNTS) {
-    my $seed_settings = -f $CONTAINER_SETTINGS_JSON
-        ? $CONTAINER_SETTINGS_JSON
-        : "$CONTAINER_CONFIG/settings.json";
+    # These masks only ever reach `podman create`, and that create merges the
+    # CURRENT preset into the sandbox's settings.json (apply_blueprints_to_
+    # host_data), so a plugin the preset newly enables must be masked by it.
+    # $CONTAINER_SETTINGS_JSON is the preset the sandbox was last GIVEN -- the
+    # drift signature's seed (_host_only_mask_signature), not this one's.
+    my $seed_settings = "$CONTAINER_CONFIG/settings.json";
     my ($mask_rc, $mask_out, $mask_err) = _capture_out_err($^X, $SANDBOX_SKILLS_PL,
         'host-only-masks',
         '--selection-file', $SELECTION_FILE,
@@ -4515,8 +4734,9 @@ if (-f "$CLAUDE_DATA/git-ssh-command.sh") {
 # this because Docker Desktop ships its own user-mode proxy. The WSL
 # distro's external IPv4 is always reachable from the host, so we capture
 # it here and expose it in the container as $SANDBOX_HOST_IP; the
-# container's CLAUDE.md tells agents to prefer that URL when emitting
-# user-facing links. Captured at create-time; goes stale only if WSL
+# container's CLAUDE.md part for this combination
+# (container/CLAUDE.windows-podman.md) tells agents to use that address
+# in user-facing links. Captured at create-time; goes stale only if WSL
 # restarts before the user re-launches.
 if ($WINDOWS_FAMILY && $PODMAN =~ /podman/i) {
     my $machine = _qx_bounded(qq{$PODMAN machine inspect --format "{{.Name}}" 2>/dev/null});
@@ -4677,15 +4897,74 @@ sub pick_session_action {
 # Reintroduce ONLY if a future backend's host-bind fails the t/01
 # (O_APPEND, utimensat UTIME_NOW, utimensat explicit-timestamp) probes.
 
+# apply_blueprints_to_host_data() -- give a container being created the
+# current CLAUDE.md render and the current preset.
+#
+# CLAUDE.md is generated, so it is replaced -- but a copy the sandbox edited
+# (it differs from the render it was last given) is backed up first and the
+# operator is told where. settings.json is the sandbox's own: the current
+# preset is MERGED into it key by key against the preset it was last given
+# (SandboxSettings::merge_settings), a key both changed is asked about
+# (_ask_settings_conflict), the old file is backed up first, and the preset
+# becomes the new base. This runs for EVERY create, Rebuild or not, so a
+# recreate never brings back an old preset; the hash records written here are
+# what the drift check compares against, so they move only when the sandbox
+# was actually given the new version.
 sub apply_blueprints_to_host_data {
     my $host_data = "$CLAUDE_DATA";
     make_path($host_data) unless -d $host_data;
-    if (-f $CONTAINER_CLAUDE_MD) {
-        _copy_file($CONTAINER_CLAUDE_MD, "$host_data/CLAUDE.md");
+    my $backup_dir = SandboxSettings::backup_dir_maker($LAUNCHER_DIR, time);
+
+    my $md = SandboxSettings::refresh_claude_md(
+        target      => "$host_data/CLAUDE.md",
+        last_render => $CONTAINER_CLAUDE_MD,
+        render      => $CONTAINER_CLAUDE_MD_TEXT,
+        backup_dir  => $backup_dir,
+    );
+    _write_file($CLAUDE_MD_HASH_FILE, $CURRENT_CLAUDE_MD_HASH);
+    unlink $CLAUDE_MD_DECLINED_FILE;
+    if (defined $md->{backup}) {
+        _emit_step(_c_step("This sandbox's CLAUDE.md had edits of its own; backed up to $md->{backup} before regenerating it"), "\n");
     }
-    if (-f $CONTAINER_SETTINGS_JSON) {
-        _copy_file($CONTAINER_SETTINGS_JSON, "$host_data/settings.json");
+
+    my $st = SandboxSettings::merge_settings(
+        target     => "$host_data/settings.json",
+        base       => $CONTAINER_SETTINGS_JSON,
+        preset     => "$CONTAINER_CONFIG/settings.json",
+        backup_dir => $backup_dir,
+        resolve    => \&_ask_settings_conflict,
+    );
+    if ($st->{base_recorded}) {
+        _write_file($SETTINGS_HASH_FILE, md5_of_file($CONTAINER_SETTINGS_JSON));
+        unlink $SETTINGS_DECLINED_FILE;
     }
+    my @c = @{ $st->{conflicts} };
+    my $took_preset = grep { $_->{choice} eq 'take' } @c;
+    if ($st->{status} eq 'merged') {
+        _emit_step(_c_step(sprintf(
+            "Sandbox settings merged with the preset: kept %d of the sandbox's own change(s), took %d preset change(s)%s; the old file is backed up to %s",
+            scalar(@{ $st->{kept} }) + (@c - $took_preset), scalar(@{ $st->{taken} }) + $took_preset,
+            (@c ? sprintf(', %d key(s) changed on both sides', scalar @c) : ''), $st->{backup})), "\n");
+    }
+    elsif ($st->{status} eq 'unchanged' && @{ $st->{kept} }) {
+        _emit_ok(_c_ok(sprintf("Sandbox settings kept: %d change(s) of its own, nothing new in the preset",
+                               scalar @{ $st->{kept} })), "\n");
+    }
+    _emit_err(_c_warn("WARNING:"), " $st->{warning}" . (defined $st->{backup} ? " (backup: $st->{backup})" : '') . "\n")
+        if defined $st->{warning};
+    _emit_err(_c_warn("NOTE:"), " no record of the preset this sandbox was last given, so every key it and the preset both have with different values was treated as changed on both sides\n")
+        if $st->{base_missing} && @c;
+    # Key names come out of decoded JSON as text; the launch log's encoder
+    # takes bytes.
+    my $bytes = sub { my ($s) = @_; utf8::encode($s) if utf8::is_utf8($s); return $s };
+    log_ev('sandbox_settings_merge', {
+        status => $st->{status}, backup => $st->{backup},
+        taken  => [ map { $bytes->($_) } @{ $st->{taken} } ],
+        kept   => [ map { $bytes->($_) } @{ $st->{kept} } ],
+        agreed => [ map { $bytes->($_) } @{ $st->{agreed} } ],
+        conflicts => [ map { { name => $bytes->($_->{name}), choice => $_->{choice} } } @c ],
+        claude_md_backup => $md->{backup},
+    });
     # .credentials.json is NOT copied here — materialize-credentials
     # writes it directly at claude-home/.credentials.json (a real file in
     # the RW dir bind), so writes from inside the container (an OAuth token
@@ -4693,6 +4972,57 @@ sub apply_blueprints_to_host_data {
     # canonical host file and persist across container rebuild with no sync
     # step. See the $SANDBOX_CREDENTIALS_FILE definition for why this is a
     # real file and not a single-file mount.
+}
+
+# _ask_settings_conflict(\%conflict) -> 'keep' | 'take'
+#
+# One settings.json key the sandbox and the preset BOTH changed since the
+# sandbox was last given the preset (a SettingsUnits::merge3 conflict record).
+# The same three paths as the stale prompt: a screen when the launch frame is
+# up, a line prompt on a bare terminal, and with nobody to ask (no TTY) the
+# sandbox's value is kept. Keeping is also what q/ESC and an empty answer do:
+# the sandbox's value is the one somebody chose on purpose.
+#
+# The values came out of a file the container can write, so they are shown as
+# ASCII-escaped JSON (no raw control byte or escape sequence reaches the
+# terminal) and clipped.
+sub _ask_settings_conflict {
+    my ($c) = @_;
+    my $json = JSON::PP->new->canonical->allow_nonref->ascii;
+    my $show = sub {
+        my ($found, $v) = @_;
+        return '(not set)' unless $found;
+        my $s = $json->encode($v);
+        $s = substr($s, 0, 160) . ' ...' if length($s) > 160;
+        return $s;
+    };
+    (my $name = $json->encode("$c->{name}")) =~ s/\A"|"\z//g;
+    my @detail = (
+        "  This sandbox and the sandbox preset both changed this key since the sandbox was last given the preset.",
+        '',
+        "  this sandbox:   " . $show->($c->{local_found},  $c->{local_val}),
+        "  the preset now: " . $show->($c->{remote_found}, $c->{remote_val}),
+        "  both had:       " . $show->($c->{base_found},   $c->{base_val}),
+    );
+
+    if ($LAUNCH_MODE ne 'plain' && $LAUNCH_HOST && $LAUNCH_HOST->{active}) {
+        my $model = tui::LaunchScreens::menu_model(
+            label   => "Sandbox setting changed on both sides: $name",
+            detail  => \@detail,
+            options => [
+                { id => 'keep', key => 'k', display => "[k] Keep this sandbox's value" },
+                { id => 'take', key => 'p', display => "[p] Take the preset's value" },
+            ],
+        );
+        return tui::LaunchScreens::menu_choice(_launch_run_list($model), 'keep');
+    }
+    return 'keep' unless -t STDIN && -t STDOUT;
+    print "\nSandbox setting changed on both sides: $name\n";
+    print "$_\n" for @detail;
+    print "\n[k] Keep this sandbox's value   [p] Take the preset's value\nChoice [k/p] (default k): ";
+    my $line = <STDIN>;
+    $line //= '';
+    return lc(substr($line, 0, 1) // '') eq 'p' ? 'take' : 'keep';
 }
 
 # Single-file bind mounts require the host path to exist before podman
@@ -5366,20 +5696,12 @@ if (! _container_exists($CONTAINER_NAME)) {
 if (! _container_exists($CONTAINER_NAME)) {
     _launch_stage_begin('create');
 
-    # Materialize blueprint copies on first create.
-    if (! -f $CONTAINER_CLAUDE_MD) {
-        _copy_file("$CONTAINER_CONFIG/CLAUDE.md", $CONTAINER_CLAUDE_MD);
-        _write_file($CLAUDE_MD_HASH_FILE, md5_of_file("$CONTAINER_CONFIG/CLAUDE.md"));
-    }
-    if (! -f $CONTAINER_SETTINGS_JSON) {
-        _copy_file("$CONTAINER_CONFIG/settings.json", $CONTAINER_SETTINGS_JSON);
-        _write_file($SETTINGS_HASH_FILE, md5_of_file("$CONTAINER_CONFIG/settings.json"));
-    }
-
-    # Materialize blueprint files + single-file-bind placeholders on host
-    # BEFORE the bind mounts go live, so /root/.claude/ inside the
-    # container sees everything at the canonical paths from the first
-    # moment.
+    # Give the sandbox the CURRENT CLAUDE.md render and preset -- merged into
+    # its own settings.json, never copied over it -- on EVERY create, Rebuild
+    # or not (a recreate used to copy back the stale per-project copy), plus
+    # the single-file-bind placeholders, BEFORE the bind mounts go live, so
+    # /root/.claude/ inside the container sees everything at the canonical
+    # paths from the first moment.
     apply_blueprints_to_host_data();
     # Decision #10 / Ruling B: migrate the global config off the pre-fix
     # location before anything reads or heals it. In THIS layout both
@@ -5413,6 +5735,10 @@ if (! _container_exists($CONTAINER_NAME)) {
             # Hosts this launcher's identity must not reach (empty for
             # ccpraxis); pinned to 0.0.0.0 in the container's /etc/hosts.
             SandboxIdentity::blocked_host_args(),
+            # A name for the host (host.docker.internal) where the runtime
+            # does not provide one itself: Docker Engine on Linux only, empty
+            # everywhere else. The container's CLAUDE.md names it.
+            HostPlatform::host_gateway_args($PODMAN),
             # Sandbox-marker env var that skill guards inside the container
             # key off (instead of fragile $HOME-path sniffing). Stable across
             # any future image-internal user/path changes.
@@ -5477,7 +5803,8 @@ if (! _container_exists($CONTAINER_NAME)) {
             launcher_dir => $LAUNCHER_DIR,
             statusline   => "${INSTALL_ROOT}/scripts/statusline.pl",
             (defined &MountSpec::ensure_global_counts_file
-                ? (global_counts => "${CLAUDE_HOST_CONFIG}/almanac-global-counts.json") : ()),
+                ? (global_counts => "${CLAUDE_HOST_CONFIG}/almanac-global-counts.json",
+                   global_counts_copy_dir => $CONTAINER_FILES_DIR) : ()),
         );
         push @args, @SKILL_MOUNTS;
         push @args, @PLUGIN_MOUNTS;
@@ -5491,6 +5818,17 @@ if (! _container_exists($CONTAINER_NAME)) {
         push @args, ProjectSandbox::resource_args($PROJECT_SPEC, _podman_host_mem_bytes()) if _podman_host_mem_bytes();
         push @args, $CREATE_IMAGE;
 
+        # macOS: every bind out of the install root (statusline, skills, the
+        # ccpraxis-local plugin tree, the backpack script and hook) is served
+        # from the live-install mirror the podman machine shares in its place.
+        # The container paths and the read-only flags do not change. A bind from
+        # anywhere else in the install root has no copy, stays as it is, and is
+        # refused below as outside the machine's shares. undef elsewhere: the
+        # list is untouched.
+        @args = MountSpec::map_bind_sources(
+                    sub { LiveMirror::mirror_path($_[0], $INSTALL_ROOT, $LIVE_MIRROR) }, @args)
+            if defined $LIVE_MIRROR;
+
         # Rewrite every `-v HOST:CONTAINER[:opts]` pair into
         # `--mount type=bind,…` to defeat MSYS2's `:`-as-path-list mangling on
         # Git-for-Windows perl. The generated `-p N-M:N-M` args are NOT `-v`
@@ -5499,7 +5837,20 @@ if (! _container_exists($CONTAINER_NAME)) {
         return convert_v_to_mount(@args);
     };
 
+    # macOS: the binds read the live-install mirror, so it must be current --
+    # and hold everything they bind -- before podman create resolves them.
+    unless (_refresh_live_mirror('create')) {
+        log_ev('launch_failed', { reason => 'the live-install mirror lacks what the container binds' });
+        _launch_fail('create', 'the live-install mirror lacks what the container binds', undef);
+        _fail_visibly("ERROR: the sandbox's copy of the live install ($LIVE_MIRROR) lacks plugins/, skills/ or",
+                      "  scripts/statusline.pl, so podman create cannot bind it. The warning above says why it could not be refreshed.");
+        LaunchLog::close_log($LAUNCH_LOG);
+        SandboxLock::release($LOCK_DIR);
+        reset_terminal();
+        exit 1;
+    }
     @podman_args = $build_create_args->();
+    _refuse_unshared_mounts('create', HostPlatform::bind_mounts(@podman_args));
 
     # _tee_system: `podman create`'s diagnostics are the whole content of a
     # create failure, and a bare system() writes them into the alt buffer that
@@ -5542,7 +5893,7 @@ if (! _container_exists($CONTAINER_NAME)) {
             _emit_err("       Found $n stray `;C`-suffixed bind-mount target(s):\n");
             _emit_err("         - $_\n") for @stray;
             _emit_err("\n");
-            _emit_err("       Cause: the MSYS2_ARG_CONV_EXCL=* guard didn't apply when podman.exe was invoked. Likely someone edited launcher.pl or the .sh/.ps1 shim and removed the env-var setup, OR you invoked launcher.pl directly without the shim. See global-config/CLAUDE.md \"MSYS2 path-conversion\" for the full failure mode.\n");
+            _emit_err("       Cause: the MSYS2_ARG_CONV_EXCL=* guard didn't apply when podman.exe was invoked. Likely someone edited launcher.pl or the .sh/.ps1 shim and removed the env-var setup, OR you invoked launcher.pl directly without the shim. See global-config/CLAUDE.windows.md \"MSYS2 path-conversion\" for the full failure mode.\n");
             _emit_err("\n");
             _emit_err("       Auto-recovering: removing the stray dirs and the broken container so the next run can rebuild cleanly.\n");
             _launch_fail('create', 'MSYS2 path corruption detected after podman create', undef);
@@ -5586,6 +5937,28 @@ else {
     _launch_stage_end('create', 'skipped');
 }
 # <<< launch-emit:create:END
+
+# This machine's list of sandboxed projects (SandboxRegistry), which
+# /steward:backup reads to compare each sandbox's settings with the preset.
+# Recorded on every manager launch, not only at create, so a sandbox created
+# before the list existed appears without a Rebuild; a launch that changes
+# nothing rewrites nothing, and entries whose directory is gone are pruned.
+# Fail-soft: the list is a convenience for the backup, never a reason to stop
+# a launch.
+{
+    my $reg = eval {
+        SandboxRegistry::register(
+            registry     => SandboxRegistry::registry_path($CLAUDE_HOST_CONFIG),
+            project_path => $PROJECT_PATH,
+            launcher     => $SandboxIdentity::ID,
+            container    => $CONTAINER_NAME,
+        );
+    } || { error => ($@ || 'unknown error') };
+    _emit_err(_c_warn("WARNING:"), " this sandbox was not recorded in the machine's sandbox list ($reg->{error}); /steward:backup will not see its settings until a later launch records it\n")
+        if defined $reg->{error};
+    log_ev('sandbox_registry', { id => $reg->{id}, changed => $reg->{changed}, reminted => $reg->{reminted},
+                                 pruned => $reg->{pruned}, error => $reg->{error} });
+}
 
 # =====================================================================
 # Backpack approval (host-side, BEFORE podman start)
@@ -5995,6 +6368,14 @@ sub _launch_commit_reap_marker {
     return 1;
 }
 _surface_last_reap();
+
+# macOS: refresh the copies the container's binds read before it (re)starts --
+# the global-counts snapshot, as fresh as the host's (the freshness the direct
+# bind of ~/.claude/almanac-global-counts.json gave), and the live-install
+# mirror, which then serves the install root as it is now even when nothing was
+# promoted since the container was created. Best effort: a failure leaves the
+# previous copies and the launch goes on. A no-op elsewhere.
+_stage_container_copies('start');
 
 # $start_rc stays undef through a pre-flight abort below (machine
 # unreachable / image missing / degraded exec -- none of which ever call the
@@ -6412,6 +6793,14 @@ sub enter_dashboard {
         # touched, which is not a reap event worth an entry in the launch log.
         log_ev('keepawake_orphan_reaped', { pid => $w, result => $r }) if defined $r && $r eq 'gone';
     }
+    # macOS: a previous launcher's caffeinate holder exits within a poll of
+    # its owner (and its caffeinate with it, -w), so there is no process to
+    # reap -- only its state file, which goes with the pid file
+    # (reap_orphan above unlinks the pid file off Windows).
+    if ($^O eq 'darwin') {
+        my $sf = KeepAwake::state_path($ka_pidfile);
+        unlink $sf if defined $sf && -f $sf;
+    }
 
     # package 08: this launcher's OWN wake-lock signal now goes through
     # HostAwake's registry rather than through any helper of its own.
@@ -6428,14 +6817,31 @@ sub enter_dashboard {
         ensure    => \&_host_awake_ensure,
         log       => \&log_ev,
     );
-    # No `alive` and no `on_event`: there is no child process of the
-    # launcher's own to poll any more, nor a death of one to report. The
-    # registry entry's freshness IS the liveness signal, and that lives on
-    # the host side (HostAwake::entry_counts), not here.
-    $KEEPAWAKE = KeepAwake->new(
-        start => $ka_reg{start},
-        stop  => $ka_reg{stop}
-    );
+    # Windows (and any host_side() host): no `alive` and no `on_event` --
+    # there is no child process of the launcher's own to poll any more, nor
+    # a death of one to report. The registry entry's freshness IS the
+    # liveness signal, and that lives on the host side
+    # (HostAwake::entry_counts), not here. A host that is neither Windows nor
+    # macOS gets these seams too, with available => 0: start returns no
+    # handle, so held() reports 0 and nothing is published.
+    #
+    # macOS: HostAwake's registry has no reader there (host_side() is
+    # Windows-only; gather counts no source off Windows), so the launcher
+    # keeps its own holder -- KeepAwake's caffeinate holder, the same one
+    # butler's managed wake-lock runs -- and held() checks the holder child
+    # is really alive.
+    if ($^O ne 'darwin') {
+        $KEEPAWAKE = KeepAwake->new(
+            start => $ka_reg{start},
+            stop  => $ka_reg{stop}
+        );
+    } else {
+        $KEEPAWAKE = KeepAwake->new(
+            start => sub { _keepawake_start_caffeinate($ka_pidfile) },
+            stop  => sub { _keepawake_stop_caffeinate($_[0], $ka_pidfile) },
+            alive => \&_keepawake_child_alive,
+        );
+    }
 
     # 03-resources-reader-model: detached resources sampler. Reap any helper
     # orphaned by a previously-crashed launcher first, then fork+exec our own
@@ -6928,12 +7334,20 @@ sub enter_dashboard {
                 # gather would like it to do. They diverge exactly when a probe
                 # failure is being held through, which is the case worth
                 # rendering honestly.
-                keepawake_held  => ($KEEPAWAKE && $KEEPAWAKE->running) ? 1 : 0,
+                # macOS: the launcher's own caffeinate holder -- held() (the
+                # holder child is alive) AND really asserted (a holder
+                # standing by on battery holds nothing). Elsewhere (package
+                # 08): `running`, i.e. the launcher has requested the lock
+                # through the registry.
+                ($^O eq 'darwin'
+                    ? (keepawake_held  => ($KEEPAWAKE && $KEEPAWAKE->held && _keepawake_asserting($ka_pidfile)) ? 1 : 0)
+                    : (keepawake_held  => ($KEEPAWAKE && $KEEPAWAKE->running) ? 1 : 0)),
                 # Since package 08 the holder's handle is the published
                 # registry source: defined only when the sandbox-<container>
                 # entry was really written. `running` alone flips to 1 even
                 # when the write failed (KeepAwake::sync), so the Run panel
-                # needs this to tell "requested" from "not published".
+                # needs this to tell "requested" from "not published". (On
+                # macOS the handle is the holder pid: defined once it started.)
                 keepawake_published => ($KEEPAWAKE && $KEEPAWAKE->running && defined $KEEPAWAKE->handle) ? 1 : 0,
                 needs_you        => $cached_needs_you,
                 triage_queued    => $cached_triage_queued,
@@ -7010,7 +7424,7 @@ sub enter_dashboard {
                 $ka_reg{refresh}->() if $KEEPAWAKE->running;
                 log_ev('keepawake_decision', {
                     want       => ($st->{stay_awake} ? 1 : 0),
-                    held       => ($KEEPAWAKE->running ? 1 : 0),
+                    held       => ($KEEPAWAKE->held ? 1 : 0),
                     busy_age   => $st->{busy_age},
                     stale      => $BUSY_STALE,
                     probe      => ($probe_state ne '' ? $probe_state : undef),
@@ -7158,6 +7572,25 @@ sub _machine_start_bounded {
     my $secs = ($ENV{SANDBOX_RECOVER_MACHINE_TIMEOUT}
                 && $ENV{SANDBOX_RECOVER_MACHINE_TIMEOUT} =~ /^\d+$/)
                ? $ENV{SANDBOX_RECOVER_MACHINE_TIMEOUT} : 180;
+    # macOS: vfkit refuses to start a VM whose shared folder is missing, and
+    # ccpraxis's own share folders live under ~/.cache, which cleanup tools
+    # empty. Recreate them (empty) first; the launcher refills container-files
+    # and the live-install mirror before any container starts.
+    if ($^O eq 'darwin') {
+        my $home = PodmanMachine::account_home();
+        eval { PodmanMachine::ensure_share_dirs(PodmanMachine::layout(home => $home),
+                                                grep { defined } $LIVE_MIRROR) }
+            if defined $home && length $home;
+        # Any other shared folder that is gone (a project deleted or moved)
+        # stops the start too; say which, and how to fix it, instead of
+        # letting vfkit fail and then advising another `podman machine start`.
+        my $shares = _machine_shares();
+        my @gone = PodmanMachine::missing_share_sources($shares);
+        return { ok => 0, remedy => [ PodmanMachine::missing_share_remedy($shares) ],
+                 detail => 'shared folder missing, so vfkit cannot start the VM: ' . join(', ', @gone)
+                         . ' (recreate it, or podman-machine.pl remove-project <dir> --confirm)' }
+            if @gone;
+    }
     my $out = _run_timed(qq{$PODMAN machine start 2>&1}, $secs);
     return { ok => 0, timeout => 1,
              detail => "podman machine start did not finish within ${secs}s" }
@@ -7363,6 +7796,11 @@ sub recover_container {
             # user that). The failure path is worse: multi-line `Error: ...`
             # text straight into the live frame. Capturing also turns the
             # stage's detail from a bare "rc 125" into podman's own sentence.
+            #
+            # macOS: the machine start this flow just ran may have recreated
+            # the ccpraxis share folders empty, and the container's binds read
+            # them -- refill them first, logging only (we are on the alt-screen).
+            _stage_container_copies('recover', quiet => 1);
             my $out  = `$PODMAN start "$CONTAINER_NAME" 2>&1`;
             my $code = $? >> 8;
             # The sentinel refresh is the VERY NEXT podman invocation after the
@@ -7629,6 +8067,92 @@ sub _host_awake_ensure {
         exec($^X, $cli, 'ensure') or POSIX::_exit(127);
     }
     waitpid($pid, 0);
+}
+
+# ---------------------------------------------------------------------
+# macOS keep-awake: the one exception to package 08's "the launcher owns no
+# helper". HostAwake's registry is read only on Windows (host_side(),
+# gather), so on a Mac the launcher still holds the lock itself, through
+# KeepAwake's caffeinate holder (enter_dashboard's darwin branch).
+# ---------------------------------------------------------------------
+
+# _keepawake_start_caffeinate($pidfile) -> child pid | undef. The macOS
+# wake-lock: KeepAwake's holder (`perl KeepAwake.pm hold`), owned by this
+# launcher, the same holder butler's managed wake-lock runs. It holds
+# `caffeinate -i -w <holder pid>` only while the Mac is on AC power, so a
+# closed lid always sleeps the Mac and nothing is asserted on battery
+# (KeepAwake.pm's header has the reasoning and the battery bound). No lease
+# (--lease 0): the dashboard stops it when the busy-lease goes idle. It exits
+# within a poll of this launcher exiting, and its caffeinate dies with it
+# (-w), so a crashed or killed launcher leaves nothing behind and there is no
+# orphan to reap (only a pre-08 Windows helper ever needed reaping; see
+# BpKeepAwake::reap_orphan at dashboard entry).
+# fork+exec with stdio on /dev/null, so nothing it
+# prints can reach the dashboard's alt-screen. The binary is checked before
+# forking: an exec that fails in the child would hand the holder a pid for a
+# lock that never existed.
+sub _keepawake_start_caffeinate {
+    my ($pidfile) = @_;
+    my $bin = KeepAwake::caffeinate_bin();
+    unless (defined $bin && -x $bin) {
+        log_ev('keepawake_start_failed', { reason => 'helper missing: ' . ($bin // 'caffeinate') });
+        return undef;
+    }
+    my $owner = $$;
+    (my $logfile = $pidfile) =~ s/\.pid\z/.log/;
+    my @argv = KeepAwake::holder_argv(pid_file => $pidfile, log_file => $logfile,
+                                      lease => 0, owner_pid => $owner);
+    my $pid = fork();
+    if (!defined $pid) {
+        log_ev('keepawake_start_failed', { reason => "fork: $!" });
+        return undef;
+    }
+    if ($pid == 0) {
+        open(STDIN,  '<', '/dev/null');
+        open(STDOUT, '>', '/dev/null');
+        open(STDERR, '>', '/dev/null');
+        exec(@argv) or do { POSIX::_exit(127); };
+    }
+    log_ev('keepawake_started', { pid => $pid, helper => 'caffeinate', owner_pid => $owner });
+    return $pid;
+}
+
+# _keepawake_asserting($pidfile) -> 1 when the wake-lock is really asserted.
+# On macOS a live holder off AC power holds nothing (it stands by until AC
+# returns), so the dashboard must not render it as held; the holder's state
+# file says which. Every other host: 1 (held() alone decides, as before).
+sub _keepawake_asserting {
+    my ($pidfile) = @_;
+    return 1 unless $^O eq 'darwin';
+    my $st = KeepAwake::holder_state($pidfile);
+    return (defined $st && $st eq 'asserted') ? 1 : 0;
+}
+
+# _keepawake_child_alive($pid) -> 1 while our helper child is still running.
+# waitpid(WNOHANG) is a syscall, not a spawn, so it is safe on the render tick;
+# it also reaps a helper that exited, which is then reported as gone.
+sub _keepawake_child_alive {
+    my ($pid) = @_;
+    return 0 unless defined $pid && $pid =~ /^\d+$/ && $pid > 0;
+    require POSIX;
+    my $r = waitpid($pid, POSIX::WNOHANG());
+    return $r == 0 ? 1 : 0;
+}
+
+# _keepawake_stop_caffeinate($child_pid, $pidfile) -- macOS: kill our holder
+# child (its caffeinate, bound to it with -w, exits with it, which releases the
+# assertion) and clear the pid and state files. SIGKILL so it's immediate;
+# waitpid reaps the zombie (it's a direct fork of ours).
+sub _keepawake_stop_caffeinate {
+    my ($pid, $pidfile) = @_;
+    if (defined $pid && $pid =~ /^\d+$/ && $pid > 0) {
+        kill('KILL', $pid);
+        waitpid($pid, 0);
+        log_ev('keepawake_stopped', { pid => $pid });
+    }
+    unlink $pidfile if defined $pidfile && -f $pidfile;
+    # The holder's state file (KeepAwake::state_path).
+    if (defined $pidfile) { my $sf = KeepAwake::state_path($pidfile); unlink $sf if defined $sf && -f $sf; }
 }
 
 # ---------------------------------------------------------------------
@@ -7924,6 +8448,13 @@ sub _timeout_prefix {
     return $bin ? qq{$bin $secs } : q{};
 }
 
+#
+# macOS SHIPS NO `timeout` AT ALL, so on a Mac every probe used to run
+# unbounded. Off Windows the search therefore continues: a GNU timeout on PATH
+# (`gtimeout` / `timeout`, Homebrew coreutils), and failing that this
+# plugin's own bounded-run.pl, a perl fork/alarm/kill watchdog with the same
+# `N cmd...` form and the same exit 124 -- so a probe is bounded on every
+# host, with nothing to install. Windows resolution is unchanged.
 my $GNU_TIMEOUT_MEMO;
 sub _gnu_timeout_bin {
     return $GNU_TIMEOUT_MEMO if defined $GNU_TIMEOUT_MEMO;
@@ -7933,10 +8464,22 @@ sub _gnu_timeout_bin {
         push @candidates, "$bin/timeout.exe", "$bin/timeout";
     }
     push @candidates, '/usr/bin/timeout', '/bin/timeout';
+    if (!$WINDOWS_FAMILY) {
+        for my $dir (grep { length } split /:/, ($ENV{PATH} // '')) {
+            push @candidates, "$dir/gtimeout", "$dir/timeout";
+        }
+    }
     for my $c (@candidates) {
         next unless -x $c || -f $c;
         # Quoted: Git for Windows installs under "C:\Program Files\Git".
         $GNU_TIMEOUT_MEMO = qq{"$c"};
+        return $GNU_TIMEOUT_MEMO;
+    }
+    my $bounded = "$SANDBOX_PLUGIN/scripts/bounded-run.pl";
+    if (!$WINDOWS_FAMILY && -f $bounded) {
+        require Config;
+        my $perl = ($^X =~ m{\A/}) ? $^X : ($Config::Config{perlpath} || 'perl');
+        $GNU_TIMEOUT_MEMO = qq{"$perl" "$bounded"};
         return $GNU_TIMEOUT_MEMO;
     }
     $GNU_TIMEOUT_MEMO = '';
@@ -8114,6 +8657,24 @@ sub _resources_probes {
     # (absent, not failing), so its silence never reads as a fault on the panel.
     delete $p{ctr_pss} if !defined $container
         || eval { _podman_host_mem_bytes(); $PODMAN_MEM_CONTROLLER };
+    if ($^O eq 'darwin') {
+        # The macOS host and its podman machine. The machine probe is the same
+        # one Windows uses; the three host probes read sysctl / vm_stat / ps /
+        # df and are turned into the CIM JSON shapes by Resources::darwin_*,
+        # so the parsers and the panel are shared with Windows. Each probe is
+        # one bounded shell spawn, like its Windows counterpart.
+        $p{machine}  = sub { my $e = _probe_err_path('machine'); my $t = _timeout_prefix(5);
+                             scalar `${t}$PODMAN machine list --format json 2>"$e"` }
+            if $PODMAN =~ /podman/i;
+        $p{cim_mem}  = sub { my $e = _probe_err_path('cim_mem'); my $t = _timeout_prefix(5);
+                             Resources::darwin_memory_json(scalar `${t}/bin/sh -c 'sysctl -n hw.memsize vm.swapusage; vm_stat' 2>"$e"`) };
+        $p{cim_cpu}  = sub { my $e = _probe_err_path('cim_cpu'); my $t = _timeout_prefix(5);
+                             Resources::darwin_cpu_json(scalar `${t}/bin/sh -c 'sysctl -n hw.logicalcpu; ps -A -o %cpu=' 2>"$e"`) };
+        my $proj = _shell_quote($PROJECT_PATH);
+        $p{cim_disk} = sub { my $e = _probe_err_path('cim_disk'); my $t = _timeout_prefix(5);
+                             Resources::darwin_disk_json(scalar `${t}df -kP $proj 2>"$e"`) };
+        return \%p;
+    }
     return \%p unless $WINDOWS_FAMILY;
     my %cmd = _ps_commands();
     $p{machine}  = sub { my $e = _probe_err_path('machine'); my $t = _timeout_prefix(5);
@@ -8520,6 +9081,13 @@ sub _resources_sampler_main {
     delete $ENV{MSYS2_ARG_CONV_EXCL};
     my $device;
     $device = ($PROJECT_PATH =~ m{^([A-Za-z]):}) ? uc($1) . ':' : 'C:' if $WINDOWS_FAMILY;
+    # macOS: the disk row is the volume the project lives on, named by its
+    # mount point. Asked once, here, off the render tick.
+    if ($^O eq 'darwin') {
+        my $q = _shell_quote($PROJECT_PATH);
+        my $t = _timeout_prefix(5);
+        $device = Resources::darwin_disk_device(scalar `${t}df -kP $q 2>/dev/null`);
+    }
     while (1) {
         last unless kill(0, $owner_pid);                     # owner gone -> self-exit within one cadence
         eval { _write_file_atomic($RESOURCES_SAMPLER_PID, "$$ $owner_pid " . time . "\n"); 1 };
@@ -9224,6 +9792,12 @@ sub _relaunch_self {
     # no gap at all. If that process then decides "not wanted", the entry
     # lapses within LEASE_FRESH on its own -- the same bounded over-hold as
     # today's plan hold left alone across [r], just through the registry.
+    #
+    # macOS is the exception: there the launcher DOES own a holder child,
+    # and its owner pid survives the exec, so it would run on beside the new
+    # process's own. Release it through the holder, which knows its pid
+    # file and state file.
+    _keepawake_release_global() if $^O eq 'darwin';
 
     _restore_terminal(1);
 
@@ -9695,6 +10269,8 @@ sub winpid_alive {
 # and return to the dashboard. find_wt asserts availability (PATH + the canonical
 # %LOCALAPPDATA%\Microsoft\WindowsApps app-execution-alias location).
 sub _spawn_session {
+    return _spawn_session_terminal_app() if $^O eq 'darwin';
+    return _spawn_session_hint('no new-window launcher for this platform') unless $WINDOWS_FAMILY;
     my @inner = ('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
                  '-File', $SANDBOX_PS1, '--session', $PROJECT_PATH);
 
@@ -9731,6 +10307,80 @@ sub _spawn_session {
     my $rc = system(@$argv);   # returns immediately (detached window)
     log_ev('launch_session_done', { mode => 'wt', exit => ($rc >> 8) });
     return;
+}
+
+# _spawn_session_terminal_app — the macOS [c]: open a new Terminal.app window
+# running the same connector entry (`launcher.pl --session <project>`).
+#
+# The window gets its command from a single-use, 0700 .command file written
+# into this launcher's own temp dir ($SAMPLER_TMPDIR, per project and owned by
+# this user) and opened with `open -a Terminal <file>`. That goes through
+# LaunchServices: no Apple Events, so no Automation permission and no TCC
+# prompt, which driving Terminal with osascript would raise. The file removes
+# itself as its first line and then execs the connector, so the window closes
+# with the session. If Terminal cannot be asked, the operator gets the exact
+# command to run instead (_spawn_session_hint).
+sub _spawn_session_terminal_app {
+    require Config;
+    my $perl = ($^X =~ m{\A/}) ? $^X : ($Config::Config{perlpath} || 'perl');
+    my %env;
+    for my $k (qw(CCPRAXIS_CONTAINER_CLI)) {
+        $env{$k} = $ENV{$k} if defined $ENV{$k} && length $ENV{$k};
+    }
+    my $script = Dashboard::terminal_command_script({
+        cmd => [ $perl, $LAUNCHER_PL, '--session', $PROJECT_PATH ],
+        cwd => $PROJECT_PATH,
+        env => \%env,
+    });
+    # File::Temp: a fresh, exclusively-created name per press (two presses in
+    # one second must not collide), mode 0600 at birth, widened to 0700 only
+    # once the content is in place.
+    my ($fh, $file) = eval {
+        File::Temp::tempfile('claude-session-XXXXXXXX', DIR => $SAMPLER_TMPDIR,
+                             SUFFIX => '.command', UNLINK => 0);
+    };
+    my $wrote = 0;
+    if ($fh && defined $script) {
+        print {$fh} $script;
+        $wrote = close($fh) ? 1 : 0;
+        $wrote = 0 unless chmod(0700, $file);
+    }
+    unless ($wrote) {
+        my $why = 'could not write a .command file in ' . $SAMPLER_TMPDIR . ($@ ? ": $@" : ": $!");
+        $why =~ s/\s+\z//;
+        unlink $file if defined $file;
+        log_ev('launch_session_failed', { mode => 'terminal', reason => $why });
+        return _spawn_session_hint($why);
+    }
+    my $argv = Dashboard::spawn_argv('terminal', { file => $file });
+    log_ev('launch_session', { mode => 'terminal' });
+    my ($status, undef, $err) = _capture_out_err(@$argv);   # returns before the window does
+    my $rc = $status < 0 ? $status : $status >> 8;
+    log_ev('launch_session_done', { mode => 'terminal', exit => $rc });
+    if ($status != 0) {
+        unlink $file;
+        my $why = "open -a Terminal failed (exit $rc)" . (defined $err && length $err ? ": " . _trim_err($err) : '');
+        log_ev('launch_session_failed', { mode => 'terminal', reason => $why });
+        return _spawn_session_hint($why);
+    }
+    return;
+}
+
+# _spawn_session_hint($why) -- when no new window can be opened, say how to get
+# the same session by hand, wait for a key, and repaint the dashboard.
+sub _spawn_session_hint {
+    my ($why) = @_;
+    print STDOUT "\e[?25h\e[?1049l";
+    eval { Term::ReadKey::ReadMode('restore') };
+    print STDERR "\n";
+    print STDERR "  [c] could not open a new terminal window" . (defined $why ? " ($why)." : '.') . "\n";
+    print STDERR "  Start the same session yourself, in a new terminal: claude-sandbox --session " . Dashboard::sh_quote($PROJECT_PATH) . "\n";
+    print STDERR "  (a second bare `claude-sandbox` opens another dashboard, not a session).\n";
+    print STDERR "\n  Press any key to return to the dashboard...";
+    eval { Term::ReadKey::ReadKey(0) };
+    eval { Term::ReadKey::ReadMode('cbreak') };
+    print STDOUT "\e[?1049h\e[?25l";
+    return 'redraw';
 }
 
 # plain_heartbeat_loop — the non-TTY fallback: the original scrolling manager

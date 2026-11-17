@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # s06: colors + glyphs across Sandbox/Run/Backpack/Activity.
 #
 # This file is the IMMUTABLE ORACLE for blueprint sandbox-butler-overhaul,

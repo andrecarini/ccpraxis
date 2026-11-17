@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # 69 -- the ORACLE for blueprint unified-tui-design-system,
 # package 10
 # (specs/10-spec.md).
@@ -51,6 +51,14 @@ use File::Path qw(make_path remove_tree);
 use Time::HiRes ();
 
 use_ok('Theme') or BAIL_OUT('Theme.pm did not load -- package 02 is a dependency of this one');
+
+# macOS ships no `timeout`: the runner puts scripts/test-bin/timeout on PATH
+# for a sweep, and a file run on its own puts it there itself (the same rule
+# as GuardHarness.pm), so every `timeout` below resolves either way.
+unless (grep { -x "$_/timeout" } split /:/, ($ENV{PATH} // '')) {
+    $ENV{PATH} = "$Bin/../../../../scripts/test-bin:" . ($ENV{PATH} // '')
+        if -x "$Bin/../../../../scripts/test-bin/timeout";
+}
 
 my $STATUSLINE    = "$Bin/../../../../scripts/statusline.pl";
 my $BP_STATUSLINE = "$Bin/../../../butler/scripts/bp-statusline.pl";
@@ -259,6 +267,12 @@ sub make_tput {
     my ($cols) = @_;
     spew_raw("$SHIM_DIR/tput", "#!/bin/sh\necho $cols\n");
     chmod 0755, "$SHIM_DIR/tput";
+    # statusline.pl asks $COLUMNS and the controlling terminal (stty size
+    # </dev/tty) before tput off Windows; pin both so the shim decides the
+    # width even when this file is run from an interactive terminal.
+    spew_raw("$SHIM_DIR/stty", "#!/bin/sh\nexit 1\n");
+    chmod 0755, "$SHIM_DIR/stty";
+    delete $ENV{COLUMNS};
 }
 
 # make_git(toplevel => $bytes|undef, branch => $str|undef)

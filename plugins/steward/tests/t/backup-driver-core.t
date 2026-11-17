@@ -30,7 +30,7 @@
 #   AC17 answer_unknown_choice / answer_missing
 #   AC18 --answer without --resume, and an unknown subcommand, are usage errors
 #   AC19 perl -c is clean on all three files
-#   AC20 every one of the 14 kinds is constructible via validate_decision
+#   AC20 every required kind is constructible via validate_decision
 #   AC21 (added by coordinator) invalid decision kind -> decision_invalid, nothing pending
 #   AC22 (added by coordinator) a failed phase does not abort the run -> complete_with_failures
 #   AC23 (added by coordinator) a died phase DOES abort the run -> phase_died (contrast w/ AC22)
@@ -79,22 +79,25 @@ ok(-f $RUNPM, 'scripts/backup/Run.pm exists on disk')
     or diag('scripts/backup/Run.pm is absent -- every Run.pm-contract test below will fail for this reason');
 
 # ---------------------------------------------------------------------------
-# The 14 decision kinds, per spec S2.1. Hard-coded here deliberately: this is
+# The decision kinds, per spec S2.1. Hard-coded here deliberately: this is
 # the ORACLE's own list of what the spec requires to exist, not a copy of the
 # implementation's array. Per the AMENDED AC1 (coordinator ruling), we assert
 # a FLOOR against @Backup::Run::DECISION_KINDS -- never its count or order.
+# 2026-10-30 (see Run.pm): clone_live_divergence was retired (the live
+# install follows the dev clone by promotion), and dirty_worktree,
+# remote_merge_conflict and push_confirmation moved out with the GitHub side
+# to /steward:upstream-sync; all four are asserted ABSENT below.
+# promote_pending is new.
 # ---------------------------------------------------------------------------
 my @REQUIRED_KINDS = qw(
-    dirty_worktree
-    remote_merge_conflict
-    clone_live_divergence
+    promote_pending
     readme_drift
     settings_key
     marketplace_key
     file_conflict
+    claude_md_drift
     container_settings_key
     sensitive_finding
-    push_confirmation
     vault_conflict
     project_registration
     plugin_install
@@ -125,6 +128,9 @@ if ($RUNPM_OK) {
         ok(Backup::Run::is_decision_kind($k), "AC1: is_decision_kind('$k') is true");
     }
     ok(!Backup::Run::is_decision_kind('not_a_kind'), "AC1: is_decision_kind('not_a_kind') is false");
+    for my $gone (qw(clone_live_divergence dirty_worktree remote_merge_conflict push_confirmation)) {
+        ok(!Backup::Run::is_decision_kind($gone), "AC1: the retired kind $gone is gone from the backup's enum");
+    }
     ok(!Backup::Run::is_decision_kind(''),           "AC1: is_decision_kind('') is false");
     ok(!Backup::Run::is_decision_kind(undef),        "AC1: is_decision_kind(undef) is false");
 }
@@ -251,7 +257,7 @@ else {
 }
 
 # =====================================================================
-# AC20 -- every one of the 14 kinds is constructible
+# AC20 -- every required kind is constructible
 # =====================================================================
 if ($RUNPM_OK) {
     for my $k (@REQUIRED_KINDS) {
@@ -726,7 +732,7 @@ sub run_phase {
     unless (defined \$ctx->{answers}{'stub_r6.confirm'}) {
         return { status => 'needs_decision', decisions => [ \$ctx->{decision}->(
             id      => 'stub_r6.confirm',
-            kind    => 'push_confirmation',
+            kind    => 'promote_pending',
             title   => 'Confirm the push?',
             choices => [ { id => 'yes', label => 'Yes' }, { id => 'no', label => 'No' } ],
         ) ] };
@@ -1742,7 +1748,7 @@ sub run_phase {
     unless (defined \$ctx->{answers}{'stub_crash_answer.confirm'}) {
         return { status => 'needs_decision', decisions => [ \$ctx->{decision}->(
             id      => 'stub_crash_answer.confirm',
-            kind    => 'push_confirmation',
+            kind    => 'promote_pending',
             title   => 'Confirm the push?',
             choices => [ { id => 'yes', label => 'Yes' }, { id => 'no', label => 'No' } ],
         ) ] };
@@ -1787,7 +1793,7 @@ sub run_phase {
     unless (defined \$ctx->{answers}{'stub_pause_off.q'}) {
         return { status => 'needs_decision', decisions => [ \$ctx->{decision}->(
             id      => 'stub_pause_off.q',
-            kind    => 'push_confirmation',
+            kind    => 'promote_pending',
             title   => 'Proceed?',
             choices => [ { id => 'yes', label => 'Yes' }, { id => 'no', label => 'No' } ],
         ) ] };
@@ -1823,7 +1829,7 @@ sub run_phase {
     unless (defined \$ctx->{answers}{'stub_pause_on.q'}) {
         return { status => 'needs_decision', decisions => [ \$ctx->{decision}->(
             id      => 'stub_pause_on.q',
-            kind    => 'push_confirmation',
+            kind    => 'promote_pending',
             title   => 'Proceed?',
             choices => [ { id => 'yes', label => 'Yes' }, { id => 'no', label => 'No' } ],
         ) ] };

@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # e04-honest-terminal-reporting, AC4 (-> DC4): an order.json entry naming a
 # blueprint absent from disk must be pruned in memory before the B3 walk --
 # never reaching a false {"action":"blueprint-done",...} (or {"action":"done"})

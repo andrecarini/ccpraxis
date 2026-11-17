@@ -1,0 +1,1 @@
+Keeps the macOS podman machine rootful and sharing only what the sandbox mounts: plan, apply, add-project, remove-project, test-scratch

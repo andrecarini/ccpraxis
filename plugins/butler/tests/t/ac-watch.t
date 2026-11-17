@@ -544,14 +544,31 @@ SKIP: {
     skip 'BpAcWatch.pm does not exist yet', 2 unless $LOADED;
     local $ENV{CCPRAXIS_AC_PROBE_FILE} = undef;
     delete $ENV{CCPRAXIS_AC_PROBE_FILE};
-    my $is_win = ($^O =~ /^(?:MSWin32|msys|cygwin)$/) ? 1 : 0;
-    is(BpAcWatch::enabled(), $is_win, 'Edge: enabled() matches the $^O rule with no probe-file override');
+    # A host that can lose AC: Windows, and macOS (pmset). Never the sandbox.
+    my $is_host = ($^O =~ /^(?:MSWin32|msys|cygwin)$/ || $^O eq 'darwin') ? 1 : 0;
+    is(BpAcWatch::enabled(), $is_host, 'Edge: enabled() matches the $^O rule with no probe-file override');
 
     my ($fh, $pf) = tempfile();
     print {$fh} "ac\n";
     close $fh;
     local $ENV{CCPRAXIS_AC_PROBE_FILE} = $pf;
     is(BpAcWatch::enabled(), 1, 'Edge: enabled() is 1 once CCPRAXIS_AC_PROBE_FILE is set to an absolute path');
+}
+
+# ===========================================================================
+# macOS: the power source is the FIRST line of `pmset -g ps`.
+# ===========================================================================
+SKIP: {
+    skip 'BpAcWatch.pm does not exist yet', 7 unless $LOADED;
+    my $batt = "\n -InternalBattery-0 (id=1234)\t87%; charging; 0:41 remaining present: true\n";
+    is(BpAcWatch::parse_pmset_ps("Now drawing from 'AC Power'$batt"), 'ac', 'pmset: AC Power -> ac');
+    is(BpAcWatch::parse_pmset_ps("Now drawing from 'Battery Power'$batt"), 'dc', 'pmset: Battery Power -> dc');
+    is(BpAcWatch::parse_pmset_ps("Now drawing from 'UPS Power'\n"), 'dc', 'pmset: UPS Power -> dc (mains already lost)');
+    is(BpAcWatch::parse_pmset_ps("Now drawing from 'AC Power'\n"), 'ac', 'pmset: a desktop Mac (no battery rows) -> ac');
+    is(BpAcWatch::parse_pmset_ps("something else\n -Battery 'AC Power'\n"), 'unknown',
+        'pmset: only the first line decides');
+    is(BpAcWatch::parse_pmset_ps(''), 'unknown', 'pmset: empty output -> unknown');
+    is(BpAcWatch::parse_pmset_ps(undef), 'unknown', 'pmset: no output -> unknown');
 }
 
 # ===========================================================================

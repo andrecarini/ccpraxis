@@ -196,4 +196,88 @@ sub run_helper {
       . 'silently never happened pre-fix for any space-containing install path');
 }
 
+# ===========================================================================
+# B4 -- the rc line names a directory that exists, and lands in a file the
+# shell reads (macOS port, 2026-10-29). run_unix only, $^O forced.
+#
+#   (a) A bin dir outside $HOME used to become `$HOME//abs/path`: the strip of
+#       the $HOME prefix matched nothing and "$HOME/" was prepended anyway.
+#   (b) On macOS a login bash (what Terminal.app and iTerm2 start) reads the
+#       first of .bash_profile/.bash_login/.profile and never .bashrc, so a
+#       line appended to .bashrc never reached PATH.
+# ===========================================================================
+sub rc_after {
+    my (%o) = @_;
+    my $home = tempdir(CLEANUP => 1);
+    my $bindir = $o{bindir_under_home} ? "$home/.claude/ccpraxis/plugins/x/bin" : tempdir(CLEANUP => 1) . '/bin';
+    File::Path::make_path($bindir);
+    for my $f (@{ $o{seed} || [] }) { open my $s, '>', "$home/$f" or die $!; print {$s} "# seeded\n"; close $s; }
+    local $ENV{SHELL} = $o{shell};
+    delete local $ENV{ZSH_VERSION};
+    my ($out, $ok, $err) = run_helper(home => $home, bindir => $bindir, os => $o{os});
+    ok($ok, "B4 setup ($o{label}): apply completes") or diag("  died: $err");
+    my %rc = map { ($_ => slurp("$home/$_")) } grep { -f "$home/$_" } qw(.zshrc .bashrc .bash_profile .bash_login .profile);
+    return (\%rc, $bindir, $home);
+}
+{
+    require File::Path;
+    my ($rc, $bindir) = rc_after(label => 'outside HOME', os => 'linux', shell => '/bin/zsh');
+    unlike($rc->{'.zshrc'} // '', qr{\$HOME//}, 'B4(a): a bin dir outside $HOME never yields a $HOME// path');
+    like($rc->{'.zshrc'} // '', qr{^export PATH="\Q$bindir\E:\$PATH"$}m, 'B4(a): ...it is written as its absolute path');
+
+    ($rc, $bindir) = rc_after(label => 'under HOME', os => 'linux', shell => '/bin/zsh', bindir_under_home => 1);
+    like($rc->{'.zshrc'} // '', qr{^export PATH="\$HOME/\.claude/ccpraxis/plugins/x/bin:\$PATH"$}m,
+        'B4(a): a bin dir under $HOME stays $HOME-relative (unchanged)');
+
+    ($rc) = rc_after(label => 'darwin bash, no rc', os => 'darwin', shell => '/bin/bash', bindir_under_home => 1);
+    like($rc->{'.bash_profile'} // '', qr{^export PATH=}m, 'B4(b): darwin bash with no rc files writes .bash_profile');
+
+    ($rc) = rc_after(label => 'darwin bash, .bashrc only', os => 'darwin', shell => '/bin/bash', bindir_under_home => 1, seed => ['.bashrc']);
+    like($rc->{'.bash_profile'} // '', qr{^export PATH=}m, 'B4(b): darwin bash ignores .bashrc, which a login shell never reads');
+    unlike($rc->{'.bashrc'} // '', qr{export PATH}, 'B4(b): ...and leaves .bashrc alone');
+
+    ($rc) = rc_after(label => 'darwin bash, .profile', os => 'darwin', shell => '/bin/bash', bindir_under_home => 1, seed => ['.profile']);
+    like($rc->{'.profile'} // '', qr{^export PATH=}m, 'B4(b): darwin bash with an existing .profile appends there');
+    ok(!exists $rc->{'.bash_profile'}, 'B4(b): ...and does NOT create .bash_profile, which would stop .profile being read');
+
+    ($rc) = rc_after(label => 'linux bash, .bashrc', os => 'linux', shell => '/bin/bash', bindir_under_home => 1, seed => ['.bashrc']);
+    like($rc->{'.bashrc'} // '', qr{^export PATH=}m, 'B4: Linux bash keeps using .bashrc (unchanged)');
+}
+
+# ===========================================================================
+# B5 -- never write inside a git work tree. A bin dir under a `.git` is
+# tracked content: an install-time chmod or alias symlink there dirties the
+# live install and makes the next promote refuse it. The helper reports what
+# the repo must track instead. run_unix only, $^O forced.
+# ===========================================================================
+{
+    my $home = tempdir(CLEANUP => 1);
+    my $repo = tempdir(CLEANUP => 1);
+    mkdir "$repo/.git" or die $!;
+    File::Path::make_path("$repo/plugins/x/bin");
+    my $bindir = "$repo/plugins/x/bin";
+    my $launcher = "$bindir/bp-example.sh";
+    open my $fh, '>', $launcher or die $!; print {$fh} "#!/bin/bash\nexit 0\n"; close $fh;
+    chmod 0644, $launcher;
+    open my $seed, '>', "$home/.bashrc" or die $!; close $seed;
+
+    local $ENV{SHELL} = "/bin/bash";
+    delete local $ENV{ZSH_VERSION};
+    my ($out, $ok, $err) = run_helper(home => $home, bindir => $bindir, os => 'linux');
+    ok($ok, 'B5 setup: apply inside a work tree completes') or diag("  died: $err");
+    # The exec-bit pair needs a filesystem that keeps a mode: on Windows (MSYS
+    # perl over NTFS) a file starting with "#!" always stats as executable, so
+    # chmod 0644 cannot take the bit off and the helper rightly sees nothing
+    # missing. The alias and PATH checks below hold on every host.
+    SKIP: {
+        skip 'exec bits are not stored on NTFS: a #! file always stats executable', 2
+            if $^O =~ /^(?:MSWin32|msys|cygwin)$/;
+        ok(!((stat($launcher))[2] & 0111), 'B5: the launcher was NOT chmod +x inside the work tree');
+        like($out, qr/MISSING executable bit.*bp-example\.sh/, 'B5: the missing exec bit is reported');
+    }
+    ok(!-e "$bindir/bp-example" && !-l "$bindir/bp-example", 'B5: no alias symlink was created inside the work tree');
+    like($out, qr/MISSING tracked extensionless alias: bp-example\b/, 'B5: the missing alias is reported');
+    like(slurp("$home/.bashrc") // '', qr/export PATH=/, 'B5: the PATH line is still written (it lives in $HOME, not the repo)');
+}
+
 done_testing();

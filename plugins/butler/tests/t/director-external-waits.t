@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Companion oracle for cross-blueprint dependency tokens of the shape
 # <blueprint>/<package> in the package-status table's depends_on column
 # (hook-continuity-remake package 30). Covers AC-1..AC-19 from

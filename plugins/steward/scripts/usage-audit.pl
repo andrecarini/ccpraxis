@@ -118,6 +118,16 @@ sub discover_roots {
         AppData .git node_modules .cache venv target build dist
         .ccpraxis-local-data .venv __pycache__ Windows
     );
+    # macOS: the top of $HOME holds the folders TCC guards (Desktop,
+    # Documents, Downloads, the media libraries, .Trash, and parts of
+    # Library). Listing one from a terminal-spawned perl raises a GUI
+    # "would like to access" prompt -- or, unattended, just fails -- and none
+    # of them holds a project's .ccpraxis-local-data that the vault registry
+    # does not already name. Skipped at the top of $HOME only; a project
+    # folder that happens to be called Library deeper down is still walked.
+    my %darwin_home_skip = ($^O eq 'darwin')
+        ? (map { $_ => 1 } qw(Library Desktop Documents Downloads Pictures Movies Music .Trash))
+        : ();
     for my $sr (sort keys %scan) {
         next unless -d $sr;
         my @frontier = ([$sr, 0]);
@@ -130,6 +140,7 @@ sub discover_roots {
             closedir $dh;
             for my $k (@kids) {
                 next if $k eq '.' || $k eq '..' || $skip{$k};
+                next if $darwin_home_skip{$k} && $dir eq $HOME;
                 my $p = "$dir/$k";
                 push @frontier, [$p, $depth + 1] if -d $p && !-l $p;
             }

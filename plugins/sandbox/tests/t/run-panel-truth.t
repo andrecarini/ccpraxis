@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # 63 — ORACLE for package 04-run-panel-ledger-truth
 # (blueprint unified-tui-design-system), specs/04-run-panel-ledger-truth-spec.md.
 # Written BLIND to any RunState.pm/launcher.pl implementation of THIS package

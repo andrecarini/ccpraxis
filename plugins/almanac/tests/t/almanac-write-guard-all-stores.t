@@ -531,6 +531,39 @@ for my $shape (
 }
 
 # =============================================================================
+# AC9b -- a quote-dense payload stays fast on every bash. AC9's 1 MiB of 'x'
+# carries almost no quotes, so it never exercised the quote/backslash strip
+# Stage 1 builds when the raw text misses. On macOS /bin/bash 3.2 that strip
+# (${P//[...]/}) is super-linear: 1.6s for 3 KB, 66s for 10 KB, measured, so
+# an ordinary Edit of a few KB of source hung past the hook timeout. Two
+# shapes: an Edit (Stage 1's strip) and a Bash call whose transcript_path
+# names a store, so Stage 1 hits and Stage 1b strips the 6 KB command.
+# =============================================================================
+{
+    my $chunk = q{my $s = "it's \"quoted\" and back\\slashed"; } x 160;   # ~6.6 KB
+    my @cases = (
+        [ 'Edit', { hook_event_name => 'PreToolUse', tool_name => 'Edit',
+                    tool_input => { file_path => '/c/P/src/q.pl', old_string => $chunk, new_string => q{x} } } ],
+        [ 'Bash', { hook_event_name => 'PreToolUse', tool_name => 'Bash', cwd => '/c/P',
+                    transcript_path => '/c/H/.claude/claude-code-vault/almanac/t.jsonl',
+                    tool_input => { command => "cat > /c/P/src/q.pl <<'EOF'\n$chunk\nEOF" } } ],
+    );
+    for my $c (@cases) {
+        my ($label, $payload) = @$c;
+        my (undef, $tmp) = tempfile('alm-XXXXXX', TMPDIR => 1);
+        open(my $fh, '>:raw', $tmp) or die $!;
+        print {$fh} $J->encode($payload);
+        close $fh;
+        my $t0 = Time::HiRes::time();
+        my $rc = system(qq{bash "$GUARD" < "$tmp" > /dev/null 2>/dev/null});
+        my $elapsed_ms = (Time::HiRes::time() - $t0) * 1000;
+        unlink $tmp;
+        is($rc >> 8, 0, "AC9b/$label: a quote-dense ~6 KB payload outside both roots is allowed");
+        ok($elapsed_ms < 3000, sprintf('AC9b/%s: completed in %.1fms (< 3000ms)', $label, $elapsed_ms));
+    }
+}
+
+# =============================================================================
 # AC11 [S] (DC5) -- seal semantics: create/update leave a one-line seal; the
 # ON_BEFORE_RENAME seam sees a two-line seal and OLD record bytes; delete
 # removes the record and its seal, keeping .lock/.lock.holder.

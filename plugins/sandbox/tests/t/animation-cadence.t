@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # The spinner shipped with ten frames and could only ever show TWO of them.
 #
 # THE DEFECT

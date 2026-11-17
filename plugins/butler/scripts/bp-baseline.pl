@@ -262,9 +262,19 @@ sub _default_gate_runner {
         closedir $dh;
     }
     my @results;
+    # GNU `timeout` where the host has one (Linux, Git for Windows): unchanged.
+    # macOS ships none, and `timeout: command not found` (127) for every file
+    # reported the whole suite as NEW RED; there the same 120s bound is kept
+    # in perl instead.
+    my $have_timeout = _have_cmd('timeout');
     for my $f (@files) {
-        my $out = `timeout 120 perl "$f->{abs}" 2>&1`;
-        my $rc  = $? >> 8;
+        my ($out, $rc);
+        if ($have_timeout) {
+            $out = `timeout 120 perl "$f->{abs}" 2>&1`;
+            $rc  = $? >> 8;
+        } else {
+            ($out, $rc) = _run_bounded(120, 'perl', $f->{abs});
+        }
         my $not_ok = () = ($out =~ /^not ok/mg);
         my $skips  = () = ($out =~ /^ok \d+ # skip/mg);
         # `file` is the repo-relative path on purpose. Reporting the ABSOLUTE
@@ -303,6 +313,53 @@ sub gate {
 # small generic helpers (subprocess/IO), used only by CLI verbs below
 # ===========================================================================
 sub _shquote { my $s = shift; $s = '' unless defined $s; $s =~ s/'/'\\''/g; return "'$s'"; }
+
+# _have_cmd($name) -> 0|1: is $name an executable on PATH? (No spawn.)
+sub _have_cmd {
+    my ($name) = @_;
+    my $sep = ($^O eq 'MSWin32') ? ';' : ':';
+    for my $d (split /\Q$sep\E/, $ENV{PATH} // '') {
+        next unless length $d;
+        return 1 if -x "$d/$name" && !-d "$d/$name";
+    }
+    return 0;
+}
+
+# _run_bounded($secs, @cmd) -> ($combined_output, $rc). GNU timeout's contract
+# in perl: rc 124 when the bound is hit, after the whole process group (the
+# command and anything it started) is killed.
+sub _run_bounded {
+    my ($secs, @cmd) = @_;
+    my $pid = open(my $fh, '-|');
+    return ('', 127) unless defined $pid;
+    if ($pid == 0) {
+        eval { POSIX::setpgid(0, 0) };
+        open(STDERR, '>&', \*STDOUT) or close(STDERR);
+        open(STDIN, '<', '/dev/null') or close(STDIN);
+        exec(@cmd) or POSIX::_exit(127);
+    }
+    my $out = '';
+    my $timed_out = 0;
+    {
+        local $SIG{ALRM} = sub { die "bp-baseline-timeout\n" };
+        my $ok = eval {
+            alarm($secs);
+            local $/;
+            my $t = <$fh>;
+            $out = defined $t ? $t : '';
+            alarm(0);
+            1;
+        };
+        alarm(0);
+        unless ($ok) {
+            $timed_out = 1;
+            kill('KILL', -$pid);
+            kill('KILL', $pid);
+        }
+    }
+    close $fh;
+    return ($out, $timed_out ? 124 : (($? == -1) ? -1 : ($? >> 8)));
+}
 
 sub _run_capture {
     my (@cmd) = @_;
@@ -343,8 +400,13 @@ sub _write_all_bytes {
 
 # stat -f -c %T of the nearest EXISTING ancestor of $path (the path itself may
 # not exist yet -- spec section 4.1).
+#
+# Linux only. The one answer that matters, v9fs (the container's /project bind
+# mount), exists nowhere else, and the call is GNU syntax: BSD stat reads
+# `-f -c` as "format string -c" and printed "-c" as the type.
 sub _fstype_of {
     my ($path) = @_;
+    return undef unless $^O eq 'linux';
     return undef unless defined $path && length $path;
     my $p = $path;
     $p =~ s{/+\z}{} if length($p) > 1;

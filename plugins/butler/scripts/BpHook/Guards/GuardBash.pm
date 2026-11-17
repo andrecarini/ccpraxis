@@ -150,11 +150,12 @@ sub _gb_a {
     my ($match_text, $reason) = _match_text_and_reason($cmd);
     my $A = _anchor_for($reason);
     my $GITOPT = BpHook::Guards::Common::git_opt_re();
+    my $GIT    = BpHook::Guards::Common::git_word_re();
     my $cmd_line = 'Command: ' . BpHook::Guards::Common::echo_cmd($cmd);
 
     # 1: git working-tree / history mutations.
     if (BpHook::Guards::Common::line_match(
-            qr/${A}git[[:space:]]+${GITOPT}(checkout|switch|restore|reset|clean|rebase|merge|commit|push)\b/,
+            qr/${A}${GIT}[[:space:]]+${GITOPT}(checkout|switch|restore|reset|clean|rebase|merge|commit|push)\b/,
             $match_text))
     {
         return [
@@ -167,7 +168,7 @@ sub _gb_a {
     # against the SAME occurrence, not the whole command (redteam M3), so
     # "git stash list && git stash pop" still denies on the pop.
     if (BpHook::Guards::Common::line_match(
-            qr/${A}git[[:space:]]+${GITOPT}stash\b(?![[:space:]]+(list|show)\b)/, $match_text))
+            qr/${A}${GIT}[[:space:]]+${GITOPT}stash\b(?![[:space:]]+(list|show)\b)/, $match_text))
     {
         return [
             'BLOCKED: git stash mutations are forbidden in coordinator sessions (list/show are fine).',
@@ -924,7 +925,7 @@ sub _perl_binary_name {
     return 0;
 }
 
-# _runner_or_dot_t_name($name, $is_winfam) -> 0|1. never-halt 03 S4: a
+# _runner_or_dot_t_name($name, $is_ci) -> 0|1. never-halt 03 S4: a
 # command's own (already folded/basename'd/case-normalised) name is the
 # runner or a .t file outright -- direct exec/shebang, or a thin wrapper
 # _hyg_reduce/_hyg_commands already unwrapped down to this name. On
@@ -932,28 +933,28 @@ sub _perl_binary_name {
 # the same way, lexically, without depending on a real alias existing on
 # disk.
 sub _runner_or_dot_t_name {
-    my ($name, $is_winfam) = @_;
+    my ($name, $is_ci) = @_;
     return 0 unless defined $name;
     return 1 if $name eq 'run-tests.pl';
     return 1 if $name =~ /\.t$/;
-    return 1 if $is_winfam && $name =~ /~\d+\.(?:pl|t)$/i;
+    return 1 if _hyg_is_winfam() && $name =~ /~\d+\.(?:pl|t)$/i;
     return 0;
 }
 
 # never-halt 09-gb-h-residuals sec 3.14 (Decision 38) -- rule (a): a RAW
 # word's own text (quotes stripped, backslash turned to forward slash) is
 # test-run-shaped by itself: it ends in ".t" (case-insensitive on
-# Windows-family perls) or its basename is "run-tests.pl". Independent of
+# case-insensitive hosts, _hyg_is_ci) or its basename is "run-tests.pl". Independent of
 # whether the word is predictable -- "plugins/fx/tests/t/*.t" and
 # "$D/alpha.t" both qualify this way, without resolving $D at all.
 sub _d38_raw_is_test_shaped {
-    my ($raw, $is_winfam) = @_;
+    my ($raw, $is_ci) = @_;
     return 0 unless defined $raw;
     (my $rf = $raw) =~ s/['"]//g;
     $rf =~ tr{\\}{/};
-    return 1 if $is_winfam ? ($rf =~ /\.t$/i) : ($rf =~ /\.t$/);
+    return 1 if $is_ci ? ($rf =~ /\.t$/i) : ($rf =~ /\.t$/);
     (my $base = $rf) =~ s{.*/}{};
-    $base = lc($base) if $is_winfam;
+    $base = lc($base) if $is_ci;
     return 1 if $base eq 'run-tests.pl';
     return 0;
 }
@@ -964,7 +965,7 @@ sub _d38_raw_is_test_shaped {
 # any segment (including right after "export"), or a segment shaped
 # "for NAME in W1 W2 ..." where any Wi is test-shaped by rule (a).
 sub _d38_name_resolves_test_shaped {
-    my ($cmd, $name, $is_winfam) = @_;
+    my ($cmd, $name, $is_ci) = @_;
     return 0 unless defined $cmd && defined $name && length $name;
     my @segs = eval { BpHook::_segments($cmd) };
     return 0 unless @segs;
@@ -984,7 +985,7 @@ sub _d38_name_resolves_test_shaped {
             my $raw = $words->[$wi]{raw};
             last unless defined $raw && $raw =~ /^[A-Za-z_][A-Za-z0-9_]*=/;
             if ($raw =~ /^\Q$name\E=(.*)$/s) {
-                return 1 if _d38_raw_is_test_shaped($1, $is_winfam);
+                return 1 if _d38_raw_is_test_shaped($1, $is_ci);
             }
             $wi++;
         }
@@ -997,7 +998,7 @@ sub _d38_name_resolves_test_shaped {
             for my $j (3 .. $#$words) {
                 my $raw = $words->[$j]{raw};
                 next unless defined $raw;
-                return 1 if _d38_raw_is_test_shaped($raw, $is_winfam);
+                return 1 if _d38_raw_is_test_shaped($raw, $is_ci);
             }
         }
     }
@@ -1029,7 +1030,7 @@ sub _perl_test_run {
 
         my $deadline = _hyg_deadline_at(2);
         local $HYG_SCAN_DEADLINE = $deadline;
-        my $is_winfam = _hyg_is_winfam();
+        my $is_ci = _hyg_is_ci();
         for my $e (_hyg_commands($cmd, 0, $deadline)) {
             next unless ref $e eq 'HASH';
             my $name = _hyg_command_name($e->{name});
@@ -1038,7 +1039,7 @@ sub _perl_test_run {
             # S4: the command itself, already unwrapped, is the runner or a
             # .t file (direct exec/shebang, or a thin wrapper _hyg_reduce
             # already stripped).
-            return 1 if _runner_or_dot_t_name($name, $is_winfam);
+            return 1 if _runner_or_dot_t_name($name, $is_ci);
 
             # S3: `prove`, bare or perl-launched, is a test run outright --
             # it has no ".t operand" of its own to walk for.
@@ -1067,7 +1068,7 @@ sub _perl_test_run {
                     my $w = $aw[$ix];
                     my $an = _hyg_command_name($w);
                     next unless defined $an;
-                    if (_runner_or_dot_t_name($an, $is_winfam)) { return 1 }
+                    if (_runner_or_dot_t_name($an, $is_ci)) { return 1 }
                     if (_perl_binary_name($an)) {
                         my @rest = @aw[$ix + 1 .. $#aw];
                         my ($ops2, undef) = _hyg_scan_redirects(\@rest);
@@ -1084,8 +1085,8 @@ sub _perl_test_run {
                         if (defined $s2 && $s2 ne '-') {
                             (my $f2 = $s2) =~ tr{\\}{/};
                             (my $b2 = $f2) =~ s{.*/}{};
-                            $b2 = lc($b2) if $is_winfam;
-                            return 1 if _runner_or_dot_t_name($b2, $is_winfam);
+                            $b2 = lc($b2) if $is_ci;
+                            return 1 if _runner_or_dot_t_name($b2, $is_ci);
                         }
                         last;
                     }
@@ -1137,7 +1138,7 @@ sub _perl_test_run {
                 # in the same command). Mere MENTION of ".t" anywhere else
                 # on the line (e.g. inside a --text value) is not enough.
                 my $raw_idx = $ops->[$idx]{raw};
-                if (_d38_raw_is_test_shaped($raw_idx, $is_winfam)) { return 1 }
+                if (_d38_raw_is_test_shaped($raw_idx, $is_ci)) { return 1 }
                 my $name_var;
                 if ($raw_idx =~ /^"\$\{([A-Za-z_][A-Za-z0-9_]*)\}"$/
                     || $raw_idx =~ /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/)
@@ -1146,7 +1147,7 @@ sub _perl_test_run {
                     || $raw_idx =~ /^\$([A-Za-z_][A-Za-z0-9_]*)$/)
                 { $name_var = $1 }
                 if (defined $name_var
-                    && _d38_name_resolves_test_shaped($cmd, $name_var, $is_winfam))
+                    && _d38_name_resolves_test_shaped($cmd, $name_var, $is_ci))
                 {
                     return 1;
                 }
@@ -1180,8 +1181,8 @@ sub _perl_test_run {
                 (my $folded = $s) =~ tr{\\}{/};
                 ($base = $folded) =~ s{.*/}{};
             }
-            $base = lc($base) if $is_winfam;
-            return 1 if _runner_or_dot_t_name($base, $is_winfam);
+            $base = lc($base) if $is_ci;
+            return 1 if _runner_or_dot_t_name($base, $is_ci);
             # S3: `perl /path/to/prove x.t` launches prove as perl's own
             # script -- the same as a bare/absolute `prove` invocation.
             return 1 if $base eq 'prove' || $base eq 'prove.bat';
@@ -1546,7 +1547,7 @@ sub _validate_ledger_value {
 # this way since the tokenizer's own literal already stripped matched-pair
 # quotes with no escapes), folds backslash to forward slash (an unquoted
 # Windows-style "scripts\run-tests.pl"), then compares the basename to
-# "run-tests.pl" case-insensitively on Windows-family perls -- the SAME case
+# "run-tests.pl" case-insensitively on case-insensitive hosts (_hyg_is_ci) -- the SAME case
 # rule _perl_test_run's own script-basename check uses, so the two readers
 # can never disagree about which basename ends a scoped run (N2).
 sub _runner_basename_matches {
@@ -1555,7 +1556,7 @@ sub _runner_basename_matches {
     (my $t = $raw) =~ s/['"]//g;
     $t =~ tr{\\}{/};
     (my $base = $t) =~ s{.*/}{};
-    $base = lc($base) if _hyg_is_winfam();
+    $base = lc($base) if _hyg_is_ci();
     return $base eq 'run-tests.pl' ? 1 : 0;
 }
 
@@ -1577,7 +1578,7 @@ sub _scoped_test_operand {
         return undef unless defined $name_word;
         $argv ||= [];
         my $name = _hyg_command_name($name_word);
-        my $is_winfam = _hyg_is_winfam();
+        my $is_ci = _hyg_is_ci();
 
         my $S;
         my @after_pool;
@@ -1597,7 +1598,7 @@ sub _scoped_test_operand {
             my ($text) = @_;
             return 0 unless defined $text;
             (my $tt = $text) =~ tr{\\}{/};
-            return $is_winfam ? ($tt =~ /\.t$/i ? 1 : 0) : ($tt =~ /\.t$/ ? 1 : 0);
+            return $is_ci ? ($tt =~ /\.t$/i ? 1 : 0) : ($tt =~ /\.t$/ ? 1 : 0);
         };
 
         if (_runner_basename_matches($S->{raw})) {
@@ -1911,6 +1912,10 @@ sub _is_full_sweep_runner {
     return 0 if index($cmd, 'run-tests.pl') < 0; # fast path: one index call
     my $text = _blank_data_heredocs($cmd);
     $text =~ s/\\\n/ /g;
+    # zsh redirection spellings (">! log", ">>| log", "&>! log", the macOS
+    # Bash tool's shell) read as the bash operator they mean, so the drop
+    # below takes the log file with them instead of keeping it as an operand.
+    $text = BpHook::normalize_redirects($text);
     for my $line (split /\n/, $text) {
         for my $seg (split $RUNNER_SEPARATOR_RE, $line) {
             next unless defined $seg;
@@ -1970,7 +1975,7 @@ sub _is_full_sweep_runner {
                 return 1 if $t =~ /[*?\[{]/;
                 if ($t =~ m{/}) {
                     (my $tb = $t) =~ s{.*/}{};
-                    $tb = lc($tb) if _hyg_is_winfam();
+                    $tb = lc($tb) if _hyg_is_ci();
                     return 1 unless $tb =~ /\.t$/i;
                 }
                 push @args, $t;
@@ -2266,10 +2271,20 @@ my $HYG_HINT_TEXT = 'If the operator asked for this, ask them to run it themselv
 
 sub _hyg_is_winfam { return ($^O =~ /^(?:MSWin32|msys|cygwin)$/) ? 1 : 0 }
 
+# _hyg_is_ci() -- does this host's filesystem (and so its shell's command
+# lookup) ignore ASCII case? Windows-family perls and darwin (APFS and HFS+
+# are case-insensitive by default: `RM -rf x` runs /bin/rm and `.GIT` is the
+# repo's .git there). Every case fold below keys on THIS; the Windows-only
+# rules -- drive letters, 8.3 short-name aliases, a drive root's volume --
+# keep _hyg_is_winfam. Before the split, darwin folded nothing, so
+# `rm -rf .GIT` and `RM -rf ~` walked past the protected-path and trigger
+# checks on a Mac.
+sub _hyg_is_ci { return ($^O =~ /^(?:MSWin32|msys|cygwin|darwin)$/) ? 1 : 0 }
+
 # redteam S1: the old path-run class '[^\s;&|()\'"\x60]*' does not exclude
 # '{' / '}', so a run of braces re-scans itself from every '{' -- quadratic.
 # Excluding them here makes each run non-overlapping (linear). redteam S3:
-# on Windows-family perls, `type RM` resolves case-insensitively, so the
+# on case-insensitive hosts (_hyg_is_ci), `type RM` resolves case-insensitively, so the
 # name group is matched case-insensitively there too (paired with
 # _hyg_command_name's fold).
 # redteam-3 S4: the .exe suffix itself must fold case too on a Windows-
@@ -2278,9 +2293,9 @@ sub _hyg_is_winfam { return ($^O =~ /^(?:MSWin32|msys|cygwin)$/) ? 1 : 0 }
 # never-halt 09-gb-h-residuals sec 3.11 (Decision 33): unlink, shred, dd,
 # sort and curl are added to both alternations, with the same .exe/case
 # rules as every other trigger verb.
-my $HYG_TRIGGER_RE = _hyg_is_winfam()
-    ? qr/(?:^|[;&|\s(){}\x60'"])(?:[^\s;&|()'"\x60{}]*\/)?(?i:cd|pushd|rm|rmdir|mv|cp|ln|touch|mkdir|tee|sed|perl|truncate|unlink|shred|dd|sort|curl)(?i:\.exe)?(?=[\s;&|()'"\x60]|$)|>/
-    : qr/(?:^|[;&|\s(){}\x60'"])(?:[^\s;&|()'"\x60{}]*\/)?(?:cd|pushd|rm|rmdir|mv|cp|ln|touch|mkdir|tee|sed|perl|truncate|unlink|shred|dd|sort|curl)(?:\.exe)?(?=[\s;&|()'"\x60]|$)|>/;
+my $HYG_TRIGGER_RE = _hyg_is_ci()
+    ? qr/(?:^|[;&|\s(){}\x60'"])=?(?:[^\s;&|()'"\x60{}]*\/)?(?i:cd|pushd|rm|rmdir|mv|cp|ln|touch|mkdir|tee|sed|perl|truncate|unlink|shred|dd|sort|curl)(?i:\.exe)?(?=[\s;&|()'"\x60]|$)|>/
+    : qr/(?:^|[;&|\s(){}\x60'"])=?(?:[^\s;&|()'"\x60{}]*\/)?(?:cd|pushd|rm|rmdir|mv|cp|ln|touch|mkdir|tee|sed|perl|truncate|unlink|shred|dd|sort|curl)(?:\.exe)?(?=[\s;&|()'"\x60]|$)|>/;
 
 sub _hyg_is_abs {
     my ($v) = @_;
@@ -2293,7 +2308,7 @@ sub _hyg_is_abs {
 sub _hyg_fold_key {
     my ($k) = @_;
     return $k unless defined $k;
-    return $k unless _hyg_is_winfam();
+    return $k unless _hyg_is_ci();
     (my $v = $k) =~ tr/A-Z/a-z/;
     return $v;
 }
@@ -2518,39 +2533,6 @@ sub _hyg_classify_redirect {
     return (1, 0, $op, $rest_raw) if $op eq '<>';
     my $is_output = ($op =~ /^(?:>>|>\||&>>|&>|>)$/) ? 1 : 0;
     return ($is_output, 0, $op, $rest_raw);
-}
-
-# _hyg_rewrite_clobber_redirect($text) -> $text with every unquoted ">|"
-# rewritten to "> " (redteam S4). BpHook::_segments splits unconditionally
-# on a bare "|", so an unrewritten ">|" is torn into two "commands" and its
-# target is lost; converting it to a plain ">" first (before _segments ever
-# sees it) keeps the target parseable and only gives up the no-clobber-
-# override semantics, which this rule has no way to represent anyway.
-sub _hyg_rewrite_clobber_redirect {
-    my ($t) = @_;
-    return $t unless defined $t && index($t, '>|') >= 0;
-    my $len = length($t);
-    my $out = '';
-    my $i = 0;
-    my $q = 'none';
-    while ($i < $len) {
-        my $c = substr($t, $i, 1);
-        if ($q eq 'squote') { $out .= $c; $q = 'none' if $c eq "'"; $i++; next }
-        if ($q eq 'dquote') {
-            if ($c eq '\\' && $i + 1 < $len) { $out .= $c . substr($t, $i + 1, 1); $i += 2; next }
-            $out .= $c;
-            $q = 'none' if $c eq '"';
-            $i++;
-            next;
-        }
-        if ($c eq "'") { $q = 'squote'; $out .= $c; $i++; next }
-        if ($c eq '"') { $q = 'dquote'; $out .= $c; $i++; next }
-        if ($c eq '\\' && $i + 1 < $len) { $out .= $c . substr($t, $i + 1, 1); $i += 2; next }
-        if ($c eq '>' && $i + 1 < $len && substr($t, $i + 1, 1) eq '|') { $out .= '> '; $i += 2; next }
-        $out .= $c;
-        $i++;
-    }
-    return $out;
 }
 
 # _hyg_raw_value_and_flags($raw) -> ($value, \@flags). Mirrors
@@ -2964,9 +2946,20 @@ sub _hyg_ctx {
         $R = _hyg_root_via_git($cwd);
     }
 
+    # Claude Code's own temp root is a temp root on every non-Windows host,
+    # whatever $TMPDIR says. macOS points $TMPDIR (and so File::Spec->tmpdir)
+    # at /var/folders/.../T, while Claude Code keeps its temp root -- the
+    # session scratchpad included -- at /private/tmp/claude-<uid>/, and /tmp
+    # is a symlink to /private/tmp there, so either spelling can arrive.
+    # Without these a worker's write to its own scratchpad read as "outside
+    # the repo and the temp dir" on a Mac. Only claude-<uid>, not all of
+    # /tmp: elsewhere under /tmp is outside unless $TMPDIR says otherwise,
+    # as before (the test runner's own /tmp/ccpraxis-sweep-* fixtures rely
+    # on exactly that).
+    my @posix_tmp = _hyg_is_winfam() ? () : ("/tmp/claude-$<", "/private/tmp/claude-$<");
     my @tmp;
     my %seen_tmp;
-    for my $v (eval { File::Spec->tmpdir }, $ENV{TMP}, $ENV{TEMP}, $ENV{TMPDIR}) {
+    for my $v (eval { File::Spec->tmpdir }, $ENV{TMP}, $ENV{TEMP}, $ENV{TMPDIR}, @posix_tmp) {
         next unless defined $v && length $v;
         my $b = BpHook::_to_bytes($v);
         next unless _hyg_is_abs($b);
@@ -3227,11 +3220,23 @@ sub _hyg_command_name {
         $s = _hyg_dequote($w->{raw});
     }
     return undef unless defined $s;
-    (my $b = $s) =~ s{.*[/\\]}{};
+    return _hyg_cmd_basename($s);
+}
+
+# _hyg_cmd_basename($word) -> the command a shell runs for this command word:
+# the basename after the last '/' or '\', without a ".exe" suffix, folded on
+# case-insensitive hosts (redteam S3: there RM/TOUCH/etc resolve
+# case-insensitively; _hyg_is_ci: Windows-family perls and darwin). A leading
+# '=' goes too: zsh -- the macOS Bash tool's shell -- replaces a word "=rm"
+# with the path of rm, so "=rm <file>" deletes exactly like "rm <file>" (and
+# under bash it is merely a command not found).
+sub _hyg_cmd_basename {
+    my ($s) = @_;
+    return undef unless defined $s;
+    (my $b = $s) =~ s/\A=(?=[^=])//;
+    $b =~ s{.*[/\\]}{};
     $b =~ s/\.exe$//i;
-    # redteam S3: this host's shell resolves RM/TOUCH/etc case-
-    # insensitively on Windows-family perls (case-insensitive filesystem).
-    $b = lc($b) if _hyg_is_winfam();
+    $b = lc($b) if _hyg_is_ci();
     return $b;
 }
 
@@ -3292,16 +3297,17 @@ sub _hyg_reduce {
         my $lit = $w[$i]{literal};
         last unless defined $lit;
         # redteam-2 S4 / redteam-3 S4: this host's shell resolves wrapper
-        # keywords (env/nice/sudo/...) case-insensitively too, on Windows-
-        # family perls -- fold before every keyword comparison below. Also
+        # keywords (env/nice/sudo/...) case-insensitively too, on case-
+        # insensitive hosts (_hyg_is_ci) -- fold before every keyword
+        # comparison below. Also
         # strip a path prefix and a ".exe" suffix (case-insensitively) the
         # same way _hyg_command_name does, so "/usr/bin/env" and "env.exe"
         # are recognised as "env" too, not just a bare "env" word.
-        my $lit_fold = $lit;
-        $lit_fold =~ s{.*[/\\]}{};
-        $lit_fold =~ s/\.exe$//i;
-        $lit_fold = lc($lit_fold) if _hyg_is_winfam();
-        if ($lit_fold =~ /^(?:builtin|exec|nohup|then|do|else|elif|if|while|until)$/) {
+        my $lit_fold = _hyg_cmd_basename($lit);
+        # noglob, nocorrect and a lone "-" are zsh precommand modifiers (the
+        # macOS Bash tool runs zsh): "noglob rm f" runs rm. Under bash they
+        # are merely commands not found, so unwrapping them only adds targets.
+        if ($lit_fold =~ /^(?:builtin|exec|nohup|then|do|else|elif|if|while|until|noglob|nocorrect|-)$/) {
             $i++;
             $progress = 1;
             next;
@@ -3504,10 +3510,11 @@ sub _hyg_commands {
     return () if $depth > 3;
     return () unless defined $text;
     (my $t = $text) =~ s/\\\n//g;
-    # redteam S4: rewrite an unquoted ">|" to a plain ">" BEFORE _segments
-    # ever splits on the bare '|' it contains, or the clobber redirect's
-    # target is torn into a separate "command" and lost.
-    $t = _hyg_rewrite_clobber_redirect($t);
+    # redteam S4: an unquoted ">|" must become a plain ">" before anything
+    # splits on the bare '|' it contains, or the clobber redirect's target is
+    # torn into a separate "command" and lost. BpHook::_segments() does that
+    # itself now, inside its own quote-aware walk, together with zsh's
+    # spellings (">!", ">>|", "&>!", ">>&", ...) -- see %BASH_FOR_ZSH_REDIR.
     my @segs = BpHook::_segments($t);
     my @out;
     for my $seg (@segs) {

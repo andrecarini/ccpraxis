@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # The oracle for the throwaway, capped run-mode that executes .t files inside
 # the EXISTING sandbox image on the container's own overlay filesystem,
 # rather than the launcher's bind mount. Spec:

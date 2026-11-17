@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # b13-deterministic oracle. Derived ONLY from
 # .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/b13-deterministic-spec.md
 # §2 (contracts, V1-V5, the five ops), §3 (behaviours B1..B62), §4 (AC-1..AC-63), §6 (edge cases).

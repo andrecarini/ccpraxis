@@ -606,9 +606,14 @@ my $H1_SID = 'hold-h1-sid';
     reap_and_log('H4a-new-holder', $pid2, $out2f, $err2f);
 }
 
-# H4(b) -- pid changed to a live, unrelated pid; fp left alone -> 0. /proc-dependent.
+# H4(b) -- pid changed to a live, unrelated pid; fp left alone -> 0. Needs a
+# process identity to compare: /proc's cmdline hash, or on darwin (no /proc)
+# the start time butler-hold records as a "ps:" fingerprint. Before darwin
+# had one, its fp was always empty and kill(0) alone answered, so this exact
+# forgery read as live there.
 SKIP: {
-    skip 'H4b: /proc/self/cmdline unavailable on this host', 1 unless -r '/proc/self/cmdline';
+    skip 'H4b: no process identity on this host (no /proc/self/cmdline, not darwin)', 1
+        unless -r '/proc/self/cmdline' || $^O eq 'darwin';
     my $sid = 'hold-h4b-sid';
     my $tp = transcript_path_for($sid);
     write_transcript($tp);
@@ -619,6 +624,12 @@ SKIP: {
 
     SKIP: {
         skip 'H4b: no record to forge from', 1 unless defined $h;
+        if (!-r '/proc/self/cmdline') {
+            like($h->{fp}, qr/\Aps:\S/, 'H4b (darwin): the holder record carries a start-time fingerprint');
+            is(BpHook::holder_live($sid, {}), 1, 'H4b (darwin): the genuine record reads live before the forgery');
+            isnt(BpHook::start_fp($$), $h->{fp},
+                'H4b (darwin) precondition: this test process started at a different second than the holder');
+        }
         my $forged = { %$h, pid => $$ };   # this test process: real, alive, unrelated cmdline
         my $path = "$CONT_ROOT/holder/$sid.json";
         open my $fh, '>:raw', $path or die $!;

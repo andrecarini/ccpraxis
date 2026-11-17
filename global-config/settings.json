@@ -54,7 +54,7 @@
    "extraKnownMarketplaces" : {
       "ccpraxis-local" : {
          "source" : {
-            "path" : "C:/Users/André/.claude/ccpraxis/plugins",
+            "path" : "${CCPRAXIS_LIVE}/plugins",
             "source" : "directory"
          }
       },

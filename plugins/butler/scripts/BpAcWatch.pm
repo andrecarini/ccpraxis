@@ -246,7 +246,9 @@ sub _monitor_tick {
 
 sub enabled {
     return 1 if _seam_active();
-    return ($^O =~ /^(?:MSWin32|msys|cygwin)$/) ? 1 : 0;
+    # A host that can lose AC: Windows (the PowerShell probe) and macOS
+    # (pmset). The Linux sandbox has no battery of its own to watch.
+    return ($^O =~ /^(?:MSWin32|msys|cygwin)$/ || $^O eq 'darwin') ? 1 : 0;
 }
 
 # ---------------------------------------------------------------------------
@@ -292,6 +294,8 @@ sub probe_source {
         1;
     };
     return 'unknown' unless $ok;
+    # macOS has no PowerShell: its power source is one pmset read.
+    return _probe_darwin() if $^O eq 'darwin';
     my $argv = eval { BpPowerJournal::probe_argv() };
     return 'unknown' unless ref $argv eq 'ARRAY';
     # red-team m8 / fix-batch: pass the shared zombie cache so a prior call's
@@ -308,6 +312,38 @@ sub probe_source {
     # regardless of the overall status rather than discarded as unknown.
     my $ps = $parsed->{power_source};
     return (defined $ps && ($ps eq 'ac' || $ps eq 'dc')) ? $ps : 'unknown';
+}
+
+# _probe_darwin() -> 'ac' | 'dc' | 'unknown' -- the sandbox plugin's
+# KeepAwake::power_source: one bounded `pmset -g ps`, the same read the macOS
+# wake-lock holder makes every two seconds to drop caffeinate on battery, so
+# the AC-loss watch and the holder can never disagree about the power source.
+# Refused under a .t and under CCPRAXIS_NO_WAKELOCK, the same rule (and the
+# same reason) as BpPowerJournal::probe_argv on Windows: a test must read the
+# probe-file seam, never the real machine's power source.
+sub _probe_darwin {
+    return 'unknown' if defined $0 && $0 =~ /\.t\z/;
+    return 'unknown' if $ENV{CCPRAXIS_NO_WAKELOCK};
+    unless (defined &KeepAwake::power_source) {
+        my $p = "$DIR/../../sandbox/scripts/KeepAwake.pm";
+        return 'unknown' unless -f $p && eval { require $p; 1 } && defined &KeepAwake::power_source;
+    }
+    return KeepAwake::power_source();
+}
+
+# parse_pmset_ps($text) -> 'ac' | 'dc' | 'unknown'. PURE. The parser is the
+# sandbox plugin's KeepAwake::parse_pmset_ps -- the same one the macOS
+# wake-lock holder uses to drop caffeinate on battery, so "is this Mac on AC"
+# has one answer. Only the FIRST line decides ("Now drawing from 'AC Power'" /
+# 'Battery Power' / 'UPS Power'); a UPS counts as DC. 'unknown' when that
+# library cannot be loaded.
+sub parse_pmset_ps {
+    my ($text) = @_;
+    unless (defined &KeepAwake::parse_pmset_ps) {
+        my $p = "$DIR/../../sandbox/scripts/KeepAwake.pm";
+        return 'unknown' unless -f $p && eval { require $p; 1 } && defined &KeepAwake::parse_pmset_ps;
+    }
+    return KeepAwake::parse_pmset_ps($text);
 }
 
 # ---------------------------------------------------------------------------

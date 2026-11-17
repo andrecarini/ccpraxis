@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # Oracle tests for q05, derived from
 #   .ccpraxis-local-data/blueprints/sandbox-butler-overhaul/specs/q05-spec.md
 #
@@ -252,7 +252,17 @@ sub _run_guard {
 # touches the real filesystem outside this tempdir; never the real HOME,
 # USERPROFILE, CLAUDE_CONFIG_DIR, or ~/.claude.
 # =====================================================================
+# Resolved, because the launcher only ever asks about a RESOLVED target (it
+# abs_paths the project path first) while the guard resolves every protected
+# root it ingests. A raw tempdir is /var/folders/... on macOS, where /var is a
+# symlink into /private: the roots then resolve to /private/var/... and the
+# unresolved targets below compare as unrelated to them, which is a fixture
+# artefact, not the guard behaviour these cases pin.
+# Only on macOS: on Git-for-Windows perl abs_path rewrites a C:/... tempdir into
+# the MSYS /c/... spelling, which the guard (reporting the C:/... form it
+# ingested) never produces, and C1/C5 then compare two spellings of one path.
 my $ROOT       = tempdir(CLEANUP => 1);
+$ROOT          = abs_path($ROOT) if $^O eq 'darwin';
 my $AUTH_HOME  = "$ROOT/auth_home";
 my $DECOY_HOME = "$ROOT/decoy_home";
 my $CFG_DIR    = "$ROOT/cfg_dir";

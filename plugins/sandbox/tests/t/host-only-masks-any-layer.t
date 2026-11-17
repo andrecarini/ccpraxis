@@ -542,10 +542,15 @@ SKIP: {
     my $block_start = $marker_at > 250 ? $marker_at - 250 : 0;
     my $mask_block  = substr($src, $block_start, 3000);
 
-    ok(index($mask_block, '$CONTAINER_SETTINGS_JSON') >= 0,
-        'm4: the seed expression names $CONTAINER_SETTINGS_JSON (the create-time-if-it-exists branch)');
-    ok(index($mask_block, '$CONTAINER_CONFIG/settings.json') >= 0,
-        'm4: the seed expression names $CONTAINER_CONFIG/settings.json (the shipped-template fallback)');
+    # 2026-11-02: these masks only reach `podman create`, and the create merges
+    # the CURRENT preset into the sandbox settings (SandboxSettings), so the
+    # seed is the current preset itself; the preset the sandbox was last given
+    # ($CONTAINER_SETTINGS_JSON) stays the drift signature's seed.
+    like($mask_block, qr{my \$seed_settings = "\$CONTAINER_CONFIG/settings\.json";},
+        'm4: the create-time mask seed is the current preset, $CONTAINER_CONFIG/settings.json');
+    my ($sig_body) = $src =~ m{sub _host_only_mask_signature \{(.*?)\n\}}s;
+    like($sig_body // '', qr{-f \$CONTAINER_SETTINGS_JSON\s*\?\s*\$CONTAINER_SETTINGS_JSON\s*:\s*"\$CONTAINER_CONFIG/settings\.json"},
+        'm4: the drift signature still seeds from $CONTAINER_SETTINGS_JSON, falling back to the shipped template');
     ok(index($mask_block, 'run_perl_to_file') == -1,
         'M1: the mask-discovery call site no longer goes through run_perl_to_file '
       . '(which exits the launcher on a non-zero child exit)');

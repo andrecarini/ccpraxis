@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # t/03 — a report cannot be born forged.
 #
 # almanac-bug.pl's frontmatter serializer (`AlmanacBug::_render`) is hand-rolled

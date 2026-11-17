@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 # The ORACLE for blueprint tooling-backlog,
 # package 01-statusline-bounded-walkup (specs/01-statusline-bounded-walkup-spec.md).
 #
@@ -26,6 +26,13 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
+# macOS ships no `timeout`: the runner puts scripts/test-bin/timeout on PATH
+# for a sweep, and a file run on its own puts it there itself (the same rule
+# as GuardHarness.pm), so every `timeout` below resolves either way.
+unless (grep { -x "$_/timeout" } split /:/, ($ENV{PATH} // q{})) {
+    $ENV{PATH} = "$Bin/../../../../scripts/test-bin:" . ($ENV{PATH} // q{})
+        if -x "$Bin/../../../../scripts/test-bin/timeout";
+}
 use Test::More;
 use File::Temp qw(tempdir tempfile);
 use File::Path qw(make_path);
@@ -122,6 +129,7 @@ sub normalize_alm_mirror_body {
     my ($body) = @_;
     return '' unless defined $body;
     $body =~ s/\$ALMANAC_SW_IS_WIN\b/\$IS_WIN/g;
+    $body =~ s/\$ALMANAC_SW_IS_DARWIN\b/\$IS_DARWIN/g;
     $body =~ s/_alm_sw_same_path_any_form/_same_path_any_form/g;
     $body =~ s/_alm_sw_same_path\b/same_path/g;
     $body =~ s/_alm_sw_/_/g;
@@ -194,6 +202,20 @@ for my $p (@PAIRS) {
         my $n_alm = normalize_alm_mirror_body($rhs_alm);
         my $n_bdr = normalize_alm_mirror_body($rhs_bdr);
         is($n_alm, $n_bdr, 'AC-3: $ALMANAC_SW_IS_WIN right-hand side matches $IS_WIN (mod naming)');
+    }
+}
+
+# The darwin flag drives the case fold and the /tmp second temp root in every
+# stop rule above; a drifted definition would change which paths the statusline
+# walk treats as equal on a Mac without any sub body differing.
+{
+    my ($rhs_alm) = $PAYLOAD =~ /my\s+\$ALMANAC_SW_IS_DARWIN\s*=\s*(.*?);/s;
+    my ($rhs_bdr) = $bdr_txt =~ /my\s+\$IS_DARWIN\s*=\s*(.*?);/s;
+    ok(defined $rhs_alm, 'AC-3: statusline.pl\'s payload defines $ALMANAC_SW_IS_DARWIN');
+    ok(defined $rhs_bdr, 'AC-3 sanity: BpDataRoot.pm defines $IS_DARWIN');
+    if (defined $rhs_alm && defined $rhs_bdr) {
+        is(normalize_alm_mirror_body($rhs_alm), normalize_alm_mirror_body($rhs_bdr),
+            'AC-3: $ALMANAC_SW_IS_DARWIN right-hand side matches $IS_DARWIN (mod naming)');
     }
 }
 

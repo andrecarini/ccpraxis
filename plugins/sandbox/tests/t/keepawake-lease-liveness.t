@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# platform: windows
+# platform: host
 #
 # 02-lease-distinguishes-quiet-from-gone (host-wake-and-suspend blueprint).
 #
@@ -207,7 +207,9 @@ like($src, qr/OWNER-REPLACED/,
                . 'wiring this decision requires may live under a different shape', 4
                 unless defined $loop_body;
 
-            like($loop_body, qr/BpKeepAwake::self_winpid\s*\(\s*\)/,
+            # self_owner_pid (the macOS port) returns self_winpid() on
+            # Windows; on darwin, one pid namespace, it is $$.
+            like($loop_body, qr/BpKeepAwake::self_(?:owner_pid|winpid)\s*\(\s*\)/,
                 "Decision 16(c): BpContinuityLease::daemon_loop's body calls BpKeepAwake::self_winpid() "
               . '(the owner pid defaults to the daemon\'s own WINDOWS pid, not derived any other way)');
 
@@ -217,7 +219,7 @@ like($src, qr/OWNER-REPLACED/,
             # Ordering: the self_winpid() default must happen textually BEFORE
             # BpKeepAwake::spawn( is ever reached inside the loop's body --
             # "read in the parent... before forking" (spawn() does the fork).
-            my $self_winpid_pos = ($loop_body =~ /BpKeepAwake::self_winpid\s*\(\s*\)/) ? $-[0] : undef;
+            my $self_winpid_pos = ($loop_body =~ /BpKeepAwake::self_(?:owner_pid|winpid)\s*\(\s*\)/) ? $-[0] : undef;
             my $spawn_pos       = ($loop_body =~ /BpKeepAwake::spawn\s*\(/) ? $-[0] : undef;
             ok(defined($self_winpid_pos) && (!defined($spawn_pos) || $self_winpid_pos < $spawn_pos),
                 'Decision 16(c): BpKeepAwake::self_winpid() default is computed before any BpKeepAwake::spawn( '
