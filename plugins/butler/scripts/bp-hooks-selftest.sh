@@ -131,6 +131,14 @@ main() {
     export BP_LEDGER="$WS/bp/ledger.md" BP_DIR="$WS/bp" BP_PROJECT_ROOT="$WS/proj"
     export BP_PACKAGE="hooks-selftest" BP_WRITE_SET="allowed/" BP_TEST_PATHS="tests/"
     : > "$BP_LEDGER"
+    # This session wears a coordinator's environment (BP_LEDGER set, no
+    # BP_ROLE), so the Stop gate holds it to a coordinator's ledger discipline,
+    # and the stub ledger above can never reach a terminal status: the session
+    # could not end its one turn, kept going, and once filed a bug about it
+    # (20261111-093546-547b). The gate's own force-stop marker lets exactly that
+    # one stop through and is consumed by it; guard-writes, the thing under
+    # test, is untouched.
+    : > "$BP_DIR/runs/$BP_PACKAGE.force-stop"
     claude -p "$PROMPT" \
       --settings "$SETTINGS" \
       --model "${BP_HOOKS_SELFTEST_MODEL:-sonnet}" \
