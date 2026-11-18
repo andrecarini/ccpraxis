@@ -169,6 +169,7 @@ use PortAlloc ();         # fix-multiple-running-sandboxes: per-container port-b
 use SandboxLock ();       # 04-build-race-lock: generalised mkdir lock + global build-race guard
 use ProjectSandbox ();    # claude-sandbox.json: a project's image layer + allowlisted run settings
 use BoundedRun ();        # bug 20261110-165535-d71b: every pre-dashboard podman call is bounded
+use ImagePrune ();        # bug 20261118-004944-c84a: remove superseded images; name a full disk
 use SandboxSettings ();   # the sandbox's settings.json merge / CLAUDE.md refresh at create, with backups
 use SandboxRegistry ();   # this machine's list of sandboxed projects (read by /steward:backup)
 use JSON::PP ();          # parse backpack.json + write the approved install-set
@@ -2041,6 +2042,11 @@ sub _container_sampler_release_global { eval { _container_sampler_stop($CONTAINE
 sub _tx_write    { my ($fh, $b) = @_; return 0 unless $fh; print {$fh} $b; return 1; }
 sub _tee_display { my ($b) = @_; print STDOUT $b; return 1; }
 
+# $LAST_TEE_OUT -- the combined output of the last podman command _tee_system
+# ran (BoundedRun keeps it anyway), so a failed build can be read for its
+# cause instead of pointing at a 4,500-line log (bug 20261118-004944-c84a).
+my $LAST_TEE_OUT = '';
+
 #
 # A podman command is BOUNDED (bug 20261110-165535-d71b) and always captured:
 # its kind comes from BoundedRun::podman_kind unless a leading { kind => ... }
@@ -2049,6 +2055,7 @@ sub _tee_display { my ($b) = @_; print STDOUT $b; return 1; }
 sub _tee_system {
     my $opt = (ref $_[0] eq 'HASH') ? shift : {};
     my @cmd = @_;
+    $LAST_TEE_OUT = '';
     my $host_active = ($LAUNCH_HOST && $LAUNCH_HOST->{mode} eq 'tui' && $LAUNCH_HOST->{active}) ? 1 : 0;
     my $has_tx = $TRANSCRIPT ? 1 : 0;
     if (@cmd && _is_podman_cmd($cmd[0])) {
@@ -2062,6 +2069,7 @@ sub _tee_system {
             cmd       => \@cmd,
             merge     => 1,
             on_output => sub { tui::LaunchScreens::fanout([ $tx_sink, $display_sink ], $_[0]) });
+        $LAST_TEE_OUT = defined $r->{out} ? $r->{out} : '';
         # Spawn failure (no fork) -> the old uncaptured run, as below.
         return system(@cmd) if $r->{rc} == -1 && !defined $r->{pid};
         return $r->{rc};
@@ -2805,6 +2813,82 @@ sub _stage_container_copies {
     return _refresh_live_mirror($stage, %o);
 }
 
+# _bounded_quiet(\@cmd, $kind, $limit) -> BoundedRun result. For calls that
+# must NEVER end the launch: unlike _bounded_run, a timeout here is just a
+# failed result, not _podman_unresponsive_fail. $limit (seconds) overrides
+# the kind's default.
+sub _bounded_quiet {
+    my ($cmd, $kind, $limit) = @_;
+    my %lim = BoundedRun::limits($kind, \%ENV);
+    %lim = (timeout => $limit) if defined $limit;
+    my $r = eval { BoundedRun::run(%lim, cmd => $cmd, windows => ($WINDOWS_FAMILY ? 1 : 0)) };
+    return ref $r eq 'HASH' ? $r : { rc => -1, out => '', err => ($@ || 'spawn failed'), timed_out => 0 };
+}
+
+# _image_cleanup(@targets) -- after a SUCCESSFUL build: remove the tags of the
+# named repositories that the build superseded, keeping the newest previous one
+# and anything a container uses, then dangling images (ImagePrune::cleanup has
+# the rules). Best effort: whatever fails is one warning line, and the launch
+# goes on (bug 20261118-004944-c84a: nothing ever removed an image, and the
+# machine's disk filled until a build died).
+sub _image_cleanup {
+    my (@targets) = @_;
+    my $res = eval {
+        ImagePrune::cleanup(
+            cli     => $PODMAN,
+            targets => \@targets,
+            run     => sub { my ($cmd) = @_; _bounded_quiet($cmd, BoundedRun::podman_kind(@{$cmd}[1 .. $#$cmd])) },
+        );
+    };
+    unless (ref $res eq 'HASH') {
+        log_ev('image_cleanup', { ok => 0, error => ($@ || 'unknown') });
+        return;
+    }
+    log_ev('image_cleanup', { ok => (@{ $res->{failed} } || $res->{skipped} ? 0 : 1),
+                              removed => join(' ', @{ $res->{removed} }),
+                              kept    => join(' ', map { "$_->{ref} ($_->{why})" } @{ $res->{kept} }),
+                              pruned  => $res->{pruned},
+                              (defined $res->{skipped} ? (skipped => $res->{skipped}) : ()),
+                              (@{ $res->{failed} } ? (failed => join(' | ', map { "$_->{ref}: $_->{error}" } @{ $res->{failed} })) : ()) });
+    _tx("--- image cleanup: removed " . (@{ $res->{removed} } ? join(', ', @{ $res->{removed} }) : 'none')
+        . ($res->{pruned} ? '; dangling images pruned' : '') . " ---\n");
+    _emit_out("Removed superseded images: " . join(', ', @{ $res->{removed} }) . "\n") if @{ $res->{removed} };
+    _emit_err(_c_warn('WARNING:'), " $_\n") for @{ $res->{lines} };
+}
+
+# _machine_df() -> the text of `df -h /` inside the podman machine, or undef.
+# Only where a machine exists (podman on Windows or macOS), and bounded: this
+# runs on the way out of a failed launch, so it may cost seconds, never a hang.
+# Windows asks WSL directly: `podman machine ssh` from Git-for-Windows perl
+# hands MSYS ssh `UserKnownHostsFile=NUL` and leaves a file named NUL in the
+# working directory (the operator's project).
+sub _machine_df {
+    return undef unless defined $PODMAN && $PODMAN =~ /podman/i && $^O ne 'linux';
+    my $r;
+    if ($WINDOWS_FAMILY) {
+        my $m = _bounded_quiet([ $PODMAN, 'machine', 'inspect', '--format', '{{.Name}}' ], 'query', 10);
+        my $name = ($m->{rc} == 0 && !$m->{timed_out}) ? $m->{out} : '';
+        $name =~ s/\s+//g;
+        $name = 'podman-machine-default' unless $name =~ /\A[\w.-]+\z/;
+        $r = _bounded_quiet([ 'wsl', '-d', $name, '--', 'df', '-h', '/' ], 'query', 10);
+    } else {
+        $r = _bounded_quiet([ $PODMAN, 'machine', 'ssh', 'df -h /' ], 'query', 15);
+    }
+    return undef if $r->{timed_out} || $r->{rc} != 0 || $r->{out} !~ /\S/;
+    return $r->{out};
+}
+
+# _build_cause_lines() -> extra lines for a failed build's message: the cause
+# when the build output names one the operator should not have to dig for.
+# Today that is a full disk, whose "no space left on device" is the last line
+# of thousands.
+sub _build_cause_lines {
+    return () unless ImagePrune::disk_full($LAST_TEE_OUT);
+    log_ev('image_build_disk_full', {});
+    my $cli = HostPlatform::runtime_family($PODMAN);
+    return ImagePrune::disk_full_lines(df => scalar(eval { _machine_df() }), cli_name => $cli);
+}
+
 sub build_image {
     # Before the build, not after it fails: a cold machine makes `podman build`
     # exit 125 with a socket error that reads like a broken install.
@@ -2848,6 +2932,7 @@ sub build_image {
         # transcript file to find out why.
         _fail_visibly(
             "ERROR: podman build failed (exit @{[$rc >> 8]}).",
+            _build_cause_lines(),
             "  The output above is podman's own explanation.",
             "  Full transcript: $CLAUDE_DATA/sandbox-logs/launch-$LAUNCH_ID.transcript.log",
         );
@@ -2857,6 +2942,9 @@ sub build_image {
     }
     log_ev('image_build_ok', { version => $HOST_VERSION });
     _write_file("$LAUNCHER_DIR/containerfile-hash", containerfile_hash());
+    # Older claude-sandbox:<version> tags no container or image needs; a
+    # project layer built on one keeps it (rmi is never forced).
+    _image_cleanup({ repo => $SandboxIdentity::ID, current_tag => $HOST_VERSION, kind => 'base' });
 }
 
 # ensure_project_image($spec, $force, $container_name) -> the image reference to create the container from.
@@ -2909,6 +2997,7 @@ sub ensure_project_image {
         _launch_fail('image', 'project image build failed', $rc >> 8);
         _fail_visibly(
             "ERROR: building the project image layer failed (exit @{[$rc >> 8]}).",
+            _build_cause_lines(),
             "  The output above is podman's own explanation; the file is $img->{context}/"
                 . ($img->{containerfile} // 'Containerfile') . " in this project.",
             "  Full transcript: $CLAUDE_DATA/sandbox-logs/launch-$LAUNCH_ID.transcript.log",
@@ -2918,6 +3007,13 @@ sub ensure_project_image {
         exit 1;
     }
     log_ev('project_image_build_ok', { tag => $tag });
+    # This project's superseded layers first: removing them can be what
+    # frees an old base, so the base is swept after them.
+    {
+        my ($repo, $cur) = ImagePrune::split_ref($tag);
+        _image_cleanup({ repo => $repo, current_tag => $cur, kind => 'project' },
+                       { repo => $SandboxIdentity::ID, current_tag => $HOST_VERSION, kind => 'base' });
+    }
     return $tag;
 }
 

@@ -3,8 +3,23 @@
 The sandbox runs its containers through podman, which on Windows and macOS keeps them inside a
 small Linux VM, the *podman machine*. These are the facts about operating that VM on each host.
 
+## Both hosts: the machine's disk
+
+Images live on the machine's root disk. After a successful build the launcher removes the images that
+build superseded: this project's older layer tags and older `claude-sandbox:<version>` tags, keeping
+the newest previous one as a fallback and anything a container (running or stopped) or another image
+still uses, then `podman image prune -f --filter until=1h` (dangling layers at least an hour old, so a build running at the same time keeps its fresh ones). Another project's images are never touched. When a build still dies with `no space left
+on device`, the launcher says the disk is full and shows `df -h /` from inside the machine; see what
+holds the space with `podman system df` and free it with `podman image prune -a` (every image no
+container uses; the sandbox rebuilds its own on the next launch).
+
 ## Windows (WSL2 backend)
 
+- **The sandbox does not create the Windows machine**, so the 100 GiB default below (macOS,
+  `podman-machine.pl`) does not apply here: its size is whatever `podman machine init --provider wsl`
+  gave it. This host's machine, created before any of this, measured a 30 GB root on 2026-11-18
+  (bug report 20261118-004944-c84a), which filled with superseded images. Check yours with
+  `df -h /` inside the machine (`wsl -d podman-machine-default -- df -h /`).
 - **`podman machine set --disk-size` fails on WSL machines** (exit 125). Grow via WSL instead:
   `wsl --shutdown`, then `wsl --manage podman-machine-default --resize <bytes>` (grow only; it runs
   `e2fsck`/`resize2fs` itself). Verify with `df -h /` inside the machine; `podman machine list`
