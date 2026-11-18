@@ -1713,9 +1713,13 @@ sub remote_head_sha {
 # APFS (macOS) refuses a file name that is not valid UTF-8 (EILSEQ, "Illegal
 # byte sequence"), so the lone Latin-1 \xE9 byte cannot even be created
 # there; on darwin the same e-acute is spelled as its UTF-8 bytes, which is
-# also how a real non-ASCII macOS home reaches perl. Every other host keeps
-# the original single-byte fixture.
-my $AC24_EACUTE = $^O eq q{darwin} ? "\xc3\xa9" : "\x{e9}";
+# also how a real non-ASCII macOS home reaches perl. Windows is the same:
+# Git-for-Windows perl (MSYS) stores a lone \xE9 byte as the character U+00E9
+# and reads every name back as UTF-8, so git lists "caf\xc3\xa9" and the
+# single-byte expectation can never match; a real non-ASCII Windows home
+# (C:\Users\Andr\xc3\xa9) reaches perl as UTF-8 bytes too. Linux keeps the
+# original single-byte fixture.
+my $AC24_EACUTE = $^O =~ /^(?:darwin|MSWin32|cygwin|msys)$/ ? "\xc3\xa9" : "\x{e9}";
 for my $variant (
     { label => 'plain',    machine_name => 'host',       file => 'export-marker.txt',   content => "new content\n" },
     { label => q{non-ASCII}, machine_name => "host-Andr$AC24_EACUTE", file => "caf${AC24_EACUTE}-notes.txt", content => "Andr$AC24_EACUTE was here\n" },
