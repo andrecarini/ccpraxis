@@ -253,6 +253,35 @@ sub read_tail {
     return $data;
 }
 
+# own_task_id() -> the Claude Code background-task id this holder runs as, or
+# undef. A background Bash task's stdout is the file tasks/<id>.output, so
+# the id is the name of the file fd 1 points at (/proc on Linux and on
+# Git-for-Windows MSYS; macOS has no /proc and gets undef, where a stopped
+# task's signal does reach this process).
+sub own_task_id {
+    my $p = readlink("/proc/$$/fd/1");
+    return undef unless defined $p;
+    return $1 if $p =~ m{[\\/]tasks[\\/]([A-Za-z0-9_-]{1,64})\.output\z};
+    return undef;
+}
+
+# own_task_stopped_in_tail($tail, $task_id) -> 1 when the transcript shows
+# this holder's own background task stopped (TaskStop's "Successfully
+# stopped task: <id>" result, or a non-running notification for <id>).
+#
+# Bug 20261118-003338-92e7: on Windows, stopping the task kills the shell
+# Claude Code started but the signal never reaches this MSYS perl, which
+# held on, kept the record live (so continuity off was refused) and would
+# have run to its deadline. Task ids are unique per session, so a match can
+# only be this task.
+sub own_task_stopped_in_tail {
+    my ($tail, $task_id) = @_;
+    return 0 unless defined $tail && length $tail && defined $task_id;
+    return 1 if index($tail, "Successfully stopped task: $task_id") >= 0;
+    my $st = finished_status_in_tail($tail, $task_id);
+    return (defined $st && $st ne 'running') ? 1 : 0;
+}
+
 sub finished_status_in_tail {
     my ($tail, $id) = @_;
     return undef unless defined $tail && length $tail;
@@ -998,6 +1027,10 @@ sub sleep_watching_signal {
 my $known_deadline = $rec->{deadline};
 my $last_valid = $rec;
 
+# Bug 92e7: the task this holder runs as, so a stop the signal never
+# delivered is still noticed (see own_task_stopped_in_tail).
+my $OWN_TASK_ID = own_task_id();
+
 # 2.4 loop state: $last_seq is the ext_seq last reported (become writes 0,
 # so this starts at 0); @last_items is items as of the last read or write.
 my $last_seq = $rec->{ext_seq} // 0;
@@ -1165,6 +1198,9 @@ while (1) {
     my $t1 = time();
     my $items_ref = (ref $rp->{items} eq 'ARRAY') ? $rp->{items} : [];
     my $tail = read_tail($rp->{transcript_path});
+    if (own_task_stopped_in_tail($tail, $OWN_TASK_ID)) {
+        end_report('its background task was stopped', $last_valid, 143);
+    }
     my @finished_ids = grep { defined item_gone($rp, $_, $tail) } @$items_ref;
     my $deadline_due = ($t1 >= $rp->{deadline});
 
