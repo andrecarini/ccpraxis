@@ -1,1 +1,1 @@
-Registers the bug-report write guard for any project with almanac enabled
+Registers the almanac write and Tasks-tool guards, the chart reminder, and the open-loops PreCompact/SessionStart pair

@@ -44,3 +44,12 @@ perl "${CLAUDE_PLUGIN_ROOT}/scripts/almanac.pl" todo promote <id> --thread <thre
 ```
 
 Add `--json` to `list`/`show` for machine-readable output.
+
+## Open loops
+
+Todos titled `Open loop: ...` and tagged `open-loop` plus `session-<first 8 chars of the session
+id>` are filed automatically: before each compaction a headless extractor reads the
+conversation since the last one and files what is still open (an unanswered question, an unfinished
+request, an offer nobody answered, a promise not yet kept). After the compaction they are listed in
+the session's context. Complete one when it is answered or done; the next compaction also completes
+those the conversation shows resolved. Set `CCPRAXIS_OPEN_LOOPS=0` to turn this off.
