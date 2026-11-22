@@ -384,9 +384,14 @@ sub spawn_detached {
 # degrades to the "unavailable" value (undef); nothing here ever dies to its
 # caller, spawns, or writes. Paths are byte strings throughout.
 #
-#   almanac_counts(cwd => $dir, sandbox => 0|1) -> {
+#   almanac_counts(cwd => $dir, sandbox => 0|1, name => $project_name) -> {
 #       project => { todo, note, thread, inbox } | undef,
-#       global  => { todo, note, thread } | undef }
+#       global  => { todo, note, thread, inbox } | undef }
+#     global.inbox is the unanswered inbox items of the OTHER projects, from
+#     the snapshot: { open => N, projects => n, name => $basename } (name only
+#     when n == 1) or undef. The current project is left out by path; in a
+#     sandbox, where the snapshot's host paths never match the /project
+#     mount, by base name against "name" (bug 20261121-234250-39b1).
 #   almanac_thread(cwd => $dir, session => $sid) -> undef | {
 #       name, done, total, doing => [ \%label, ... ],
 #       current => \%label | undef, next => \%label | undef }
@@ -869,13 +874,53 @@ sub _alm_snapshot {
         }
         $thread = 0 + $th->{open} if $projects_ok;
     }
-    return { todo => 0 + $todo->{open}, note => 0 + $note->{total}, thread => $thread };
+    my $inbox;
+    my $in = $d->{inbox};
+    if (ref($in) eq 'HASH' && _alm_nonneg_int($in->{open}) && ref($in->{projects}) eq 'ARRAY') {
+        my ($ok, @list) = (1);
+        for my $e (@{ $in->{projects} }) {
+            unless (ref($e) eq 'HASH' && defined($e->{path}) && !ref($e->{path})
+                    && length("$e->{path}") && _alm_nonneg_int($e->{open})) {
+                $ok = 0;
+                last;
+            }
+            my $p = "$e->{path}";
+            utf8::downgrade($p, 1) if utf8::is_utf8($p);
+            push @list, { path => $p, open => 0 + $e->{open} };
+        }
+        $inbox = \@list if $ok;
+    }
+    return { todo => 0 + $todo->{open}, note => 0 + $note->{total}, thread => $thread, inbox => $inbox };
+}
+# _alm_inbox_elsewhere(\@entries, $root, $name) -> { open, projects, name }
+# summing the entries that are not the current project, or undef when none
+# remain. $root is the current project root (host paths); $name, when given,
+# is the current project's base name (the sandbox case). name is the base
+# name of the one remaining project, set only when exactly one remains.
+sub _alm_inbox_elsewhere {
+    my ($entries, $root, $name) = @_;
+    return undef unless ref($entries) eq 'ARRAY';
+    my ($open, @names) = (0);
+    my $want = (defined $name && length $name) ? _alm_bytes($name) : undef;
+    for my $e (@$entries) {
+        next unless $e->{open} > 0;
+        my $p = $e->{path};
+        next if defined $root && _alm_sw_same_path($p, $root, 0);
+        (my $base = $p) =~ tr{\\}{/};
+        $base =~ s{/+\z}{};
+        $base =~ s{\A.*/}{}s;
+        next if defined $want && _alm_sw_seg_eq($base, $want, 0);
+        $open += $e->{open};
+        push @names, $base;
+    }
+    return undef unless $open > 0;
+    return { open => $open, projects => scalar(@names), name => (@names == 1 ? $names[0] : undef) };
 }
 sub almanac_counts {
     my (%o) = @_;
-    my ($project, $global);
+    my ($project, $global, $root);
     eval {
-        my $root = _alm_project_root($o{cwd});
+        $root = _alm_project_root($o{cwd});
         if (defined $root) {
             my $ad = "$root/.ccpraxis-local-data/almanac";
             $project = {
@@ -896,6 +941,10 @@ sub almanac_counts {
             } else {
                 my $v = "$home/.claude/claude-code-vault/almanac";
                 $global = { todo => _alm_count("$v/todo", 'open'), note => _alm_count("$v/note"), thread => (ref($snap) eq 'HASH' ? $snap->{thread} : undef) };
+            }
+            if (ref($global) eq 'HASH') {
+                my $entries = ref($snap) eq 'HASH' ? $snap->{inbox} : undef;
+                $global->{inbox} = _alm_inbox_elsewhere($entries, $root, $o{sandbox} ? $o{name} : undef);
             }
         }
         1;
@@ -1475,7 +1524,7 @@ eval {
 my $almanac = { project => undef, global => undef };
 {
     # -- inbox:begin --
-    $almanac = almanac_counts(cwd => $workspace, sandbox => $SANDBOX_ON);
+    $almanac = almanac_counts(cwd => $workspace, sandbox => $SANDBOX_ON, name => $project);
     # -- inbox:end --
 }
 my $alm_project = ref($almanac) eq 'HASH' && ref($almanac->{project}) eq 'HASH' ? $almanac->{project} : {};
@@ -1489,6 +1538,30 @@ my $inbox_unanswered = $alm_project->{inbox} // 0;
 my $inbox_str = '';
 $inbox_str = bgrgb('overlay.warn') . rgb('overlay.warn') . "${\ _g(0x2691)} ${inbox_unanswered}${R}"
     if $inbox_unanswered > 0;
+
+# ...and the items waiting in OTHER projects (bug 20261121-234250-39b1): an
+# item exists because it needs the operator, so one filed in another project
+# must show here too. Same flag, after this project's: "<flag> 1 in acxpraxis"
+# for one project, "<flag> 3 in 2 projects" for more. almanac_counts has
+# already left this project out, so its items are never counted twice. The
+# name is the project directory's base name, cut to 16 columns, and is part
+# of $inbox_str, so the fit ladder keeps or folds it together with the flag.
+{
+    my $else = $alm_global->{inbox};
+    if (ref($else) eq 'HASH' && ($else->{open} // 0) > 0) {
+        my $where;
+        if (($else->{projects} // 0) == 1 && defined $else->{name}) {
+            my $n = $else->{name};
+            utf8::decode($n) unless utf8::is_utf8($n);
+            $n =~ s/[\x00-\x1f\x7f]//g;
+            $where = fit_head($n, 16);
+        }
+        $where = "$else->{projects} projects" unless defined $where && length $where;
+        my $else_str = bgrgb('overlay.warn') . rgb('overlay.warn')
+                     . "${\ _g(0x2691)} $else->{open} in ${where}${R}";
+        $inbox_str = length($inbox_str) ? "$inbox_str $else_str" : $else_str;
+    }
+}
 
 # ── ...and where it goes ─────────────────────────────────────
 #

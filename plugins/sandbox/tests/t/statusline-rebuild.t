@@ -482,6 +482,12 @@ $ENV{CCPRAXIS_DATA_DIR} = $HYG_DATA;               # process-wide, plain assignm
 # `create` verb -- mint a matching ticket for this one-time call).
 {
     local $ENV{BUTLER_STATE_DIR} = $HYG_BSD;
+    # A thread write refreshes the global-counts snapshot under HOME: without
+    # these, this one call rewrote the operator's real
+    # ~/.claude/almanac-global-counts.json and recorded $HYG_PROJ in it.
+    local $ENV{HOME} = $HYG_HOME;
+    local $ENV{USERPROFILE} = $HYG_HOME;
+    local $ENV{ALMANAC_HOME} = $HYG_HOME;
     require $BPHOOK_PM_FOR_HYG unless grep { m{(?:^|/)BpHook\.pm$} } keys %INC;
     BpHook::write_ticket(
         { session_id => 'HYG-HELPER', tool_use_id => 'HYGSETUP',

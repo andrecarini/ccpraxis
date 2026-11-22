@@ -964,6 +964,154 @@ sub mk_thread {
 }
 
 # =============================================================================
+# INBOX (bug 20261121-234250-39b1) -- the snapshot carries the unanswered
+# inbox items of every known project, so the statusline of one project can
+# show the operator an item waiting in another. Before the fix the snapshot
+# had no inbox section at all.
+# =============================================================================
+sub mk_inbox_item {
+    my ($root, $title, $status, $type) = @_;
+    my $store = Almanac::Store->open(scope => 'project', type => ($type // 'inbox'), root => $root);
+    my %f = (title => $title, status => $status, created => '2026-01-01T00:00:00Z');
+    my @o = qw(title status created);
+    if ($status eq 'answered') { $f{answer} = 'yes'; $f{answered_at} = '2026-01-02T00:00:00Z'; push @o, qw(answer answered_at) }
+    return $store->create(fields => \%f, order => \@o);
+}
+sub inbox_entry_for {
+    my ($snap, $root) = @_;
+    return undef unless ref($snap) eq 'HASH' && ref($snap->{inbox}) eq 'HASH' && ref($snap->{inbox}{projects}) eq 'ARRAY';
+    my @hit = grep { ref($_) eq 'HASH' && norm_path($_->{path}) eq norm_path($root) } @{ $snap->{inbox}{projects} };
+    return @hit == 1 ? $hit[0] : (@hit ? 'duplicate' : undef);
+}
+
+{
+    my $H = new_home();
+    my $PA = tempdir(CLEANUP => 1); $PA =~ s{\\}{/}g;   # 2 unanswered, 1 answered
+    my $PB = tempdir(CLEANUP => 1); $PB =~ s{\\}{/}g;   # 1 unanswered, legacy (pre-rename) dir only
+    my $PC = tempdir(CLEANUP => 1); $PC =~ s{\\}{/}g;   # answered only
+    my $PD = tempdir(CLEANUP => 1); $PD =~ s{\\}{/}g;   # no inbox at all
+    mkdir_p("$H/.claude/claude-code-vault");
+    write_raw("$H/.claude/claude-code-vault/.registry-local.json",
+        JSON::PP->new->canonical->encode({ projects => {
+            pa => { path => $PA }, pb => { path => $PB }, pc => { path => $PC }, pd => { path => $PD } } }));
+    mk_inbox_item($PA, 'a1', 'unanswered');
+    mk_inbox_item($PA, 'a2', 'unanswered');
+    mk_inbox_item($PA, 'a3', 'answered');
+    mk_inbox_item($PB, 'b1', 'unanswered', 'decision');
+    mk_inbox_item($PC, 'c1', 'answered');
+
+    my $res = eval { Almanac::GlobalCounts::refresh(home => $H) };
+    ok(ref($res) eq 'HASH' && ($res->{ok} // 0), 'INBOX: refresh over four registered projects succeeds')
+        or diag('error: ' . ($@ // 'refresh did not return ok'));
+    my $path = eval { Almanac::GlobalCounts::snapshot_path(home => $H) };
+    my $raw  = defined $path ? slurp_raw($path) : undef;
+    like($raw // '', qr/"inbox":\{/, 'INBOX: the snapshot file on disk carries an "inbox" section');
+    my $snap = eval { Almanac::GlobalCounts::read_snapshot(defined $path ? $path : '') };
+    ok(ref($snap) eq 'HASH' && ref($snap->{inbox}) eq 'HASH', 'INBOX: read_snapshot returns the inbox section')
+        or diag('snapshot: ' . ($raw // '(none)'));
+    is(ref($snap) eq 'HASH' && ref($snap->{inbox}) eq 'HASH' ? $snap->{inbox}{open} : undef, 3,
+        'INBOX: inbox.open == 3 (PA 2 + PB 1; answered items never counted)');
+    my $ea = inbox_entry_for($snap, $PA);
+    my $eb = inbox_entry_for($snap, $PB);
+    is(ref($ea) eq 'HASH' ? $ea->{open} : $ea, 2, 'INBOX: PA is listed once, with open == 2');
+    is(ref($eb) eq 'HASH' ? $eb->{open} : $eb, 1, 'INBOX: PB (legacy inbox dir) is listed once, with open == 1');
+    ok(!defined inbox_entry_for($snap, $PC), 'INBOX: PC (answered only) is not listed');
+    ok(!defined inbox_entry_for($snap, $PD), 'INBOX: PD (no inbox) is not listed');
+    my $comp = eval { Almanac::GlobalCounts::compute(home => $H, roots => [$PA, $PB, $PC, $PD]) };
+    is(ref($comp) eq 'HASH' && ref($comp->{inbox}) eq 'HASH' ? $comp->{inbox}{open} : undef, 3,
+        'INBOX: compute(roots => ...) reports the same inbox.open');
+    my $comp0 = eval { Almanac::GlobalCounts::compute(home => $H) };
+    ok(ref($comp0) eq 'HASH' && !exists $comp0->{inbox}, 'INBOX: compute() without roots adds no inbox section (todo/note only, as before)');
+
+    # The non-ASCII project path round-trips byte-exact (the thread section's
+    # AC18 case, for the inbox list).
+    my $Hu = new_home();
+    my $Pu = tempdir(CLEANUP => 1); $Pu =~ s{\\}{/}g;
+    $Pu .= "/Andr\xc3\xa9-proj";
+    mkdir_p($Pu);
+    mkdir_p("$Hu/.claude/claude-code-vault");
+    write_raw("$Hu/.claude/claude-code-vault/.registry-local.json",
+        JSON::PP->new->utf8->canonical->encode({ projects => { u => { path => Encode::decode('UTF-8', $Pu) } } }));
+    mk_inbox_item($Pu, 'u1', 'unanswered');
+    my $resu = eval { Almanac::GlobalCounts::refresh(home => $Hu) };
+    my $snapu = eval { Almanac::GlobalCounts::read_snapshot(Almanac::GlobalCounts::snapshot_path(home => $Hu)) };
+    my $eu = inbox_entry_for($snapu, $Pu);
+    is(ref($eu) eq 'HASH' ? $eu->{open} : $eu, 1, 'INBOX: a non-ASCII project path round-trips byte-exact in inbox.projects');
+}
+
+# A malformed inbox section is dropped, never fatal: todo/note/thread survive.
+{
+    my $Hmal = new_home();
+    run_cli($TODO_PL, 'create', '--title', 'INBOX malformed-section todo', '--global', '--home', $Hmal);
+    my $path = eval { Almanac::GlobalCounts::snapshot_path(home => $Hmal) };
+    my $base = defined $path ? eval { JSON::PP->new->utf8->decode(slurp_raw($path) // '') } : undef;
+    ok(ref($base) eq 'HASH', 'INBOX (malformed) fixture: a snapshot exists after a todo write');
+    my @bad = (
+        [ 'not a hash',                 'nope' ],
+        [ 'open not an integer',        { open => 'x', projects => [] } ],
+        [ 'projects not an array',      { open => 1, projects => 'p' } ],
+        [ 'entry without a path',       { open => 1, projects => [ { open => 1 } ] } ],
+        [ 'entry with a bad count',     { open => 1, projects => [ { path => '/x', open => -1 } ] } ],
+        [ 'entry not a hash',           { open => 1, projects => [ '/x' ] } ],
+    );
+    for my $case (@bad) {
+        my ($label, $section) = @$case;
+        next unless ref($base) eq 'HASH';
+        my %doc = %$base;
+        $doc{inbox}  = $section;
+        $doc{thread} = { open => 2, projects => [] };
+        write_raw($path, JSON::PP->new->utf8->canonical->encode(\%doc));
+        my $snap = eval { Almanac::GlobalCounts::read_snapshot($path) };
+        ok(ref($snap) eq 'HASH' && !exists $snap->{inbox}
+            && ref($snap->{todo}) eq 'HASH' && ref($snap->{thread}) eq 'HASH' && $snap->{thread}{open} == 2,
+            "INBOX (malformed: $label): the inbox key is dropped; todo/note/thread survive");
+    }
+    my $counts = { todo => { open => 1, done => 2, total => 3 }, note => { total => 4 } };
+    my $bytes = eval { Almanac::GlobalCounts::serialize($counts, '2026-01-01T00:00:00Z') };
+    unlike($bytes // '', qr/"inbox"/, 'INBOX: serialize() emits no "inbox" key when $counts carries none');
+
+    # serialize() leaves the caller's paths alone. It used to decode them
+    # with a CHECK argument and no LEAVE_SRC, which empties the source in
+    # place, so refresh's size-budget loop re-serialized blank paths.
+    my $c2 = { todo => { open => 0, done => 0, total => 0 }, note => { total => 0 },
+               thread => { open => 1, projects => ["/p/Andr\xc3\xa9"] },
+               inbox  => { open => 1, projects => [ { path => "/p/Andr\xc3\xa9", open => 1 } ] } };
+    my $b1 = eval { Almanac::GlobalCounts::serialize($c2, '2026-01-01T00:00:00Z') };
+    my $b2 = eval { Almanac::GlobalCounts::serialize($c2, '2026-01-01T00:00:00Z') };
+    is($c2->{thread}{projects}[0], "/p/Andr\xc3\xa9", 'serialize(): thread.projects entries are not emptied by serializing');
+    is($c2->{inbox}{projects}[0]{path}, "/p/Andr\xc3\xa9", 'serialize(): inbox.projects paths are not emptied by serializing');
+    is($b2, $b1, 'serialize(): serializing the same counts twice yields the same bytes');
+}
+
+# Filing and answering through the inbox CLI refreshes the snapshot, as todo,
+# note and thread writes already do. HOME/ALMANAC_HOME are pinned to a temp
+# home for the spawned CLI: the real snapshot is never touched.
+{
+    my $Hc = new_home();
+    my $Pc = tempdir(CLEANUP => 1); $Pc =~ s{\\}{/}g;
+    mkdir_p("$Pc/.ccpraxis-local-data");
+    my $INBOX_PL = "$S/almanac-inbox.pl";
+    local $ENV{ALMANAC_HOME} = $Hc;
+    local $ENV{HOME} = $Hc;
+    local $ENV{USERPROFILE} = $Hc;
+    my $path = eval { Almanac::GlobalCounts::snapshot_path(home => $Hc) };
+    ok(defined $path && !-e $path, 'INBOX (CLI) fixture: no snapshot before the first inbox write');
+    my $rf = run_cli($INBOX_PL, 'file', '--root', $Pc, '--title', 'Ship it?');
+    is($rf->{rc}, 0, 'INBOX (CLI): almanac-inbox.pl file exits 0') or diag($rf->{err});
+    my $id = field0($rf->{out}, 'id');
+    my $snap = eval { Almanac::GlobalCounts::read_snapshot($path) };
+    my $e = inbox_entry_for($snap, $Pc);
+    is(ref($e) eq 'HASH' ? $e->{open} : $e, 1, 'INBOX (CLI): filing an item refreshes the snapshot -- the project is listed with 1 unanswered')
+        or diag('snapshot: ' . (slurp_raw($path) // '(none)'));
+    my $ra = run_cli($INBOX_PL, 'answer', $id // 'missing-id', '--root', $Pc, '--answer', 'yes');
+    is($ra->{rc}, 0, 'INBOX (CLI): almanac-inbox.pl answer exits 0') or diag($ra->{err});
+    my $snap2 = eval { Almanac::GlobalCounts::read_snapshot($path) };
+    is(ref($snap2) eq 'HASH' && ref($snap2->{inbox}) eq 'HASH' ? $snap2->{inbox}{open} : undef, 0,
+        'INBOX (CLI): answering it refreshes the snapshot -- inbox.open back to 0');
+    ok(!defined inbox_entry_for($snap2, $Pc), 'INBOX (CLI): ...and the project is no longer listed');
+}
+
+# =============================================================================
 # REGRESSION (blueprint tooling-backlog, package 13-almanac-decision-
 # relative-path; almanac bug 20261001-184636-75fe; no architect spec --
 # Decision 65, mechanical fix): almanac-todo.pl and almanac-note.pl, invoked

@@ -8,8 +8,8 @@ package Almanac::GlobalCounts;
 # atomically through Almanac::Lock; a sandbox bind-mounts that single file
 # read-only (MountSpec.pm, out of this module's scope).
 #
-# CORE PERL plus Almanac::Store, Almanac::Lock, JSON::PP. No import from
-# another plugin (spec 2.3).
+# CORE PERL plus Almanac::Store, Almanac::Lock, Almanac::Record, JSON::PP.
+# No import from another plugin (spec 2.3).
 use strict;
 use warnings;
 use File::Path ();
@@ -18,6 +18,7 @@ use Time::HiRes ();
 use Encode ();
 use Almanac::Store ();
 use Almanac::Lock ();
+use Almanac::Record ();
 
 our $VERSION = '1.0';
 
@@ -91,9 +92,48 @@ sub compute {
             # swallow: a root whose read dies contributes 0.
         }
         $out{thread} = { open => $n };
+
+        # inbox (bug 20261121-234250-39b1): the unanswered inbox items of
+        # every root, so the statusline of one project can show the operator
+        # an item waiting in another. Only roots with at least one are
+        # listed. Same roots, same "a root whose read dies contributes 0".
+        my ($in_open, @in_projects) = (0);
+        for my $root (@{ (ref $opt{roots} eq 'ARRAY') ? $opt{roots} : [] }) {
+            my $k = eval { _unanswered_in($root) };
+            next unless defined $k && $k > 0;
+            $in_open += $k;
+            push @in_projects, { path => $root, open => $k };
+        }
+        $out{inbox} = { open => $in_open, projects => \@in_projects };
     }
 
     return \%out;
+}
+
+# The inbox store's directory before blueprint where-things-go renamed it;
+# a project that has not migrated yet still keeps its items there.
+our $LEGACY_INBOX_DIR = 'decision';
+
+# _unanswered_in($root) -> the number of records in $root's inbox whose
+# status is "unanswered". The legacy directory is read only when the inbox
+# directory does not exist, the rule almanac_counts in
+# gen-statusline-counters.pl applies to the current project. Reads each
+# record file directly: a Store list() would run recover(), a WRITE into
+# another project's store (the thread count's redteam S5 note). A record
+# that does not parse is not counted, as the statusline does not count it.
+sub _unanswered_in {
+    my ($root) = @_;
+    my $ad  = "$root/.ccpraxis-local-data/almanac";
+    my $dir = -d "$ad/inbox" ? "$ad/inbox" : "$ad/$LEGACY_INBOX_DIR";
+    return 0 unless -d $dir;
+    my $n = 0;
+    for my $path (Almanac::Store::record_files_in($dir)) {
+        my $rec = eval { Almanac::Record::read_file($path) };
+        next unless ref($rec) eq 'HASH' && ref($rec->{fields}) eq 'HASH';
+        my $st = $rec->{fields}{status};
+        $n++ if defined $st && $st eq 'unanswered';
+    }
+    return $n;
 }
 
 # ---------------------------------------------------------------------------
@@ -123,14 +163,38 @@ sub serialize {
                 # re-encodes every string field (including the plain-ASCII
                 # ones) to UTF-8 bytes itself, so decoded characters are the
                 # correct input here, not raw bytes.
-                my $decoded = eval { Encode::decode('UTF-8', $p, Encode::FB_CROAK()) };
+                my $decoded = _decode_path($p);
                 next unless defined $decoded;
                 push @projects, $decoded;
             }
         }
         $doc{thread} = { open => 0 + $counts->{thread}{open}, projects => \@projects };
     }
+    # inbox (bug 20261121-234250-39b1): { open, projects => [ { open, path } ] },
+    # paths decoded exactly as thread.projects are above.
+    if (ref $counts->{inbox} eq 'HASH') {
+        my @projects;
+        if (ref $counts->{inbox}{projects} eq 'ARRAY') {
+            for my $e (@{ $counts->{inbox}{projects} }) {
+                next unless ref($e) eq 'HASH' && defined $e->{path} && length $e->{path};
+                my $decoded = _decode_path($e->{path});
+                next unless defined $decoded;
+                push @projects, { open => 0 + ($e->{open} // 0), path => $decoded };
+            }
+        }
+        $doc{inbox} = { open => 0 + ($counts->{inbox}{open} // 0), projects => \@projects };
+    }
     return JSON::PP->new->utf8->canonical(1)->encode(\%doc) . "\n";
+}
+
+# _decode_path($bytes) -> characters, or undef when not valid UTF-8.
+# LEAVE_SRC matters: with a CHECK argument and without it, Encode::decode
+# empties its source in place, and serialize's source is the caller's own
+# counts -- refresh serializes the same counts again on every size-budget
+# eviction, which then saw every path as '' and dropped them all at once.
+sub _decode_path {
+    my ($p) = @_;
+    return scalar eval { Encode::decode('UTF-8', $p, Encode::FB_CROAK() | Encode::LEAVE_SRC()) };
 }
 
 sub _now_iso {
@@ -276,6 +340,31 @@ sub _read_snapshot_once {
             }
         }
         delete $decoded->{thread} unless $ok;
+    }
+
+    # inbox (bug 20261121-234250-39b1): optional, and dropped whole when
+    # malformed, exactly as thread is above. Each listed project is a HASH
+    # with a non-empty path and a non-negative integer open; path bytes are
+    # restored with utf8::downgrade for the reason given above.
+    if (exists $decoded->{inbox}) {
+        my $in = $decoded->{inbox};
+        my $ok = (ref($in) eq 'HASH') && _is_nonneg_int($in->{open})
+              && ref($in->{projects}) eq 'ARRAY';
+        if ($ok) {
+            for my $e (@{ $in->{projects} }) {
+                unless (ref($e) eq 'HASH' && defined $e->{path} && !ref($e->{path})
+                        && length($e->{path}) && _is_nonneg_int($e->{open})) {
+                    $ok = 0;
+                    last;
+                }
+            }
+        }
+        if ($ok) {
+            for my $e (@{ $in->{projects} }) {
+                utf8::downgrade($e->{path}, 1) if utf8::is_utf8($e->{path});
+            }
+        }
+        delete $decoded->{inbox} unless $ok;
     }
 
     return $decoded;
@@ -460,6 +549,14 @@ sub refresh {
         }
         $victim_idx = 0 unless defined $victim_idx;
         splice(@$projects, $victim_idx, 1);
+        $bytes = serialize($counts, $gen_at);
+    }
+    # Still over budget with no thread.projects left: drop inbox.projects
+    # entries from the end, never inbox.open. They go last because each one
+    # is an item waiting on the operator, which the statusline exists to show.
+    while (length($bytes) > 4096 && ref($counts->{inbox}) eq 'HASH'
+           && ref($counts->{inbox}{projects}) eq 'ARRAY' && @{ $counts->{inbox}{projects} }) {
+        pop @{ $counts->{inbox}{projects} };
         $bytes = serialize($counts, $gen_at);
     }
 

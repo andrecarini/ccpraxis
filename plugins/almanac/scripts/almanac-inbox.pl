@@ -39,6 +39,7 @@ use Almanac::Store ();
 use Almanac::Record ();
 use Almanac::Lock ();
 use Almanac::LegacyQueue ();
+use Almanac::GlobalCounts ();
 
 # Loading this script brings Almanac::Task::* with it (spec S2.3): a
 # `require` of the sibling script's absolute path, at compile time, so
@@ -599,6 +600,38 @@ sub _print_show_json {
 }
 
 # ---------------------------------------------------------------------------
+# global-counts refresh (bug 20261121-234250-39b1): filing or answering an
+# item changes the inbox section of ~/.claude/almanac-global-counts.json,
+# which is how the statusline of every OTHER project learns of it. Same
+# behaviour as almanac-thread.pl's: the item is already written, so a failed
+# refresh only warns; in a container refresh declines and nothing is said.
+# The project root is recorded, so a project nobody registered is still
+# counted. Called from the CLI only, like the todo and thread refreshes: the
+# library subs file() and answer() stay free of side effects on the home.
+# ---------------------------------------------------------------------------
+#
+# The root is read off the written record's path rather than a second Store
+# open (open_inbox stays this file's one ->open call). A store relocated by
+# CCPRAXIS_DATA_DIR has no project root to name, so none is recorded.
+sub _maybe_refresh_global_counts {
+    my ($rec) = @_;
+    local $@;
+    my $root;
+    if (ref($rec) eq 'HASH' && defined $rec->{path}) {
+        (my $p = $rec->{path}) =~ s{\\}{/}g;
+        $root = $1 if $p =~ m{\A(.+)/\.ccpraxis-local-data/almanac/inbox/[^/]+\z}s;
+    }
+    my $res = eval { Almanac::GlobalCounts::refresh(record_root => $root) };
+    return if ref($res) eq 'HASH' && $res->{ok};
+    my $reason = (ref($res) eq 'HASH' && defined $res->{reason}) ? $res->{reason} : 'unknown';
+    return if $reason eq 'container';
+    print STDERR "almanac: global counts snapshot not refreshed (reason: $reason)\n";
+    print STDERR "almanac-warning:\n";
+    print STDERR "  kind: global_counts_stale\n";
+    print STDERR "  reason: $reason\n";
+}
+
+# ---------------------------------------------------------------------------
 # CLI verbs.
 # ---------------------------------------------------------------------------
 sub _cmd_file {
@@ -616,6 +649,7 @@ sub _cmd_file {
 
     my $rec = file(%opt);
     _print_result($rec, status => 'unanswered', changed => 'yes');
+    _maybe_refresh_global_counts($rec);
 }
 
 sub _cmd_list {
@@ -644,6 +678,7 @@ sub _cmd_answer {
 
         my ($rec, $changed) = answer($id, %opt);
         _print_result($rec, status => $rec->{fields}{status}, changed => ($changed ? 'yes' : 'no'));
+        _maybe_refresh_global_counts($rec) if $changed;
 
         my $report = blocked_tasks($id, root => $o->{root});
         _print_traversal($report);
@@ -658,6 +693,7 @@ sub _cmd_answer {
 
     my ($rec, $changed) = answer($id, %opt);
     _print_result($rec, status => $rec->{fields}{status}, changed => ($changed ? 'yes' : 'no'));
+    _maybe_refresh_global_counts($rec) if $changed;
 
     my $report = blocked_tasks($id, root => $o->{root});
     _print_traversal($report);
