@@ -16,7 +16,7 @@
 #   BP_LEDGER or BP_ROLE set          a butler fleet session, not an operator chat
 #
 # Fails open on everything: a missing script, an unreadable or timed-out
-# payload, an unexpected event. It never exits 2 and never prints a decision,
+# payload, an unexpected event. It never exits 2 and never prints a block verdict,
 # so it can never block a compaction. Bash 3.2 safe (macOS /bin/bash): the
 # payload goes through the shared read-payload.sh reader; [[ =~ ]] and <<<
 # both exist in 3.2.

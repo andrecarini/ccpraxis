@@ -20,7 +20,7 @@
 # by event and source in bash so an ordinary session start spawns no perl.
 #
 # FAILS OPEN, ALWAYS. A PreCompact hook can block a compaction (exit 2 or a
-# "block" decision); this one never does. Any error, timeout, missing
+# "block" verdict); this one never does. Any error, timeout, missing
 # `claude`, or unparseable extractor output ends in exit 0 with nothing on
 # stdout, or with only the list of loops that were already safely filed, and
 # one line in <home>/.claude/almanac-state/open-loops/open-loops.log.
