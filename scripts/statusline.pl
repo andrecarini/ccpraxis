@@ -1535,31 +1535,24 @@ my $inbox_unanswered = $alm_project->{inbox} // 0;
 # below: this way a failure in the blueprint scan (opendir ... or die) can
 # never take the flag down with it. It leads the counters field (Decision 1)
 # rather than riding in the marker.
+#
+# It follows the other counters' "glyph P·G" shape (operator, 2026-11-22): P
+# is this project's unanswered items, G the items waiting in OTHER projects
+# (bug 20261121-234250-39b1: an item exists because it needs the operator, so
+# one filed elsewhere must show here too). almanac_counts has already left
+# this project out of G, so nothing is counted twice. "⚑ 2·1" is two here and
+# one elsewhere, on the warning background. With none here, "⚑ 1" is drawn
+# faded, exactly like the other counters' elsewhere-only form (operator,
+# 2026-11-22): the warning colours mark only what this project is waiting on.
 my $inbox_str = '';
-$inbox_str = bgrgb('overlay.warn') . rgb('overlay.warn') . "${\ _g(0x2691)} ${inbox_unanswered}${R}"
-    if $inbox_unanswered > 0;
-
-# ...and the items waiting in OTHER projects (bug 20261121-234250-39b1): an
-# item exists because it needs the operator, so one filed in another project
-# must show here too. Same flag, after this project's: "<flag> 1 in acxpraxis"
-# for one project, "<flag> 3 in 2 projects" for more. almanac_counts has
-# already left this project out, so its items are never counted twice. The
-# name is the project directory's base name, cut to 16 columns, and is part
-# of $inbox_str, so the fit ladder keeps or folds it together with the flag.
 {
     my $else = $alm_global->{inbox};
-    if (ref($else) eq 'HASH' && ($else->{open} // 0) > 0) {
-        my $where;
-        if (($else->{projects} // 0) == 1 && defined $else->{name}) {
-            my $n = $else->{name};
-            utf8::decode($n) unless utf8::is_utf8($n);
-            $n =~ s/[\x00-\x1f\x7f]//g;
-            $where = fit_head($n, 16);
-        }
-        $where = "$else->{projects} projects" unless defined $where && length $where;
-        my $else_str = bgrgb('overlay.warn') . rgb('overlay.warn')
-                     . "${\ _g(0x2691)} $else->{open} in ${where}${R}";
-        $inbox_str = length($inbox_str) ? "$inbox_str $else_str" : $else_str;
+    my $g = (ref($else) eq 'HASH' && ($else->{open} // 0) > 0) ? $else->{open} : 0;
+    if ($inbox_unanswered > 0) {
+        $inbox_str = bgrgb('overlay.warn') . rgb('overlay.warn') . "${\ _g(0x2691)} ${inbox_unanswered}"
+                   . ($g > 0 ? "\x{00B7}${g}" : '') . $R;
+    } elsif ($g > 0) {
+        $inbox_str = "${FAINT}${\ _g(0x2691)}${R}${FAINT} ${g}${R}";
     }
 }
 

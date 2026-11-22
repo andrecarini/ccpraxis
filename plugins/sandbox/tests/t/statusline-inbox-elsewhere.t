@@ -4,9 +4,9 @@
 # invisible in the statusline everywhere else, because the global-counts
 # snapshot had no inbox section and row 1 drew only the current project's
 # flag. The snapshot now lists every project's unanswered items, and row 1
-# draws a second flag for the other projects: "<flag> 1 in <name>" for one,
-# "<flag> N in M projects" for several. The current project is never counted
-# twice.
+# draws them in the other counters' shape (operator, 2026-11-22): "<flag> P·G",
+# P this project's, G the other projects'; "<flag> G" when P is 0. The current
+# project is never counted twice.
 #
 # Scaffolding is a trimmed copy of statusline-counters-layout.t's (tput/git
 # shims, a scrubbed temp HOME, a timeout-bounded spawn); never the real
@@ -72,7 +72,7 @@ sub render {
     if ($o{sandbox}) { $ENV{CCPRAXIS_SANDBOX} = '1' } else { delete $ENV{CCPRAXIS_SANDBOX} }
     my $out = `timeout 20 perl "$STATUSLINE" < "$inpath" 2>/dev/null`;
     unlink $inpath;
-    return strip_sgr(first_line($out));
+    return $o{raw} ? first_line($out) : strip_sgr(first_line($out));
 }
 
 sub mk_proj {
@@ -106,49 +106,66 @@ sub seed_unanswered {
 }
 
 my $F = encode('UTF-8', chr(0x2691));
+my $D = encode('UTF-8', chr(0x00B7));   # the counters' P-dot-G separator
 sub flags { my ($row) = @_; my @m = ($row =~ /\Q$F\E/g); return scalar @m }
 
 SKIP: {
-    skip('almanac-inbox.pl did not load', 12) unless $ALMANAC_OK;
+    skip('almanac-inbox.pl did not load', 15) unless $ALMANAC_OK;
 
     my $P_HERE  = mk_proj('here-proj');
     my $P_OTHER = mk_proj('acxpraxis');
     my $P_THIRD = mk_proj('third-proj');
     seed_unanswered($P_HERE, 2);
 
-    # One other project: "<flag> 1 in acxpraxis", after this project's own
-    # "<flag> 2"; this project's two are not counted again.
+    # One other project: "<flag> 2-dot-1"; this project's two are not counted again.
     my $H1 = mk_home();
     write_snapshot($H1, [ [ $P_HERE, 2 ], [ $P_OTHER, 1 ] ]);
     my $row = render(cwd => $P_HERE, home => $H1);
-    like($row, qr/\Q$F\E 2 \Q$F\E 1 in acxpraxis(?!\S)/,
-        'one other project: its item renders as "<flag> 1 in acxpraxis" after this project\'s "<flag> 2"')
+    like($row, qr/\Q$F\E 2\Q$D\E1(?!\S)/,
+        'one other project: "<flag> 2-dot-1", this project first, the others after the dot')
         or diag("row 1 = [$row]");
-    is(flags($row), 2, 'one other project: exactly two flags -- this project\'s is not repeated');
-    unlike($row, qr/in here-proj/, 'one other project: the current project is never named as "elsewhere"');
+    is(flags($row), 1, 'one other project: one flag, as every counter has one glyph');
+    unlike($row, qr/ in /, 'one other project: no project name or " in " text');
 
-    # No item in this project: the other project's flag stands alone.
+    # No item in this project: the others' count alone, faded like the other
+    # counters' elsewhere-only form.
     my $P_EMPTY = mk_proj('empty-proj');
     my $rowe = render(cwd => $P_EMPTY, home => $H1);
-    like($rowe, qr/\Q$F\E 3 in 2 projects(?!\S)/,
-        'seen from a project with no items, both others count: "<flag> 3 in 2 projects"')
+    like($rowe, qr/\Q$F\E 3(?!\S)/,
+        'seen from a project with no items, both others count, with no dot: "<flag> 3"')
         or diag("row 1 = [$rowe]");
     is(flags($rowe), 1, '...and that is the only flag');
 
-    # Several other projects: a count of projects, not names.
+    # Colour: with items here the flag sits on the warning background; with
+    # none here it is faded, with no background (operator, 2026-11-22). The
+    # SGR run that opens the flag is read from the raw row.
+    my $sgr_before_flag = sub {
+        my ($raw) = @_;
+        return undef unless $raw =~ /((?:\e\[[0-9;]*m)+)\Q$F\E/;
+        return $1;
+    };
+    my $raw_here  = $sgr_before_flag->(render(cwd => $P_HERE,  home => $H1, raw => 1));
+    my $raw_empty = $sgr_before_flag->(render(cwd => $P_EMPTY, home => $H1, raw => 1));
+    ok(defined $raw_here && $raw_here =~ /\e\[48;/, 'items here: the flag has a background colour')
+        or diag('SGR = [' . ($raw_here // 'none') . ']');
+    ok(defined $raw_empty && $raw_empty !~ /\e\[48;/, 'none here: the flag has no background (faded)')
+        or diag('SGR = [' . ($raw_empty // 'none') . ']');
+    isnt($raw_empty, $raw_here, 'none here: the flag is drawn in different colours from the local-items flag');
+
+    # Several other projects: one total after the dot.
     my $H2 = mk_home();
     write_snapshot($H2, [ [ $P_HERE, 2 ], [ $P_OTHER, 1 ], [ $P_THIRD, 4 ] ]);
     my $row2 = render(cwd => $P_HERE, home => $H2);
-    like($row2, qr/\Q$F\E 2 \Q$F\E 5 in 2 projects(?!\S)/,
-        'two other projects: "<flag> 5 in 2 projects" after this project\'s flag')
+    like($row2, qr/\Q$F\E 2\Q$D\E5(?!\S)/,
+        'two other projects: "<flag> 2-dot-5"')
         or diag("row 1 = [$row2]");
 
     # Only this project has items: nothing extra.
     my $H3 = mk_home();
     write_snapshot($H3, [ [ $P_HERE, 2 ] ]);
     my $row3 = render(cwd => $P_HERE, home => $H3);
-    is(flags($row3), 1, 'only this project has items: one flag, no "elsewhere" flag') or diag("row 1 = [$row3]");
-    unlike($row3, qr/ in /, '...and no " in " text');
+    is(flags($row3), 1, 'only this project has items: one flag') or diag("row 1 = [$row3]");
+    unlike($row3, qr/\Q$D\E/, '...and no dot');
 
     # No snapshot inbox at all: nothing extra (a pre-fix snapshot).
     my $H4 = mk_home();
@@ -164,10 +181,10 @@ SKIP: {
     my $twin = nslash(tempdir(CLEANUP => 1)) . '/host-side/empty-proj';
     write_snapshot($H5, [ [ $twin, 2 ], [ $P_OTHER, 1 ] ]);
     my $rows = render(cwd => $P_EMPTY, home => $H5, sandbox => 1);
-    like($rows, qr/\Q$F\E 1 in acxpraxis(?!\S)/, 'sandbox: another project still shows') or diag("row 1 = [$rows]");
-    is(flags($rows), 1, 'sandbox: the entry named like the current project is left out');
+    like($rows, qr/\Q$F\E 1(?!\S)/, 'sandbox: another project still shows, and the entry named like the current project is left out') or diag("row 1 = [$rows]");
+    is(flags($rows), 1, 'sandbox: one flag');
     my $rowh = render(cwd => $P_EMPTY, home => $H5);
-    like($rowh, qr/\Q$F\E 3 in 2 projects(?!\S)/, 'host: the same entry is another project (a different path) and counts')
+    like($rowh, qr/\Q$F\E 3(?!\S)/, 'host: the same entry is another project (a different path) and counts')
         or diag("row 1 = [$rowh]");
 }
 
@@ -190,8 +207,8 @@ SKIP: {
         is($fe // '', '', 'end to end: the CLI warns about nothing (the refresh succeeded)');
     }
     my $row = render(cwd => $P_A, home => $H);
-    like($row, qr/\Q$F\E 1 in Andr\xc3\xa9-proj(?!\S)/,
-        'end to end: project A\'s statusline shows B\'s item by name, non-ASCII intact')
+    like($row, qr/\Q$F\E 1(?!\S)/,
+        'end to end: project A\'s statusline counts B\'s item (B has a non-ASCII path)')
         or diag("row 1 = [$row]");
 }
 
