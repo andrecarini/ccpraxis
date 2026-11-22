@@ -130,15 +130,19 @@ main() {
     cd "$WS/proj"
     export BP_LEDGER="$WS/bp/ledger.md" BP_DIR="$WS/bp" BP_PROJECT_ROOT="$WS/proj"
     export BP_PACKAGE="hooks-selftest" BP_WRITE_SET="allowed/" BP_TEST_PATHS="tests/"
-    : > "$BP_LEDGER"
     # This session wears a coordinator's environment (BP_LEDGER set, no
-    # BP_ROLE), so the Stop gate holds it to a coordinator's ledger discipline,
-    # and the stub ledger above can never reach a terminal status: the session
-    # could not end its one turn, kept going, and once filed a bug about it
-    # (20261111-093546-547b). The gate's own force-stop marker lets exactly that
-    # one stop through and is consumed by it; guard-writes, the thing under
-    # test, is untouched.
-    : > "$BP_DIR/runs/$BP_PACKAGE.force-stop"
+    # BP_ROLE), so the Stop gate holds it to a coordinator's ledger discipline.
+    # An empty stub ledger never reaches a terminal status, so the session could
+    # not end its one turn, kept going, and once filed a bug about it
+    # (20261111-093546-547b). The stub therefore says `status: done`, which the
+    # gate's ledger rule accepts while the file is fresh. Not the force-stop
+    # marker: GateShutdown reads that as "this package is stopping" and denies
+    # the very subagent dispatch this test exists to make (seen 2026-11-23,
+    # INCONCLUSIVE, "STOP-AND-PARK ... new work is denied"). guard-writes, the
+    # thing under test, never reads the ledger's status.
+    printf '%s\n' '---' "package: $BP_PACKAGE" 'status: done' '---' '' \
+      "# Package $BP_PACKAGE (hooks self-test stub)" '' '## Next action' '' \
+      'None: this stub exists only so the self-test session may end its turn.' > "$BP_LEDGER"
     claude -p "$PROMPT" \
       --settings "$SETTINGS" \
       --model "${BP_HOOKS_SELFTEST_MODEL:-sonnet}" \
